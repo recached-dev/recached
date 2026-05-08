@@ -1,6 +1,7 @@
 import { defineConfig } from 'vitepress'
 
 export default defineConfig({
+  base: '/recached/',
   title: 'Recached',
   titleTemplate: ':title — Recached',
   description:
