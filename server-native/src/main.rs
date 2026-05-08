@@ -2230,10 +2230,7 @@ mod tests {
     use std::sync::atomic::AtomicI64;
 
     fn tmp_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "recached_test_{name}_{}",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("recached_test_{name}_{}", std::process::id()))
     }
 
     // ── is_write_command ──────────────────────────────────────────────────────
@@ -2252,8 +2249,14 @@ mod tests {
             "h".into(),
             vec![("f".into(), "v".into())]
         )));
-        assert!(is_write_command(&Command::LPush("l".into(), vec!["v".into()])));
-        assert!(is_write_command(&Command::SAdd("s".into(), vec!["m".into()])));
+        assert!(is_write_command(&Command::LPush(
+            "l".into(),
+            vec!["v".into()]
+        )));
+        assert!(is_write_command(&Command::SAdd(
+            "s".into(),
+            vec!["m".into()]
+        )));
         assert!(is_write_command(&Command::ZAdd(
             "z".into(),
             ZAddOptions::default(),
@@ -2266,7 +2269,10 @@ mod tests {
         assert!(!is_write_command(&Command::SMembers("s".into())));
         assert!(!is_write_command(&Command::DbSize));
         assert!(!is_write_command(&Command::Ping(None)));
-        assert!(!is_write_command(&Command::Publish("ch".into(), "msg".into())));
+        assert!(!is_write_command(&Command::Publish(
+            "ch".into(),
+            "msg".into()
+        )));
     }
 
     // ── AOF replay ────────────────────────────────────────────────────────────
@@ -2325,7 +2331,8 @@ mod tests {
     async fn aof_writer_append_and_truncate() {
         let path = tmp_path("aof_writer.aof");
         let aof = AofWriter::open(path.clone(), AofSync::No).await.unwrap();
-        aof.append("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n").await;
+        aof.append("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
+            .await;
         aof.flush().await;
         let len_before = tokio::fs::metadata(&path).await.unwrap().len();
         assert!(len_before > 0);

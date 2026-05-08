@@ -3288,7 +3288,11 @@ mod tests {
     #[test]
     fn snapshot_round_trip_all_types() {
         let s = store();
-        s.execute(Command::Set("str".into(), "hello".into(), SetOptions::default()));
+        s.execute(Command::Set(
+            "str".into(),
+            "hello".into(),
+            SetOptions::default(),
+        ));
         s.execute(Command::HSet("hash".into(), vec![("f".into(), "v".into())]));
         s.execute(Command::LPush("list".into(), vec!["a".into(), "b".into()]));
         s.execute(Command::SAdd("set".into(), vec!["x".into()]));
@@ -3305,17 +3309,33 @@ mod tests {
         s2.restore(entries);
 
         assert_eq!(s2.execute(Command::Get("str".into())), bulk("hello"));
-        assert_eq!(s2.execute(Command::HGet("hash".into(), "f".into())), bulk("v"));
-        assert_eq!(s2.execute(Command::LRange("list".into(), 0, -1)), arr(&["b", "a"]));
-        assert_eq!(s2.execute(Command::SIsMember("set".into(), "x".into())), int(1));
-        assert_eq!(s2.execute(Command::ZScore("zset".into(), "m".into())), bulk("1.5"));
+        assert_eq!(
+            s2.execute(Command::HGet("hash".into(), "f".into())),
+            bulk("v")
+        );
+        assert_eq!(
+            s2.execute(Command::LRange("list".into(), 0, -1)),
+            arr(&["b", "a"])
+        );
+        assert_eq!(
+            s2.execute(Command::SIsMember("set".into(), "x".into())),
+            int(1)
+        );
+        assert_eq!(
+            s2.execute(Command::ZScore("zset".into(), "m".into())),
+            bulk("1.5")
+        );
     }
 
     #[test]
     fn snapshot_skips_expired_keys() {
         use std::time::Duration;
         let s = store();
-        s.execute(Command::Set("live".into(), "v".into(), SetOptions::default()));
+        s.execute(Command::Set(
+            "live".into(),
+            "v".into(),
+            SetOptions::default(),
+        ));
         s.execute(Command::PSetEx("dead".into(), 1, "v".into()));
         std::thread::sleep(Duration::from_millis(10));
 
