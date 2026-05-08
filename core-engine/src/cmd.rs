@@ -144,6 +144,9 @@ pub enum Command {
     PSubscribe(Vec<String>),
     PUnsubscribe(Vec<String>),
     Publish(String, String),
+    // ── Observable keys ───────────────────────────────────────────────────────
+    Watch(Vec<String>),
+    Unwatch(Vec<String>),
     Unknown(String),
 }
 
@@ -952,6 +955,17 @@ impl Command {
                         ))
                     }
 
+                    // ── Observable keys ───────────────────────────────────────
+                    "WATCH" => {
+                        need!(2);
+                        Ok(Command::Watch(
+                            arr[1..].iter().filter_map(extract_string).collect(),
+                        ))
+                    }
+                    "UNWATCH" => Ok(Command::Unwatch(
+                        arr[1..].iter().filter_map(extract_string).collect(),
+                    )),
+
                     _ => Ok(Command::Unknown(cmd_name.to_owned())),
                 }
             }
@@ -1295,5 +1309,398 @@ mod tests {
     #[test]
     fn publish_requires_args() {
         assert!(Command::from_value(array(&["PUBLISH", "chan"])).is_err());
+    }
+
+    // ── Strings (parsing) ─────────────────────────────────────────────────────
+
+    #[test]
+    fn get_parse() {
+        assert_eq!(
+            Command::from_value(array(&["GET", "k"])).unwrap(),
+            Command::Get("k".into())
+        );
+    }
+
+    #[test]
+    fn del_multi_key_parse() {
+        assert_eq!(
+            Command::from_value(array(&["DEL", "a", "b", "c"])).unwrap(),
+            Command::Del(vec!["a".into(), "b".into(), "c".into()])
+        );
+    }
+
+    #[test]
+    fn unlink_parse() {
+        assert_eq!(
+            Command::from_value(array(&["UNLINK", "a", "b"])).unwrap(),
+            Command::Unlink(vec!["a".into(), "b".into()])
+        );
+    }
+
+    #[test]
+    fn append_parse() {
+        assert_eq!(
+            Command::from_value(array(&["APPEND", "k", "v"])).unwrap(),
+            Command::Append("k".into(), "v".into())
+        );
+    }
+
+    #[test]
+    fn strlen_parse() {
+        assert_eq!(
+            Command::from_value(array(&["STRLEN", "k"])).unwrap(),
+            Command::Strlen("k".into())
+        );
+    }
+
+    #[test]
+    fn getset_parse() {
+        assert_eq!(
+            Command::from_value(array(&["GETSET", "k", "v"])).unwrap(),
+            Command::GetSet("k".into(), "v".into())
+        );
+    }
+
+    #[test]
+    fn mget_parse() {
+        assert_eq!(
+            Command::from_value(array(&["MGET", "a", "b", "c"])).unwrap(),
+            Command::MGet(vec!["a".into(), "b".into(), "c".into()])
+        );
+    }
+
+    #[test]
+    fn mset_parse() {
+        assert_eq!(
+            Command::from_value(array(&["MSET", "a", "1", "b", "2"])).unwrap(),
+            Command::MSet(vec![("a".into(), "1".into()), ("b".into(), "2".into())])
+        );
+    }
+
+    #[test]
+    fn mset_odd_args_error() {
+        assert!(Command::from_value(array(&["MSET", "a", "1", "b"])).is_err());
+    }
+
+    #[test]
+    fn setnx_parse() {
+        assert_eq!(
+            Command::from_value(array(&["SETNX", "k", "v"])).unwrap(),
+            Command::SetNx("k".into(), "v".into())
+        );
+    }
+
+    #[test]
+    fn setex_parse() {
+        assert_eq!(
+            Command::from_value(array(&["SETEX", "k", "60", "v"])).unwrap(),
+            Command::SetEx("k".into(), 60, "v".into())
+        );
+    }
+
+    #[test]
+    fn psetex_parse() {
+        assert_eq!(
+            Command::from_value(array(&["PSETEX", "k", "5000", "v"])).unwrap(),
+            Command::PSetEx("k".into(), 5000, "v".into())
+        );
+    }
+
+    #[test]
+    fn incr_decr_parse() {
+        assert_eq!(
+            Command::from_value(array(&["INCR", "k"])).unwrap(),
+            Command::Incr("k".into())
+        );
+        assert_eq!(
+            Command::from_value(array(&["DECR", "k"])).unwrap(),
+            Command::Decr("k".into())
+        );
+    }
+
+    #[test]
+    fn incrby_decrby_parse() {
+        assert_eq!(
+            Command::from_value(array(&["INCRBY", "k", "5"])).unwrap(),
+            Command::IncrBy("k".into(), 5)
+        );
+        assert_eq!(
+            Command::from_value(array(&["DECRBY", "k", "3"])).unwrap(),
+            Command::DecrBy("k".into(), 3)
+        );
+    }
+
+    // ── Expiry (parsing) ──────────────────────────────────────────────────────
+
+    #[test]
+    fn expire_pexpire_parse() {
+        assert_eq!(
+            Command::from_value(array(&["EXPIRE", "k", "60"])).unwrap(),
+            Command::Expire("k".into(), 60)
+        );
+        assert_eq!(
+            Command::from_value(array(&["PEXPIRE", "k", "5000"])).unwrap(),
+            Command::PExpire("k".into(), 5000)
+        );
+    }
+
+    #[test]
+    fn expireat_pexpireat_parse() {
+        assert_eq!(
+            Command::from_value(array(&["EXPIREAT", "k", "9999999999"])).unwrap(),
+            Command::ExpireAt("k".into(), 9999999999)
+        );
+        assert_eq!(
+            Command::from_value(array(&["PEXPIREAT", "k", "9999999999000"])).unwrap(),
+            Command::PExpireAt("k".into(), 9999999999000)
+        );
+    }
+
+    #[test]
+    fn ttl_pttl_parse() {
+        assert_eq!(
+            Command::from_value(array(&["TTL", "k"])).unwrap(),
+            Command::Ttl("k".into())
+        );
+        assert_eq!(
+            Command::from_value(array(&["PTTL", "k"])).unwrap(),
+            Command::PTtl("k".into())
+        );
+    }
+
+    #[test]
+    fn persist_parse() {
+        assert_eq!(
+            Command::from_value(array(&["PERSIST", "k"])).unwrap(),
+            Command::Persist("k".into())
+        );
+    }
+
+    // ── Keys (parsing) ────────────────────────────────────────────────────────
+
+    #[test]
+    fn exists_parse() {
+        assert_eq!(
+            Command::from_value(array(&["EXISTS", "a", "b"])).unwrap(),
+            Command::Exists(vec!["a".into(), "b".into()])
+        );
+    }
+
+    #[test]
+    fn keys_parse() {
+        assert_eq!(
+            Command::from_value(array(&["KEYS", "user:*"])).unwrap(),
+            Command::Keys("user:*".into())
+        );
+    }
+
+    #[test]
+    fn scan_parse_with_count() {
+        assert_eq!(
+            Command::from_value(array(&["SCAN", "0", "MATCH", "*", "COUNT", "10"])).unwrap(),
+            Command::Scan(0, Some("*".into()), Some(10))
+        );
+    }
+
+    #[test]
+    fn rename_parse() {
+        assert_eq!(
+            Command::from_value(array(&["RENAME", "src", "dst"])).unwrap(),
+            Command::Rename("src".into(), "dst".into())
+        );
+    }
+
+    #[test]
+    fn type_parse() {
+        assert_eq!(
+            Command::from_value(array(&["TYPE", "k"])).unwrap(),
+            Command::Type("k".into())
+        );
+    }
+
+    #[test]
+    fn dbsize_flushdb_parse() {
+        assert_eq!(
+            Command::from_value(array(&["DBSIZE"])).unwrap(),
+            Command::DbSize
+        );
+        assert_eq!(
+            Command::from_value(array(&["FLUSHDB"])).unwrap(),
+            Command::FlushDb
+        );
+    }
+
+    // ── Hash (parsing) ────────────────────────────────────────────────────────
+
+    #[test]
+    fn hkeys_hvals_hexists_parse() {
+        assert_eq!(
+            Command::from_value(array(&["HKEYS", "h"])).unwrap(),
+            Command::HKeys("h".into())
+        );
+        assert_eq!(
+            Command::from_value(array(&["HVALS", "h"])).unwrap(),
+            Command::HVals("h".into())
+        );
+        assert_eq!(
+            Command::from_value(array(&["HEXISTS", "h", "f"])).unwrap(),
+            Command::HExists("h".into(), "f".into())
+        );
+    }
+
+    #[test]
+    fn hdel_multi_field_parse() {
+        assert_eq!(
+            Command::from_value(array(&["HDEL", "h", "f1", "f2"])).unwrap(),
+            Command::HDel("h".into(), vec!["f1".into(), "f2".into()])
+        );
+    }
+
+    #[test]
+    fn hlen_parse() {
+        assert_eq!(
+            Command::from_value(array(&["HLEN", "h"])).unwrap(),
+            Command::HLen("h".into())
+        );
+    }
+
+    // ── List (parsing) ────────────────────────────────────────────────────────
+
+    #[test]
+    fn lpushx_rpushx_parse() {
+        assert_eq!(
+            Command::from_value(array(&["LPUSHX", "l", "v"])).unwrap(),
+            Command::LPushX("l".into(), vec!["v".into()])
+        );
+        assert_eq!(
+            Command::from_value(array(&["RPUSHX", "l", "v"])).unwrap(),
+            Command::RPushX("l".into(), vec!["v".into()])
+        );
+    }
+
+    #[test]
+    fn lindex_lset_lrem_ltrim_parse() {
+        assert_eq!(
+            Command::from_value(array(&["LINDEX", "l", "0"])).unwrap(),
+            Command::LIndex("l".into(), 0)
+        );
+        assert_eq!(
+            Command::from_value(array(&["LSET", "l", "0", "v"])).unwrap(),
+            Command::LSet("l".into(), 0, "v".into())
+        );
+        assert_eq!(
+            Command::from_value(array(&["LREM", "l", "1", "v"])).unwrap(),
+            Command::LRem("l".into(), 1, "v".into())
+        );
+        assert_eq!(
+            Command::from_value(array(&["LTRIM", "l", "0", "9"])).unwrap(),
+            Command::LTrim("l".into(), 0, 9)
+        );
+    }
+
+    // ── Set (parsing) ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn spop_parse() {
+        assert_eq!(
+            Command::from_value(array(&["SPOP", "s"])).unwrap(),
+            Command::SPop("s".into(), None)
+        );
+        assert_eq!(
+            Command::from_value(array(&["SPOP", "s", "3"])).unwrap(),
+            Command::SPop("s".into(), Some(3))
+        );
+    }
+
+    #[test]
+    fn srandmember_parse() {
+        assert_eq!(
+            Command::from_value(array(&["SRANDMEMBER", "s"])).unwrap(),
+            Command::SRandMember("s".into(), None)
+        );
+        assert_eq!(
+            Command::from_value(array(&["SRANDMEMBER", "s", "-5"])).unwrap(),
+            Command::SRandMember("s".into(), Some(-5))
+        );
+    }
+
+    #[test]
+    fn sinterstore_sdiffstore_parse() {
+        assert_eq!(
+            Command::from_value(array(&["SINTERSTORE", "dst", "s1", "s2"])).unwrap(),
+            Command::SInterStore("dst".into(), vec!["s1".into(), "s2".into()])
+        );
+        assert_eq!(
+            Command::from_value(array(&["SDIFFSTORE", "dst", "s1", "s2"])).unwrap(),
+            Command::SDiffStore("dst".into(), vec!["s1".into(), "s2".into()])
+        );
+        assert_eq!(
+            Command::from_value(array(&["SUNIONSTORE", "dst", "s1"])).unwrap(),
+            Command::SUnionStore("dst".into(), vec!["s1".into()])
+        );
+    }
+
+    // ── Sorted Set (parsing) ──────────────────────────────────────────────────
+
+    #[test]
+    fn zmscore_parse() {
+        assert_eq!(
+            Command::from_value(array(&["ZMSCORE", "z", "a", "b"])).unwrap(),
+            Command::ZMScore("z".into(), vec!["a".into(), "b".into()])
+        );
+    }
+
+    #[test]
+    fn zrevrangebyscore_parse() {
+        assert_eq!(
+            Command::from_value(array(&["ZREVRANGEBYSCORE", "z", "+inf", "-inf"])).unwrap(),
+            Command::ZRevRangeByScore("z".into(), "+inf".into(), "-inf".into(), false, None)
+        );
+    }
+
+    #[test]
+    fn zrevrangebyscore_with_limit_parse() {
+        let cmd = Command::from_value(array(&[
+            "ZREVRANGEBYSCORE",
+            "z",
+            "100",
+            "0",
+            "LIMIT",
+            "0",
+            "5",
+        ]))
+        .unwrap();
+        assert_eq!(
+            cmd,
+            Command::ZRevRangeByScore("z".into(), "100".into(), "0".into(), false, Some((0, 5)))
+        );
+    }
+
+    #[test]
+    fn zrevrange_parse() {
+        assert_eq!(
+            Command::from_value(array(&["ZREVRANGE", "z", "0", "-1"])).unwrap(),
+            Command::ZRevRange("z".into(), 0, -1, false)
+        );
+    }
+
+    #[test]
+    fn zrank_zrevrank_zcard_zcount_parse() {
+        assert_eq!(
+            Command::from_value(array(&["ZRANK", "z", "m"])).unwrap(),
+            Command::ZRank("z".into(), "m".into())
+        );
+        assert_eq!(
+            Command::from_value(array(&["ZREVRANK", "z", "m"])).unwrap(),
+            Command::ZRevRank("z".into(), "m".into())
+        );
+        assert_eq!(
+            Command::from_value(array(&["ZCARD", "z"])).unwrap(),
+            Command::ZCard("z".into())
+        );
+        assert_eq!(
+            Command::from_value(array(&["ZCOUNT", "z", "-inf", "+inf"])).unwrap(),
+            Command::ZCount("z".into(), "-inf".into(), "+inf".into())
+        );
     }
 }

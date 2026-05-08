@@ -15,6 +15,7 @@ js-sys.workspace       = true
 workspace = true
 features = [
     "WebSocket",
+    "BroadcastChannel",
     "MessageEvent",
     "ErrorEvent",
     "console",

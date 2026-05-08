@@ -4,3 +4,5 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+dashmap.workspace = true
+rand.workspace = true

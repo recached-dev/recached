@@ -1,18 +1,198 @@
 use core_engine::cmd::{Command, SetExpiry, ZAddCondition};
 use core_engine::resp::Value;
-use core_engine::store::KeyValueStore;
+use core_engine::store::{EvictionPolicy, KeyValueStore};
 use futures_util::{SinkExt, StreamExt};
+use metrics::{counter, gauge};
+use rustls_pemfile::{certs, private_key};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, broadcast, mpsc};
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
+
+// ── metrics ───────────────────────────────────────────────────────────────────
+
+/// RAII guard that tracks an active connection. Increments on creation,
+/// decrements when dropped (i.e. when the handler future completes).
+struct ConnectionGuard;
+
+impl ConnectionGuard {
+    fn tcp() -> Self {
+        counter!("recached_connections_total", "type" => "tcp").increment(1);
+        gauge!("recached_connections_active").increment(1.0);
+        Self
+    }
+
+    fn ws() -> Self {
+        counter!("recached_connections_total", "type" => "ws").increment(1);
+        gauge!("recached_connections_active").increment(1.0);
+        Self
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        gauge!("recached_connections_active").decrement(1.0);
+    }
+}
+
+fn command_name(cmd: &Command) -> &'static str {
+    match cmd {
+        Command::Ping(_) => "ping",
+        Command::Auth(_) => "auth",
+        Command::Get(_) => "get",
+        Command::Set(_, _, _) => "set",
+        Command::Del(_) => "del",
+        Command::Unlink(_) => "unlink",
+        Command::Append(_, _) => "append",
+        Command::Strlen(_) => "strlen",
+        Command::GetSet(_, _) => "getset",
+        Command::MGet(_) => "mget",
+        Command::MSet(_) => "mset",
+        Command::SetNx(_, _) => "setnx",
+        Command::SetEx(_, _, _) => "setex",
+        Command::PSetEx(_, _, _) => "psetex",
+        Command::Incr(_) => "incr",
+        Command::Decr(_) => "decr",
+        Command::IncrBy(_, _) => "incrby",
+        Command::DecrBy(_, _) => "decrby",
+        Command::Expire(_, _) => "expire",
+        Command::PExpire(_, _) => "pexpire",
+        Command::ExpireAt(_, _) => "expireat",
+        Command::PExpireAt(_, _) => "pexpireat",
+        Command::Ttl(_) => "ttl",
+        Command::PTtl(_) => "pttl",
+        Command::Persist(_) => "persist",
+        Command::Exists(_) => "exists",
+        Command::Keys(_) => "keys",
+        Command::Scan(_, _, _) => "scan",
+        Command::DbSize => "dbsize",
+        Command::FlushDb => "flushdb",
+        Command::Rename(_, _) => "rename",
+        Command::Type(_) => "type",
+        Command::HSet(_, _) => "hset",
+        Command::HGet(_, _) => "hget",
+        Command::HGetAll(_) => "hgetall",
+        Command::HDel(_, _) => "hdel",
+        Command::HKeys(_) => "hkeys",
+        Command::HVals(_) => "hvals",
+        Command::HLen(_) => "hlen",
+        Command::HIncrBy(_, _, _) => "hincrby",
+        Command::HIncrByFloat(_, _, _) => "hincrbyfloat",
+        Command::HExists(_, _) => "hexists",
+        Command::HSetNx(_, _, _) => "hsetnx",
+        Command::HMGet(_, _) => "hmget",
+        Command::LPush(_, _) => "lpush",
+        Command::RPush(_, _) => "rpush",
+        Command::LPushX(_, _) => "lpushx",
+        Command::RPushX(_, _) => "rpushx",
+        Command::LPop(_, _) => "lpop",
+        Command::RPop(_, _) => "rpop",
+        Command::LRange(_, _, _) => "lrange",
+        Command::LLen(_) => "llen",
+        Command::LIndex(_, _) => "lindex",
+        Command::LSet(_, _, _) => "lset",
+        Command::LRem(_, _, _) => "lrem",
+        Command::LTrim(_, _, _) => "ltrim",
+        Command::SAdd(_, _) => "sadd",
+        Command::SMembers(_) => "smembers",
+        Command::SRem(_, _) => "srem",
+        Command::SCard(_) => "scard",
+        Command::SIsMember(_, _) => "sismember",
+        Command::SMIsMember(_, _) => "smismember",
+        Command::SInter(_) => "sinter",
+        Command::SInterStore(_, _) => "sinterstore",
+        Command::SUnion(_) => "sunion",
+        Command::SUnionStore(_, _) => "sunionstore",
+        Command::SDiff(_) => "sdiff",
+        Command::SDiffStore(_, _) => "sdiffstore",
+        Command::SPop(_, _) => "spop",
+        Command::SRandMember(_, _) => "srandmember",
+        Command::SMove(_, _, _) => "smove",
+        Command::ZAdd(_, _, _) => "zadd",
+        Command::ZRange(_, _, _, _) => "zrange",
+        Command::ZRevRange(_, _, _, _) => "zrevrange",
+        Command::ZRangeByScore(_, _, _, _, _) => "zrangebyscore",
+        Command::ZRevRangeByScore(_, _, _, _, _) => "zrevrangebyscore",
+        Command::ZScore(_, _) => "zscore",
+        Command::ZMScore(_, _) => "zmscore",
+        Command::ZRank(_, _) => "zrank",
+        Command::ZRevRank(_, _) => "zrevrank",
+        Command::ZRem(_, _) => "zrem",
+        Command::ZCard(_) => "zcard",
+        Command::ZIncrBy(_, _, _) => "zincrby",
+        Command::ZCount(_, _, _) => "zcount",
+        Command::Multi => "multi",
+        Command::Exec => "exec",
+        Command::Discard => "discard",
+        Command::Subscribe(_) => "subscribe",
+        Command::Unsubscribe(_) => "unsubscribe",
+        Command::PSubscribe(_) => "psubscribe",
+        Command::PUnsubscribe(_) => "punsubscribe",
+        Command::Publish(_, _) => "publish",
+        Command::Watch(_) => "watch",
+        Command::Unwatch(_) => "unwatch",
+        Command::Unknown(_) => "unknown",
+    }
+}
+
+fn execute_and_record(store: &KeyValueStore, cmd: &Command) -> Value {
+    let name = command_name(cmd);
+    let response = store.execute(cmd.clone());
+    counter!("recached_commands_total", "command" => name).increment(1);
+    if matches!(response, Value::Error(_)) {
+        counter!("recached_command_errors_total", "command" => name).increment(1);
+    }
+    if matches!(cmd, Command::Get(_)) {
+        match &response {
+            Value::BulkString(Some(_)) => counter!("recached_keyspace_hits_total").increment(1),
+            Value::BulkString(None) => counter!("recached_keyspace_misses_total").increment(1),
+            _ => {}
+        }
+    }
+    response
+}
+
+// ── TLS ───────────────────────────────────────────────────────────────────────
+
+fn load_certs(path: &str) -> std::io::Result<Vec<CertificateDer<'static>>> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    certs(&mut reader).collect()
+}
+
+fn load_private_key(path: &str) -> std::io::Result<PrivateKeyDer<'static>> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    private_key(&mut reader)?
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no private key found"))
+}
+
+/// Returns a `TlsAcceptor` if both `RECACHED_TLS_CERT` and `RECACHED_TLS_KEY`
+/// are set. Falls back to plain TCP when either is absent.
+fn load_tls_acceptor() -> Option<TlsAcceptor> {
+    let cert_path = std::env::var("RECACHED_TLS_CERT").ok()?;
+    let key_path = std::env::var("RECACHED_TLS_KEY").ok()?;
+
+    let cert_coll = load_certs(&cert_path).unwrap_or_else(|e| panic!("TLS cert {cert_path}: {e}"));
+    let key = load_private_key(&key_path).unwrap_or_else(|e| panic!("TLS key {key_path}: {e}"));
+
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(cert_coll, key)
+        .expect("invalid TLS configuration");
+
+    Some(TlsAcceptor::from(Arc::new(config)))
+}
 
 // ── tunables ────────────────────────────────────────────────────────────────
 
@@ -132,6 +312,93 @@ impl PubSubHub {
 }
 
 type SharedPubSub = Arc<Mutex<PubSubHub>>;
+
+// ── observable keys ───────────────────────────────────────────────────────────
+
+type WatchNotif = (String, Value);
+type WatchRegistry =
+    Arc<Mutex<HashMap<String, Vec<(u64, mpsc::UnboundedSender<WatchNotif>)>>>>;
+
+/// Extract the key(s) that `cmd` writes to, without inspecting the response.
+/// Used together with `broadcast_for()` — only call this when `broadcast_for`
+/// already confirmed a mutation occurred.
+fn primary_keys(cmd: &Command) -> Vec<String> {
+    match cmd {
+        Command::Set(k, _, _)
+        | Command::Append(k, _)
+        | Command::GetSet(k, _)
+        | Command::SetNx(k, _)
+        | Command::SetEx(k, _, _)
+        | Command::PSetEx(k, _, _)
+        | Command::Incr(k)
+        | Command::Decr(k)
+        | Command::IncrBy(k, _)
+        | Command::DecrBy(k, _)
+        | Command::Expire(k, _)
+        | Command::PExpire(k, _)
+        | Command::ExpireAt(k, _)
+        | Command::PExpireAt(k, _)
+        | Command::Persist(k)
+        | Command::HSet(k, _)
+        | Command::HDel(k, _)
+        | Command::HSetNx(k, _, _)
+        | Command::HIncrBy(k, _, _)
+        | Command::HIncrByFloat(k, _, _)
+        | Command::LPush(k, _)
+        | Command::RPush(k, _)
+        | Command::LPushX(k, _)
+        | Command::RPushX(k, _)
+        | Command::LPop(k, _)
+        | Command::RPop(k, _)
+        | Command::LSet(k, _, _)
+        | Command::LRem(k, _, _)
+        | Command::LTrim(k, _, _)
+        | Command::SAdd(k, _)
+        | Command::SRem(k, _)
+        | Command::SPop(k, _)
+        | Command::SInterStore(k, _)
+        | Command::SUnionStore(k, _)
+        | Command::SDiffStore(k, _)
+        | Command::ZAdd(k, _, _)
+        | Command::ZRem(k, _)
+        | Command::ZIncrBy(k, _, _) => vec![k.clone()],
+        Command::Del(keys) | Command::Unlink(keys) => keys.clone(),
+        Command::MSet(pairs) => pairs.iter().map(|(k, _)| k.clone()).collect(),
+        Command::Rename(src, dst) | Command::SMove(src, dst, _) => {
+            vec![src.clone(), dst.clone()]
+        }
+        _ => vec![],
+    }
+}
+
+fn encode_keychange(key: &str, value: &Value) -> Vec<u8> {
+    Value::Array(Some(vec![
+        Value::BulkString(Some(b"keychange".to_vec())),
+        Value::BulkString(Some(key.as_bytes().to_vec())),
+        value.clone(),
+    ]))
+    .serialize()
+}
+
+fn notify_watchers(registry: &WatchRegistry, cmd: &Command, response: &Value, store: &KeyValueStore) {
+    if broadcast_for(cmd, response).is_none() {
+        return;
+    }
+    let keys = primary_keys(cmd);
+    if keys.is_empty() {
+        return;
+    }
+    let mut reg = registry.lock().unwrap();
+    for key in &keys {
+        if let Some(subs) = reg.get_mut(key) {
+            let value = store.get_current(key);
+            subs.retain(|(_, tx)| tx.send((key.clone(), value.clone())).is_ok());
+            if subs.is_empty() {
+                reg.remove(key);
+            }
+        }
+    }
+}
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -575,6 +842,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    // ── Prometheus metrics ────────────────────────────────────────────────
+    let metrics_port: u16 = std::env::var("RECACHED_METRICS_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9091);
+    let metrics_addr: std::net::SocketAddr = format!("0.0.0.0:{}", metrics_port).parse().unwrap();
+    metrics_exporter_prometheus::PrometheusBuilder::new()
+        .with_http_listener(metrics_addr)
+        .install()
+        .expect("failed to install Prometheus metrics exporter");
+    info!("Prometheus metrics at http://{}/metrics", metrics_addr);
+
     // ── auth ──────────────────────────────────────────────────────────────
     let password = std::env::var("RECACHED_PASSWORD").ok();
     let global_password = Arc::new(password);
@@ -614,13 +893,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|v| v.parse::<usize>().ok());
 
-    let store = Arc::new(match max_keys {
-        Some(n) => {
-            info!("Key limit set to {}", n);
-            KeyValueStore::with_max_keys(n)
-        }
-        None => KeyValueStore::new(),
-    });
+    let eviction_policy = match std::env::var("RECACHED_EVICTION")
+        .unwrap_or_default()
+        .to_lowercase()
+        .as_str()
+    {
+        "allkeys-lru" | "lru" => EvictionPolicy::AllKeysLru,
+        "allkeys-random" | "random" => EvictionPolicy::AllKeysRandom,
+        "volatile-lru" => EvictionPolicy::VolatileLru,
+        "volatile-ttl" | "ttl" => EvictionPolicy::VolatileTtl,
+        _ => EvictionPolicy::NoEviction,
+    };
+
+    if max_keys.is_some() {
+        info!(
+            "Key limit: {:?}, eviction: {:?}",
+            max_keys, eviction_policy
+        );
+    }
+
+    let store = Arc::new(KeyValueStore::with_config(max_keys, eviction_policy));
 
     // ── background eviction ───────────────────────────────────────────────
     {
@@ -642,15 +934,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── pub/sub hub ───────────────────────────────────────────────────────
     let pubsub: SharedPubSub = Arc::new(Mutex::new(PubSubHub::new()));
 
+    // ── watch registry ────────────────────────────────────────────────────
+    let watch_registry: WatchRegistry = Arc::new(Mutex::new(HashMap::new()));
+
     // ── connection limiter ────────────────────────────────────────────────
     let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
-    // ── listeners ─────────────────────────────────────────────────────────
-    let tcp_listener = TcpListener::bind("127.0.0.1:6379").await?;
-    info!("TCP server listening on 127.0.0.1:6379");
+    // ── TLS ───────────────────────────────────────────────────────────────
+    let tls_acceptor: Option<TlsAcceptor> = load_tls_acceptor();
+    if tls_acceptor.is_some() {
+        info!(
+            "TLS ENABLED (cert={}, key={})",
+            std::env::var("RECACHED_TLS_CERT").unwrap_or_default(),
+            std::env::var("RECACHED_TLS_KEY").unwrap_or_default()
+        );
+    } else {
+        warn!("TLS DISABLED. Set RECACHED_TLS_CERT and RECACHED_TLS_KEY to enable.");
+    }
+    let tls_acceptor = Arc::new(tls_acceptor);
 
-    let ws_listener = TcpListener::bind("127.0.0.1:6380").await?;
-    info!("WebSocket server listening on 127.0.0.1:6380");
+    // ── listeners ─────────────────────────────────────────────────────────
+    let tcp_listener = TcpListener::bind("0.0.0.0:6379").await?;
+    info!("TCP server listening on 0.0.0.0:6379");
+
+    let ws_listener = TcpListener::bind("0.0.0.0:6380").await?;
+    info!("WebSocket server listening on 0.0.0.0:6380");
 
     let store_tcp = Arc::clone(&store);
     let tx_tcp = tx.clone();
@@ -658,6 +966,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let allowed_tcp = allowed_ips.clone();
     let sem_tcp = Arc::clone(&semaphore);
     let pubsub_tcp = Arc::clone(&pubsub);
+    let tls_tcp = Arc::clone(&tls_acceptor);
+    let watch_tcp = Arc::clone(&watch_registry);
 
     tokio::spawn(async move {
         loop {
@@ -680,9 +990,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let t = tx_tcp.clone();
                     let p = Arc::clone(&pass_tcp);
                     let ps = Arc::clone(&pubsub_tcp);
+                    let wr = Arc::clone(&watch_tcp);
+                    let tls = Arc::clone(&tls_tcp);
                     tokio::spawn(async move {
                         let _permit = permit;
-                        handle_tcp(socket, s, t, p, ps).await;
+                        if let Some(acc) = tls.as_ref() {
+                            match acc.accept(socket).await {
+                                Ok(tls_stream) => handle_tcp(tls_stream, s, t, p, ps, wr).await,
+                                Err(e) => warn!("TCP TLS handshake failed from {}: {}", addr, e),
+                            }
+                        } else {
+                            handle_tcp(socket, s, t, p, ps, wr).await;
+                        }
                     });
                 }
                 Err(e) => warn!("TCP accept error: {}", e),
@@ -710,10 +1029,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let t = tx.clone();
                 let p = Arc::clone(&global_password);
                 let ps = Arc::clone(&pubsub);
+                let wr = Arc::clone(&watch_registry);
+                let tls = Arc::clone(&tls_acceptor);
                 let id = next_conn_id();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    handle_ws(socket, s, t, p, id, ps).await;
+                    if let Some(acc) = tls.as_ref() {
+                        match acc.accept(socket).await {
+                            Ok(tls_stream) => handle_ws(tls_stream, s, t, p, id, ps, wr).await,
+                            Err(e) => warn!("WS TLS handshake failed from {}: {}", addr, e),
+                        }
+                    } else {
+                        handle_ws(socket, s, t, p, id, ps, wr).await;
+                    }
                 });
             }
             Err(e) => warn!("WS accept error: {}", e),
@@ -723,14 +1051,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // ── TCP handler ───────────────────────────────────────────────────────────────
 
-async fn handle_tcp(
-    socket: TcpStream,
+async fn handle_tcp<S>(
+    socket: S,
     store: Arc<KeyValueStore>,
     tx: broadcast::Sender<(u64, String)>,
     password: Arc<Option<String>>,
     pubsub: SharedPubSub,
-) {
-    let (mut reader, mut writer) = socket.into_split();
+    watch_registry: WatchRegistry,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let _guard = ConnectionGuard::tcp();
+    let (mut reader, mut writer) = tokio::io::split(socket);
     let mut buf = Vec::<u8>::new();
     let mut read_buf = [0u8; TCP_READ_BUFFER_BYTES];
     let mut is_authenticated = password.is_none();
@@ -809,10 +1141,11 @@ async fn handle_tcp(
                                                 Some(queue) => {
                                                     let mut results = Vec::with_capacity(queue.len());
                                                     for qcmd in queue {
-                                                        let resp = store.execute(qcmd.clone());
+                                                        let resp = execute_and_record(&store, &qcmd);
                                                         if let Some(msg) = broadcast_for(&qcmd, &resp) {
                                                             let _ = tx.send((0, msg));
                                                         }
+                                                        notify_watchers(&watch_registry, &qcmd, &resp, &store);
                                                         results.push(resp);
                                                     }
                                                     let out = Value::Array(Some(results)).serialize();
@@ -909,12 +1242,13 @@ async fn handle_tcp(
                                                 if writer.write_all(err).await.is_err() { break 'outer; }
                                                 continue 'parse;
                                             }
-                                            let response = store.execute(cmd.clone());
+                                            let response = execute_and_record(&store, &cmd);
                                             if let Some(msg) = broadcast_for(&cmd, &response)
                                                 && let Err(e) = tx.send((0, msg))
                                             {
                                                 debug!("TCP broadcast had no WS receivers: {}", e);
                                             }
+                                            notify_watchers(&watch_registry, &cmd, &response, &store);
                                             if writer.write_all(&response.serialize()).await.is_err() {
                                                 break 'outer;
                                             }
@@ -958,14 +1292,18 @@ async fn handle_tcp(
 
 // ── WebSocket handler ─────────────────────────────────────────────────────────
 
-async fn handle_ws(
-    socket: TcpStream,
+async fn handle_ws<S>(
+    socket: S,
     store: Arc<KeyValueStore>,
     tx: broadcast::Sender<(u64, String)>,
     password: Arc<Option<String>>,
     conn_id: u64,
     pubsub: SharedPubSub,
-) {
+    watch_registry: WatchRegistry,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let _guard = ConnectionGuard::ws();
     let ws_stream = match accept_async(socket).await {
         Ok(ws) => ws,
         Err(e) => {
@@ -982,6 +1320,8 @@ async fn handle_ws(
     let mut subscribed_channels: HashSet<String> = HashSet::new();
     let mut subscribed_patterns: HashSet<String> = HashSet::new();
     let (ps_tx, mut ps_rx) = mpsc::unbounded_channel::<PubSubMsg>();
+    let mut watched_keys: HashSet<String> = HashSet::new();
+    let (watch_tx, mut watch_rx) = mpsc::unbounded_channel::<WatchNotif>();
 
     macro_rules! ws_send {
         ($bytes:expr) => {{
@@ -1062,10 +1402,11 @@ async fn handle_ws(
                                     Some(queue) => {
                                         let mut results = Vec::with_capacity(queue.len());
                                         for qcmd in queue {
-                                            let resp = store.execute(qcmd.clone());
+                                            let resp = execute_and_record(&store, &qcmd);
                                             if let Some(msg) = broadcast_for(&qcmd, &resp) {
                                                 let _ = tx.send((conn_id, msg));
                                             }
+                                            notify_watchers(&watch_registry, &qcmd, &resp, &store);
                                             results.push(resp);
                                         }
                                         let out = Value::Array(Some(results)).serialize();
@@ -1146,17 +1487,50 @@ async fn handle_ws(
                                 ws_send!(&Value::Integer(count).serialize());
                             }
 
+                            Command::Watch(keys) => {
+                                {
+                                    let mut reg = watch_registry.lock().unwrap();
+                                    for key in &keys {
+                                        watched_keys.insert(key.clone());
+                                        reg.entry(key.clone())
+                                            .or_default()
+                                            .push((conn_id, watch_tx.clone()));
+                                    }
+                                }
+                                ws_send!(b"+OK\r\n");
+                            }
+                            Command::Unwatch(keys) => {
+                                let targets: Vec<String> = if keys.is_empty() {
+                                    watched_keys.drain().collect()
+                                } else {
+                                    keys.into_iter().filter(|k| watched_keys.remove(k)).collect()
+                                };
+                                {
+                                    let mut reg = watch_registry.lock().unwrap();
+                                    for key in &targets {
+                                        if let Some(subs) = reg.get_mut(key) {
+                                            subs.retain(|(id, _)| *id != conn_id);
+                                            if subs.is_empty() {
+                                                reg.remove(key);
+                                            }
+                                        }
+                                    }
+                                }
+                                ws_send!(b"+OK\r\n");
+                            }
+
                             cmd => {
                                 if is_subscribed && !matches!(cmd, Command::Ping(_)) {
                                     ws_send!(b"-ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in subscribe mode\r\n");
                                     continue 'outer;
                                 }
-                                let response = store.execute(cmd.clone());
+                                let response = execute_and_record(&store, &cmd);
                                 if let Some(b_msg) = broadcast_for(&cmd, &response)
                                     && let Err(e) = tx.send((conn_id, b_msg))
                                 {
                                     debug!("WS broadcast on conn {} had no receivers: {}", conn_id, e);
                                 }
+                                notify_watchers(&watch_registry, &cmd, &response, &store);
                                 ws_send!(&response.serialize());
                             }
                         }
@@ -1198,10 +1572,31 @@ async fn handle_ws(
                     None => break,
                 }
             }
+
+            notif = watch_rx.recv(), if !watched_keys.is_empty() => {
+                if let Some((key, value)) = notif {
+                    let bytes = encode_keychange(&key, &value);
+                    let text = String::from_utf8_lossy(&bytes).into_owned();
+                    if ws_sender.send(Message::Text(text.into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
         }
     }
 
     if !subscribed_channels.is_empty() || !subscribed_patterns.is_empty() {
         pubsub.lock().unwrap().unsubscribe_all(conn_id);
+    }
+    if !watched_keys.is_empty() {
+        let mut reg = watch_registry.lock().unwrap();
+        for key in &watched_keys {
+            if let Some(subs) = reg.get_mut(key) {
+                subs.retain(|(id, _)| *id != conn_id);
+                if subs.is_empty() {
+                    reg.remove(key);
+                }
+            }
+        }
     }
 }
