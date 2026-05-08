@@ -1,52 +1,6 @@
 # Roadmap
 
-## What shipped
-
-The following features are implemented and stable.
-
-**Protocol & server**
-
-- RESP protocol — full parser and serializer, fragmentation handling, depth-limited (no stack-overflow DoS)
-- TCP server (port 6379) — compatible with any Redis client (`ioredis`, `node-redis`, `redis-py`, `Jedis`, etc.)
-- WebSocket sync (port 6380) — real-time mutation broadcast between server and browser WASM instances
-- Sender-ID dedup filter — browser clients do not double-apply their own mutations
-- `RECACHED_PASSWORD` + brute-force lockout after 5 consecutive failed `AUTH` attempts
-- `RECACHED_ALLOW_IPS` — comma-separated IP allowlist with validated IP parsing
-- `RECACHED_MAX_KEYS` — hard key cap
-- Connection semaphore (max 1024 concurrent connections)
-- Eviction policies: `noeviction`, `lru`, `allkeys-random`, `volatile-lru`, `volatile-ttl`
-- Background active eviction (1s sweep) + lazy eviction on every read
-- TLS on both ports (`RECACHED_TLS_CERT` + `RECACHED_TLS_KEY`)
-- Prometheus metrics (`RECACHED_METRICS_PORT`, scrape at `/metrics`)
-- Structured `tracing` logs with configurable level via `RUST_LOG`
-- Docker image (`ghcr.io/thinkgrid-labs/recached`)
-- Homebrew formula
-
-**Commands**
-
-See [Commands](/server/commands) for the full list. In summary: `PING`, `AUTH`, all String commands, Expiry commands, Key management (`DEL`, `EXISTS`, `TYPE`, `RENAME`, `KEYS`, `SCAN`, `DBSIZE`, `FLUSHDB`), Hash, List, Set, Sorted Set, Transactions (`MULTI`/`EXEC`/`DISCARD`), Pub/Sub (`SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`), and WebSocket-only observable keys (`WATCH`/`UNWATCH`).
-
-**Browser (WASM)**
-
-- `recached-edge` npm package — TypeScript SDK for the browser
-- `RecachedCache` class — zero-latency local reads, all cache types
-- WebSocket sync — connect to port 6380 and receive server mutations automatically
-- Observable keys (`cache.watch()`) — callbacks on key change from any source
-- Pub/Sub over WebSocket — `subscribe()` and `publish()` in the browser
-- IndexedDB WAL persistence — cache survives page refresh
-- BroadcastChannel cross-tab sync — all tabs in the same origin share mutations
-
----
-
 ## Planned
-
-### Delta sync (`SYNC <seq>`)
-
-Currently, when a WebSocket client reconnects after a gap, the server performs a full resync: it sends the current value of all keys. For most applications this is fine, but for high write-rate deployments with large key sets, a full resync on every reconnect adds unnecessary data transfer.
-
-The plan: the server maintains an in-memory ring buffer of recent mutations (configurable depth, e.g. last 10,000 writes). Each mutation has a sequence number. On reconnect, the client sends `SYNC <last-seq>` and the server replays only the mutations that occurred after that sequence number. If the client's sequence number is older than the ring buffer, the server falls back to a full resync.
-
-The `wasm-edge` module already tracks a WAL sequence number — this becomes the cursor for delta sync.
 
 ### WASI target
 

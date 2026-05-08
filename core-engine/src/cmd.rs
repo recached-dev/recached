@@ -147,6 +147,10 @@ pub enum Command {
     // ── Observable keys ───────────────────────────────────────────────────────
     Watch(Vec<String>),
     Unwatch(Vec<String>),
+    // ── Persistence ───────────────────────────────────────────────────────────
+    Save,
+    BgSave,
+    LastSave,
     Unknown(String),
 }
 
@@ -965,6 +969,11 @@ impl Command {
                     "UNWATCH" => Ok(Command::Unwatch(
                         arr[1..].iter().filter_map(extract_string).collect(),
                     )),
+
+                    // ── Persistence ───────────────────────────────────────────
+                    "SAVE" => Ok(Command::Save),
+                    "BGSAVE" => Ok(Command::BgSave),
+                    "LASTSAVE" => Ok(Command::LastSave),
 
                     _ => Ok(Command::Unknown(cmd_name.to_owned())),
                 }

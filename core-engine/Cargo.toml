@@ -6,3 +6,4 @@ edition.workspace = true
 [dependencies]
 dashmap.workspace = true
 rand.workspace = true
+serde.workspace = true

@@ -4,6 +4,26 @@ All notable changes to Recached are documented here.
 
 ---
 
+## [0.1.4] — 2026-05-09
+
+### Added
+
+**Snapshot persistence** (`server-native`)
+- New `SAVE` command: blocks until the snapshot is written to disk and returns `+OK`.
+- New `BGSAVE` command: forks a background Tokio task to write the snapshot and immediately returns `+Background saving started`. The server continues accepting connections during the save.
+- New `LASTSAVE` command: returns the Unix timestamp (seconds) of the most recent successful save as an integer.
+- On startup, the server loads the snapshot from disk before accepting connections. Expired keys are silently skipped during restore.
+- On clean shutdown (SIGTERM or Ctrl-C), a final snapshot is saved before the process exits.
+- Periodic autosave runs every `RECACHED_SAVE_INTERVAL` seconds (default: 900 = 15 min). Set to `0` to disable autosave while keeping `SAVE`/`BGSAVE`/`LASTSAVE` available.
+- Snapshot path is controlled by `RECACHED_SAVE_PATH` (default: `recached.rdb` in the working directory).
+- Snapshot format: [MessagePack](https://msgpack.org/) via `rmp-serde`. Atomic write: data is written to a `.tmp` file then renamed, so a crash mid-save cannot corrupt the previous snapshot.
+- All data types are preserved: strings, hashes, lists, sets, sorted sets, and TTLs.
+- `Command::Save`, `Command::BgSave`, `Command::LastSave` added to `core-engine`; handled by the server before reaching `execute_and_record` since they require async filesystem I/O.
+- `SnapshotEntry` and `SnapshotValue` public types added to `core-engine::store`.
+- `KeyValueStore::snapshot()` and `KeyValueStore::restore()` methods added.
+
+---
+
 ## [0.1.3] — 2026-05-09
 
 ### Added

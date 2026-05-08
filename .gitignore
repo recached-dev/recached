@@ -31,3 +31,4 @@ Thumbs.db
 # committing Cargo.lock is best practice to ensure reproducible builds!
 
 PLAN.md
+NOTES.md

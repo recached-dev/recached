@@ -2,6 +2,7 @@ use crate::cmd::{Command, SetCondition, SetExpiry, ZAddOptions};
 use crate::resp::Value;
 use dashmap::DashMap;
 use rand::seq::IteratorRandom;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -258,6 +259,24 @@ pub enum EvictionPolicy {
 
 // ── KeyValueStore ─────────────────────────────────────────────────────────────
 
+// ── Snapshot types ────────────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize)]
+pub enum SnapshotValue {
+    Str(String),
+    Hash(HashMap<String, String>),
+    List(Vec<String>),
+    Set(Vec<String>),
+    ZSet(Vec<(String, f64)>),
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SnapshotEntry {
+    pub key: String,
+    pub value: SnapshotValue,
+    pub expires_at_ms: Option<u64>,
+}
+
 #[derive(Clone)]
 pub struct KeyValueStore {
     data: Arc<DashMap<String, Entry>>,
@@ -385,6 +404,58 @@ impl KeyValueStore {
                     None => false,
                 }
             }
+        }
+    }
+
+    pub fn snapshot(&self) -> Vec<SnapshotEntry> {
+        let now = now_ms();
+        self.data
+            .iter()
+            .filter(|e| !e.is_expired(now))
+            .map(|e| {
+                let value = match &e.value {
+                    EntryValue::Str(s) => SnapshotValue::Str(s.clone()),
+                    EntryValue::Hash(m) => SnapshotValue::Hash(m.clone()),
+                    EntryValue::List(l) => SnapshotValue::List(l.iter().cloned().collect()),
+                    EntryValue::Set(s) => SnapshotValue::Set(s.iter().cloned().collect()),
+                    EntryValue::ZSet(z) => {
+                        SnapshotValue::ZSet(z.scores.iter().map(|(k, &v)| (k.clone(), v)).collect())
+                    }
+                };
+                SnapshotEntry {
+                    key: e.key().clone(),
+                    value,
+                    expires_at_ms: e.expires_at_ms,
+                }
+            })
+            .collect()
+    }
+
+    pub fn restore(&self, entries: Vec<SnapshotEntry>) {
+        let now = now_ms();
+        for e in entries {
+            if let Some(exp) = e.expires_at_ms
+                && now >= exp
+            {
+                continue;
+            }
+            let value = match e.value {
+                SnapshotValue::Str(s) => EntryValue::Str(s),
+                SnapshotValue::Hash(m) => EntryValue::Hash(m),
+                SnapshotValue::List(l) => EntryValue::List(l.into_iter().collect()),
+                SnapshotValue::Set(s) => EntryValue::Set(s.into_iter().collect()),
+                SnapshotValue::ZSet(pairs) => EntryValue::ZSet(ZSetInner {
+                    scores: pairs.into_iter().collect(),
+                }),
+            };
+            self.data.insert(
+                e.key,
+                Entry {
+                    value,
+                    expires_at_ms: e.expires_at_ms,
+                    written_at_ms: now,
+                },
+            );
         }
     }
 
@@ -1779,6 +1850,9 @@ impl KeyValueStore {
             Command::Unknown(name) => Value::Error(format!("ERR unknown command '{}'", name)),
             Command::Watch(_) | Command::Unwatch(_) => {
                 Value::Error("ERR WATCH/UNWATCH only supported over WebSocket".to_string())
+            }
+            Command::Save | Command::BgSave | Command::LastSave => {
+                Value::Error("ERR persistence commands must be handled by the server".to_string())
             }
         }
     }

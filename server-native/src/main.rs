@@ -1,16 +1,19 @@
 use core_engine::cmd::{Command, SetExpiry, ZAddCondition};
 use core_engine::resp::Value;
-use core_engine::store::{EvictionPolicy, KeyValueStore};
+use core_engine::store::{EvictionPolicy, KeyValueStore, SnapshotEntry};
 use futures_util::{SinkExt, StreamExt};
 use metrics::{counter, gauge};
 use rustls_pemfile::{certs, private_key};
 use std::collections::{HashMap, HashSet};
+use std::io::ErrorKind;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, broadcast, mpsc};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
@@ -141,6 +144,9 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::Publish(_, _) => "publish",
         Command::Watch(_) => "watch",
         Command::Unwatch(_) => "unwatch",
+        Command::Save => "save",
+        Command::BgSave => "bgsave",
+        Command::LastSave => "lastsave",
         Command::Unknown(_) => "unknown",
     }
 }
@@ -201,9 +207,363 @@ const MAX_TCP_READ_BUFFER_BYTES: usize = 64 * 1024 * 1024; // 64 MB per connecti
 const MAX_MULTI_QUEUE_LEN: usize = 10_000;
 const MAX_WATCHES_PER_CONN: usize = 1_024;
 const BROADCAST_CHANNEL_CAPACITY: usize = 512;
-const MAX_CONNECTIONS: usize = 1024;
+const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 const MAX_AUTH_FAILURES: u32 = 5;
 const EVICTION_INTERVAL_SECS: u64 = 1;
+
+// ── snapshot persistence ──────────────────────────────────────────────────────
+
+struct SnapshotConfig {
+    path: PathBuf,
+    last_save: AtomicI64,
+}
+
+fn now_unix_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+async fn save_snapshot(store: &KeyValueStore, cfg: &SnapshotConfig) {
+    let entries = store.snapshot();
+    let count = entries.len();
+    let tmp = cfg.path.with_extension("tmp");
+    match rmp_serde::to_vec(&entries) {
+        Err(e) => warn!("Snapshot serialize failed: {}", e),
+        Ok(bytes) => match tokio::fs::write(&tmp, &bytes).await {
+            Err(e) => warn!("Snapshot write failed: {}", e),
+            Ok(()) => match tokio::fs::rename(&tmp, &cfg.path).await {
+                Err(e) => warn!("Snapshot rename failed: {}", e),
+                Ok(()) => {
+                    cfg.last_save.store(now_unix_secs(), Ordering::Relaxed);
+                    info!("Snapshot saved: {} entries → {:?}", count, cfg.path);
+                }
+            },
+        },
+    }
+}
+
+async fn load_snapshot(store: &KeyValueStore, path: &std::path::Path) -> bool {
+    match tokio::fs::read(path).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            info!("No snapshot at {:?}, starting fresh", path);
+            false
+        }
+        Err(e) => {
+            warn!("Snapshot read failed: {}", e);
+            false
+        }
+        Ok(bytes) => match rmp_serde::from_slice::<Vec<SnapshotEntry>>(&bytes) {
+            Err(e) => {
+                warn!("Snapshot deserialize failed: {}", e);
+                false
+            }
+            Ok(entries) => {
+                let count = entries.len();
+                store.restore(entries);
+                info!("Snapshot loaded: {} entries ← {:?}", count, path);
+                true
+            }
+        },
+    }
+}
+
+// ── AOF ───────────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq)]
+enum AofSync {
+    Always,
+    EverySec,
+    No,
+}
+
+struct AofWriter {
+    #[allow(dead_code)]
+    path: PathBuf,
+    file: tokio::sync::Mutex<tokio::fs::File>,
+    sync: AofSync,
+}
+
+impl AofWriter {
+    async fn open(path: PathBuf, sync: AofSync) -> std::io::Result<Self> {
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await?;
+        Ok(Self {
+            path,
+            file: tokio::sync::Mutex::new(file),
+            sync,
+        })
+    }
+
+    async fn append(&self, resp: &str) {
+        let mut f = self.file.lock().await;
+        if f.write_all(resp.as_bytes()).await.is_err() {
+            warn!("AOF write failed");
+            return;
+        }
+        if self.sync == AofSync::Always {
+            let _ = f.flush().await;
+        }
+    }
+
+    async fn flush(&self) {
+        let _ = self.file.lock().await.flush().await;
+    }
+
+    async fn truncate(&self) {
+        match self.file.lock().await.set_len(0).await {
+            Ok(()) => info!("AOF truncated after snapshot save"),
+            Err(e) => warn!("AOF truncate failed: {}", e),
+        }
+    }
+}
+
+async fn replay_aof(store: &KeyValueStore, path: &std::path::Path) -> usize {
+    let bytes = match tokio::fs::read(path).await {
+        Err(e) if e.kind() == ErrorKind::NotFound => return 0,
+        Err(e) => {
+            warn!("AOF read failed: {}", e);
+            return 0;
+        }
+        Ok(b) => b,
+    };
+    let mut replayed = 0usize;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match Value::parse(&bytes[offset..]) {
+            Ok((value, consumed)) => {
+                offset += consumed;
+                if let Ok(cmd) = Command::from_value(value) {
+                    store.execute(cmd);
+                    replayed += 1;
+                }
+            }
+            Err(ref e) if e == "Incomplete" => break,
+            Err(_) => {
+                warn!("AOF corrupted at offset {}, stopping replay", offset);
+                break;
+            }
+        }
+    }
+    if replayed > 0 {
+        info!("AOF replayed: {} commands ← {:?}", replayed, path);
+    }
+    replayed
+}
+
+// ── Replication ───────────────────────────────────────────────────────────────
+
+type ReplSender = mpsc::UnboundedSender<Vec<u8>>;
+type ReplRegistry = Arc<tokio::sync::Mutex<Vec<ReplSender>>>;
+
+#[derive(Clone, PartialEq)]
+enum ServerRole {
+    Primary,
+    Replica,
+}
+
+// ── Server state ──────────────────────────────────────────────────────────────
+
+struct ServerState {
+    snap: Arc<SnapshotConfig>,
+    aof: Option<Arc<AofWriter>>,
+    replicas: ReplRegistry,
+    role: ServerRole,
+}
+
+impl ServerState {
+    /// Called after every successful write: appends to AOF and fans out to replicas.
+    async fn on_write(&self, resp: &str) {
+        if let Some(aof) = &self.aof {
+            aof.append(resp).await;
+        }
+        let bytes = resp.as_bytes().to_vec();
+        let mut reg = self.replicas.lock().await;
+        reg.retain(|tx| tx.send(bytes.clone()).is_ok());
+    }
+
+    /// Save snapshot then truncate AOF (snapshot subsumes the log).
+    async fn save(&self, store: &KeyValueStore) {
+        save_snapshot(store, &self.snap).await;
+        if let Some(aof) = &self.aof {
+            aof.truncate().await;
+        }
+    }
+}
+
+fn is_write_command(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Set(..)
+            | Command::Del(..)
+            | Command::Unlink(..)
+            | Command::Append(..)
+            | Command::GetSet(..)
+            | Command::MSet(..)
+            | Command::SetNx(..)
+            | Command::SetEx(..)
+            | Command::PSetEx(..)
+            | Command::Incr(..)
+            | Command::Decr(..)
+            | Command::IncrBy(..)
+            | Command::DecrBy(..)
+            | Command::Expire(..)
+            | Command::PExpire(..)
+            | Command::ExpireAt(..)
+            | Command::PExpireAt(..)
+            | Command::Persist(..)
+            | Command::FlushDb
+            | Command::Rename(..)
+            | Command::HSet(..)
+            | Command::HDel(..)
+            | Command::HIncrBy(..)
+            | Command::HIncrByFloat(..)
+            | Command::HSetNx(..)
+            | Command::LPush(..)
+            | Command::RPush(..)
+            | Command::LPushX(..)
+            | Command::RPushX(..)
+            | Command::LPop(..)
+            | Command::RPop(..)
+            | Command::LSet(..)
+            | Command::LRem(..)
+            | Command::LTrim(..)
+            | Command::SAdd(..)
+            | Command::SRem(..)
+            | Command::SInterStore(..)
+            | Command::SUnionStore(..)
+            | Command::SDiffStore(..)
+            | Command::SPop(..)
+            | Command::SMove(..)
+            | Command::ZAdd(..)
+            | Command::ZRem(..)
+            | Command::ZIncrBy(..)
+    )
+}
+
+// ── Replication server (primary side) ────────────────────────────────────────
+
+async fn run_repl_server(
+    port: u16,
+    store: Arc<KeyValueStore>,
+    snap_cfg: Arc<SnapshotConfig>,
+    replicas: ReplRegistry,
+) {
+    let listener = match TcpListener::bind(format!("0.0.0.0:{}", port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            warn!("Replication listener failed to bind :{}: {}", port, e);
+            return;
+        }
+    };
+    info!("Replication server listening on 0.0.0.0:{}", port);
+    loop {
+        match listener.accept().await {
+            Ok((socket, addr)) => {
+                info!("Replica connected from {}", addr);
+                let store = Arc::clone(&store);
+                let snap_cfg = Arc::clone(&snap_cfg);
+                let replicas = Arc::clone(&replicas);
+                tokio::spawn(async move {
+                    if let Err(e) = handle_replica(socket, store, snap_cfg, replicas).await {
+                        info!("Replica {} disconnected: {}", addr, e);
+                    }
+                });
+            }
+            Err(e) => warn!("Replication accept error: {}", e),
+        }
+    }
+}
+
+async fn handle_replica(
+    mut socket: TcpStream,
+    store: Arc<KeyValueStore>,
+    _snap_cfg: Arc<SnapshotConfig>,
+    replicas: ReplRegistry,
+) -> std::io::Result<()> {
+    // 1. Register channel first so subsequent writes are buffered
+    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    replicas.lock().await.push(tx);
+
+    // 2. Take snapshot and send (writes since snapshot are in channel)
+    let snap_bytes =
+        rmp_serde::to_vec(&store.snapshot()).map_err(|e| std::io::Error::other(e.to_string()))?;
+    let len = snap_bytes.len() as u32;
+    socket.write_all(&len.to_le_bytes()).await?;
+    socket.write_all(&snap_bytes).await?;
+    socket.flush().await?;
+
+    // 3. Stream buffered + ongoing writes
+    while let Some(bytes) = rx.recv().await {
+        let len = bytes.len() as u32;
+        socket.write_all(&len.to_le_bytes()).await?;
+        socket.write_all(&bytes).await?;
+        socket.flush().await?;
+    }
+    Ok(())
+}
+
+// ── Replication client (replica side) ────────────────────────────────────────
+
+async fn run_repl_client(primary_addr: String, store: Arc<KeyValueStore>) {
+    let mut backoff_secs = 2u64;
+    loop {
+        info!("Replica: connecting to primary at {}", primary_addr);
+        match TcpStream::connect(&primary_addr).await {
+            Err(e) => warn!("Replica: connect failed: {}", e),
+            Ok(mut socket) => {
+                backoff_secs = 2;
+                if let Err(e) = sync_from_primary(&mut socket, &store).await {
+                    warn!("Replica: sync ended: {}", e);
+                }
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
+        backoff_secs = (backoff_secs * 2).min(30);
+    }
+}
+
+async fn sync_from_primary(socket: &mut TcpStream, store: &KeyValueStore) -> std::io::Result<()> {
+    // 1. Receive full snapshot
+    let mut len_buf = [0u8; 4];
+    socket.read_exact(&mut len_buf).await?;
+    let snap_len = u32::from_le_bytes(len_buf) as usize;
+    let mut snap_bytes = vec![0u8; snap_len];
+    socket.read_exact(&mut snap_bytes).await?;
+
+    match rmp_serde::from_slice::<Vec<SnapshotEntry>>(&snap_bytes) {
+        Ok(entries) => {
+            let count = entries.len();
+            store.restore(entries);
+            info!("Replica: snapshot loaded ({} entries)", count);
+        }
+        Err(e) => {
+            return Err(std::io::Error::new(ErrorKind::InvalidData, e.to_string()));
+        }
+    }
+
+    // 2. Stream write commands from primary
+    loop {
+        let mut len_buf = [0u8; 4];
+        socket.read_exact(&mut len_buf).await?;
+        let cmd_len = u32::from_le_bytes(len_buf) as usize;
+        let mut cmd_bytes = vec![0u8; cmd_len];
+        socket.read_exact(&mut cmd_bytes).await?;
+
+        match Value::parse(&cmd_bytes) {
+            Ok((value, _)) => {
+                if let Ok(cmd) = Command::from_value(value) {
+                    store.execute(cmd);
+                }
+            }
+            Err(e) => warn!("Replica: bad command from primary: {}", e),
+        }
+    }
+}
 
 // ── connection identity ──────────────────────────────────────────────────────
 
@@ -532,6 +892,10 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
             let ms_s = ms.to_string();
             Some(resp_command(&["SET", k, v, "PX", &ms_s]))
         }
+        Command::Append(k, v) => match response {
+            Value::Integer(_) => Some(resp_command(&["APPEND", k, v])),
+            _ => None,
+        },
         Command::GetSet(k, v) => Some(resp_command(&["SET", k, v])),
         Command::Incr(k) | Command::Decr(k) => match response {
             Value::Integer(n) => {
@@ -923,6 +1287,130 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let store = Arc::new(KeyValueStore::with_config(max_keys, eviction_policy));
 
+    // ── snapshot persistence ──────────────────────────────────────────────
+    let save_path = PathBuf::from(
+        std::env::var("RECACHED_SAVE_PATH").unwrap_or_else(|_| "recached.rdb".to_string()),
+    );
+    let save_interval_secs: u64 = std::env::var("RECACHED_SAVE_INTERVAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(900);
+
+    load_snapshot(&store, &save_path).await;
+
+    let snap_cfg = Arc::new(SnapshotConfig {
+        path: save_path,
+        last_save: AtomicI64::new(now_unix_secs()),
+    });
+
+    // ── AOF ───────────────────────────────────────────────────────────────
+    let aof_path = std::env::var("RECACHED_AOF_PATH").ok().map(PathBuf::from);
+    let aof_sync = match std::env::var("RECACHED_AOF_SYNC")
+        .unwrap_or_default()
+        .to_lowercase()
+        .as_str()
+    {
+        "always" => AofSync::Always,
+        "no" => AofSync::No,
+        _ => AofSync::EverySec,
+    };
+
+    let aof: Option<Arc<AofWriter>> = if let Some(path) = aof_path {
+        match AofWriter::open(path.clone(), aof_sync).await {
+            Ok(w) => {
+                replay_aof(&store, &path).await;
+                let writer = Arc::new(w);
+                if aof_sync == AofSync::EverySec {
+                    let w2 = Arc::clone(&writer);
+                    tokio::spawn(async move {
+                        let mut interval =
+                            tokio::time::interval(tokio::time::Duration::from_secs(1));
+                        loop {
+                            interval.tick().await;
+                            w2.flush().await;
+                        }
+                    });
+                }
+                info!(
+                    "AOF enabled: {:?} (sync={})",
+                    path,
+                    match aof_sync {
+                        AofSync::Always => "always",
+                        AofSync::EverySec => "everysec",
+                        AofSync::No => "no",
+                    }
+                );
+                Some(writer)
+            }
+            Err(e) => {
+                warn!("AOF open failed: {} — running without AOF", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // ── Replication ───────────────────────────────────────────────────────
+    let replicaof = std::env::var("RECACHED_REPLICAOF").ok();
+    let repl_port: u16 = std::env::var("RECACHED_REPL_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6381);
+
+    let role = if replicaof.is_some() {
+        ServerRole::Replica
+    } else {
+        ServerRole::Primary
+    };
+
+    let replicas: ReplRegistry = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+    // ── server state ──────────────────────────────────────────────────────
+    let state = Arc::new(ServerState {
+        snap: Arc::clone(&snap_cfg),
+        aof,
+        replicas: Arc::clone(&replicas),
+        role: role.clone(),
+    });
+
+    // ── autosave ──────────────────────────────────────────────────────────
+    if save_interval_secs > 0 {
+        let store_snap = Arc::clone(&store);
+        let state_snap = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(save_interval_secs));
+            interval.tick().await; // skip immediate first tick
+            loop {
+                interval.tick().await;
+                state_snap.save(&store_snap).await;
+            }
+        });
+        info!(
+            "Autosave every {}s → {:?}",
+            save_interval_secs, snap_cfg.path
+        );
+    } else {
+        info!("Autosave disabled (RECACHED_SAVE_INTERVAL=0). Use SAVE or BGSAVE manually.");
+    }
+
+    // ── start replication ─────────────────────────────────────────────────
+    if role == ServerRole::Primary {
+        let store_r = Arc::clone(&store);
+        let snap_r = Arc::clone(&snap_cfg);
+        let reg_r = Arc::clone(&replicas);
+        tokio::spawn(async move {
+            run_repl_server(repl_port, store_r, snap_r, reg_r).await;
+        });
+    } else if let Some(primary_addr) = replicaof {
+        let store_r = Arc::clone(&store);
+        tokio::spawn(async move {
+            run_repl_client(primary_addr, store_r).await;
+        });
+        info!("Running as replica — write commands will be rejected");
+    }
+
     // ── background eviction ───────────────────────────────────────────────
     {
         let store_sweep = Arc::clone(&store);
@@ -947,7 +1435,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let watch_registry: WatchRegistry = Arc::new(Mutex::new(HashMap::new()));
 
     // ── connection limiter ────────────────────────────────────────────────
-    let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let max_connections = std::env::var("RECACHED_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_CONNECTIONS);
+    info!("Max connections: {}", max_connections);
+    let semaphore = Arc::new(Semaphore::new(max_connections));
 
     // ── TLS ───────────────────────────────────────────────────────────────
     let tls_acceptor: Option<TlsAcceptor> = load_tls_acceptor();
@@ -977,6 +1470,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pubsub_tcp = Arc::clone(&pubsub);
     let tls_tcp = Arc::clone(&tls_acceptor);
     let watch_tcp = Arc::clone(&watch_registry);
+    let snap_tcp = Arc::clone(&state);
 
     tokio::spawn(async move {
         loop {
@@ -1001,15 +1495,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let ps = Arc::clone(&pubsub_tcp);
                     let wr = Arc::clone(&watch_tcp);
                     let tls = Arc::clone(&tls_tcp);
+                    let sc = Arc::clone(&snap_tcp);
                     tokio::spawn(async move {
                         let _permit = permit;
                         if let Some(acc) = tls.as_ref() {
                             match acc.accept(socket).await {
-                                Ok(tls_stream) => handle_tcp(tls_stream, s, t, p, ps, wr).await,
+                                Ok(tls_stream) => handle_tcp(tls_stream, s, t, p, ps, wr, sc).await,
                                 Err(e) => warn!("TCP TLS handshake failed from {}: {}", addr, e),
                             }
                         } else {
-                            handle_tcp(socket, s, t, p, ps, wr).await;
+                            handle_tcp(socket, s, t, p, ps, wr, sc).await;
                         }
                     });
                 }
@@ -1018,44 +1513,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    loop {
-        match ws_listener.accept().await {
-            Ok((socket, addr)) => {
-                if let Some(allowed) = &allowed_ips
-                    && !allowed.contains(&addr.ip())
-                {
-                    debug!("WS: rejected IP {}", addr.ip());
-                    continue;
-                }
-                let permit = match Arc::clone(&semaphore).try_acquire_owned() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        warn!("WS: connection limit reached, dropping {}", addr);
-                        continue;
-                    }
-                };
-                let s = Arc::clone(&store);
-                let t = tx.clone();
-                let p = Arc::clone(&global_password);
-                let ps = Arc::clone(&pubsub);
-                let wr = Arc::clone(&watch_registry);
-                let tls = Arc::clone(&tls_acceptor);
-                let id = next_conn_id();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    if let Some(acc) = tls.as_ref() {
-                        match acc.accept(socket).await {
-                            Ok(tls_stream) => handle_ws(tls_stream, s, t, p, id, ps, wr).await,
-                            Err(e) => warn!("WS TLS handshake failed from {}: {}", addr, e),
-                        }
-                    } else {
-                        handle_ws(socket, s, t, p, id, ps, wr).await;
-                    }
-                });
+    // ── graceful shutdown via oneshot channel ────────────────────────────
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("failed to register SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = sigterm.recv() => {},
             }
-            Err(e) => warn!("WS accept error: {}", e),
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        let _ = shutdown_tx.send(());
+    });
+
+    loop {
+        tokio::select! {
+            biased;
+
+            res = ws_listener.accept() => {
+                match res {
+                    Ok((socket, addr)) => {
+                        if let Some(allowed) = &allowed_ips
+                            && !allowed.contains(&addr.ip())
+                        {
+                            debug!("WS: rejected IP {}", addr.ip());
+                            continue;
+                        }
+                        let permit = match Arc::clone(&semaphore).try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                warn!("WS: connection limit reached, dropping {}", addr);
+                                continue;
+                            }
+                        };
+                        let s = Arc::clone(&store);
+                        let t = tx.clone();
+                        let p = Arc::clone(&global_password);
+                        let ps = Arc::clone(&pubsub);
+                        let wr = Arc::clone(&watch_registry);
+                        let tls = Arc::clone(&tls_acceptor);
+                        let sc = Arc::clone(&state);
+                        let id = next_conn_id();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            if let Some(acc) = tls.as_ref() {
+                                match acc.accept(socket).await {
+                                    Ok(tls_stream) => handle_ws(tls_stream, s, t, p, id, ps, wr, sc).await,
+                                    Err(e) => warn!("WS TLS handshake failed from {}: {}", addr, e),
+                                }
+                            } else {
+                                handle_ws(socket, s, t, p, id, ps, wr, sc).await;
+                            }
+                        });
+                    }
+                    Err(e) => warn!("WS accept error: {}", e),
+                }
+            }
+
+            _ = &mut shutdown_rx => {
+                info!("Shutdown signal received, saving final snapshot...");
+                state.save(&store).await;
+                info!("Done. Goodbye.");
+                break;
+            }
         }
     }
+
+    Ok(())
 }
 
 // ── TCP handler ───────────────────────────────────────────────────────────────
@@ -1067,6 +1598,7 @@ async fn handle_tcp<S>(
     password: Arc<Option<String>>,
     pubsub: SharedPubSub,
     watch_registry: WatchRegistry,
+    state: Arc<ServerState>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -1156,7 +1688,8 @@ async fn handle_tcp<S>(
                                                     for qcmd in queue {
                                                         let resp = execute_and_record(&store, &qcmd);
                                                         if let Some(msg) = broadcast_for(&qcmd, &resp) {
-                                                            let _ = tx.send((0, msg));
+                                                            let _ = tx.send((0, msg.clone()));
+                                                            state.on_write(&msg).await;
                                                         }
                                                         notify_watchers(&watch_registry, &qcmd, &resp, &store);
                                                         results.push(resp);
@@ -1260,11 +1793,37 @@ async fn handle_tcp<S>(
                                                 if writer.write_all(err).await.is_err() { break 'outer; }
                                                 continue 'parse;
                                             }
+                                            // Replica: reject writes
+                                            if state.role == ServerRole::Replica && is_write_command(&cmd) {
+                                                let err = b"-READONLY You can't write against a read only replica.\r\n";
+                                                if writer.write_all(err).await.is_err() { break 'outer; }
+                                                continue 'parse;
+                                            }
+                                            // Snapshot commands — handled here (async I/O, not in execute())
+                                            match &cmd {
+                                                Command::Save => {
+                                                    state.save(&store).await;
+                                                    if writer.write_all(b"+OK\r\n").await.is_err() { break 'outer; }
+                                                    continue 'parse;
+                                                }
+                                                Command::BgSave => {
+                                                    let s = Arc::clone(&store);
+                                                    let st = Arc::clone(&state);
+                                                    tokio::spawn(async move { st.save(&s).await; });
+                                                    if writer.write_all(b"+Background saving started\r\n").await.is_err() { break 'outer; }
+                                                    continue 'parse;
+                                                }
+                                                Command::LastSave => {
+                                                    let ts = state.snap.last_save.load(Ordering::Relaxed);
+                                                    if writer.write_all(&Value::Integer(ts).serialize()).await.is_err() { break 'outer; }
+                                                    continue 'parse;
+                                                }
+                                                _ => {}
+                                            }
                                             let response = execute_and_record(&store, &cmd);
-                                            if let Some(msg) = broadcast_for(&cmd, &response)
-                                                && let Err(e) = tx.send((0, msg))
-                                            {
-                                                debug!("TCP broadcast had no WS receivers: {}", e);
+                                            if let Some(msg) = broadcast_for(&cmd, &response) {
+                                                let _ = tx.send((0, msg.clone()));
+                                                state.on_write(&msg).await;
                                             }
                                             notify_watchers(&watch_registry, &cmd, &response, &store);
                                             if writer.write_all(&response.serialize()).await.is_err() {
@@ -1310,6 +1869,7 @@ async fn handle_tcp<S>(
 
 // ── WebSocket handler ─────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_ws<S>(
     socket: S,
     store: Arc<KeyValueStore>,
@@ -1318,6 +1878,7 @@ async fn handle_ws<S>(
     conn_id: u64,
     pubsub: SharedPubSub,
     watch_registry: WatchRegistry,
+    state: Arc<ServerState>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -1422,7 +1983,8 @@ async fn handle_ws<S>(
                                         for qcmd in queue {
                                             let resp = execute_and_record(&store, &qcmd);
                                             if let Some(msg) = broadcast_for(&qcmd, &resp) {
-                                                let _ = tx.send((conn_id, msg));
+                                                let _ = tx.send((conn_id, msg.clone()));
+                                                state.on_write(&msg).await;
                                             }
                                             notify_watchers(&watch_registry, &qcmd, &resp, &store);
                                             results.push(resp);
@@ -1555,11 +2117,38 @@ async fn handle_ws<S>(
                                     ws_send!(b"-ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in subscribe mode\r\n");
                                     continue 'outer;
                                 }
+                                // Replica: reject writes
+                                if state.role == ServerRole::Replica && is_write_command(&cmd) {
+                                    ws_send!(b"-READONLY You can't write against a read only replica.\r\n");
+                                    continue 'outer;
+                                }
+                                // Snapshot commands
+                                match &cmd {
+                                    Command::Save => {
+                                        state.save(&store).await;
+                                        ws_send!(b"+OK\r\n");
+                                        continue 'outer;
+                                    }
+                                    Command::BgSave => {
+                                        let s = Arc::clone(&store);
+                                        let st = Arc::clone(&state);
+                                        tokio::spawn(async move { st.save(&s).await; });
+                                        ws_send!(b"+Background saving started\r\n");
+                                        continue 'outer;
+                                    }
+                                    Command::LastSave => {
+                                        let ts = state.snap.last_save.load(Ordering::Relaxed);
+                                        ws_send!(&Value::Integer(ts).serialize());
+                                        continue 'outer;
+                                    }
+                                    _ => {}
+                                }
                                 let response = execute_and_record(&store, &cmd);
-                                if let Some(b_msg) = broadcast_for(&cmd, &response)
-                                    && let Err(e) = tx.send((conn_id, b_msg))
-                                {
-                                    debug!("WS broadcast on conn {} had no receivers: {}", conn_id, e);
+                                if let Some(b_msg) = broadcast_for(&cmd, &response) {
+                                    if let Err(e) = tx.send((conn_id, b_msg.clone())) {
+                                        debug!("WS broadcast on conn {} had no receivers: {}", conn_id, e);
+                                    }
+                                    state.on_write(&b_msg).await;
                                 }
                                 notify_watchers(&watch_registry, &cmd, &response, &store);
                                 ws_send!(&response.serialize());

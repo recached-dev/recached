@@ -232,6 +232,32 @@ await pub.publish('events:orders', JSON.stringify({ id: 123, status: 'shipped' }
 
 ---
 
+## Persistence
+
+Snapshot commands write the in-memory store to disk in MessagePack format. The snapshot path and autosave interval are controlled by [`RECACHED_SAVE_PATH` and `RECACHED_SAVE_INTERVAL`](/server/configuration#environment-variable-reference).
+
+| Command | Description |
+|---|---|
+| `SAVE` | Synchronously writes a snapshot to disk. Blocks until the file is written. Returns `OK` on success. |
+| `BGSAVE` | Triggers a background snapshot. Returns immediately; the save runs in a background task while the server continues accepting connections. |
+| `LASTSAVE` | Returns the Unix timestamp (seconds) of the most recent successful snapshot. Returns the server start time if no save has completed yet. |
+
+### Example
+
+```bash
+# Trigger a background save and check when it completed
+BGSAVE          # +Background saving started
+# ... time passes ...
+LASTSAVE        # (integer) 1746794400
+```
+
+```bash
+# Force a synchronous save (blocks until done — use BGSAVE in production)
+SAVE            # +OK
+```
+
+---
+
 ## Observable Keys (WebSocket-only)
 
 `WATCH` and `UNWATCH` are Recached-specific commands available only over WebSocket connections (port 6380). They have different semantics from Redis's `WATCH` (which is used for optimistic locking with transactions).
