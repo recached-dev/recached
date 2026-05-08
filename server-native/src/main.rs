@@ -197,6 +197,9 @@ fn load_tls_acceptor() -> Option<TlsAcceptor> {
 // ── tunables ────────────────────────────────────────────────────────────────
 
 const TCP_READ_BUFFER_BYTES: usize = 4096;
+const MAX_TCP_READ_BUFFER_BYTES: usize = 64 * 1024 * 1024; // 64 MB per connection
+const MAX_MULTI_QUEUE_LEN: usize = 10_000;
+const MAX_WATCHES_PER_CONN: usize = 1_024;
 const BROADCAST_CHANNEL_CAPACITY: usize = 512;
 const MAX_CONNECTIONS: usize = 1024;
 const MAX_AUTH_FAILURES: u32 = 5;
@@ -392,10 +395,15 @@ fn notify_watchers(
     if keys.is_empty() {
         return;
     }
+    // Fetch current values from DashMap *before* acquiring the registry lock
+    // to avoid holding two locks simultaneously.
+    let key_values: Vec<(String, Value)> = keys
+        .iter()
+        .map(|k| (k.clone(), store.get_current(k)))
+        .collect();
     let mut reg = registry.lock().unwrap();
-    for key in &keys {
+    for (key, value) in &key_values {
         if let Some(subs) = reg.get_mut(key) {
-            let value = store.get_current(key);
             subs.retain(|(_, tx)| tx.send((key.clone(), value.clone())).is_ok());
             if subs.is_empty() {
                 reg.remove(key);
@@ -1082,6 +1090,10 @@ async fn handle_tcp<S>(
                 match result {
                     Ok(0) => break,
                     Ok(n) => {
+                        if buf.len() + n > MAX_TCP_READ_BUFFER_BYTES {
+                            warn!("TCP connection exceeded max buffer size, closing");
+                            break 'outer;
+                        }
                         buf.extend_from_slice(&read_buf[..n]);
                         'parse: loop {
                             match Value::parse(&buf) {
@@ -1169,8 +1181,13 @@ async fn handle_tcp<S>(
                                                 if writer.write_all(err).await.is_err() { break 'outer; }
                                             }
                                             _ => {
-                                                queue.push(cmd);
-                                                if writer.write_all(b"+QUEUED\r\n").await.is_err() { break 'outer; }
+                                                if queue.len() >= MAX_MULTI_QUEUE_LEN {
+                                                    let err = b"-ERR transaction queue limit reached\r\n";
+                                                    if writer.write_all(err).await.is_err() { break 'outer; }
+                                                } else {
+                                                    queue.push(cmd);
+                                                    if writer.write_all(b"+QUEUED\r\n").await.is_err() { break 'outer; }
+                                                }
                                             }
                                         }
                                         continue 'parse;
@@ -1428,8 +1445,12 @@ async fn handle_ws<S>(
                                     ws_send!(b"-ERR Command not allowed inside a transaction\r\n");
                                 }
                                 _ => {
-                                    queue.push(cmd);
-                                    ws_send!(b"+QUEUED\r\n");
+                                    if queue.len() >= MAX_MULTI_QUEUE_LEN {
+                                        ws_send!(b"-ERR transaction queue limit reached\r\n");
+                                    } else {
+                                        queue.push(cmd);
+                                        ws_send!(b"+QUEUED\r\n");
+                                    }
                                 }
                             }
                             continue;
@@ -1489,16 +1510,25 @@ async fn handle_ws<S>(
                             }
 
                             Command::Watch(keys) => {
-                                {
-                                    let mut reg = watch_registry.lock().unwrap();
-                                    for key in &keys {
-                                        watched_keys.insert(key.clone());
-                                        reg.entry(key.clone())
-                                            .or_default()
-                                            .push((conn_id, watch_tx.clone()));
-                                    }
+                                let new_count = keys
+                                    .iter()
+                                    .filter(|k| !watched_keys.contains(*k))
+                                    .count();
+                                if watched_keys.len() + new_count > MAX_WATCHES_PER_CONN {
+                                    ws_send!(b"-ERR watch limit per connection reached\r\n");
+                                } else {
+                                    {
+                                        let mut reg = watch_registry.lock().unwrap();
+                                        for key in &keys {
+                                            if watched_keys.insert(key.clone()) {
+                                                reg.entry(key.clone())
+                                                    .or_default()
+                                                    .push((conn_id, watch_tx.clone()));
+                                            }
+                                        }
+                                    } // reg dropped before await
+                                    ws_send!(b"+OK\r\n");
                                 }
-                                ws_send!(b"+OK\r\n");
                             }
                             Command::Unwatch(keys) => {
                                 let targets: Vec<String> = if keys.is_empty() {

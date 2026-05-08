@@ -1,4 +1,6 @@
 const MAX_ARRAY_DEPTH: usize = 16;
+const MAX_ARRAY_ELEMENTS: usize = 1_000_000;
+const MAX_BULK_STRING_BYTES: usize = 64 * 1024 * 1024; // 64 MB
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -125,6 +127,12 @@ impl Value {
                 }
 
                 let length = length as usize;
+                if length > MAX_BULK_STRING_BYTES {
+                    return Err(format!(
+                        "ERR bulk string too large ({} > {} bytes)",
+                        length, MAX_BULK_STRING_BYTES
+                    ));
+                }
                 let end = head_len + length + 2; // +2 for trailing CRLF
                 if buffer.len() < end {
                     return Err("Incomplete".to_string());
@@ -152,6 +160,12 @@ impl Value {
                 }
                 if count < 0 {
                     return Err("Invalid array length".to_string());
+                }
+                if count as usize > MAX_ARRAY_ELEMENTS {
+                    return Err(format!(
+                        "ERR array too large ({} > {} elements)",
+                        count, MAX_ARRAY_ELEMENTS
+                    ));
                 }
 
                 let mut arr = Vec::with_capacity(count as usize);

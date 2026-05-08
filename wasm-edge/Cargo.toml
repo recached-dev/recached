@@ -20,3 +20,8 @@ features = [
     "ErrorEvent",
     "console",
 ]
+
+# getrandom v0.3 requires explicit opt-in for wasm32-unknown-unknown to use
+# the JS globalThis.crypto backend (pulled transitively via rand in core-engine).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
