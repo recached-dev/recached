@@ -19,7 +19,7 @@ On the backend it speaks RESP, so any Redis client works against it today. In th
 > [!NOTE]
 > Recached is not a full Redis replacement. It covers the subset most applications actually need: strings, expiry, counters, all collection types, transactions, pub/sub, and observable keys. Best fit: reactive UIs, session caches, browser-side API response caching, and rate limiting.
 
-**→ Full documentation, use cases, API reference, and guides at [recached.dev](https://recached.dev)**
+**→ Full documentation, use cases, API reference, and guides at [recached.io](https://thinkgrid-labs.github.io/recached/)**
 
 ---
 
