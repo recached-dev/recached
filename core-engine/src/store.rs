@@ -1920,7 +1920,7 @@ fn set_union(
             }
         };
         if let Some(s) = s_clone {
-            result.extend(s.into_iter());
+            result.extend(s);
         }
     }
     Ok(result)
