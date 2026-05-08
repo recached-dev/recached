@@ -1,0 +1,89 @@
+# Introduction
+
+## What Recached is
+
+Recached is an in-memory cache server written in Rust. It speaks RESP (the Redis Serialization Protocol) on port 6379, so any Redis client — `ioredis`, `node-redis`, `redis-py`, `Jedis` — works against it today with no code changes.
+
+That is where the similarity with Redis ends.
+
+The distinguishing feature is the `core-engine` crate: a pure Rust state machine with no network dependencies, no file I/O, and no OS-specific code. It compiles to native x86-64/ARM64 for the server **and** to `wasm32-unknown-unknown` for the browser. Both targets run the same cache logic from the same source. The WebSocket sync layer (port 6380) keeps the two sides consistent in real time.
+
+The result: your backend caches data over RESP as it always has, and every connected browser instance holds a local copy of the cache in WASM memory. Frontend reads are 0 ms — no network hop. Frontend writes propagate to the server and fan out to all other connected clients.
+
+## The core insight
+
+Every caching solution today forces a choice:
+
+- **Server-side cache (Redis, Memcached):** Every frontend read is a network round-trip. The browser is just a display layer; all state lives on the server.
+- **Client-side state (Zustand, Redux, SWR):** State lives in the browser, but you write manual staleness checks, manual invalidation, manual sync code. Two caches emerge: one on the server and one in every client.
+
+Recached removes the choice. The `core-engine` is the cache. It runs in both places. The network layer is not a read path — it is only a sync path. Reads always come from local memory.
+
+## Architecture
+
+```
+┌─────────────────┐        RESP (port 6379)        ┌──────────────────┐
+│   Your backend  │ ──────────────────────────────► │  Recached Server │
+└─────────────────┘                                 │  (server-native) │
+                                                    └────────┬─────────┘
+                                                             │ WebSocket
+                                                             │ sync (6380)
+                                                    ┌────────▼─────────┐
+                                                    │  Browser / Edge  │
+                                                    │  (wasm-edge)     │
+                                                    │  local reads: 0ms│
+                                                    └──────────────────┘
+```
+
+Three crates with hard dependency boundaries:
+
+| Crate | Role |
+|---|---|
+| `core-engine` | Pure state machine — no networking, no I/O. RESP parser, typed command dispatch, `Arc<RwLock<HashMap>>` store, TTL engine, optional key cap. Compiles to both native and `wasm32`. |
+| `server-native` | Tokio TCP server (port 6379) + WebSocket server (port 6380). Persistent read buffers handle fragmented RESP. Per-connection pub/sub via `mpsc` channels. Connection semaphore, auth rate-limiting, sender-ID broadcast filter. |
+| `wasm-edge` | `wasm-bindgen` JS bindings. Local zero-latency reads, RESP-over-WebSocket sync. Closure lifecycle managed to avoid memory leaks on reconnect. |
+
+## When to use Recached
+
+Recached is a good fit when:
+
+- **Your frontend reads the same data your backend writes.** User sessions, feature flags, live counters, cart state, active user lists — anything your backend mutates that the UI needs to display instantly.
+- **You want live UI without polling.** The WebSocket sync replaces a polling loop without requiring you to build a separate SSE or WebSocket server.
+- **You want a frontend-only cache with TTL.** The WASM module works entirely without a server. Call `createCache()` without `connect()` and you get a local in-memory cache with built-in TTL — no Recached server, no Redis, no backend changes required.
+- **You need cross-tab sync.** BroadcastChannel support means all open tabs in the same browser share mutations automatically.
+- **You want a drop-in Redis replacement** for the subset of commands most applications actually use (strings, expiry, counters, collections, transactions, pub/sub).
+
+## When Recached is not the right fit
+
+- **You need persistence across server restarts.** Recached has no RDB or AOF persistence. The data is entirely in-memory. Your backend should repopulate from a database on startup if you need durability.
+- **You need replication.** There is no `REPLICAOF`. The native→browser WebSocket is the sync story. A multi-server deployment is not currently supported.
+- **You depend on uncommon Redis commands.** Recached implements the commands most applications use, not all 250+. Server introspection (`INFO`, `SLOWLOG`, `COMMAND`), Lua scripting, RESP3, and cluster mode are out of scope.
+- **You need very large datasets.** Recached is an in-memory cache — it is not a database. If your working set does not fit in RAM, Redis with RDB persistence or a proper database is the right tool.
+
+## Recached vs Redis
+
+| | Recached | Redis |
+|---|---|---|
+| Protocol | RESP (compatible) | RESP |
+| Browser-side cache | Yes — WASM | No |
+| WebSocket sync | Built-in | Not built-in |
+| Persistence | No | RDB + AOF |
+| Replication | No | Yes |
+| Lua scripting | No (WASM scripting on roadmap) | Yes |
+| Cluster mode | No | Yes |
+| Command coverage | ~80 commands | 250+ |
+| License | MIT | BSD-3 |
+
+## Recached vs SWR / React Query
+
+SWR and React Query are data-fetching libraries. They manage HTTP request lifecycles, deduplication, background revalidation, and cache invalidation in the context of a single page app. They are framework-level dependencies with their own mental models.
+
+Recached is a cache primitive. It has no concept of HTTP, components, or rendering. It is closer to Redis in the browser than to SWR. Use Recached when you need a shared, server-synchronized cache that multiple components (or multiple tabs) can read from. Use SWR or React Query when you need request deduplication and automatic revalidation of HTTP endpoints.
+
+They can coexist: Recached for your server-synced live state, SWR for your HTTP data fetching.
+
+## Recached vs Zustand / Redux
+
+Zustand and Redux are UI state managers. They are excellent for component state, UI interactions, form state, and modal visibility. They have no concept of expiry or server sync.
+
+Recached replaces the manual caching layer developers build on top of Zustand or Redux: the `fetchedAt` timestamp tracking, the staleness checks, the manual invalidation on mutation. It does not replace UI state management — it replaces the cache you bolted onto it.

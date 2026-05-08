@@ -1,0 +1,280 @@
+# Commands
+
+Recached implements the subset of RESP commands that most applications use. Commands work over both TCP (port 6379) and WebSocket (port 6380).
+
+## Core
+
+| Command | Description |
+|---|---|
+| `PING [message]` | Returns `PONG`, or echoes `message` if provided. Used to test connectivity and measure latency. |
+| `AUTH password` | Authenticates the connection. Required on the first command if `RECACHED_PASSWORD` is set. 5 consecutive failures close the connection. |
+
+---
+
+## Strings
+
+The most common data type. Values are always stored as byte strings; numeric operations parse the value as an integer or float.
+
+| Command | Description |
+|---|---|
+| `SET key value [EX seconds] [PX ms] [EXAT timestamp] [PXAT ms-timestamp] [NX\|XX] [KEEPTTL] [GET]` | Set a key to a string value. `EX`/`PX`/`EXAT`/`PXAT` set expiry. `NX` only sets if key does not exist. `XX` only sets if key exists. `KEEPTTL` preserves the existing TTL. `GET` returns the old value before overwriting. |
+| `GET key` | Returns the value of a key, or nil if the key does not exist or has expired. |
+| `GETSET key value` | Sets the key to a new value and returns the old value atomically. Deprecated in Redis 6.2 — prefer `SET key value GET`. |
+| `MGET key [key ...]` | Returns the values of multiple keys. Keys that do not exist return nil. |
+| `MSET key value [key value ...]` | Sets multiple keys to their respective values in a single atomic operation. |
+| `SETNX key value` | Set a key only if it does not exist. Returns 1 if set, 0 if the key already existed. |
+| `SETEX key seconds value` | Set a key with an integer-second expiry. Equivalent to `SET key value EX seconds`. |
+| `PSETEX key milliseconds value` | Set a key with a millisecond-precision expiry. |
+| `APPEND key value` | Appends a string to the end of the existing value. If the key does not exist, it is created. Returns the new length. |
+| `STRLEN key` | Returns the length of the string stored at key. Returns 0 if the key does not exist. |
+| `INCR key` | Increments the integer value of a key by 1. Creates the key with value 1 if it does not exist. Returns an error if the value is not a valid integer. |
+| `DECR key` | Decrements the integer value of a key by 1. Creates the key with value -1 if it does not exist. |
+| `INCRBY key increment` | Increments the integer value of a key by the given integer. |
+| `DECRBY key decrement` | Decrements the integer value of a key by the given integer. |
+
+---
+
+## Expiry
+
+| Command | Description |
+|---|---|
+| `EXPIRE key seconds` | Set a timeout on a key in seconds. The key is deleted when the timeout expires. Returns 1 if set, 0 if key does not exist. |
+| `PEXPIRE key milliseconds` | Set a timeout in milliseconds. |
+| `EXPIREAT key unix-timestamp` | Set an absolute expiry time as a Unix timestamp (seconds). |
+| `PEXPIREAT key ms-unix-timestamp` | Set an absolute expiry time as a Unix timestamp in milliseconds. |
+| `TTL key` | Returns the remaining time-to-live of a key in seconds. Returns -2 if the key does not exist, -1 if the key has no expiry. |
+| `PTTL key` | Returns the remaining TTL in milliseconds. |
+| `PERSIST key` | Removes the TTL from a key, making it persistent. Returns 1 if the TTL was removed, 0 if the key has no expiry or does not exist. |
+
+---
+
+## Keys
+
+| Command | Description |
+|---|---|
+| `DEL key [key ...]` | Deletes one or more keys. Returns the number of keys that were deleted. Keys that do not exist are ignored. |
+| `UNLINK key [key ...]` | Non-blocking delete. Semantically equivalent to `DEL` (Recached does not implement async deletion, but `UNLINK` is accepted for client compatibility). |
+| `EXISTS key [key ...]` | Returns the number of keys that exist among the provided arguments. A key listed multiple times counts multiple times. |
+| `TYPE key` | Returns the type of the value stored at key: `string`, `hash`, `list`, `set`, `zset`, or `none` if the key does not exist. |
+| `RENAME key newkey` | Renames a key. Returns an error if the source key does not exist. Overwrites `newkey` if it already exists. |
+| `KEYS pattern` | Returns all keys matching the glob pattern. `*` matches any sequence of characters, `?` matches a single character, `[abc]` matches a character class. Warning: `KEYS *` on a large store is slow — prefer `SCAN`. |
+| `SCAN cursor [MATCH pattern] [COUNT count]` | Iterates keys incrementally. Returns the next cursor and a batch of keys. Start with cursor `0`; continue until the returned cursor is `0`. `MATCH` filters results. `COUNT` is a hint for batch size. |
+| `DBSIZE` | Returns the total number of keys in the store. |
+| `FLUSHDB [ASYNC]` | Removes all keys from the store. `ASYNC` is accepted but does not change behavior (the flush is always synchronous). |
+
+---
+
+## Hash
+
+A hash is a map of field-value pairs stored under a single key. Use hashes to store structured objects without serializing to JSON.
+
+| Command | Description |
+|---|---|
+| `HSET key field value [field value ...]` | Sets one or more fields in a hash. Creates the hash if it does not exist. Returns the number of fields that were added (not updated). |
+| `HGET key field` | Returns the value of a specific field. Returns nil if the field or hash does not exist. |
+| `HGETALL key` | Returns all field-value pairs of a hash as a flat array: field1, value1, field2, value2, ... |
+| `HDEL key field [field ...]` | Deletes one or more fields from a hash. Returns the number of fields removed. |
+| `HMGET key field [field ...]` | Returns the values of multiple fields. Non-existent fields return nil. |
+| `HKEYS key` | Returns all field names in the hash. |
+| `HVALS key` | Returns all values in the hash. |
+| `HLEN key` | Returns the number of fields in the hash. |
+| `HEXISTS key field` | Returns 1 if the field exists in the hash, 0 otherwise. |
+| `HSETNX key field value` | Sets a field only if it does not already exist. Returns 1 if set, 0 if the field already existed. |
+| `HINCRBY key field increment` | Increments the integer value of a hash field by the given integer. Creates the field with value 0 before incrementing if it does not exist. |
+| `HINCRBYFLOAT key field increment` | Increments the float value of a hash field by the given float. |
+
+### Example
+
+```bash
+HSET user:1 name Alice plan pro credits 500
+HGET user:1 name          # "Alice"
+HGETALL user:1            # ["name", "Alice", "plan", "pro", "credits", "500"]
+HINCRBY user:1 credits -50
+HGET user:1 credits       # "450"
+```
+
+---
+
+## List
+
+A doubly-linked list. Supports push/pop from both ends. Use for queues (`RPUSH` + `LPOP`), stacks (`LPUSH` + `LPOP`), and fixed-length histories (`RPUSH` + `LTRIM`).
+
+| Command | Description |
+|---|---|
+| `LPUSH key element [element ...]` | Prepends one or more elements to the head of a list. Multiple elements are pushed left-to-right (the last argument ends up at the head). Returns the list length. |
+| `RPUSH key element [element ...]` | Appends one or more elements to the tail of a list. Returns the list length. |
+| `LPUSHX key element [element ...]` | Like `LPUSH`, but only if the key already exists. Returns 0 if the key does not exist. |
+| `RPUSHX key element [element ...]` | Like `RPUSH`, but only if the key already exists. |
+| `LPOP key [count]` | Removes and returns the first element (or `count` elements) from the list. Returns nil if the list is empty or does not exist. |
+| `RPOP key [count]` | Removes and returns the last element (or `count` elements) from the list. |
+| `LRANGE key start stop` | Returns the elements of the list between index `start` and `stop` (inclusive). Negative indices count from the tail: -1 is the last element. |
+| `LLEN key` | Returns the length of the list, or 0 if the key does not exist. |
+| `LINDEX key index` | Returns the element at the given index. 0 is the first element, -1 is the last. Returns nil if the index is out of range. |
+| `LSET key index element` | Sets the list element at the given index to a new value. Returns an error if the index is out of range. |
+| `LREM key count element` | Removes occurrences of `element` from the list. `count > 0`: removes from head. `count < 0`: removes from tail. `count = 0`: removes all occurrences. Returns the number of removed elements. |
+| `LTRIM key start stop` | Keeps only the elements between `start` and `stop`, removing the rest. Useful for capping list length. |
+
+---
+
+## Set
+
+An unordered collection of unique string members. Supports set operations (intersection, union, difference).
+
+| Command | Description |
+|---|---|
+| `SADD key member [member ...]` | Adds one or more members to a set. Ignores members that already exist. Returns the number of new members added. |
+| `SMEMBERS key` | Returns all members of the set. Order is not guaranteed. |
+| `SREM key member [member ...]` | Removes one or more members from a set. Returns the number of members actually removed. |
+| `SCARD key` | Returns the number of members in the set. |
+| `SISMEMBER key member` | Returns 1 if the member exists in the set, 0 otherwise. |
+| `SMISMEMBER key member [member ...]` | Returns an array of 1/0 values for each member, indicating existence. |
+| `SINTER key [key ...]` | Returns the intersection of all given sets. |
+| `SINTERSTORE destination key [key ...]` | Stores the intersection into `destination` and returns its size. |
+| `SUNION key [key ...]` | Returns the union of all given sets. |
+| `SUNIONSTORE destination key [key ...]` | Stores the union into `destination` and returns its size. |
+| `SDIFF key [key ...]` | Returns the members in the first set that are not in any of the other sets. |
+| `SDIFFSTORE destination key [key ...]` | Stores the difference into `destination` and returns its size. |
+| `SPOP key [count]` | Removes and returns one or more random members from the set. |
+| `SRANDMEMBER key [count]` | Returns one or more random members without removing them. Positive `count`: unique members. Negative `count`: may repeat. |
+| `SMOVE source destination member` | Atomically moves a member from one set to another. Returns 1 on success, 0 if the member did not exist in source. |
+
+---
+
+## Sorted Set
+
+An ordered collection where each member has a numeric score. Members are unique; scores need not be. Members are always returned in ascending score order.
+
+| Command | Description |
+|---|---|
+| `ZADD key [NX\|XX] [CH] [INCR] score member [score member ...]` | Adds members with scores. `NX`: only add, never update. `XX`: only update, never add. `CH`: count changed elements (updated + added) instead of just added. `INCR`: add the score to the existing score instead of replacing it. |
+| `ZREM key member [member ...]` | Removes members from the sorted set. Returns the number of members removed. |
+| `ZINCRBY key increment member` | Adds `increment` to the score of `member`. Creates the member with score `increment` if it does not exist. |
+| `ZRANGE key start stop [WITHSCORES]` | Returns members between rank `start` and `stop` (0-based, ascending). Add `WITHSCORES` to include scores. |
+| `ZREVRANGE key start stop [WITHSCORES]` | Same as `ZRANGE`, but returns members in descending score order. |
+| `ZRANGEBYSCORE key min max [WITHSCORES] [LIMIT offset count]` | Returns members with scores between `min` and `max`. Use `-inf` and `+inf` for open bounds. Use `(min` for exclusive lower bound. |
+| `ZREVRANGEBYSCORE key max min [WITHSCORES] [LIMIT offset count]` | Same, but from high score to low. |
+| `ZSCORE key member` | Returns the score of a member, or nil if the member does not exist. |
+| `ZMSCORE key member [member ...]` | Returns the scores of multiple members. Non-existent members return nil. |
+| `ZRANK key member` | Returns the 0-based rank of a member in ascending score order. Returns nil if the member does not exist. |
+| `ZREVRANK key member` | Returns the rank in descending score order. |
+| `ZCARD key` | Returns the number of members in the sorted set. |
+| `ZCOUNT key min max` | Returns the number of members with scores between `min` and `max`. |
+
+### Example: leaderboard
+
+```bash
+ZADD leaderboard 1500 alice 2200 bob 980 carol
+ZREVRANGE leaderboard 0 2 WITHSCORES
+# ["bob", "2200", "alice", "1500", "carol", "980"]
+
+ZINCRBY leaderboard 300 carol
+ZREVRANK leaderboard carol    # 2 → 1 (moved up)
+```
+
+---
+
+## Transactions
+
+Transactions queue commands and execute them atomically. No other client can interleave commands between `MULTI` and `EXEC`. After `EXEC`, the full result set is broadcast to WebSocket clients.
+
+| Command | Description |
+|---|---|
+| `MULTI` | Begins a transaction. Subsequent commands are queued, not executed. Returns `OK`. |
+| `EXEC` | Executes all queued commands atomically. Returns an array of results, one per queued command. |
+| `DISCARD` | Abandons the transaction queue. Returns `OK`. |
+
+### Example
+
+```bash
+MULTI
+SET counter 0
+INCR counter
+INCR counter
+EXEC
+# 1) OK
+# 2) 1
+# 3) 2
+```
+
+Note: Recached transactions do not support optimistic locking (`WATCH` in the Redis sense). `WATCH` in Recached is the key observation command — see [Observable Keys](#observable-keys-websocket-only) below.
+
+---
+
+## Pub/Sub
+
+Publish/subscribe messaging. Clients can subscribe to channels (exact match) or patterns (glob). Published messages are delivered to all matching subscribers.
+
+Pub/Sub works over both TCP (port 6379) and WebSocket (port 6380).
+
+| Command | Description |
+|---|---|
+| `SUBSCRIBE channel [channel ...]` | Subscribes the client to one or more channels. The client enters pub/sub mode and can only use pub/sub commands until it unsubscribes. |
+| `UNSUBSCRIBE [channel ...]` | Unsubscribes from the given channels. With no arguments, unsubscribes from all channels. |
+| `PSUBSCRIBE pattern [pattern ...]` | Subscribes to channels matching a glob pattern. `*` matches any sequence, `?` matches any single character, `[abc]` matches a character class. |
+| `PUNSUBSCRIBE [pattern ...]` | Unsubscribes from pattern subscriptions. With no arguments, unsubscribes from all patterns. |
+| `PUBLISH channel message` | Publishes a message to all subscribers of the given channel and all clients with matching pattern subscriptions. Returns the number of clients that received the message. |
+
+### Example
+
+```typescript
+// Subscriber (Node.js)
+const sub = new Redis('redis://127.0.0.1:6379')
+await sub.subscribe('events:orders')
+sub.on('message', (channel, message) => {
+  console.log(`${channel}: ${message}`)
+})
+
+// Publisher
+const pub = new Redis('redis://127.0.0.1:6379')
+await pub.publish('events:orders', JSON.stringify({ id: 123, status: 'shipped' }))
+// events:orders: {"id":123,"status":"shipped"}
+```
+
+---
+
+## Observable Keys (WebSocket-only)
+
+`WATCH` and `UNWATCH` are Recached-specific commands available only over WebSocket connections (port 6380). They have different semantics from Redis's `WATCH` (which is used for optimistic locking with transactions).
+
+In Recached, `WATCH` subscribes the connection to change notifications for a specific key. Whenever the key is mutated — by any client, from any connection — the server sends a push message to all watching connections.
+
+| Command | Description |
+|---|---|
+| `WATCH key [key ...]` | Registers the WebSocket connection to receive push notifications whenever the given key(s) change. |
+| `UNWATCH [key ...]` | Stops watching the given keys. With no arguments, clears all watches for this connection. |
+
+### Push message format
+
+When a watched key changes, the server sends a RESP array:
+
+```
+["keychange", "key-name", "new-value-or-type-hint"]
+```
+
+- For string keys: the third element is the current value.
+- For complex types (hash, list, set, sorted set): the third element is the type name (`hash`, `list`, `set`, `zset`). Re-fetch the full value with `HGETALL`, `LRANGE`, `SMEMBERS`, or `ZRANGE`.
+- For deleted keys: the third element is nil (`$-1\r\n`).
+
+### Raw WebSocket example
+
+```javascript
+const ws = new WebSocket('ws://127.0.0.1:6380')
+
+ws.onopen = () => {
+  // Watch a key — send RESP directly
+  ws.send('*2\r\n$5\r\nWATCH\r\n$12\r\ncart:user:42\r\n')
+}
+
+ws.onmessage = ({ data }) => {
+  // Parse RESP push: ["keychange", "cart:user:42", "3"]
+  console.log('Key changed:', data)
+}
+
+// Stop watching this key
+ws.send('*2\r\n$7\r\nUNWATCH\r\n$12\r\ncart:user:42\r\n')
+
+// Stop watching all keys
+ws.send('*1\r\n$7\r\nUNWATCH\r\n')
+```
+
+When using the `recached-edge` WASM client, `WATCH`/`UNWATCH` are wrapped in the `cache.watch()` / `cache.unwatch()` TypeScript API — you do not need to handle raw RESP.
