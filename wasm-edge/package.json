@@ -1,6 +1,31 @@
 {
   "name": "recached-edge",
   "description": "Browser and edge WebAssembly client for Recached — zero-latency local cache with automatic server sync",
+  "version": "0.1.3",
+  "type": "module",
+  "main": "sdk.js",
+  "module": "sdk.js",
+  "types": "sdk.d.ts",
+  "exports": {
+    ".": {
+      "types": "./sdk.d.ts",
+      "import": "./sdk.js",
+      "default": "./sdk.js"
+    }
+  },
+  "files": [
+    "sdk.js",
+    "sdk.d.ts",
+    "sdk.d.ts.map",
+    "pkg/"
+  ],
+  "scripts": {
+    "build": "wasm-pack build --target web --out-dir pkg && tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/thinkgrid-labs/recached"

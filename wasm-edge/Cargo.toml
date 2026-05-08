@@ -7,9 +7,10 @@ edition.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-core-engine.workspace  = true
-wasm-bindgen.workspace = true
-js-sys.workspace       = true
+core-engine.workspace    = true
+wasm-bindgen.workspace   = true
+wasm-bindgen-futures     = "0.4"
+js-sys.workspace         = true
 
 [dependencies.web-sys]
 workspace = true

@@ -300,8 +300,7 @@ Three crates with hard dependency boundaries:
 
 **Edge & browser**
 - [ ] **WASI target** — `wasm32-wasip1` build for Cloudflare Workers and Deno Deploy
-- [ ] **Offline-first WASM** — IndexedDB persistence layer; cache survives refresh and syncs delta on reconnect
-- [ ] **Typed TypeScript SDK** — generated from the command schema, zero-overhead WASM bindings
+- [ ] **Delta sync** — `SYNC <seq>` protocol; server replays missed mutations from an in-memory ring buffer on WebSocket reconnect; browser uses the WAL sequence number already tracked in `wasm-edge` as the cursor
 
 Intentionally out of scope: RDB/AOF persistence, `REPLICAOF` (the native→browser WebSocket is the sync story), full Redis command parity (250+ commands, Lua scripting, RESP3 — doesn't fit the browser-sync model), server introspection (`INFO`, `SLOWLOG`, `COMMAND`).
 

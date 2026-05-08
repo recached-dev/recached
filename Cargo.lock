@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "core-engine"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "dashmap",
  "rand",
@@ -910,7 +910,7 @@ dependencies = [
 
 [[package]]
 name = "server-native"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "core-engine",
  "futures-util",
@@ -1274,6 +1274,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm-bindgen-futures"
+version = "0.4.70"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af934872acec734c2d80e6617bbb5ff4f12b052dd8e6332b0817bce889516084"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "wasm-bindgen-macro"
 version = "0.2.120"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1307,12 +1317,13 @@ dependencies = [
 
 [[package]]
 name = "wasm-edge"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "core-engine",
  "getrandom 0.3.4",
  "js-sys",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
 ]
 
