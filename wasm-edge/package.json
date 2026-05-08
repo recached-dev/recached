@@ -37,8 +37,17 @@
     "wasm",
     "webassembly",
     "redis",
+    "redis-compatible",
     "local-first",
-    "edge"
+    "offline-first",
+    "edge",
+    "websocket",
+    "indexeddb",
+    "typescript",
+    "real-time",
+    "in-memory",
+    "browser-cache",
+    "zero-latency"
   ],
   "license": "MIT",
   "licenseFile": "../LICENSE.md"

@@ -20,6 +20,7 @@ export default defineConfig({
     ],
     ['meta', { name: 'twitter:card', content: 'summary_large_image' }],
     ['meta', { name: 'twitter:image', content: 'https://recached.dev/recached.jpg' }],
+    ['meta', { name: 'keywords', content: 'rust cache, redis alternative, redis compatible, webassembly cache, wasm browser cache, local-first, zero-latency reads, websocket sync, in-memory cache, browser cache, edge cache, real-time sync, offline-first, indexeddb cache, pub-sub' }],
   ],
 
   themeConfig: {
