@@ -316,8 +316,7 @@ type SharedPubSub = Arc<Mutex<PubSubHub>>;
 // ── observable keys ───────────────────────────────────────────────────────────
 
 type WatchNotif = (String, Value);
-type WatchRegistry =
-    Arc<Mutex<HashMap<String, Vec<(u64, mpsc::UnboundedSender<WatchNotif>)>>>>;
+type WatchRegistry = Arc<Mutex<HashMap<String, Vec<(u64, mpsc::UnboundedSender<WatchNotif>)>>>>;
 
 /// Extract the key(s) that `cmd` writes to, without inspecting the response.
 /// Used together with `broadcast_for()` — only call this when `broadcast_for`
@@ -380,7 +379,12 @@ fn encode_keychange(key: &str, value: &Value) -> Vec<u8> {
     .serialize()
 }
 
-fn notify_watchers(registry: &WatchRegistry, cmd: &Command, response: &Value, store: &KeyValueStore) {
+fn notify_watchers(
+    registry: &WatchRegistry,
+    cmd: &Command,
+    response: &Value,
+    store: &KeyValueStore,
+) {
     if broadcast_for(cmd, response).is_none() {
         return;
     }
@@ -906,10 +910,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if max_keys.is_some() {
-        info!(
-            "Key limit: {:?}, eviction: {:?}",
-            max_keys, eviction_policy
-        );
+        info!("Key limit: {:?}, eviction: {:?}", max_keys, eviction_policy);
     }
 
     let store = Arc::new(KeyValueStore::with_config(max_keys, eviction_policy));

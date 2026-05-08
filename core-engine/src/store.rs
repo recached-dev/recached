@@ -340,11 +340,7 @@ impl KeyValueStore {
                 }
             }
             EvictionPolicy::AllKeysRandom => {
-                let key = self
-                    .data
-                    .iter()
-                    .map(|r| r.key().clone())
-                    .choose(&mut rng);
+                let key = self.data.iter().map(|r| r.key().clone()).choose(&mut rng);
                 match key {
                     Some(k) => {
                         self.data.remove(&k);
@@ -374,7 +370,11 @@ impl KeyValueStore {
                     .iter()
                     .filter_map(|r| {
                         let exp = r.value().expires_at_ms?;
-                        if r.value().is_expired(now) { None } else { Some((r.key().clone(), exp)) }
+                        if r.value().is_expired(now) {
+                            None
+                        } else {
+                            Some((r.key().clone(), exp))
+                        }
                     })
                     .choose_multiple(&mut rng, SAMPLE);
                 match sample.into_iter().min_by_key(|(_, exp)| *exp) {
@@ -557,9 +557,7 @@ impl KeyValueStore {
                         let needed = new_count - available;
                         for _ in 0..needed {
                             if !self.evict_one(now) {
-                                return Value::Error(
-                                    "ERR max keys limit reached".to_string(),
-                                );
+                                return Value::Error("ERR max keys limit reached".to_string());
                             }
                         }
                     }
