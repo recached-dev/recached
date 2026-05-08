@@ -3282,4 +3282,73 @@ mod tests {
         let res = s.execute(Command::ZRevRange("z".into(), 0, -1, true));
         assert_eq!(res, arr(&["b", "2", "a", "1"]));
     }
+
+    // ── Snapshot / Restore ────────────────────────────────────────────────────
+
+    #[test]
+    fn snapshot_round_trip_all_types() {
+        let s = store();
+        s.execute(Command::Set("str".into(), "hello".into(), SetOptions::default()));
+        s.execute(Command::HSet("hash".into(), vec![("f".into(), "v".into())]));
+        s.execute(Command::LPush("list".into(), vec!["a".into(), "b".into()]));
+        s.execute(Command::SAdd("set".into(), vec!["x".into()]));
+        s.execute(Command::ZAdd(
+            "zset".into(),
+            ZAddOptions::default(),
+            vec![(1.5, "m".into())],
+        ));
+
+        let entries = s.snapshot();
+        assert_eq!(entries.len(), 5);
+
+        let s2 = store();
+        s2.restore(entries);
+
+        assert_eq!(s2.execute(Command::Get("str".into())), bulk("hello"));
+        assert_eq!(s2.execute(Command::HGet("hash".into(), "f".into())), bulk("v"));
+        assert_eq!(s2.execute(Command::LRange("list".into(), 0, -1)), arr(&["b", "a"]));
+        assert_eq!(s2.execute(Command::SIsMember("set".into(), "x".into())), int(1));
+        assert_eq!(s2.execute(Command::ZScore("zset".into(), "m".into())), bulk("1.5"));
+    }
+
+    #[test]
+    fn snapshot_skips_expired_keys() {
+        use std::time::Duration;
+        let s = store();
+        s.execute(Command::Set("live".into(), "v".into(), SetOptions::default()));
+        s.execute(Command::PSetEx("dead".into(), 1, "v".into()));
+        std::thread::sleep(Duration::from_millis(10));
+
+        let entries = s.snapshot();
+        assert!(entries.iter().any(|e| e.key == "live"));
+        assert!(!entries.iter().any(|e| e.key == "dead"));
+    }
+
+    #[test]
+    fn restore_skips_already_expired() {
+        let s = store();
+        let entry = SnapshotEntry {
+            key: "ghost".into(),
+            value: SnapshotValue::Str("v".into()),
+            expires_at_ms: Some(1),
+        };
+        s.restore(vec![entry]);
+        assert_eq!(s.execute(Command::DbSize), int(0));
+    }
+
+    #[test]
+    fn snapshot_preserves_ttl() {
+        let s = store();
+        s.execute(Command::SetEx("k".into(), 60, "v".into()));
+
+        let entries = s.snapshot();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].expires_at_ms.is_some());
+
+        let s2 = store();
+        s2.restore(entries);
+
+        let ttl = s2.execute(Command::Ttl("k".into()));
+        assert!(matches!(ttl, Value::Integer(n) if n > 0 && n <= 60));
+    }
 }

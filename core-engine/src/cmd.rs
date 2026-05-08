@@ -1712,4 +1712,22 @@ mod tests {
             Command::ZCount("z".into(), "-inf".into(), "+inf".into())
         );
     }
+
+    // ── Persistence ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn save_bgsave_lastsave_parse() {
+        assert_eq!(
+            Command::from_value(array(&["SAVE"])).unwrap(),
+            Command::Save
+        );
+        assert_eq!(
+            Command::from_value(array(&["BGSAVE"])).unwrap(),
+            Command::BgSave
+        );
+        assert_eq!(
+            Command::from_value(array(&["LASTSAVE"])).unwrap(),
+            Command::LastSave
+        );
+    }
 }

@@ -2220,3 +2220,118 @@ async fn handle_ws<S>(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_engine::cmd::{SetOptions, ZAddOptions};
+    use core_engine::resp::Value;
+    use core_engine::store::KeyValueStore;
+    use std::sync::atomic::AtomicI64;
+
+    fn tmp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "recached_test_{name}_{}",
+            std::process::id()
+        ))
+    }
+
+    // ── is_write_command ──────────────────────────────────────────────────────
+
+    #[test]
+    fn is_write_command_classifies_correctly() {
+        assert!(is_write_command(&Command::Set(
+            "k".into(),
+            "v".into(),
+            SetOptions::default()
+        )));
+        assert!(is_write_command(&Command::Del(vec!["k".into()])));
+        assert!(is_write_command(&Command::Incr("k".into())));
+        assert!(is_write_command(&Command::FlushDb));
+        assert!(is_write_command(&Command::HSet(
+            "h".into(),
+            vec![("f".into(), "v".into())]
+        )));
+        assert!(is_write_command(&Command::LPush("l".into(), vec!["v".into()])));
+        assert!(is_write_command(&Command::SAdd("s".into(), vec!["m".into()])));
+        assert!(is_write_command(&Command::ZAdd(
+            "z".into(),
+            ZAddOptions::default(),
+            vec![(1.0, "m".into())]
+        )));
+        // reads
+        assert!(!is_write_command(&Command::Get("k".into())));
+        assert!(!is_write_command(&Command::HGet("h".into(), "f".into())));
+        assert!(!is_write_command(&Command::LRange("l".into(), 0, -1)));
+        assert!(!is_write_command(&Command::SMembers("s".into())));
+        assert!(!is_write_command(&Command::DbSize));
+        assert!(!is_write_command(&Command::Ping(None)));
+        assert!(!is_write_command(&Command::Publish("ch".into(), "msg".into())));
+    }
+
+    // ── AOF replay ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn replay_aof_missing_file() {
+        let store = KeyValueStore::new();
+        let path = tmp_path("aof_missing");
+        let count = replay_aof(&store, &path).await;
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn replay_aof_basic() {
+        let store = KeyValueStore::new();
+        let path = tmp_path("aof_basic.aof");
+        let resp = "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n\
+                    *3\r\n$3\r\nSET\r\n$3\r\nbaz\r\n$3\r\nqux\r\n";
+        tokio::fs::write(&path, resp.as_bytes()).await.unwrap();
+        let count = replay_aof(&store, &path).await;
+        assert_eq!(count, 2);
+        assert_eq!(store.execute(Command::DbSize), Value::Integer(2));
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    // ── Snapshot save / load ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn snapshot_save_and_load() {
+        let store = KeyValueStore::new();
+        store.execute(Command::Set(
+            "hello".into(),
+            "world".into(),
+            SetOptions::default(),
+        ));
+        let path = tmp_path("snap.rdb");
+        let cfg = Arc::new(SnapshotConfig {
+            path: path.clone(),
+            last_save: AtomicI64::new(0),
+        });
+        save_snapshot(&store, &cfg).await;
+        assert!(path.exists());
+        let store2 = KeyValueStore::new();
+        let loaded = load_snapshot(&store2, &path).await;
+        assert!(loaded);
+        assert_eq!(
+            store2.execute(Command::Get("hello".into())),
+            Value::BulkString(Some(b"world".to_vec()))
+        );
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    // ── AofWriter append / truncate ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn aof_writer_append_and_truncate() {
+        let path = tmp_path("aof_writer.aof");
+        let aof = AofWriter::open(path.clone(), AofSync::No).await.unwrap();
+        aof.append("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n").await;
+        aof.flush().await;
+        let len_before = tokio::fs::metadata(&path).await.unwrap().len();
+        assert!(len_before > 0);
+        aof.truncate().await;
+        let len_after = tokio::fs::metadata(&path).await.unwrap().len();
+        assert_eq!(len_after, 0);
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+}
