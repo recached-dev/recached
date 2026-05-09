@@ -12,7 +12,8 @@ Recached is configured entirely through environment variables. There is no confi
 | `RECACHED_EVICTION` | `noeviction` | Eviction policy when `RECACHED_MAX_KEYS` is reached. See eviction policies below. |
 | `RECACHED_METRICS_PORT` | `9091` | Port for the Prometheus metrics HTTP server. Metrics are available at `/metrics`. Set to `0` to disable. |
 | `RECACHED_SAVE_PATH` | `recached.rdb` | Path to the snapshot file. The server loads this file on startup and writes to it on `SAVE`, `BGSAVE`, autosave, and clean shutdown. |
-| `RECACHED_SAVE_INTERVAL` | `900` | Autosave interval in seconds. The server automatically saves a snapshot in the background at this interval. Set to `0` to disable autosave (manual `SAVE`/`BGSAVE` still work). |
+| `RECACHED_SAVE` | _(none)_ | Multi-condition autosave policy as comma-separated `seconds:changes` pairs. A snapshot is triggered when **any** condition is satisfied: `elapsed_since_last_save >= seconds` **and** `dirty_writes >= changes`. Example: `"900:1,300:10,60:10000"` — save after 1 write in 15 min, 10 writes in 5 min, or 10 000 writes in 1 min. When set, `RECACHED_SAVE_INTERVAL` is ignored. Skips saves when no writes have occurred since the last snapshot. |
+| `RECACHED_SAVE_INTERVAL` | `900` | Autosave interval in seconds (single-condition fallback when `RECACHED_SAVE` is not set). The server saves automatically at this interval if at least one write has occurred since the last save. Set to `0` to disable autosave entirely (manual `SAVE`/`BGSAVE` still work). |
 | `RECACHED_AOF_PATH` | _(disabled)_ | Path to the append-only file. When set, every write command is appended to this file in addition to snapshot saves. On startup the snapshot is loaded first, then AOF commands are replayed for the delta. The AOF is truncated after each successful snapshot save. |
 | `RECACHED_AOF_SYNC` | `everysec` | AOF fsync policy. `always`: fsync after every write (safest, slowest). `everysec`: fsync once per second (default, good balance). `no`: let the OS decide (fastest, least safe). |
 | `RECACHED_MAX_CONNECTIONS` | `1024` | Maximum number of concurrent client connections (TCP + WebSocket combined). New connections are dropped when the limit is reached. |
@@ -188,6 +189,18 @@ recached-server
 - Use `RECACHED_FAILOVER_TIMEOUT` only on a designated standby replica, not all replicas.
 - Keep the timeout long enough (≥ 2× your typical primary restart time) to avoid spurious promotion on routine restarts.
 - After a failover event, update clients and other replicas to point at the new primary before bringing the old primary back online.
+
+### With multi-condition autosave (RECACHED_SAVE)
+
+Fine-grained save policy that triggers on the first matching condition:
+
+```bash
+RECACHED_SAVE_PATH="/data/recached.rdb" \
+RECACHED_SAVE="900:1,300:10,60:10000" \
+recached-server
+```
+
+This matches Redis's default save policy: save after 1 write in 15 min, 10 writes in 5 min, or 10 000 writes in 1 min. Saves are skipped automatically when no writes have occurred since the last snapshot, so idle servers incur zero I/O.
 
 ### With snapshot persistence
 

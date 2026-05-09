@@ -158,6 +158,8 @@ fn execute_and_record(store: &KeyValueStore, cmd: &Command) -> Value {
     counter!("recached_commands_total", "command" => name).increment(1);
     if matches!(response, Value::Error(_)) {
         counter!("recached_command_errors_total", "command" => name).increment(1);
+    } else if is_write_command(cmd) {
+        store.mark_dirty();
     }
     if matches!(cmd, Command::Get(_)) {
         match &response {
@@ -415,16 +417,19 @@ impl ServerState {
         reg.retain(|tx| match tx.try_send(bytes.clone()) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
-                warn!("Replica fell too far behind (channel full) — disconnecting so it can resync");
+                warn!(
+                    "Replica fell too far behind (channel full) — disconnecting so it can resync"
+                );
                 false
             }
             Err(mpsc::error::TrySendError::Closed(_)) => false,
         });
     }
 
-    /// Save snapshot then truncate AOF (snapshot subsumes the log).
+    /// Save snapshot, reset the dirty counter, then truncate AOF (snapshot subsumes the log).
     async fn save(&self, store: &KeyValueStore) {
         save_snapshot(store, &self.snap).await;
+        store.reset_dirty();
         if let Some(aof) = &self.aof {
             aof.truncate().await;
         }
@@ -481,6 +486,29 @@ fn is_write_command(cmd: &Command) -> bool {
     )
 }
 
+// ── Save conditions ───────────────────────────────────────────────────────────
+
+/// A single autosave condition: save if `changes` or more writes have
+/// accumulated within `secs` seconds of the last save.
+struct SaveCondition {
+    secs: u64,
+    changes: u64,
+}
+
+/// Parse `RECACHED_SAVE` value: comma-separated `seconds:changes` pairs.
+/// Example: `"900:1,300:10,60:10000"` → save after 1 change in 15 min,
+/// 10 changes in 5 min, or 10 000 changes in 1 min — whichever comes first.
+fn parse_save_conditions(s: &str) -> Vec<SaveCondition> {
+    s.split(',')
+        .filter_map(|pair| {
+            let mut parts = pair.trim().splitn(2, ':');
+            let secs: u64 = parts.next()?.trim().parse().ok()?;
+            let changes: u64 = parts.next()?.trim().parse().ok()?;
+            Some(SaveCondition { secs, changes })
+        })
+        .collect()
+}
+
 // ── Replication server (primary side) ────────────────────────────────────────
 
 async fn run_repl_server(
@@ -508,8 +536,15 @@ async fn run_repl_server(
                 let replicas = Arc::clone(&replicas);
                 let pwd = repl_password.clone();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_replica(socket, store, snap_cfg, replicas, pwd, repl_channel_capacity).await
+                    if let Err(e) = handle_replica(
+                        socket,
+                        store,
+                        snap_cfg,
+                        replicas,
+                        pwd,
+                        repl_channel_capacity,
+                    )
+                    .await
                     {
                         info!("Replica {} disconnected: {}", addr, e);
                     }
@@ -954,7 +989,6 @@ fn resp_push(parts: &[&str]) -> String {
     }
     s
 }
-
 
 /// Returns the RESP-encoded mutation to broadcast to WebSocket peers, or `None`
 /// if the command mutated nothing (read-only or conditional-and-failed).
@@ -1426,10 +1460,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let save_path = PathBuf::from(
         std::env::var("RECACHED_SAVE_PATH").unwrap_or_else(|_| "recached.rdb".to_string()),
     );
-    let save_interval_secs: u64 = std::env::var("RECACHED_SAVE_INTERVAL")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(900);
+
+    // RECACHED_SAVE takes priority: "900:1,300:10,60:10000" (secs:changes pairs).
+    // Falls back to RECACHED_SAVE_INTERVAL (single-condition, 1 change required).
+    let save_conditions: Vec<SaveCondition> = if let Ok(s) = std::env::var("RECACHED_SAVE") {
+        parse_save_conditions(&s)
+    } else {
+        let interval: u64 = std::env::var("RECACHED_SAVE_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(900);
+        if interval > 0 {
+            vec![SaveCondition {
+                secs: interval,
+                changes: 1,
+            }]
+        } else {
+            vec![]
+        }
+    };
 
     load_snapshot(&store, &save_path).await;
 
@@ -1523,24 +1572,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // ── autosave ──────────────────────────────────────────────────────────
-    if save_interval_secs > 0 {
+    if !save_conditions.is_empty() {
         let store_snap = Arc::clone(&store);
         let state_snap = Arc::clone(&state);
+        let conditions = save_conditions;
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(tokio::time::Duration::from_secs(save_interval_secs));
-            interval.tick().await; // skip immediate first tick
+            let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(1));
+            ticker.tick().await; // skip immediate first tick
             loop {
-                interval.tick().await;
-                state_snap.save(&store_snap).await;
+                ticker.tick().await;
+                let now = now_unix_secs();
+                let last = state_snap.snap.last_save.load(Ordering::Relaxed);
+                let elapsed = now.saturating_sub(last).max(0) as u64;
+                let dirty = store_snap.dirty_count();
+                if dirty > 0
+                    && conditions
+                        .iter()
+                        .any(|c| elapsed >= c.secs && dirty >= c.changes)
+                {
+                    state_snap.save(&store_snap).await;
+                }
             }
         });
-        info!(
-            "Autosave every {}s → {:?}",
-            save_interval_secs, snap_cfg.path
-        );
+        info!("Autosave active → {:?}", snap_cfg.path);
     } else {
-        info!("Autosave disabled (RECACHED_SAVE_INTERVAL=0). Use SAVE or BGSAVE manually.");
+        info!(
+            "Autosave disabled (RECACHED_SAVE=0 or RECACHED_SAVE_INTERVAL=0). Use SAVE or BGSAVE manually."
+        );
     }
 
     // ── start replication ─────────────────────────────────────────────────
@@ -1567,7 +1625,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 t
             );
         } else {
-            info!("Running as replica — write commands will be rejected (auto-failover disabled; set RECACHED_FAILOVER_TIMEOUT to enable)");
+            info!(
+                "Running as replica — write commands will be rejected (auto-failover disabled; set RECACHED_FAILOVER_TIMEOUT to enable)"
+            );
         }
     }
 

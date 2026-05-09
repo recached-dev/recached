@@ -1,6 +1,6 @@
 use core_engine::cmd::{Command, SetOptions};
 use core_engine::resp::Value;
-use core_engine::store::KeyValueStore;
+use core_engine::store::{KeyValueStore, SnapshotEntry, SnapshotValue};
 use js_sys::Promise;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -71,6 +71,113 @@ fn to_resp(parts: &[&str]) -> String {
         s.push_str(&format!("${}\r\n{}\r\n", part.len(), part));
     }
     s
+}
+
+fn to_resp_owned(parts: &[String]) -> String {
+    let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
+    to_resp(&refs)
+}
+
+// ── WAL compaction ────────────────────────────────────────────────────────────
+
+/// Compact after this many replayed WAL entries on load — rewrite as minimal
+/// snapshot commands so the next replay is fast regardless of write history.
+const WAL_COMPACT_THRESHOLD: u32 = 1000;
+
+fn format_zset_score(s: f64) -> String {
+    if s == f64::INFINITY {
+        "inf".into()
+    } else if s == f64::NEG_INFINITY {
+        "-inf".into()
+    } else if s.fract() == 0.0 && s.abs() < 1e15 {
+        format!("{}", s as i64)
+    } else {
+        format!("{}", s)
+    }
+}
+
+/// Convert snapshot entries into minimal RESP command strings suitable for
+/// storing in the WAL. Each entry produces one command; entries with a TTL on
+/// collection types produce an extra PEXPIREAT command.
+fn snapshot_to_resp_cmds(entries: &[SnapshotEntry]) -> Vec<String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let mut out = Vec::new();
+    for e in entries {
+        if e.expires_at_ms.is_some_and(|exp| now_ms >= exp) {
+            continue;
+        }
+        let data_parts: Vec<String> = match &e.value {
+            SnapshotValue::Str(s) => {
+                if let Some(exp) = e.expires_at_ms {
+                    let rem_ms = exp.saturating_sub(now_ms);
+                    vec![
+                        "SET".into(),
+                        e.key.clone(),
+                        s.clone(),
+                        "PX".into(),
+                        rem_ms.to_string(),
+                    ]
+                } else {
+                    vec!["SET".into(), e.key.clone(), s.clone()]
+                }
+            }
+            SnapshotValue::Hash(map) => {
+                if map.is_empty() {
+                    continue;
+                }
+                let mut parts = vec!["HSET".to_string(), e.key.clone()];
+                for (f, v) in map {
+                    parts.push(f.clone());
+                    parts.push(v.clone());
+                }
+                parts
+            }
+            SnapshotValue::List(list) => {
+                if list.is_empty() {
+                    continue;
+                }
+                let mut parts = vec!["RPUSH".to_string(), e.key.clone()];
+                parts.extend(list.iter().cloned());
+                parts
+            }
+            SnapshotValue::Set(set) => {
+                if set.is_empty() {
+                    continue;
+                }
+                let mut parts = vec!["SADD".to_string(), e.key.clone()];
+                parts.extend(set.iter().cloned());
+                parts
+            }
+            SnapshotValue::ZSet(pairs) => {
+                if pairs.is_empty() {
+                    continue;
+                }
+                let mut parts = vec!["ZADD".to_string(), e.key.clone()];
+                for (member, score) in pairs {
+                    parts.push(format_zset_score(*score));
+                    parts.push(member.clone());
+                }
+                parts
+            }
+        };
+        out.push(to_resp_owned(&data_parts));
+        // Non-string types with a TTL need a separate PEXPIREAT command.
+        if !matches!(&e.value, SnapshotValue::Str(_)) {
+            if let Some(exp) = e.expires_at_ms {
+                out.push(to_resp_owned(&[
+                    "PEXPIREAT".to_string(),
+                    e.key.clone(),
+                    exp.to_string(),
+                ]));
+            }
+        }
+    }
+    out
 }
 
 // ── RecachedCache ─────────────────────────────────────────────────────────────
@@ -173,8 +280,9 @@ impl RecachedCache {
             let keys = js_sys::Array::from(&pair.get(0));
             let vals = js_sys::Array::from(&pair.get(1));
 
+            let entry_count = keys.length();
             let mut max_seq: u64 = 0;
-            for i in 0..keys.length() {
+            for i in 0..entry_count {
                 let s = keys.get(i).as_f64().unwrap_or(0.0) as u64;
                 let cmd_str = vals.get(i).as_string().unwrap_or_default();
                 if let Ok((value, _)) = Value::parse(cmd_str.as_bytes())
@@ -187,8 +295,25 @@ impl RecachedCache {
                 }
             }
 
-            // If WAL was empty, start seq at 0; otherwise continue from max_seq + 1.
-            seq_cell.set(if keys.length() == 0 { 0 } else { max_seq + 1 });
+            // If the WAL grew large, compact: rewrite it as minimal snapshot
+            // commands. This keeps startup replay fast regardless of how many
+            // writes accumulated between refreshes.
+            let next_seq = if entry_count > WAL_COMPACT_THRESHOLD {
+                JsFuture::from(idb_clear_js(&db)).await?;
+                let cmds = snapshot_to_resp_cmds(&store.snapshot());
+                let mut seq: u64 = 0;
+                for cmd_str in &cmds {
+                    let _ = JsFuture::from(idb_append_js(&db, seq as f64, cmd_str)).await;
+                    seq += 1;
+                }
+                seq
+            } else if entry_count == 0 {
+                0
+            } else {
+                max_seq + 1
+            };
+
+            seq_cell.set(next_seq);
             *idb_cell.borrow_mut() = Some(db);
 
             Ok(JsValue::UNDEFINED)
