@@ -91,3 +91,35 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: cd recached-react && npm publish --access public
+
+  publish-vue:
+    name: Build and publish @recached/vue to NPM
+    runs-on: ubuntu-latest
+    needs: publish-wasm
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        run: cd recached-vue && npm install --legacy-peer-deps
+
+      - name: Typecheck
+        run: cd recached-vue && npm run typecheck
+
+      - name: Build
+        run: cd recached-vue && npm run build
+
+      - name: Copy LICENSE into package
+        run: cp LICENSE.md recached-vue/LICENSE.md
+
+      - name: Publish to NPM
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: cd recached-vue && npm publish --access public

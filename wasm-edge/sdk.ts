@@ -54,6 +54,7 @@ interface RawCache {
   subscribe(channel: string): void;
   unsubscribe(channel: string): void;
   set_mutation_callback(cb: () => void): void;
+  set_message_callback(cb: (channel: string, message: string) => void): void;
   free(): void;
 }
 
@@ -95,6 +96,7 @@ export class Cache {
   readonly raw: RawCache;
 
   private readonly _mutationListeners = new Set<() => void>();
+  private readonly _messageListeners = new Map<string, Set<(msg: string) => void>>();
 
   /** @internal Arrow function so `this` is always bound when passed as a callback. */
   private readonly _notifyMutation = (): void => {
@@ -102,9 +104,18 @@ export class Cache {
   };
 
   /** @internal */
+  private readonly _notifyMessage = (channel: string, message: string): void => {
+    const listeners = this._messageListeners.get(channel);
+    if (listeners) {
+      for (const cb of listeners) cb(message);
+    }
+  };
+
+  /** @internal */
   constructor(raw: RawCache) {
     this.raw = raw;
     raw.set_mutation_callback(this._notifyMutation);
+    raw.set_message_callback(this._notifyMessage);
   }
 
   /**
@@ -125,6 +136,33 @@ export class Cache {
   onMutation(cb: () => void): () => void {
     this._mutationListeners.add(cb);
     return () => this._mutationListeners.delete(cb);
+  }
+
+  /**
+   * Subscribe to pub/sub messages on `channel`.
+   *
+   * Returns an unsubscribe function. Call it to stop receiving messages.
+   * Does not send `UNSUBSCRIBE` to the server — use {@link unsubscribe} for that.
+   *
+   * ```ts
+   * cache.subscribe('notifications');
+   * const stop = cache.onMessage('notifications', (msg) => console.log(msg));
+   * // later:
+   * stop();
+   * cache.unsubscribe('notifications');
+   * ```
+   */
+  onMessage(channel: string, cb: (msg: string) => void): () => void {
+    let listeners = this._messageListeners.get(channel);
+    if (!listeners) {
+      listeners = new Set();
+      this._messageListeners.set(channel, listeners);
+    }
+    listeners.add(cb);
+    return () => {
+      listeners!.delete(cb);
+      if (listeners!.size === 0) this._messageListeners.delete(channel);
+    };
   }
 
   // ── Reads ─────────────────────────────────────────────────────────────────

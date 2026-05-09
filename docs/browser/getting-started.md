@@ -127,7 +127,7 @@ npm install @recached/react
 ```
 
 ```tsx
-import { RecachedProvider, useKey, useKeyJSON } from '@recached/react'
+import { RecachedProvider, useKey } from '@recached/react'
 
 function App() {
   return (
@@ -144,6 +144,42 @@ function CartBadge({ userId }: { userId: number }) {
 ```
 
 See the [React hooks docs](/react/getting-started) for the full guide.
+
+---
+
+## Vue
+
+If you are using Vue 3, install the official composables package instead:
+
+```bash
+npm install @recached/vue
+```
+
+```ts
+// main.ts
+import { createApp } from 'vue'
+import { RecachedPlugin } from '@recached/vue'
+import App from './App.vue'
+
+const app = createApp(App)
+app.use(RecachedPlugin, { connect: { url: 'ws://localhost:6380' } })
+app.mount('#app')
+```
+
+```vue
+<!-- CartBadge.vue -->
+<script setup lang="ts">
+import { useKey } from '@recached/vue'
+const props = defineProps<{ userId: number }>()
+const count = useKey(`cart:${props.userId}:count`)
+</script>
+
+<template>
+  <span class="badge">{{ count ?? '0' }}</span>
+</template>
+```
+
+See the [Vue composables docs](/vue/getting-started) for the full guide.
 
 ---
 

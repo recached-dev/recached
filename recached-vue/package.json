@@ -1,0 +1,52 @@
+{
+  "name": "@recached/vue",
+  "version": "0.1.4",
+  "description": "Official Vue 3 composables for Recached — zero-latency reactive cache",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "version:patch": "npm version patch --no-git-tag-version",
+    "version:minor": "npm version minor --no-git-tag-version",
+    "version:major": "npm version major --no-git-tag-version"
+  },
+  "peerDependencies": {
+    "vue": ">=3",
+    "recached-edge": ">=0.1.4"
+  },
+  "devDependencies": {
+    "@vue/runtime-core": "^3",
+    "typescript": "^5.9.3",
+    "vue": "^3"
+  },
+  "keywords": [
+    "recached",
+    "vue",
+    "vue3",
+    "composables",
+    "cache",
+    "wasm",
+    "real-time",
+    "zero-latency"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/thinkgrid-labs/recached"
+  },
+  "homepage": "https://github.com/thinkgrid-labs/recached/tree/main/recached-vue",
+  "bugs": "https://github.com/thinkgrid-labs/recached/issues"
+}
