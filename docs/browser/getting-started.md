@@ -1,6 +1,6 @@
 # Getting Started (Browser)
 
-The `recached-edge` package is the TypeScript SDK for the browser WASM client. It gives you a `RecachedCache` class backed by the same `core-engine` as the server, with optional WebSocket sync to a Recached server instance.
+The `recached-edge` package is the TypeScript SDK for the browser WASM client. It gives you a `Cache` class backed by the same `core-engine` as the server, with optional WebSocket sync to a Recached server instance.
 
 ## Install
 
@@ -16,46 +16,50 @@ yarn add recached-edge
 
 ## Initialize
 
-The WASM module must be initialized once before use. Call `init()` at your app entry point.
+Use `createCache()` — it initializes the WASM module and returns a ready `Cache` instance.
 
 ```typescript
-import init, { RecachedCache } from 'recached-edge'
+import { createCache } from 'recached-edge'
 
-// Initialize the WASM binary (fetches and compiles recached_edge_bg.wasm)
-await init()
-
-// Create a cache instance
-const cache = new RecachedCache()
+// Local-only, in-memory cache (no server connection)
+const cache = await createCache()
 ```
 
 For bundlers that support top-level await (Vite, Next.js, modern webpack):
 
 ```typescript
-// cache.ts — shared singleton
-import init, { RecachedCache } from 'recached-edge'
+// lib/cache.ts — shared singleton
+import { createCache } from 'recached-edge'
 
-await init()
-export const cache = new RecachedCache()
+export const cache = await createCache()
 ```
 
 ---
 
 ## Connect to a server
 
-Call `connect()` to enable WebSocket sync. Omit it to use the cache in local-only mode.
+Pass `connect` to `createCache()` to enable WebSocket sync. Omit it for local-only mode.
 
 ```typescript
+import { createCache } from 'recached-edge'
+
 // Connect to the Recached server WebSocket port
-cache.connect('ws://localhost:6380')
+const cache = await createCache({
+  connect: { url: 'ws://localhost:6380' },
+})
 
 // With TLS (production)
-cache.connect('wss://cache.yourdomain.com:6380')
+const cache = await createCache({
+  connect: { url: 'wss://cache.yourdomain.com:6380' },
+})
 
 // With auth (if RECACHED_PASSWORD is set on the server)
-cache.connect('ws://localhost:6380', { password: 'your-secret' })
+const cache = await createCache({
+  connect: { url: 'ws://localhost:6380', password: 'your-secret' },
+})
 ```
 
-Once connected, any mutation from the server (`SET`, `DEL`, `HSET`, etc.) is automatically pushed to the local WASM store. Any local write is pushed to the server and fanned out to other connected clients.
+Once connected, any mutation from the server (`SET`, `DEL`, etc.) is automatically pushed to the local WASM store. Any local write is forwarded to the server and fanned out to other connected clients.
 
 ---
 
@@ -67,213 +71,107 @@ cache.set('theme', 'dark')
 console.log(cache.get('theme')) // 'dark'
 
 // With expiry (seconds)
-cache.set_ex('session:token', 'abc123', 3600)
+cache.setEx('session:token', 'abc123', 3600)
 
 // Check existence and TTL
-cache.exists('theme')      // 1
-cache.ttl('session:token') // remaining seconds
+cache.exists('theme')       // true
+cache.ttl('session:token')  // remaining seconds
 
 // Delete
 cache.del('theme')
-cache.get('theme')         // null
+cache.get('theme')          // null
 
-// Watch a key — fires whenever it changes (from any source)
-cache.watch('cart:count', (value) => {
-  console.log('Cart count changed to:', value)
+// React to any mutation (from any source — local, server, or other tabs)
+const unsubscribe = cache.onMutation(() => {
+  const count = cache.get('cart:count')
+  console.log('Cart count is now:', count)
 })
 
-// Stop watching
-cache.unwatch('cart:count')
+// Stop listening
+unsubscribe()
 ```
 
 ---
 
-## `createCache` with all options
-
-For more control over connection and persistence, use `createCache`:
+## `createCache` options
 
 ```typescript
 import { createCache } from 'recached-edge'
 
 const cache = await createCache({
-  // WebSocket URL (omit for local-only mode)
-  url: 'ws://localhost:6380',
-
-  // Server password (if RECACHED_PASSWORD is set)
-  password: 'your-secret',
-
   // Enable IndexedDB persistence (survives page refresh)
   persistence: true,
 
-  // IndexedDB database name (default: 'recached')
-  persistenceKey: 'my-app-cache',
+  // BroadcastChannel name for cross-tab mutation sharing
+  broadcastChannel: 'my-app-cache',
 
-  // Reconnect automatically on disconnect (default: true)
-  autoReconnect: true,
-
-  // Delay between reconnection attempts in ms (default: 1000)
-  reconnectDelay: 1000,
-
-  // Called when the WebSocket connection is established
-  onConnect: () => console.log('Connected to Recached server'),
-
-  // Called when the WebSocket connection drops
-  onDisconnect: () => console.log('Disconnected'),
-
-  // Called on connection error
-  onError: (err) => console.error('Cache connection error:', err),
+  // Connect to the Recached server WebSocket port
+  connect: {
+    url: 'ws://localhost:6380',
+    // Server password (if RECACHED_PASSWORD is set)
+    password: 'your-secret',
+  },
 })
 ```
 
----
-
-## React hook example
-
-```typescript
-// hooks/useCache.ts
-import { useEffect, useState } from 'react'
-import { cache } from '../lib/cache' // your shared singleton
-
-export function useCacheValue(key: string): string | null {
-  const [value, setValue] = useState<string | null>(() => cache.get(key))
-
-  useEffect(() => {
-    // Read the current value immediately
-    setValue(cache.get(key))
-
-    // Subscribe to future changes
-    cache.watch(key, (newValue) => {
-      setValue(newValue)
-    })
-
-    return () => {
-      cache.unwatch(key)
-    }
-  }, [key])
-
-  return value
-}
-```
-
-Usage in a component:
-
-```tsx
-// components/CartBadge.tsx
-import { useCacheValue } from '../hooks/useCache'
-
-export function CartBadge({ userId }: { userId: number }) {
-  const count = useCacheValue(`cart:${userId}:count`)
-
-  return (
-    <span className="badge">
-      {count ?? '0'}
-    </span>
-  )
-}
-```
-
-When the backend calls `SET cart:42:count 3` over RESP, the badge updates automatically — no refetch, no polling, no manual state update.
-
-### With initial data + live updates
-
-```tsx
-// components/LiveStock.tsx
-import { useEffect, useState } from 'react'
-import { cache } from '../lib/cache'
-
-interface StockProps {
-  productId: string
-  initialStock: number // from SSR / page load
-}
-
-export function LiveStock({ productId, initialStock }: StockProps) {
-  const key = `stock:${productId}`
-  const [stock, setStock] = useState<number>(
-    () => {
-      const cached = cache.get(key)
-      return cached !== null ? parseInt(cached) : initialStock
-    }
-  )
-
-  useEffect(() => {
-    cache.watch(key, (value) => {
-      setStock(value !== null ? parseInt(value) : 0)
-    })
-    return () => cache.unwatch(key)
-  }, [key])
-
-  return (
-    <span className={stock === 0 ? 'out-of-stock' : 'in-stock'}>
-      {stock === 0 ? 'Out of stock' : `${stock} left`}
-    </span>
-  )
-}
-```
+All three options are independent — you can use persistence and cross-tab sync without a server connection.
 
 ---
 
-## Svelte example
+## React
 
-```svelte
-<!-- StockCount.svelte -->
-<script lang="ts">
-  import { onMount, onDestroy } from 'svelte'
-  import { writable } from 'svelte/store'
-  import { cache } from '../lib/cache'
+If you are using React, install the official hooks package instead:
 
-  export let productId: string
-
-  const key = `stock:${productId}`
-  const stock = writable<string | null>(cache.get(key))
-
-  onMount(() => {
-    stock.set(cache.get(key))
-    cache.watch(key, (value) => stock.set(value))
-  })
-
-  onDestroy(() => {
-    cache.unwatch(key)
-  })
-</script>
-
-{#if $stock === null}
-  <span class="loading">—</span>
-{:else if $stock === '0'}
-  <span class="out-of-stock">Out of stock</span>
-{:else}
-  <span class="in-stock">{$stock} left</span>
-{/if}
+```bash
+npm install @recached/react
 ```
+
+```tsx
+import { RecachedProvider, useKey, useKeyJSON } from '@recached/react'
+
+function App() {
+  return (
+    <RecachedProvider options={{ connect: { url: 'ws://localhost:6380' } }}>
+      <CartBadge userId={42} />
+    </RecachedProvider>
+  )
+}
+
+function CartBadge({ userId }: { userId: number }) {
+  const count = useKey(`cart:${userId}:count`)
+  return <span className="badge">{count ?? '0'}</span>
+}
+```
+
+See the [React hooks docs](/react/getting-started) for the full guide.
 
 ---
 
 ## Without a server (local-only cache)
 
-Do not call `connect()`. The WASM module runs as a pure in-memory cache with TTL — no server, no WebSocket, no backend changes required.
+Do not pass `connect` to `createCache()`. The WASM module runs as a pure in-memory cache with TTL — no server, no WebSocket, no backend changes required.
 
 ```typescript
-import init, { RecachedCache } from 'recached-edge'
+import { createCache } from 'recached-edge'
 
-await init()
-const cache = new RecachedCache()
-// No cache.connect() — local-only, no server needed
+const cache = await createCache() // no connect option — local-only
 
 async function getUser(id: number): Promise<User> {
   const key = `user:${id}`
-  const cached = cache.get(key)
-  if (cached !== null) return JSON.parse(cached)
+  const cached = cache.getJSON<User>(key)
+  if (cached !== null) return cached
 
   const user: User = await fetch(`/api/users/${id}`).then(r => r.json())
-  cache.set_ex(key, JSON.stringify(user), 60) // cache for 60s
+  cache.setJSON(key, user, 60) // cache for 60s
   return user
 }
 
 async function getProducts(): Promise<Product[]> {
-  const cached = cache.get('products')
-  if (cached !== null) return JSON.parse(cached)
+  const cached = cache.getJSON<Product[]>('products')
+  if (cached !== null) return cached
 
   const products: Product[] = await fetch('/api/products').then(r => r.json())
-  cache.set_ex('products', JSON.stringify(products), 300) // cache for 5 minutes
+  cache.setJSON('products', products, 300) // cache for 5 minutes
   return products
 }
 
@@ -289,6 +187,35 @@ async function updateUserName(id: number, name: string): Promise<void> {
 ```
 
 This pattern replaces the manual `fetchedAt` timestamp approach you might use with Zustand or Redux. TTL is declared once at write time; `get()` returns `null` automatically when the entry has expired.
+
+---
+
+## Manual reactivity (non-React frameworks)
+
+`onMutation` fires whenever the local store changes — from a local write, a server push, or a cross-tab BroadcastChannel message. It is the low-level hook used by `useKey` and `useKeyJSON` internally.
+
+```typescript
+// Svelte
+import { onMount, onDestroy } from 'svelte'
+import { writable } from 'svelte/store'
+import { cache } from '../lib/cache'
+
+export let productId: string
+
+const key = `stock:${productId}`
+const stock = writable<string | null>(cache.get(key))
+
+let unsubscribe: () => void
+
+onMount(() => {
+  stock.set(cache.get(key))
+  unsubscribe = cache.onMutation(() => stock.set(cache.get(key)))
+})
+
+onDestroy(() => unsubscribe?.())
+```
+
+The callback receives no arguments — it signals that something changed. Read the specific key you care about inside the callback.
 
 ---
 
@@ -316,21 +243,16 @@ export default defineConfig({
 // app/providers.tsx
 'use client'
 
-import { useEffect } from 'react'
-import init from 'recached-edge'
+import { createCache } from 'recached-edge'
+import { cache as cacheRef } from '../lib/cache'
 
 export function CacheProvider({ children }: { children: React.ReactNode }) {
-  useEffect(() => {
-    init().then(() => {
-      // WASM ready — connect cache singleton here if needed
-    })
-  }, [])
-
+  // WASM must be initialized in a client component (after hydration)
   return <>{children}</>
 }
 ```
 
-The `init()` call must happen in a client component (after hydration), not in a server component.
+Use `@recached/react` for the recommended Next.js App Router integration — it wraps WASM init and the cache lifecycle automatically.
 
 ### webpack
 

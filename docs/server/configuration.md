@@ -18,6 +18,8 @@ Recached is configured entirely through environment variables. There is no confi
 | `RECACHED_MAX_CONNECTIONS` | `1024` | Maximum number of concurrent client connections (TCP + WebSocket combined). New connections are dropped when the limit is reached. |
 | `RECACHED_REPL_PORT` | `6381` | TCP port the primary listens on for incoming replica connections. Only active when `RECACHED_REPLICAOF` is not set (i.e. this server is a primary). |
 | `RECACHED_REPLICAOF` | _(none)_ | Set to `host:port` to run this server as a read-only replica. On startup it connects to the primary, receives a full snapshot, and then streams all subsequent writes. Reconnects automatically with exponential backoff on disconnect. |
+| `RECACHED_REPL_PASSWORD` | _(none)_ | Shared secret for the replication channel. When set, replicas must send this password during the handshake before receiving any data. Must match on both primary and replica. Strongly recommended for any network-exposed replication port. |
+| `RECACHED_MAX_MEMORY` | _(unlimited)_ | Maximum approximate heap usage for the key-value store. Accepts a byte count or a human-readable suffix: `512mb`, `2gb`, `1073741824`. When the limit is exceeded, the background eviction loop runs the configured eviction policy. Has no effect when `RECACHED_EVICTION` is `noeviction`. |
 | `RECACHED_TLS_CERT` | _(none)_ | Path to a PEM-encoded TLS certificate file. TLS is enabled on both ports when this and `RECACHED_TLS_KEY` are set. |
 | `RECACHED_TLS_KEY` | _(none)_ | Path to a PEM-encoded TLS private key file. If either `RECACHED_TLS_CERT` or `RECACHED_TLS_KEY` is missing, the server falls back to plain TCP/WS. |
 | `RUST_LOG` | `info` | Log level. Accepts `error`, `warn`, `info`, `debug`, `trace`. Module-specific: `RUST_LOG=recached=debug,tokio=warn`. |
@@ -92,9 +94,14 @@ Clients connecting over RESP must now use `rediss://` (RESP over TLS). Browser c
 ```typescript
 // Backend
 const cache = new Redis('rediss://127.0.0.1:6379')
+```
 
+```typescript
 // Browser
-cache.connect('wss://your.domain:6380')
+import { createCache } from 'recached-edge'
+const cache = await createCache({
+  connect: { url: 'wss://your.domain:6380' },
+})
 ```
 
 For a production certificate, use Let's Encrypt via `certbot` or provide the cert/key from your certificate authority.
@@ -136,17 +143,21 @@ On startup: snapshot is loaded first, then any AOF commands written after the sn
 Run a primary and one or more read-only replicas. Replicas receive a full snapshot on connect, then stream every subsequent write in real time.
 
 ```bash
-# Primary (default replication port 6381)
+# Primary (default replication port 6381, auth required)
 RECACHED_SAVE_PATH="/data/recached.rdb" \
 RECACHED_REPL_PORT="6381" \
+RECACHED_REPL_PASSWORD="repl-secret" \
 recached-server
 
 # Replica (connects to primary, rejects writes)
 RECACHED_REPLICAOF="primary-host:6381" \
+RECACHED_REPL_PASSWORD="repl-secret" \
 recached-server
 ```
 
 Replicas reconnect automatically with exponential backoff (2s → 4s → … → 30s cap) if the primary is temporarily unavailable. Write commands sent to a replica return `-READONLY`.
+
+To promote a replica to primary at runtime (manual failover), send `REPLICAOF NO ONE` over any RESP connection to the replica. It immediately starts accepting writes.
 
 ### With snapshot persistence
 
@@ -170,7 +181,11 @@ The snapshot file is written atomically: the server writes to a `.tmp` file and 
 
 ### High-connection workloads
 
-The server accepts up to 1024 concurrent connections by default (enforced with a connection semaphore). This limit is not currently configurable via environment variable — if you need more, build from source and adjust the constant in `server-native/src/main.rs`.
+The server accepts up to 1024 concurrent connections by default (enforced with a connection semaphore), configurable via `RECACHED_MAX_CONNECTIONS`:
+
+```bash
+RECACHED_MAX_CONNECTIONS="4096" recached-server
+```
 
 For most web applications, 1024 concurrent connections to the cache server is more than enough. Browser clients each hold one WebSocket connection; backend services typically hold a small connection pool (2–10 connections).
 
