@@ -147,6 +147,7 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::Save => "save",
         Command::BgSave => "bgsave",
         Command::LastSave => "lastsave",
+        Command::ReplicaOfNoOne => "replicaof",
         Command::Unknown(_) => "unknown",
     }
 }
@@ -223,6 +224,24 @@ fn now_unix_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+/// Parse a human-readable memory size string (e.g. "512mb", "1gb", "262144")
+/// into a byte count. Returns None on parse failure.
+fn parse_memory_bytes(s: &str) -> Option<usize> {
+    let s = s.trim().to_lowercase();
+    if let Some(n) = s.strip_suffix("gb") {
+        n.trim()
+            .parse::<usize>()
+            .ok()
+            .map(|n| n * 1024 * 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("mb") {
+        n.trim().parse::<usize>().ok().map(|n| n * 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("kb") {
+        n.trim().parse::<usize>().ok().map(|n| n * 1024)
+    } else {
+        s.parse().ok()
+    }
 }
 
 async fn save_snapshot(store: &KeyValueStore, cfg: &SnapshotConfig) {
@@ -360,22 +379,26 @@ async fn replay_aof(store: &KeyValueStore, path: &std::path::Path) -> usize {
 type ReplSender = mpsc::UnboundedSender<Vec<u8>>;
 type ReplRegistry = Arc<tokio::sync::Mutex<Vec<ReplSender>>>;
 
-#[derive(Clone, PartialEq)]
-enum ServerRole {
-    Primary,
-    Replica,
-}
-
 // ── Server state ──────────────────────────────────────────────────────────────
 
 struct ServerState {
     snap: Arc<SnapshotConfig>,
     aof: Option<Arc<AofWriter>>,
     replicas: ReplRegistry,
-    role: ServerRole,
+    /// true = currently acting as a read-only replica
+    is_replica: std::sync::atomic::AtomicBool,
 }
 
 impl ServerState {
+    fn is_replica(&self) -> bool {
+        self.is_replica.load(Ordering::Relaxed)
+    }
+
+    fn promote_to_primary(&self) {
+        self.is_replica.store(false, Ordering::Relaxed);
+        info!("REPLICAOF NO ONE: promoted to primary — writes now accepted");
+    }
+
     /// Called after every successful write: appends to AOF and fans out to replicas.
     async fn on_write(&self, resp: &str) {
         if let Some(aof) = &self.aof {
@@ -452,6 +475,7 @@ async fn run_repl_server(
     store: Arc<KeyValueStore>,
     snap_cfg: Arc<SnapshotConfig>,
     replicas: ReplRegistry,
+    repl_password: Option<Arc<String>>,
 ) {
     let listener = match TcpListener::bind(format!("0.0.0.0:{}", port)).await {
         Ok(l) => l,
@@ -468,8 +492,9 @@ async fn run_repl_server(
                 let store = Arc::clone(&store);
                 let snap_cfg = Arc::clone(&snap_cfg);
                 let replicas = Arc::clone(&replicas);
+                let pwd = repl_password.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_replica(socket, store, snap_cfg, replicas).await {
+                    if let Err(e) = handle_replica(socket, store, snap_cfg, replicas, pwd).await {
                         info!("Replica {} disconnected: {}", addr, e);
                     }
                 });
@@ -484,7 +509,27 @@ async fn handle_replica(
     store: Arc<KeyValueStore>,
     _snap_cfg: Arc<SnapshotConfig>,
     replicas: ReplRegistry,
+    repl_password: Option<Arc<String>>,
 ) -> std::io::Result<()> {
+    // 0. Auth handshake — replica must send "<password>\n" before anything else
+    if let Some(pwd) = &repl_password {
+        let mut auth_buf = vec![0u8; pwd.len() + 1];
+        socket.read_exact(&mut auth_buf).await?;
+        let received_pwd = &auth_buf[..pwd.len()];
+        let terminator = auth_buf[pwd.len()];
+        if received_pwd != pwd.as_bytes() || terminator != b'\n' {
+            let _ = socket
+                .write_all(b"-ERR invalid replication password\n")
+                .await;
+            return Err(std::io::Error::new(
+                ErrorKind::PermissionDenied,
+                "replication auth failed",
+            ));
+        }
+        socket.write_all(b"+OK\n").await?;
+        socket.flush().await?;
+    }
+
     // 1. Register channel first so subsequent writes are buffered
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     replicas.lock().await.push(tx);
@@ -509,7 +554,11 @@ async fn handle_replica(
 
 // ── Replication client (replica side) ────────────────────────────────────────
 
-async fn run_repl_client(primary_addr: String, store: Arc<KeyValueStore>) {
+async fn run_repl_client(
+    primary_addr: String,
+    store: Arc<KeyValueStore>,
+    repl_password: Option<String>,
+) {
     let mut backoff_secs = 2u64;
     loop {
         info!("Replica: connecting to primary at {}", primary_addr);
@@ -517,7 +566,9 @@ async fn run_repl_client(primary_addr: String, store: Arc<KeyValueStore>) {
             Err(e) => warn!("Replica: connect failed: {}", e),
             Ok(mut socket) => {
                 backoff_secs = 2;
-                if let Err(e) = sync_from_primary(&mut socket, &store).await {
+                if let Err(e) =
+                    sync_from_primary(&mut socket, &store, repl_password.as_deref()).await
+                {
                     warn!("Replica: sync ended: {}", e);
                 }
             }
@@ -527,7 +578,27 @@ async fn run_repl_client(primary_addr: String, store: Arc<KeyValueStore>) {
     }
 }
 
-async fn sync_from_primary(socket: &mut TcpStream, store: &KeyValueStore) -> std::io::Result<()> {
+async fn sync_from_primary(
+    socket: &mut TcpStream,
+    store: &KeyValueStore,
+    repl_password: Option<&str>,
+) -> std::io::Result<()> {
+    // 0. Send auth password if configured
+    if let Some(pwd) = repl_password {
+        let msg = format!("{}\n", pwd);
+        socket.write_all(msg.as_bytes()).await?;
+        socket.flush().await?;
+        // Read "+OK\n" (4 bytes)
+        let mut resp = [0u8; 4];
+        socket.read_exact(&mut resp).await?;
+        if &resp != b"+OK\n" {
+            return Err(std::io::Error::new(
+                ErrorKind::PermissionDenied,
+                "replication auth rejected by primary",
+            ));
+        }
+    }
+
     // 1. Receive full snapshot
     let mut len_buf = [0u8; 4];
     socket.read_exact(&mut len_buf).await?;
@@ -1269,6 +1340,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|v| v.parse::<usize>().ok());
 
+    let max_memory_bytes = std::env::var("RECACHED_MAX_MEMORY")
+        .ok()
+        .and_then(|v| parse_memory_bytes(&v));
+
     let eviction_policy = match std::env::var("RECACHED_EVICTION")
         .unwrap_or_default()
         .to_lowercase()
@@ -1281,11 +1356,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => EvictionPolicy::NoEviction,
     };
 
-    if max_keys.is_some() {
-        info!("Key limit: {:?}, eviction: {:?}", max_keys, eviction_policy);
+    if max_keys.is_some() || max_memory_bytes.is_some() {
+        info!(
+            "Key limit: {:?}, memory limit: {:?} bytes, eviction: {:?}",
+            max_keys, max_memory_bytes, eviction_policy
+        );
     }
 
-    let store = Arc::new(KeyValueStore::with_config(max_keys, eviction_policy));
+    let store = Arc::new(KeyValueStore::with_config(
+        max_keys,
+        max_memory_bytes,
+        eviction_policy,
+    ));
 
     // ── snapshot persistence ──────────────────────────────────────────────
     let save_path = PathBuf::from(
@@ -1357,13 +1439,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(6381);
+    let repl_password: Option<String> = std::env::var("RECACHED_REPL_PASSWORD").ok();
 
-    let role = if replicaof.is_some() {
-        ServerRole::Replica
+    if repl_password.is_some() {
+        info!("Replication auth ENABLED (RECACHED_REPL_PASSWORD is set).");
     } else {
-        ServerRole::Primary
-    };
+        warn!(
+            "Replication auth DISABLED. Set RECACHED_REPL_PASSWORD to secure the replication port."
+        );
+    }
 
+    let is_replica_start = replicaof.is_some();
     let replicas: ReplRegistry = Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
     // ── server state ──────────────────────────────────────────────────────
@@ -1371,7 +1457,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         snap: Arc::clone(&snap_cfg),
         aof,
         replicas: Arc::clone(&replicas),
-        role: role.clone(),
+        is_replica: std::sync::atomic::AtomicBool::new(is_replica_start),
     });
 
     // ── autosave ──────────────────────────────────────────────────────────
@@ -1396,17 +1482,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── start replication ─────────────────────────────────────────────────
-    if role == ServerRole::Primary {
+    if !is_replica_start {
         let store_r = Arc::clone(&store);
         let snap_r = Arc::clone(&snap_cfg);
         let reg_r = Arc::clone(&replicas);
+        let pwd_r = repl_password.clone().map(Arc::new);
         tokio::spawn(async move {
-            run_repl_server(repl_port, store_r, snap_r, reg_r).await;
+            run_repl_server(repl_port, store_r, snap_r, reg_r, pwd_r).await;
         });
     } else if let Some(primary_addr) = replicaof {
         let store_r = Arc::clone(&store);
+        let pwd_r = repl_password.clone();
         tokio::spawn(async move {
-            run_repl_client(primary_addr, store_r).await;
+            run_repl_client(primary_addr, store_r, pwd_r).await;
         });
         info!("Running as replica — write commands will be rejected");
     }
@@ -1420,6 +1508,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 interval.tick().await;
                 store_sweep.sweep_expired();
+                store_sweep.try_evict_for_memory();
             }
         });
     }
@@ -1794,7 +1883,7 @@ async fn handle_tcp<S>(
                                                 continue 'parse;
                                             }
                                             // Replica: reject writes
-                                            if state.role == ServerRole::Replica && is_write_command(&cmd) {
+                                            if state.is_replica() && is_write_command(&cmd) {
                                                 let err = b"-READONLY You can't write against a read only replica.\r\n";
                                                 if writer.write_all(err).await.is_err() { break 'outer; }
                                                 continue 'parse;
@@ -1816,6 +1905,11 @@ async fn handle_tcp<S>(
                                                 Command::LastSave => {
                                                     let ts = state.snap.last_save.load(Ordering::Relaxed);
                                                     if writer.write_all(&Value::Integer(ts).serialize()).await.is_err() { break 'outer; }
+                                                    continue 'parse;
+                                                }
+                                                Command::ReplicaOfNoOne => {
+                                                    state.promote_to_primary();
+                                                    if writer.write_all(b"+OK\r\n").await.is_err() { break 'outer; }
                                                     continue 'parse;
                                                 }
                                                 _ => {}
@@ -2118,7 +2212,7 @@ async fn handle_ws<S>(
                                     continue 'outer;
                                 }
                                 // Replica: reject writes
-                                if state.role == ServerRole::Replica && is_write_command(&cmd) {
+                                if state.is_replica() && is_write_command(&cmd) {
                                     ws_send!(b"-READONLY You can't write against a read only replica.\r\n");
                                     continue 'outer;
                                 }
@@ -2139,6 +2233,11 @@ async fn handle_ws<S>(
                                     Command::LastSave => {
                                         let ts = state.snap.last_save.load(Ordering::Relaxed);
                                         ws_send!(&Value::Integer(ts).serialize());
+                                        continue 'outer;
+                                    }
+                                    Command::ReplicaOfNoOne => {
+                                        state.promote_to_primary();
+                                        ws_send!(b"+OK\r\n");
                                         continue 'outer;
                                     }
                                     _ => {}

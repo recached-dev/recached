@@ -281,6 +281,7 @@ pub struct SnapshotEntry {
 pub struct KeyValueStore {
     data: Arc<DashMap<String, Entry>>,
     max_keys: Option<usize>,
+    max_memory_bytes: Option<usize>,
     eviction_policy: EvictionPolicy,
 }
 
@@ -295,6 +296,7 @@ impl KeyValueStore {
         Self {
             data: Arc::new(DashMap::new()),
             max_keys: None,
+            max_memory_bytes: None,
             eviction_policy: EvictionPolicy::NoEviction,
         }
     }
@@ -303,15 +305,56 @@ impl KeyValueStore {
         Self {
             data: Arc::new(DashMap::new()),
             max_keys: Some(max),
+            max_memory_bytes: None,
             eviction_policy: EvictionPolicy::NoEviction,
         }
     }
 
-    pub fn with_config(max_keys: Option<usize>, eviction_policy: EvictionPolicy) -> Self {
+    pub fn with_config(
+        max_keys: Option<usize>,
+        max_memory_bytes: Option<usize>,
+        eviction_policy: EvictionPolicy,
+    ) -> Self {
         Self {
             data: Arc::new(DashMap::new()),
             max_keys,
+            max_memory_bytes,
             eviction_policy,
+        }
+    }
+
+    /// Approximate heap usage in bytes — key+value sizes plus a fixed overhead per entry.
+    pub fn approximate_memory_bytes(&self) -> usize {
+        self.data
+            .iter()
+            .map(|r| {
+                let val_size = match &r.value().value {
+                    EntryValue::Str(s) => s.len(),
+                    EntryValue::Hash(m) => m.iter().map(|(k, v)| k.len() + v.len()).sum(),
+                    EntryValue::List(l) => l.iter().map(|s| s.len()).sum(),
+                    EntryValue::Set(s) => s.iter().map(|m| m.len()).sum::<usize>(),
+                    EntryValue::ZSet(z) => z.scores.keys().map(|m| m.len() + 8).sum(),
+                };
+                r.key().len() + val_size + 64
+            })
+            .sum()
+    }
+
+    /// Evict entries until memory usage is below `max_memory_bytes`, or the
+    /// eviction policy cannot free any more. Returns true if under limit.
+    pub fn try_evict_for_memory(&self) -> bool {
+        let limit = match self.max_memory_bytes {
+            Some(l) => l,
+            None => return true,
+        };
+        let now = now_ms();
+        loop {
+            if self.approximate_memory_bytes() <= limit {
+                return true;
+            }
+            if !self.evict_one(now) {
+                return false;
+            }
         }
     }
 
@@ -1853,6 +1896,9 @@ impl KeyValueStore {
             }
             Command::Save | Command::BgSave | Command::LastSave => {
                 Value::Error("ERR persistence commands must be handled by the server".to_string())
+            }
+            Command::ReplicaOfNoOne => {
+                Value::Error("ERR REPLICAOF NO ONE must be handled by the server".to_string())
             }
         }
     }

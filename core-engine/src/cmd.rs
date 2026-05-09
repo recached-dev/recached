@@ -151,6 +151,8 @@ pub enum Command {
     Save,
     BgSave,
     LastSave,
+    // ── Replication ───────────────────────────────────────────────────────────
+    ReplicaOfNoOne,
     Unknown(String),
 }
 
@@ -974,6 +976,19 @@ impl Command {
                     "SAVE" => Ok(Command::Save),
                     "BGSAVE" => Ok(Command::BgSave),
                     "LASTSAVE" => Ok(Command::LastSave),
+
+                    // ── Replication ───────────────────────────────────────────
+                    "REPLICAOF" => {
+                        need!(3);
+                        let arg1 = extract_string(&arr[1]).unwrap_or_default().to_uppercase();
+                        let arg2 = extract_string(&arr[2]).unwrap_or_default().to_uppercase();
+                        if arg1 == "NO" && arg2 == "ONE" {
+                            Ok(Command::ReplicaOfNoOne)
+                        } else {
+                            Err("ERR REPLICAOF supports only 'REPLICAOF NO ONE' at runtime"
+                                .to_string())
+                        }
+                    }
 
                     _ => Ok(Command::Unknown(cmd_name.to_owned())),
                 }
