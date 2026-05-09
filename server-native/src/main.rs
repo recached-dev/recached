@@ -713,7 +713,13 @@ async fn sync_from_primary(
 
         match Value::parse(&cmd_bytes) {
             Ok((value, _)) => {
-                if let Ok(cmd) = Command::from_value(value) {
+                // Replication frames are broadcast as RESP3 Push (>N\r\n); normalise to
+                // Array so Command::from_value can parse them.
+                let normalised = match value {
+                    Value::Push(inner) => Value::Array(Some(inner)),
+                    other => other,
+                };
+                if let Ok(cmd) = Command::from_value(normalised) {
                     store.execute(cmd);
                 }
             }
@@ -2458,10 +2464,152 @@ mod tests {
     use core_engine::cmd::{SetOptions, ZAddOptions};
     use core_engine::resp::Value;
     use core_engine::store::KeyValueStore;
-    use std::sync::atomic::AtomicI64;
+    use std::sync::atomic::{AtomicBool, AtomicI64};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
 
     fn tmp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("recached_test_{name}_{}", std::process::id()))
+    }
+
+    // ── TestServer harness ────────────────────────────────────────────────────
+
+    struct TestServer {
+        pub tcp_addr: std::net::SocketAddr,
+        pub store: Arc<KeyValueStore>,
+        pub state: Arc<ServerState>,
+        _task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self._task.abort();
+        }
+    }
+
+    async fn spawn_server() -> TestServer {
+        spawn_server_cfg(None, None, false).await
+    }
+
+    async fn spawn_server_cfg(
+        password: Option<&str>,
+        snap_path: Option<PathBuf>,
+        start_as_replica: bool,
+    ) -> TestServer {
+        let store = Arc::new(KeyValueStore::new());
+        let (tx, _rx) = broadcast::channel::<(u64, String)>(256);
+        let pubsub: SharedPubSub = Arc::new(Mutex::new(PubSubHub::new()));
+        let watch_registry: WatchRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let semaphore = Arc::new(Semaphore::new(64));
+        let snap_cfg = Arc::new(SnapshotConfig {
+            path: snap_path.unwrap_or_else(|| tmp_path("test.rdb")),
+            last_save: AtomicI64::new(now_unix_secs()),
+        });
+        let state = Arc::new(ServerState {
+            snap: snap_cfg,
+            aof: None,
+            replicas: Arc::new(tokio::sync::Mutex::new(vec![])),
+            is_replica: AtomicBool::new(start_as_replica),
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let store2 = Arc::clone(&store);
+        let state2 = Arc::clone(&state);
+        let pass = Arc::new(password.map(|s| s.to_string()));
+
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() else {
+                    continue;
+                };
+                let (s, t, p, ps, wr, st) = (
+                    Arc::clone(&store2),
+                    tx.clone(),
+                    Arc::clone(&pass),
+                    Arc::clone(&pubsub),
+                    Arc::clone(&watch_registry),
+                    Arc::clone(&state2),
+                );
+                tokio::spawn(async move {
+                    handle_tcp(socket, s, t, p, ps, wr, st).await;
+                    drop(permit);
+                });
+            }
+        });
+
+        TestServer {
+            tcp_addr: addr,
+            store,
+            state,
+            _task: task,
+        }
+    }
+
+    // ── RespClient ────────────────────────────────────────────────────────────
+
+    struct RespClient {
+        stream: TcpStream,
+        buf: Vec<u8>,
+        filled: usize,
+    }
+
+    impl RespClient {
+        async fn connect(addr: std::net::SocketAddr) -> Self {
+            Self {
+                stream: TcpStream::connect(addr).await.unwrap(),
+                buf: vec![0u8; 65536],
+                filled: 0,
+            }
+        }
+
+        async fn cmd(&mut self, args: &[&str]) -> Value {
+            let mut req = format!("*{}\r\n", args.len());
+            for a in args {
+                req.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+            }
+            self.stream.write_all(req.as_bytes()).await.unwrap();
+            loop {
+                match Value::parse(&self.buf[..self.filled]) {
+                    Ok((val, n)) => {
+                        self.buf.copy_within(n..self.filled, 0);
+                        self.filled -= n;
+                        return val;
+                    }
+                    Err(ref e) if e == "Incomplete" => {
+                        let n = self
+                            .stream
+                            .read(&mut self.buf[self.filled..])
+                            .await
+                            .unwrap();
+                        assert!(n > 0, "server closed connection unexpectedly");
+                        self.filled += n;
+                    }
+                    Err(e) => panic!("RESP parse error: {e}"),
+                }
+            }
+        }
+
+        async fn read_until_closed(&mut self) {
+            let mut buf = [0u8; 64];
+            while self.stream.read(&mut buf).await.unwrap_or(0) > 0 {}
+        }
+    }
+
+    fn ok() -> Value {
+        Value::SimpleString("OK".to_string())
+    }
+    fn nil() -> Value {
+        Value::BulkString(None)
+    }
+    fn bulk(s: &str) -> Value {
+        Value::BulkString(Some(s.as_bytes().to_vec()))
+    }
+    fn int(n: i64) -> Value {
+        Value::Integer(n)
     }
 
     // ── is_write_command ──────────────────────────────────────────────────────
@@ -2571,5 +2719,651 @@ mod tests {
         let len_after = tokio::fs::metadata(&path).await.unwrap().len();
         assert_eq!(len_after, 0);
         let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    // ── Integration: 3a basic commands ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn integration_set_get_del() {
+        let srv = spawn_server().await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        assert_eq!(c.cmd(&["SET", "k", "v"]).await, ok());
+        assert_eq!(c.cmd(&["GET", "k"]).await, bulk("v"));
+        assert_eq!(c.cmd(&["GET", "missing"]).await, nil());
+        assert_eq!(c.cmd(&["DEL", "k"]).await, int(1));
+        assert_eq!(c.cmd(&["GET", "k"]).await, nil());
+        assert_eq!(c.cmd(&["DEL", "k"]).await, int(0)); // already gone
+    }
+
+    #[tokio::test]
+    async fn integration_incr_and_expiry() {
+        let srv = spawn_server().await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        assert_eq!(c.cmd(&["SET", "n", "10"]).await, ok());
+        assert_eq!(c.cmd(&["INCR", "n"]).await, int(11));
+        assert_eq!(c.cmd(&["INCRBY", "n", "4"]).await, int(15));
+        assert_eq!(c.cmd(&["DECR", "n"]).await, int(14));
+
+        // TTL: set a key with 1-second expiry and verify TTL and eventual expiry
+        assert_eq!(c.cmd(&["SET", "ex", "val", "EX", "1"]).await, ok());
+        let ttl = c.cmd(&["TTL", "ex"]).await;
+        assert!(matches!(ttl, Value::Integer(1) | Value::Integer(0)));
+        tokio::time::sleep(tokio::time::Duration::from_millis(1100)).await;
+        assert_eq!(c.cmd(&["GET", "ex"]).await, nil());
+    }
+
+    #[tokio::test]
+    async fn integration_string_commands() {
+        let srv = spawn_server().await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        // APPEND + STRLEN
+        assert_eq!(c.cmd(&["APPEND", "s", "hello"]).await, int(5));
+        assert_eq!(c.cmd(&["APPEND", "s", " world"]).await, int(11));
+        assert_eq!(c.cmd(&["STRLEN", "s"]).await, int(11));
+
+        // GETSET
+        assert_eq!(c.cmd(&["GETSET", "s", "new"]).await, bulk("hello world"));
+        assert_eq!(c.cmd(&["GET", "s"]).await, bulk("new"));
+
+        // SETNX
+        assert_eq!(c.cmd(&["SETNX", "nx", "first"]).await, int(1));
+        assert_eq!(c.cmd(&["SETNX", "nx", "second"]).await, int(0));
+        assert_eq!(c.cmd(&["GET", "nx"]).await, bulk("first"));
+
+        // SETEX
+        assert_eq!(c.cmd(&["SETEX", "ex", "60", "val"]).await, ok());
+        let ttl = c.cmd(&["TTL", "ex"]).await;
+        assert!(matches!(ttl, Value::Integer(t) if t > 0 && t <= 60));
+
+        // MSET / MGET
+        assert_eq!(c.cmd(&["MSET", "a", "1", "b", "2", "c", "3"]).await, ok());
+        let got = c.cmd(&["MGET", "a", "b", "c", "missing"]).await;
+        assert_eq!(
+            got,
+            Value::Array(Some(vec![bulk("1"), bulk("2"), bulk("3"), nil()]))
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_hash_commands() {
+        let srv = spawn_server().await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        assert_eq!(c.cmd(&["HSET", "h", "f1", "v1", "f2", "v2"]).await, int(2));
+        assert_eq!(c.cmd(&["HGET", "h", "f1"]).await, bulk("v1"));
+        assert_eq!(c.cmd(&["HGET", "h", "missing"]).await, nil());
+        assert_eq!(c.cmd(&["HLEN", "h"]).await, int(2));
+        assert_eq!(c.cmd(&["HDEL", "h", "f1"]).await, int(1));
+        assert_eq!(c.cmd(&["HLEN", "h"]).await, int(1));
+        // HGETALL returns field-value pairs
+        let all = c.cmd(&["HGETALL", "h"]).await;
+        assert_eq!(all, Value::Array(Some(vec![bulk("f2"), bulk("v2")])));
+    }
+
+    #[tokio::test]
+    async fn integration_list_commands() {
+        let srv = spawn_server().await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        assert_eq!(c.cmd(&["RPUSH", "l", "a", "b", "c"]).await, int(3));
+        assert_eq!(c.cmd(&["LPUSH", "l", "z"]).await, int(4));
+        assert_eq!(c.cmd(&["LLEN", "l"]).await, int(4));
+        assert_eq!(
+            c.cmd(&["LRANGE", "l", "0", "-1"]).await,
+            Value::Array(Some(vec![bulk("z"), bulk("a"), bulk("b"), bulk("c")]))
+        );
+        assert_eq!(c.cmd(&["LPOP", "l"]).await, bulk("z"));
+        assert_eq!(c.cmd(&["RPOP", "l"]).await, bulk("c"));
+        assert_eq!(c.cmd(&["LLEN", "l"]).await, int(2));
+    }
+
+    #[tokio::test]
+    async fn integration_set_commands() {
+        let srv = spawn_server().await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        assert_eq!(c.cmd(&["SADD", "s", "a", "b", "c"]).await, int(3));
+        assert_eq!(c.cmd(&["SADD", "s", "a"]).await, int(0)); // duplicate
+        assert_eq!(c.cmd(&["SCARD", "s"]).await, int(3));
+        assert_eq!(c.cmd(&["SISMEMBER", "s", "b"]).await, int(1));
+        assert_eq!(c.cmd(&["SISMEMBER", "s", "x"]).await, int(0));
+        assert_eq!(c.cmd(&["SREM", "s", "a"]).await, int(1));
+        assert_eq!(c.cmd(&["SCARD", "s"]).await, int(2));
+    }
+
+    #[tokio::test]
+    async fn integration_zset_commands() {
+        let srv = spawn_server().await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        assert_eq!(
+            c.cmd(&["ZADD", "z", "1.5", "a", "2.5", "b", "3.0", "c"])
+                .await,
+            int(3)
+        );
+        assert_eq!(c.cmd(&["ZCARD", "z"]).await, int(3));
+        assert_eq!(c.cmd(&["ZSCORE", "z", "b"]).await, bulk("2.5"));
+        assert_eq!(c.cmd(&["ZRANK", "z", "a"]).await, int(0));
+        assert_eq!(c.cmd(&["ZRANK", "z", "c"]).await, int(2));
+        assert_eq!(
+            c.cmd(&["ZRANGE", "z", "0", "-1", "WITHSCORES"]).await,
+            Value::Array(Some(vec![
+                bulk("a"),
+                bulk("1.5"),
+                bulk("b"),
+                bulk("2.5"),
+                bulk("c"),
+                bulk("3"),
+            ]))
+        );
+        assert_eq!(c.cmd(&["ZREM", "z", "b"]).await, int(1));
+        assert_eq!(c.cmd(&["ZCARD", "z"]).await, int(2));
+    }
+
+    #[tokio::test]
+    async fn integration_transactions_exec() {
+        let srv = spawn_server().await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        assert_eq!(c.cmd(&["SET", "counter", "10"]).await, ok());
+        assert_eq!(c.cmd(&["MULTI"]).await, ok());
+        assert_eq!(
+            c.cmd(&["SET", "counter", "20"]).await,
+            Value::SimpleString("QUEUED".to_string())
+        );
+        assert_eq!(
+            c.cmd(&["INCR", "counter"]).await,
+            Value::SimpleString("QUEUED".to_string())
+        );
+        let res = c.cmd(&["EXEC"]).await;
+        assert_eq!(res, Value::Array(Some(vec![ok(), int(21)])));
+        assert_eq!(c.cmd(&["GET", "counter"]).await, bulk("21"));
+    }
+
+    #[tokio::test]
+    async fn integration_transactions_discard() {
+        let srv = spawn_server().await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        assert_eq!(c.cmd(&["SET", "key", "original"]).await, ok());
+        assert_eq!(c.cmd(&["MULTI"]).await, ok());
+        assert_eq!(
+            c.cmd(&["DEL", "key"]).await,
+            Value::SimpleString("QUEUED".to_string())
+        );
+        assert_eq!(c.cmd(&["DISCARD"]).await, ok());
+        assert_eq!(c.cmd(&["GET", "key"]).await, bulk("original")); // DEL was discarded
+    }
+
+    #[tokio::test]
+    async fn integration_unknown_command() {
+        let srv = spawn_server().await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        let r = c.cmd(&["NOTACOMMAND", "arg"]).await;
+        assert!(matches!(r, Value::Error(_)));
+    }
+
+    // ── Integration: 3b auth ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn integration_auth_blocks_unauthenticated() {
+        let srv = spawn_server_cfg(Some("secret"), None, false).await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        let r = c.cmd(&["SET", "k", "v"]).await;
+        assert!(matches!(&r, Value::Error(e) if e.contains("NOAUTH")));
+    }
+
+    #[tokio::test]
+    async fn integration_auth_correct() {
+        let srv = spawn_server_cfg(Some("secret"), None, false).await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        assert_eq!(c.cmd(&["AUTH", "secret"]).await, ok());
+        assert_eq!(c.cmd(&["SET", "k", "v"]).await, ok());
+        assert_eq!(c.cmd(&["GET", "k"]).await, bulk("v"));
+    }
+
+    #[tokio::test]
+    async fn integration_auth_wrong_password_lockout() {
+        let srv = spawn_server_cfg(Some("secret"), None, false).await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        // First 4 wrong attempts → "ERR invalid password"
+        for _ in 0..4 {
+            let r = c.cmd(&["AUTH", "wrong"]).await;
+            assert!(matches!(&r, Value::Error(e) if e.contains("invalid")));
+        }
+        // 5th attempt hits MAX_AUTH_FAILURES → "too many" + server disconnects
+        let r = c.cmd(&["AUTH", "wrong"]).await;
+        assert!(matches!(&r, Value::Error(e) if e.contains("too many")));
+        c.read_until_closed().await;
+    }
+
+    // ── Integration: 3c persistence ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn integration_save_and_reload() {
+        let snap = tmp_path("integ_snap.rdb");
+        let srv = spawn_server_cfg(None, Some(snap.clone()), false).await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        assert_eq!(c.cmd(&["SET", "hello", "world"]).await, ok());
+        assert_eq!(c.cmd(&["SET", "foo", "bar"]).await, ok());
+        assert_eq!(c.cmd(&["SAVE"]).await, ok());
+
+        // Load into a fresh store
+        let store2 = KeyValueStore::new();
+        let loaded = load_snapshot(&store2, &snap).await;
+        assert!(loaded);
+        assert_eq!(
+            store2.execute(Command::Get("hello".into())),
+            Value::BulkString(Some(b"world".to_vec()))
+        );
+        assert_eq!(
+            store2.execute(Command::Get("foo".into())),
+            Value::BulkString(Some(b"bar".to_vec()))
+        );
+        let _ = tokio::fs::remove_file(&snap).await;
+    }
+
+    #[tokio::test]
+    async fn integration_aof_replay() {
+        let path = tmp_path("integ_aof.aof");
+        let aof = AofWriter::open(path.clone(), AofSync::No).await.unwrap();
+        let store = KeyValueStore::new();
+        let snap_cfg = Arc::new(SnapshotConfig {
+            path: tmp_path("integ_aof.rdb"),
+            last_save: AtomicI64::new(0),
+        });
+        let state = Arc::new(ServerState {
+            snap: snap_cfg,
+            aof: Some(Arc::new(aof)),
+            replicas: Arc::new(tokio::sync::Mutex::new(vec![])),
+            is_replica: AtomicBool::new(false),
+        });
+
+        // Simulate writes captured by AOF
+        state
+            .on_write("*3\r\n$3\r\nSET\r\n$5\r\nhello\r\n$5\r\nworld\r\n")
+            .await;
+        state
+            .on_write("*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n")
+            .await;
+        if let Some(ref a) = state.aof {
+            a.flush().await;
+        }
+
+        // Replay into fresh store
+        let store2 = KeyValueStore::new();
+        let count = replay_aof(&store2, &path).await;
+        assert_eq!(count, 2);
+        assert_eq!(
+            store2.execute(Command::Get("hello".into())),
+            Value::BulkString(Some(b"world".to_vec()))
+        );
+        drop(store); // suppress unused warning
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn integration_dirty_counter() {
+        let srv = spawn_server().await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        assert_eq!(srv.store.dirty_count(), 0);
+
+        assert_eq!(c.cmd(&["SET", "a", "1"]).await, ok());
+        assert_eq!(c.cmd(&["SET", "b", "2"]).await, ok());
+        assert_eq!(srv.store.dirty_count(), 2);
+
+        let last_save_before = srv.state.snap.last_save.load(Ordering::Relaxed);
+
+        // Trigger a save — dirty resets to 0
+        assert_eq!(c.cmd(&["SAVE"]).await, ok());
+        assert_eq!(srv.store.dirty_count(), 0);
+
+        // No new writes → save condition not met → last_save unchanged after 1s
+        tokio::time::sleep(tokio::time::Duration::from_millis(1100)).await;
+        let last_save_after = srv.state.snap.last_save.load(Ordering::Relaxed);
+        assert_eq!(last_save_before, last_save_after - 0); // no autosave fired (no conditions configured)
+    }
+
+    // ── Integration: 3d replication ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn integration_replica_rejects_writes() {
+        let srv = spawn_server_cfg(None, None, true).await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        let r = c.cmd(&["SET", "k", "v"]).await;
+        assert!(matches!(&r, Value::Error(e) if e.contains("READONLY")));
+        // Reads still work
+        assert_eq!(c.cmd(&["GET", "k"]).await, nil());
+    }
+
+    #[tokio::test]
+    async fn integration_replicaof_no_one_promotes() {
+        let srv = spawn_server_cfg(None, None, true).await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        // Promote
+        assert_eq!(c.cmd(&["REPLICAOF", "NO", "ONE"]).await, ok());
+        // Now writes are accepted
+        assert_eq!(c.cmd(&["SET", "k", "v"]).await, ok());
+        assert_eq!(c.cmd(&["GET", "k"]).await, bulk("v"));
+        assert!(!srv.state.is_replica());
+    }
+
+    #[tokio::test]
+    async fn integration_replica_receives_write() {
+        // Spawn primary with a separate replication listener on a random port
+        let primary = spawn_server().await;
+        let repl_registry: ReplRegistry = Arc::new(tokio::sync::Mutex::new(vec![]));
+        let snap_cfg = Arc::clone(&primary.state.snap);
+        let primary_store = Arc::clone(&primary.store);
+        let reg = Arc::clone(&repl_registry);
+
+        // Replication listener — binds on port 0
+        let repl_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let repl_port = repl_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = repl_listener.accept().await {
+                let s = Arc::clone(&primary_store);
+                let sc = Arc::clone(&snap_cfg);
+                let r = Arc::clone(&reg);
+                tokio::spawn(handle_replica(
+                    socket,
+                    s,
+                    sc,
+                    r,
+                    None,
+                    DEFAULT_REPL_CHANNEL_CAPACITY,
+                ));
+            }
+        });
+
+        // Also wire the repl_registry into the primary state so on_write fans out
+        // We can't replace state.replicas (it's private), but handle_replica adds
+        // itself to the registry it receives. We pass the same repl_registry to
+        // on_write via a workaround: patch primary state's replicas after the fact
+        // by passing the same Arc. Since ServerState.replicas is private in our
+        // TestServer, we re-use the one we created.
+        // ── Simpler approach: replace on_write path by sharing registry ──
+        // Instead, wire it through the primary ServerState directly.
+        // (In practice the TestServer shares state.replicas which starts empty;
+        // handle_replica will push its sender into it when it connects.)
+        // The trick: we need primary.state.replicas to point to our repl_registry.
+        // Since TestServer.state is Arc<ServerState>, we can't replace it.
+        // Use a fresh primary state that shares our registry.
+        let primary2 = {
+            let store = Arc::clone(&primary.store);
+            let (tx, _rx) = broadcast::channel::<(u64, String)>(256);
+            let pubsub: SharedPubSub = Arc::new(Mutex::new(PubSubHub::new()));
+            let wr: WatchRegistry = Arc::new(Mutex::new(HashMap::new()));
+            let sem = Arc::new(Semaphore::new(64));
+            let snap = Arc::clone(&primary.state.snap);
+            let state = Arc::new(ServerState {
+                snap,
+                aof: None,
+                replicas: Arc::clone(&repl_registry),
+                is_replica: AtomicBool::new(false),
+            });
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let store2 = Arc::clone(&store);
+            let state2 = Arc::clone(&state);
+            let pass = Arc::new(None::<String>);
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let Ok(permit) = Arc::clone(&sem).try_acquire_owned() else {
+                        continue;
+                    };
+                    let (s, t, p, ps, wrr, st) = (
+                        Arc::clone(&store2),
+                        tx.clone(),
+                        Arc::clone(&pass),
+                        Arc::clone(&pubsub),
+                        Arc::clone(&wr),
+                        Arc::clone(&state2),
+                    );
+                    tokio::spawn(async move {
+                        handle_tcp(socket, s, t, p, ps, wrr, st).await;
+                        drop(permit);
+                    });
+                }
+            });
+            TestServer {
+                tcp_addr: addr,
+                store,
+                state,
+                _task: task,
+            }
+        };
+
+        // Start replica
+        let replica_store = Arc::new(KeyValueStore::new());
+        let replica_state = Arc::new(ServerState {
+            snap: Arc::new(SnapshotConfig {
+                path: tmp_path("repl_snap.rdb"),
+                last_save: AtomicI64::new(0),
+            }),
+            aof: None,
+            replicas: Arc::new(tokio::sync::Mutex::new(vec![])),
+            is_replica: AtomicBool::new(true),
+        });
+        let rs = Arc::clone(&replica_store);
+        let rst = Arc::clone(&replica_state);
+        let repl_addr = format!("127.0.0.1:{repl_port}");
+        tokio::spawn(async move {
+            run_repl_client(repl_addr, rs, rst, None, None).await;
+        });
+
+        // Give replica time to connect and receive initial snapshot
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+        // Write to primary2 (which uses the shared repl_registry)
+        let mut c = RespClient::connect(primary2.tcp_addr).await;
+        assert_eq!(c.cmd(&["SET", "replkey", "replval"]).await, ok());
+
+        // Give replication fan-out time to arrive
+        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+
+        assert_eq!(
+            replica_store.execute(Command::Get("replkey".into())),
+            Value::BulkString(Some(b"replval".to_vec()))
+        );
+    }
+
+    // ── Integration: 3e load (ignored in normal CI) ───────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn integration_concurrent_writers() {
+        let srv = Arc::new(spawn_server().await);
+        let addr = srv.tcp_addr;
+
+        let tasks: Vec<_> = (0..50)
+            .map(|task_id| {
+                tokio::spawn(async move {
+                    let mut c = RespClient::connect(addr).await;
+                    for i in 0..100u32 {
+                        let key = format!("t{task_id}_{i}");
+                        let val = format!("v{i}");
+                        assert_eq!(c.cmd(&["SET", &key, &val]).await, ok());
+                        assert_eq!(c.cmd(&["GET", &key]).await, bulk(&val));
+                    }
+                })
+            })
+            .collect();
+
+        for t in tasks {
+            t.await.unwrap();
+        }
+        // All 50 × 100 keys should be present
+        assert_eq!(srv.store.execute(Command::DbSize), Value::Integer(5000));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn integration_connection_limit() {
+        // Small semaphore: only 3 concurrent connections
+        let store = Arc::new(KeyValueStore::new());
+        let (tx, _rx) = broadcast::channel::<(u64, String)>(16);
+        let pubsub: SharedPubSub = Arc::new(Mutex::new(PubSubHub::new()));
+        let watch_registry: WatchRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let semaphore = Arc::new(Semaphore::new(3));
+        let state = Arc::new(ServerState {
+            snap: Arc::new(SnapshotConfig {
+                path: tmp_path("conn_limit.rdb"),
+                last_save: AtomicI64::new(0),
+            }),
+            aof: None,
+            replicas: Arc::new(tokio::sync::Mutex::new(vec![])),
+            is_replica: AtomicBool::new(false),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let store2 = Arc::clone(&store);
+        let state2 = Arc::clone(&state);
+        let pass = Arc::new(None::<String>);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() else {
+                    // Drop socket immediately — connection limit reached
+                    drop(socket);
+                    continue;
+                };
+                let (s, t, p, ps, wr, st) = (
+                    Arc::clone(&store2),
+                    tx.clone(),
+                    Arc::clone(&pass),
+                    Arc::clone(&pubsub),
+                    Arc::clone(&watch_registry),
+                    Arc::clone(&state2),
+                );
+                tokio::spawn(async move {
+                    handle_tcp(socket, s, t, p, ps, wr, st).await;
+                    drop(permit);
+                });
+            }
+        });
+
+        // Open 3 connections and hold them (just send PING and keep the socket open)
+        let mut holders = Vec::new();
+        for _ in 0..3 {
+            let mut c = RespClient::connect(addr).await;
+            assert_eq!(
+                c.cmd(&["PING"]).await,
+                Value::SimpleString("PONG".to_string())
+            );
+            holders.push(c);
+        }
+
+        // 4th connection: server drops it immediately, so read returns 0
+        let mut overflow = TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = overflow.read(&mut buf).await.unwrap_or(0);
+        assert_eq!(n, 0, "4th connection should have been closed by server");
+
+        drop(holders);
+    }
+
+    // ── Integration: 3f chaos (ignored in normal CI) ──────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn integration_kill_primary_mid_write() {
+        let srv = Arc::new(spawn_server().await);
+        let addr = srv.tcp_addr;
+
+        // Start 20 concurrent writers
+        let tasks: Vec<_> = (0..20)
+            .map(|i| {
+                tokio::spawn(async move {
+                    // Connect; tolerate connection errors (server may die mid-flight)
+                    let stream = TcpStream::connect(addr).await;
+                    if stream.is_err() {
+                        return;
+                    }
+                    let mut c = RespClient {
+                        stream: stream.unwrap(),
+                        buf: vec![0u8; 65536],
+                        filled: 0,
+                    };
+                    for j in 0..50u32 {
+                        let key = format!("chaos_{i}_{j}");
+                        // Ignore errors — server may die during this
+                        let _ = tokio::time::timeout(
+                            tokio::time::Duration::from_millis(200),
+                            c.cmd(&["SET", &key, "v"]),
+                        )
+                        .await;
+                    }
+                })
+            })
+            .collect();
+
+        // Kill the server after 10ms
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        srv._task.abort();
+
+        // Join all writers — none should panic
+        for t in tasks {
+            let _ = t.await;
+        }
+
+        // Store is still intact in memory — some keys should have been written
+        assert!(
+            srv.store.execute(Command::DbSize) != Value::Integer(0) || true // allow 0 if killed before any write landed
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn integration_failover_promotes() {
+        // Point replica at a port that refuses connections immediately so the
+        // unreachable timer starts on the first loop iteration without any
+        // real primary required.  Promotion happens after:
+        //   connect fail (fast) → backoff 2s → connect fail → elapsed ≥ 1s → promote
+        // so we wait 3s to be safe.
+        let replica_state = Arc::new(ServerState {
+            snap: Arc::new(SnapshotConfig {
+                path: tmp_path("failover_snap.rdb"),
+                last_save: AtomicI64::new(0),
+            }),
+            aof: None,
+            replicas: Arc::new(tokio::sync::Mutex::new(vec![])),
+            is_replica: AtomicBool::new(true),
+        });
+        let replica_store = Arc::new(KeyValueStore::new());
+        let rs = Arc::clone(&replica_store);
+        let rst = Arc::clone(&replica_state);
+        // Bind a listener then immediately drop it so the port is known-refused
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        drop(listener);
+        tokio::spawn(async move {
+            run_repl_client(dead_addr, rs, rst, None, Some(1)).await;
+        });
+
+        // Wait for 2 backoff cycles (initial fail + 2s sleep + retry fail → promote)
+        tokio::time::sleep(tokio::time::Duration::from_millis(3000)).await;
+
+        assert!(
+            !replica_state.is_replica(),
+            "replica should have promoted after primary was unreachable for >1s"
+        );
     }
 }

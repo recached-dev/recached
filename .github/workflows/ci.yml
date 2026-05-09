@@ -39,6 +39,27 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --exclude wasm-edge
 
+  integration-load-chaos:
+    name: Load & Chaos Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "recached-ci-cache"
+
+      - name: Run load & chaos tests
+        run: cargo test -p server-native -- --include-ignored
+        timeout-minutes: 5
+
   typecheck-js:
     name: Typecheck @recached/react and @recached/vue
     runs-on: ubuntu-latest
