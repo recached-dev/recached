@@ -42,7 +42,6 @@ jobs:
   integration-load-chaos:
     name: Load & Chaos Tests
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     steps:
       - name: Checkout repository
