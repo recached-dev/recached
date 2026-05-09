@@ -107,7 +107,7 @@ dependencies = [
 
 [[package]]
 name = "core-engine"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "dashmap",
  "rand",
@@ -975,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "server-native"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "core-engine",
  "futures-util",
@@ -1384,7 +1384,7 @@ dependencies = [
 
 [[package]]
 name = "wasm-edge"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "core-engine",
  "getrandom 0.3.4",

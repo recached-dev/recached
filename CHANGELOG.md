@@ -4,7 +4,54 @@ All notable changes to Recached are documented here.
 
 ---
 
-## [0.1.4] — 2026-05-10
+## [0.1.5] — 2026-05-10
+
+### Added
+
+**`recached-react` package** (new)
+- `<RecachedProvider>` — React context provider that initialises the cache and makes it available to the component tree. Accepts `options` (passed to `createCache`) or a pre-built `cache` instance.
+- `useRecached()` — returns the `Cache` instance from context; throws if used outside a provider.
+- `useKey(key)` — returns `string | null`, re-renders on any mutation from any source (local write, WebSocket fan-out, or BroadcastChannel). Implemented with React 18 `useSyncExternalStore` — concurrent-safe, no tearing.
+- `useKeyJSON<T>(key)` — like `useKey` but deserialises the value via `cache.getJSON<T>`.
+- `usePubSub(channel, handler)` — subscribes to a pub/sub channel on mount, invokes `handler(msg)` on each message, and cleans up on unmount.
+
+**`recached-vue` package** (new)
+- `RecachedPlugin` — Vue 3 plugin (`app.use(RecachedPlugin, options)`) that creates the cache and provides it via `inject`/`provide`.
+- `useRecached()` — injects the `Cache` instance; throws if the plugin was not installed.
+- `useKey(key)` — returns a `Ref<string | null>` that updates reactively on any mutation.
+- `useKeyJSON<T>(key)` — like `useKey` but deserialised via `cache.getJSON<T>`.
+- `usePubSub(channel, handler)` — subscribes on call, unsubscribes via `onUnmounted`.
+
+**RESP3 Push frame** (`core-engine`, `server-native`, `wasm-edge`)
+- New `Value::Push(Vec<Value>)` variant in the RESP parser/serialiser (`>N\r\n…`). Push frames are unambiguously out-of-band — no heuristic needed to distinguish mutation fan-out from command responses.
+- All server-to-WebSocket mutation fan-out and pub/sub messages now use Push frames instead of Array frames.
+- `wasm-edge` `connect()` handler pattern-matches on `Value::Push` first; Array frames are ignored (they are command acknowledgements, not mutations).
+
+**Mutation notification bus** (`wasm-edge`, SDK)
+- `RecachedCache::set_mutation_callback(cb)` — WASM method that fires `cb()` after every write from any source (local call, WebSocket Push, or BroadcastChannel).
+- `RecachedCache::set_message_callback(cb)` — WASM method that fires `cb(channel, message)` on each pub/sub Push frame.
+- `Cache.onMutation(cb): () => void` — public SDK method; returns an unsubscribe function.
+- `Cache.onMessage(channel, cb): () => void` — pub/sub listener registration; returns an unsubscribe function.
+
+**Auto-failover** (`server-native`)
+- New `RECACHED_FAILOVER_TIMEOUT` env var. When set on a replica, it starts a timer the first time the primary becomes unreachable. If the primary is still unreachable after the configured number of seconds, the replica promotes itself to primary and begins accepting writes. The timer resets on successful reconnect, so brief primary restarts do not trigger spurious promotion.
+
+**Replication backpressure** (`server-native`)
+- Replica channels switched from `mpsc::UnboundedSender` to bounded `mpsc::Sender`. Channel capacity is controlled by `RECACHED_REPL_BUFFER` (default: `4096` frames). A replica that falls this many writes behind is disconnected and must reconnect from a fresh snapshot — the primary write path is never blocked by a slow replica.
+
+**Persistence hardening** (`core-engine`, `server-native`, `wasm-edge`)
+- **Dirty counter** — `KeyValueStore` now tracks a `dirty: Arc<AtomicU64>` write counter. Every successful write command increments it; `save()` resets it to zero. Autosave skips the snapshot entirely when `dirty == 0`, so idle servers produce no disk I/O.
+- **Multi-condition save policy (`RECACHED_SAVE`)** — replaces the single-interval `RECACHED_SAVE_INTERVAL` with a Redis-compatible multi-condition format: `"seconds:changes[,seconds:changes...]"`. A snapshot fires when any condition is satisfied (`elapsed >= secs && dirty >= changes`). `RECACHED_SAVE_INTERVAL` still works as a single-condition fallback for backward compatibility. Example: `RECACHED_SAVE="900:1,300:10,60:10000"`.
+- **WAL compaction on load** (`wasm-edge`) — when `enable_persistence()` replays more than 1 000 WAL entries, it compacts in-place: clears IndexedDB, then writes the current in-memory state as minimal RESP commands (`SET PX` for string TTLs, `HSET`, `RPUSH`, `SADD`, `ZADD`, plus `PEXPIREAT` for collection TTLs). Next startup replays only N snapshot entries instead of the full write history.
+
+### Changed
+
+- Autosave loop now polls every second against save conditions rather than sleeping for the full interval. This allows multi-condition triggers (e.g. "10 000 writes in 60 s") to fire promptly.
+- `ServerState::save()` calls `store.reset_dirty()` after a successful snapshot, ensuring the dirty counter accurately reflects only writes since the last save.
+
+---
+
+## [0.1.4] — 2026-05-09
 
 ### Added
 

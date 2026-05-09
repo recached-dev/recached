@@ -5,6 +5,7 @@ use rand::seq::IteratorRandom;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
@@ -283,6 +284,7 @@ pub struct KeyValueStore {
     max_keys: Option<usize>,
     max_memory_bytes: Option<usize>,
     eviction_policy: EvictionPolicy,
+    dirty: Arc<AtomicU64>,
 }
 
 impl Default for KeyValueStore {
@@ -298,6 +300,7 @@ impl KeyValueStore {
             max_keys: None,
             max_memory_bytes: None,
             eviction_policy: EvictionPolicy::NoEviction,
+            dirty: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -307,6 +310,7 @@ impl KeyValueStore {
             max_keys: Some(max),
             max_memory_bytes: None,
             eviction_policy: EvictionPolicy::NoEviction,
+            dirty: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -320,7 +324,25 @@ impl KeyValueStore {
             max_keys,
             max_memory_bytes,
             eviction_policy,
+            dirty: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Number of write commands applied since the last `reset_dirty()`.
+    pub fn dirty_count(&self) -> u64 {
+        self.dirty.load(Ordering::Relaxed)
+    }
+
+    /// Reset the dirty counter to zero (call after a successful snapshot save).
+    pub fn reset_dirty(&self) {
+        self.dirty.store(0, Ordering::Relaxed);
+    }
+
+    /// Increment the dirty counter by one. Called by the server after every
+    /// successful write command so the autosave loop can skip saves when
+    /// nothing has changed.
+    pub fn mark_dirty(&self) {
+        self.dirty.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Approximate heap usage in bytes — key+value sizes plus a fixed overhead per entry.
