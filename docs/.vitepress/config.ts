@@ -31,6 +31,7 @@ export default defineConfig({
       { text: 'Guide', link: '/guide/introduction' },
       { text: 'Server', link: '/server/installation' },
       { text: 'Browser', link: '/browser/getting-started' },
+      { text: 'React', link: '/react/getting-started' },
       { text: 'Roadmap', link: '/roadmap' },
     ],
 
@@ -62,6 +63,15 @@ export default defineConfig({
             { text: 'Getting Started', link: '/browser/getting-started' },
             { text: 'API Reference', link: '/browser/api-reference' },
             { text: 'Persistence', link: '/browser/persistence' },
+          ],
+        },
+      ],
+      '/react/': [
+        {
+          text: 'React',
+          items: [
+            { text: 'Getting Started', link: '/react/getting-started' },
+            { text: 'Hooks Reference', link: '/react/hooks-reference' },
           ],
         },
       ],

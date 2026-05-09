@@ -1,6 +1,6 @@
 {
   "name": "recached-edge",
-  "description": "Browser and edge WebAssembly client for Recached — zero-latency local cache with automatic server sync",
+  "description": "Browser and edge WebAssembly client for Recached \u2014 zero-latency local cache with automatic server sync",
   "version": "0.1.4",
   "type": "module",
   "main": "sdk.js",
@@ -21,7 +21,10 @@
   ],
   "scripts": {
     "build": "wasm-pack build --target web --out-dir pkg && tsc",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "version:patch": "npm version patch --no-git-tag-version",
+    "version:minor": "npm version minor --no-git-tag-version",
+    "version:major": "npm version major --no-git-tag-version"
   },
   "devDependencies": {
     "typescript": "^5.9.3"

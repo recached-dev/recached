@@ -4,7 +4,7 @@ All notable changes to Recached are documented here.
 
 ---
 
-## [0.1.4] — 2026-05-09
+## [0.1.4] — 2026-05-10
 
 ### Added
 
@@ -69,7 +69,7 @@ All notable changes to Recached are documented here.
 
 ---
 
-## [0.1.2] — 2026-05-08
+## [0.1.2] — 2026-05-02
 
 ### Added
 
