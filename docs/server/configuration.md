@@ -20,6 +20,7 @@ Recached is configured entirely through environment variables. There is no confi
 | `RECACHED_REPLICAOF` | _(none)_ | Set to `host:port` to run this server as a read-only replica. On startup it connects to the primary, receives a full snapshot, and then streams all subsequent writes. Reconnects automatically with exponential backoff on disconnect. |
 | `RECACHED_REPL_PASSWORD` | _(none)_ | Shared secret for the replication channel. When set, replicas must send this password during the handshake before receiving any data. Must match on both primary and replica. Strongly recommended for any network-exposed replication port. |
 | `RECACHED_FAILOVER_TIMEOUT` | _(disabled)_ | Seconds a replica waits with the primary unreachable before automatically promoting itself to primary. Set on replicas only. `0` or unset disables auto-failover — the replica reconnects indefinitely. See [auto-failover](#auto-failover) below. |
+| `RECACHED_REPL_BUFFER` | `4096` | Per-replica channel capacity (number of pending write frames buffered on the primary before a lagging replica is disconnected). A replica that falls this many writes behind is dropped and must reconnect from a fresh snapshot. Increase if replicas are on a consistently slow or high-latency link; decrease to reduce memory use per replica. |
 | `RECACHED_MAX_MEMORY` | _(unlimited)_ | Maximum approximate heap usage for the key-value store. Accepts a byte count or a human-readable suffix: `512mb`, `2gb`, `1073741824`. When the limit is exceeded, the background eviction loop runs the configured eviction policy. Has no effect when `RECACHED_EVICTION` is `noeviction`. |
 | `RECACHED_TLS_CERT` | _(none)_ | Path to a PEM-encoded TLS certificate file. TLS is enabled on both ports when this and `RECACHED_TLS_KEY` are set. |
 | `RECACHED_TLS_KEY` | _(none)_ | Path to a PEM-encoded TLS private key file. If either `RECACHED_TLS_CERT` or `RECACHED_TLS_KEY` is missing, the server falls back to plain TCP/WS. |
@@ -157,6 +158,8 @@ recached-server
 ```
 
 Replicas reconnect automatically with exponential backoff (2s → 4s → … → 30s cap) if the primary is temporarily unavailable. Write commands sent to a replica return `-READONLY`.
+
+Each replica has an internal write buffer (default 4096 frames, set by `RECACHED_REPL_BUFFER`). If a replica falls that many writes behind — due to a slow network or an overloaded replica host — it is disconnected and must reconnect from a fresh snapshot. This prevents a lagging replica from consuming unbounded memory on the primary or blocking the primary's write path.
 
 To promote a replica to primary at runtime (manual failover), send `REPLICAOF NO ONE` over any RESP connection to the replica. It immediately starts accepting writes.
 

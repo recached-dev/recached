@@ -286,32 +286,29 @@ impl RecachedCache {
         let onmessage = Closure::wrap(Box::new(move |e: MessageEvent| {
             if let Ok(text) = e.data().dyn_into::<js_sys::JsString>() {
                 let s = String::from(text);
-                if let Ok((value, _)) = Value::parse(s.as_bytes()) {
-                    // Detect pub/sub push: ["message", channel, payload]
-                    if let Value::Array(Some(arr)) = &value {
-                        if arr.len() == 3 {
-                            if let (
-                                Value::BulkString(Some(kind)),
-                                Value::BulkString(Some(channel)),
-                                Value::BulkString(Some(payload)),
-                            ) = (&arr[0], &arr[1], &arr[2])
-                            {
-                                if kind.eq_ignore_ascii_case(b"message") {
-                                    if let Some(f) = on_msg.borrow().as_ref() {
-                                        let ch = String::from_utf8_lossy(channel);
-                                        let pl = String::from_utf8_lossy(payload);
-                                        let _ = f.call2(
-                                            &JsValue::NULL,
-                                            &JsValue::from_str(&ch),
-                                            &JsValue::from_str(&pl),
-                                        );
-                                    }
-                                    return;
-                                }
-                            }
+                if let Ok((Value::Push(arr), _)) = Value::parse(s.as_bytes()) {
+                    // Pub/sub message: >3 ["message", channel, payload]
+                    if arr.len() == 3
+                        && let (
+                            Value::BulkString(Some(kind)),
+                            Value::BulkString(Some(channel)),
+                            Value::BulkString(Some(payload)),
+                        ) = (&arr[0], &arr[1], &arr[2])
+                        && kind.eq_ignore_ascii_case(b"message")
+                    {
+                        if let Some(f) = on_msg.borrow().as_ref() {
+                            let ch = String::from_utf8_lossy(channel);
+                            let pl = String::from_utf8_lossy(payload);
+                            let _ = f.call2(
+                                &JsValue::NULL,
+                                &JsValue::from_str(&ch),
+                                &JsValue::from_str(&pl),
+                            );
                         }
+                        return;
                     }
-                    if let Ok(cmd) = Command::from_value(value) {
+                    // Mutation push: convert to Array for command dispatch
+                    if let Ok(cmd) = Command::from_value(Value::Array(Some(arr))) {
                         match cmd {
                             Command::Set(_, _, _)
                             | Command::Del(_)

@@ -9,6 +9,9 @@ pub enum Value {
     Integer(i64),
     BulkString(Option<Vec<u8>>),
     Array(Option<Vec<Value>>),
+    /// RESP3 Push frame (`>N\r\n...`). Used for server-initiated out-of-band messages
+    /// (mutation fan-out, pub/sub) on the WebSocket channel. Never sent as a command response.
+    Push(Vec<Value>),
 }
 
 impl Value {
@@ -46,6 +49,12 @@ impl Value {
                     buf.extend_from_slice(&v.serialize());
                 }
             }
+            Value::Push(arr) => {
+                buf.extend_from_slice(format!(">{}\r\n", arr.len()).as_bytes());
+                for v in arr {
+                    buf.extend_from_slice(&v.serialize());
+                }
+            }
         }
         buf
     }
@@ -65,6 +74,7 @@ impl Value {
             b':' => Self::parse_integer(buffer),
             b'$' => Self::parse_bulk_string(buffer),
             b'*' => Self::parse_array(buffer, depth),
+            b'>' => Self::parse_push(buffer, depth),
             _ => Err("Invalid RESP type".to_string()),
         }
     }
@@ -140,6 +150,34 @@ impl Value {
 
                 let str_data = buffer[head_len..head_len + length].to_vec();
                 Ok((Value::BulkString(Some(str_data)), end))
+            }
+            None => Err("Incomplete".to_string()),
+        }
+    }
+
+    fn parse_push(buffer: &[u8], depth: usize) -> Result<(Value, usize), String> {
+        if depth >= MAX_ARRAY_DEPTH {
+            return Err("ERR max nesting depth exceeded".to_string());
+        }
+        match Self::read_until_crlf(buffer) {
+            Some((data, mut offset)) => {
+                let s = String::from_utf8_lossy(data);
+                let count: u64 = s
+                    .parse()
+                    .map_err(|_| "Invalid push frame length".to_string())?;
+                if count as usize > MAX_ARRAY_ELEMENTS {
+                    return Err(format!(
+                        "ERR push frame too large ({} > {} elements)",
+                        count, MAX_ARRAY_ELEMENTS
+                    ));
+                }
+                let mut arr = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    let (val, len) = Self::parse_inner(&buffer[offset..], depth + 1)?;
+                    arr.push(val);
+                    offset += len;
+                }
+                Ok((Value::Push(arr), offset))
             }
             None => Err("Incomplete".to_string()),
         }
@@ -284,6 +322,30 @@ mod tests {
         let (val, consumed) = Value::parse(input).unwrap();
         assert_eq!(val, Value::SimpleString("OK".to_string()));
         assert_eq!(consumed, 5); // "+OK\r\n" = 5 bytes
+    }
+
+    #[test]
+    fn push_round_trip() {
+        round_trip(&Value::Push(vec![]));
+        round_trip(&Value::Push(vec![
+            Value::BulkString(Some(b"SET".to_vec())),
+            Value::BulkString(Some(b"theme".to_vec())),
+            Value::BulkString(Some(b"dark".to_vec())),
+        ]));
+        round_trip(&Value::Push(vec![
+            Value::BulkString(Some(b"message".to_vec())),
+            Value::BulkString(Some(b"alerts".to_vec())),
+            Value::BulkString(Some(b"hello".to_vec())),
+        ]));
+    }
+
+    #[test]
+    fn push_prefix_distinct_from_array() {
+        let push = Value::Push(vec![Value::BulkString(Some(b"x".to_vec()))]).serialize();
+        let arr = Value::Array(Some(vec![Value::BulkString(Some(b"x".to_vec()))])).serialize();
+        assert_ne!(push, arr);
+        assert!(push.starts_with(b">"));
+        assert!(arr.starts_with(b"*"));
     }
 
     #[test]
