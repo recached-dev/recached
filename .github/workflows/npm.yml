@@ -44,15 +44,14 @@ jobs:
 
       - name: Set package name and version
         # wasm-pack derives the npm name and version from the crate — patch both so the
-        # published package always matches the git tag (e.g. refs/tags/v0.1.5 → 0.1.5).
+        # published package always matches the git tag (e.g. v0.1.5 → 0.1.5).
         run: |
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
           node -e "
             const fs = require('fs');
             const path = 'wasm-edge/pkg/package.json';
             const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
             pkg.name = 'recached-edge';
-            pkg.version = process.env.TAG_VERSION;
+            pkg.version = process.env.TAG_VERSION.replace(/^v/, '');
             fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
             console.log('Package:', pkg.name, pkg.version);
           "
