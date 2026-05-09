@@ -55,8 +55,8 @@ Recached is a good fit when:
 
 ## When Recached is not the right fit
 
-- **You need persistence across server restarts.** Recached has no RDB or AOF persistence. The data is entirely in-memory. Your backend should repopulate from a database on startup if you need durability.
-- **You need replication.** There is no `REPLICAOF`. The native→browser WebSocket is the sync story. A multi-server deployment is not currently supported.
+- **You need very high-durability persistence.** Recached supports snapshots (RDB-style) and AOF, but it is still primarily an in-memory cache. If you cannot tolerate any data loss between fsync intervals, a purpose-built database is the right tool.
+- **You need automatic failover.** Recached supports leader–follower replication (`RECACHED_REPLICAOF`) and manual promotion (`REPLICAOF NO ONE`), but does not include sentinel-style automatic leader election.
 - **You depend on uncommon Redis commands.** Recached implements the commands most applications use, not all 250+. Server introspection (`INFO`, `SLOWLOG`, `COMMAND`), Lua scripting, RESP3, and cluster mode are out of scope.
 - **You need very large datasets.** Recached is an in-memory cache — it is not a database. If your working set does not fit in RAM, Redis with RDB persistence or a proper database is the right tool.
 
@@ -67,8 +67,8 @@ Recached is a good fit when:
 | Protocol | RESP (compatible) | RESP |
 | Browser-side cache | Yes — WASM | No |
 | WebSocket sync | Built-in | Not built-in |
-| Persistence | No | RDB + AOF |
-| Replication | No | Yes |
+| Persistence | Snapshot + AOF | RDB + AOF |
+| Replication | Primary/replica | Yes (+ Sentinel/Cluster) |
 | Lua scripting | No (WASM scripting on roadmap) | Yes |
 | Cluster mode | No | Yes |
 | Command coverage | ~80 commands | 250+ |

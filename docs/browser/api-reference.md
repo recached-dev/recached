@@ -2,126 +2,98 @@
 
 Full TypeScript API for the `recached-edge` package.
 
+> **Scope:** The browser SDK exposes a focused set of string-oriented cache operations. Full key-type commands (hashes, lists, sorted sets) are available on the server over RESP (port 6379) from any Redis-compatible client — they are not part of the browser SDK surface.
+
+---
+
 ## `init()`
 
-Initializes the WASM module. Must be called once before creating any `RecachedCache` instances. Returns a promise that resolves when the WASM binary is loaded and compiled.
+Initializes the WASM module. `createCache()` calls this automatically, so you only need `init()` if you want to pre-load the WASM binary before creating a cache instance.
 
 ```typescript
-function init(input?: RequestInfo | URL | Response | BufferSource | WebAssembly.Module): Promise<void>
-```
+import { init } from 'recached-edge'
 
-```typescript
-import init from 'recached-edge'
-await init()
-```
-
-If you are serving the WASM file from a custom URL (CDN, different path):
-
-```typescript
-await init('https://cdn.example.com/recached_edge_bg.wasm')
+await init() // start downloading WASM now
+// ... other app setup ...
+const cache = await createCache() // resolves immediately — already loaded
 ```
 
 ---
 
-## `createCache(options)`
+## `createCache(options?)`
 
-Factory function that initializes the WASM module (if not already initialized), creates a `RecachedCache` instance, optionally connects to a server, and optionally enables persistence. Returns a fully-ready cache instance.
-
-```typescript
-interface CreateCacheOptions {
-  /** WebSocket URL of the Recached server (port 6380). Omit for local-only mode. */
-  url?: string
-
-  /** Password for AUTH. Required if RECACHED_PASSWORD is set on the server. */
-  password?: string
-
-  /** Enable IndexedDB WAL persistence. Cache survives page refresh. Default: false. */
-  persistence?: boolean
-
-  /** IndexedDB database name. Default: 'recached'. */
-  persistenceKey?: string
-
-  /** Reconnect automatically on WebSocket disconnect. Default: true. */
-  autoReconnect?: boolean
-
-  /** Delay in milliseconds between reconnection attempts. Default: 1000. */
-  reconnectDelay?: number
-
-  /** Called when the WebSocket connection is established. */
-  onConnect?: () => void
-
-  /** Called when the WebSocket connection drops. */
-  onDisconnect?: () => void
-
-  /** Called on WebSocket error. */
-  onError?: (error: Event) => void
-}
-
-async function createCache(options?: CreateCacheOptions): Promise<Cache>
-```
+Factory function that initializes the WASM module (idempotent), creates a `Cache` instance, and applies the provided options. Returns a fully-ready cache.
 
 ```typescript
 import { createCache } from 'recached-edge'
 
+async function createCache(options?: CacheOptions): Promise<Cache>
+```
+
+### `CacheOptions`
+
+```typescript
+interface CacheOptions {
+  /** Load the IndexedDB WAL and write-through every mutation. Default: false. */
+  persistence?: boolean
+
+  /**
+   * BroadcastChannel name. All tabs opened with the same name share mutations
+   * automatically, without a server connection.
+   */
+  broadcastChannel?: string
+
+  /**
+   * Connect to a Recached server immediately. Writes are forwarded to the server;
+   * server-side mutations are pushed down to the local WASM store.
+   */
+  connect?: ConnectOptions
+}
+
+interface ConnectOptions {
+  /** WebSocket URL, e.g. `"ws://localhost:6380"` or `"wss://cache.example.com"`. */
+  url: string
+  /** Server password. Required when the server has `RECACHED_PASSWORD` set. */
+  password?: string
+}
+```
+
+### Examples
+
+```typescript
+// Local-only
+const cache = await createCache()
+
+// With persistence (survives page refresh)
+const cache = await createCache({ persistence: true })
+
+// With server sync
 const cache = await createCache({
-  url: 'ws://localhost:6380',
-  password: 'my-secret',
+  connect: { url: 'ws://localhost:6380' },
+})
+
+// With auth
+const cache = await createCache({
+  connect: { url: 'ws://localhost:6380', password: 'my-secret' },
+})
+
+// Full options
+const cache = await createCache({
   persistence: true,
-  onConnect: () => console.log('Connected'),
-  onDisconnect: () => console.warn('Disconnected from cache server'),
+  broadcastChannel: 'my-app',
+  connect: { url: 'wss://cache.example.com', password: 'secret' },
 })
 ```
 
 ---
 
-## `RecachedCache` class
+## `Cache` class
 
-The main cache class. Wraps the WASM `core-engine` instance and the optional WebSocket connection.
-
-### Constructor
-
-```typescript
-new RecachedCache(): RecachedCache
-```
-
-Creates a new cache instance in local-only mode. Call `connect()` to enable server sync. Prefer `createCache()` for a higher-level setup.
+The main cache interface. Obtain instances via `createCache()`.
 
 ---
 
-### Connection
-
-#### `connect(url, options?)`
-
-Connect to a Recached server over WebSocket. Mutations from the server are applied to the local store automatically. Local writes are forwarded to the server.
-
-```typescript
-connect(url: string, options?: { password?: string }): void
-```
-
-```typescript
-cache.connect('ws://localhost:6380')
-cache.connect('wss://cache.example.com:6380', { password: 'secret' })
-```
-
-#### `disconnect()`
-
-Close the WebSocket connection. The cache continues to work in local-only mode.
-
-```typescript
-disconnect(): void
-```
-
-#### `isConnected()`
-
-Returns `true` if the WebSocket is currently open.
-
-```typescript
-isConnected(): boolean
-```
-
----
-
-### String commands
+### Reads
 
 #### `get(key)`
 
@@ -133,575 +105,170 @@ get(key: string): string | null
 
 ```typescript
 cache.set('name', 'Alice')
-cache.get('name')  // 'Alice'
+cache.get('name')     // 'Alice'
 cache.get('missing')  // null
 ```
 
-#### `set(key, value)`
+#### `getJSON<T>(key)`
 
-Sets a key to a string value. If the key already exists, its value is overwritten and any existing TTL is removed.
-
-```typescript
-set(key: string, value: string): void
-```
-
-#### `set_ex(key, value, seconds)`
-
-Sets a key with an expiry in seconds. The key is automatically deleted after `seconds` seconds.
+Returns a JSON-parsed value, or `null` if the key is missing, expired, or not valid JSON.
 
 ```typescript
-set_ex(key: string, value: string, seconds: number): void
+getJSON<T>(key: string): T | null
 ```
 
 ```typescript
-cache.set_ex('session', JSON.stringify({ userId: 1 }), 3600)
+interface User { id: number; name: string }
+const user = cache.getJSON<User>('user:42') // User | null
 ```
 
-#### `set_px(key, value, milliseconds)`
+#### `exists(key)`
 
-Sets a key with an expiry in milliseconds.
-
-```typescript
-set_px(key: string, value: string, milliseconds: number): void
-```
-
-#### `set_nx(key, value)`
-
-Sets a key only if it does not already exist. Returns `true` if the key was set, `false` if it already existed.
+Returns `true` if the key exists and has not expired.
 
 ```typescript
-set_nx(key: string, value: string): boolean
-```
-
-#### `getset(key, value)`
-
-Sets a key to a new value and returns the old value, or `null` if the key did not exist.
-
-```typescript
-getset(key: string, value: string): string | null
-```
-
-#### `mget(...keys)`
-
-Returns the values of multiple keys as an array. Non-existent or expired keys return `null` at the corresponding index.
-
-```typescript
-mget(...keys: string[]): (string | null)[]
-```
-
-```typescript
-cache.mset('a', '1', 'b', '2')
-cache.mget('a', 'b', 'c')  // ['1', '2', null]
-```
-
-#### `mset(...keyValues)`
-
-Sets multiple key-value pairs in a single operation.
-
-```typescript
-mset(...keyValues: string[]): void
-```
-
-```typescript
-cache.mset('a', '1', 'b', '2', 'c', '3')
-```
-
-#### `append(key, value)`
-
-Appends a string to the existing value. Creates the key if it does not exist. Returns the new length.
-
-```typescript
-append(key: string, value: string): number
-```
-
-#### `strlen(key)`
-
-Returns the length of the string stored at key, or 0 if the key does not exist.
-
-```typescript
-strlen(key: string): number
-```
-
-#### `incr(key)`
-
-Increments the integer value of a key by 1. Creates the key with value 1 if it does not exist. Returns the new value.
-
-```typescript
-incr(key: string): number
-```
-
-#### `decr(key)`
-
-Decrements the integer value of a key by 1.
-
-```typescript
-decr(key: string): number
-```
-
-#### `incrby(key, increment)`
-
-Increments the integer value of a key by a given integer.
-
-```typescript
-incrby(key: string, increment: number): number
-```
-
-#### `decrby(key, decrement)`
-
-Decrements the integer value of a key by a given integer.
-
-```typescript
-decrby(key: string, decrement: number): number
-```
-
----
-
-### Key management
-
-#### `del(...keys)`
-
-Deletes one or more keys. Returns the number of keys actually deleted.
-
-```typescript
-del(...keys: string[]): number
-```
-
-#### `exists(...keys)`
-
-Returns the number of keys that exist among the arguments. A key listed multiple times counts multiple times.
-
-```typescript
-exists(...keys: string[]): number
-```
-
-#### `expire(key, seconds)`
-
-Sets a TTL on a key in seconds. Returns `true` if the TTL was set, `false` if the key does not exist.
-
-```typescript
-expire(key: string, seconds: number): boolean
-```
-
-#### `pexpire(key, milliseconds)`
-
-Sets a TTL in milliseconds.
-
-```typescript
-pexpire(key: string, milliseconds: number): boolean
+exists(key: string): boolean
 ```
 
 #### `ttl(key)`
 
-Returns the remaining TTL in seconds. Returns `-2` if the key does not exist, `-1` if the key has no expiry.
+Returns the remaining TTL in seconds. Returns `-1` if the key has no expiry, `-2` if the key does not exist.
 
 ```typescript
 ttl(key: string): number
 ```
 
-#### `pttl(key)`
+---
 
-Returns the remaining TTL in milliseconds.
+### Writes
+
+All write methods also notify `onMutation` listeners and, when connected, forward the change to the server and other tabs via BroadcastChannel.
+
+#### `set(key, value)`
+
+Sets a key to a string value. Overwrites any existing value and removes any existing TTL.
 
 ```typescript
-pttl(key: string): number
+set(key: string, value: string): void
 ```
 
-#### `persist(key)`
+#### `setEx(key, value, seconds)`
 
-Removes the TTL from a key, making it persistent. Returns `true` if the TTL was removed.
+Sets a key with a TTL in seconds. The key is deleted automatically when the TTL elapses.
 
 ```typescript
-persist(key: string): boolean
+setEx(key: string, value: string, seconds: number): void
 ```
 
-#### `type(key)`
-
-Returns the type of the value stored at key: `'string'`, `'hash'`, `'list'`, `'set'`, `'zset'`, or `'none'`.
-
 ```typescript
-type(key: string): 'string' | 'hash' | 'list' | 'set' | 'zset' | 'none'
+cache.setEx('session', JSON.stringify({ userId: 1 }), 3600)
 ```
 
-#### `rename(key, newKey)`
+#### `setJSON<T>(key, value, ttl?)`
 
-Renames a key. Throws if the source key does not exist.
+Serializes `value` as JSON and stores it. Pass `ttl` (seconds) to set an expiry.
 
 ```typescript
-rename(key: string, newKey: string): void
+setJSON<T>(key: string, value: T, ttl?: number): void
 ```
 
-#### `keys(pattern)`
-
-Returns all keys matching the glob pattern. `*` matches any sequence, `?` matches a single character.
-
 ```typescript
-keys(pattern: string): string[]
+cache.setJSON('user:42', { id: 42, name: 'Alice' })
+cache.setJSON('session', { userId: 1 }, 3600) // expires in 1h
 ```
 
-#### `dbsize()`
+#### `del(key)`
 
-Returns the total number of keys in the local store.
-
-```typescript
-dbsize(): number
-```
-
-#### `flushdb()`
-
-Removes all keys from the local store. If connected to a server, also flushes the server.
+Deletes a key. Returns `true` if the key existed, `false` if it did not.
 
 ```typescript
-flushdb(): void
+del(key: string): boolean
 ```
 
 ---
 
-### Hash commands
+### Reactivity
 
-#### `hset(key, ...fieldValues)`
+#### `onMutation(callback)`
 
-Sets one or more fields in a hash. Returns the number of new fields added.
+Registers a callback that fires whenever the local store changes from any source — local writes, server pushes, or BroadcastChannel cross-tab messages.
+
+Returns an unsubscribe function. Pass it directly to React's `useSyncExternalStore` or call it in a cleanup function.
 
 ```typescript
-hset(key: string, ...fieldValues: string[]): number
+onMutation(cb: () => void): () => void
 ```
 
 ```typescript
-cache.hset('user:1', 'name', 'Alice', 'plan', 'pro', 'credits', '500')
+// Manual wiring
+const unsubscribe = cache.onMutation(() => {
+  const count = cache.get('cart:count')
+  document.getElementById('badge')!.textContent = count ?? '0'
+})
+
+// React (useSyncExternalStore)
+const count = useSyncExternalStore(
+  (cb) => cache.onMutation(cb),
+  () => cache.get('cart:count'),
+  () => null,
+)
+
+// Cleanup
+unsubscribe()
 ```
 
-#### `hget(key, field)`
-
-Returns the value of a field in a hash, or `null` if the field or hash does not exist.
-
-```typescript
-hget(key: string, field: string): string | null
-```
-
-#### `hgetall(key)`
-
-Returns all field-value pairs of a hash as a plain object. Returns `null` if the hash does not exist.
-
-```typescript
-hgetall(key: string): Record<string, string> | null
-```
-
-```typescript
-cache.hgetall('user:1')
-// { name: 'Alice', plan: 'pro', credits: '500' }
-```
-
-#### `hdel(key, ...fields)`
-
-Deletes one or more fields from a hash. Returns the number of fields removed.
-
-```typescript
-hdel(key: string, ...fields: string[]): number
-```
-
-#### `hmget(key, ...fields)`
-
-Returns the values of multiple fields. Non-existent fields return `null`.
-
-```typescript
-hmget(key: string, ...fields: string[]): (string | null)[]
-```
-
-#### `hkeys(key)`
-
-Returns all field names in the hash.
-
-```typescript
-hkeys(key: string): string[]
-```
-
-#### `hvals(key)`
-
-Returns all values in the hash.
-
-```typescript
-hvals(key: string): string[]
-```
-
-#### `hlen(key)`
-
-Returns the number of fields in the hash.
-
-```typescript
-hlen(key: string): number
-```
-
-#### `hexists(key, field)`
-
-Returns `true` if the field exists in the hash.
-
-```typescript
-hexists(key: string, field: string): boolean
-```
-
-#### `hincrby(key, field, increment)`
-
-Increments the integer value of a hash field. Returns the new value.
-
-```typescript
-hincrby(key: string, field: string, increment: number): number
-```
-
-#### `hincrbyfloat(key, field, increment)`
-
-Increments the float value of a hash field. Returns the new value as a string.
-
-```typescript
-hincrbyfloat(key: string, field: string, increment: number): string
-```
-
----
-
-### List commands
-
-#### `lpush(key, ...elements)` / `rpush(key, ...elements)`
-
-Push elements to the head or tail of a list. Returns the new list length.
-
-```typescript
-lpush(key: string, ...elements: string[]): number
-rpush(key: string, ...elements: string[]): number
-```
-
-#### `lpop(key, count?)` / `rpop(key, count?)`
-
-Remove and return elements from the head or tail of a list. With no `count`, returns a single string or `null`. With `count`, returns an array.
-
-```typescript
-lpop(key: string): string | null
-lpop(key: string, count: number): string[]
-rpop(key: string): string | null
-rpop(key: string, count: number): string[]
-```
-
-#### `lrange(key, start, stop)`
-
-Returns elements between indices `start` and `stop` (inclusive). Negative indices count from the tail.
-
-```typescript
-lrange(key: string, start: number, stop: number): string[]
-```
-
-```typescript
-cache.rpush('queue', 'a', 'b', 'c')
-cache.lrange('queue', 0, -1)  // ['a', 'b', 'c']
-```
-
-#### `llen(key)`
-
-Returns the length of the list.
-
-```typescript
-llen(key: string): number
-```
-
-#### `lindex(key, index)`
-
-Returns the element at the given index.
-
-```typescript
-lindex(key: string, index: number): string | null
-```
-
-#### `lset(key, index, element)`
-
-Sets the element at the given index.
-
-```typescript
-lset(key: string, index: number, element: string): void
-```
-
-#### `lrem(key, count, element)`
-
-Removes occurrences of an element.
-
-```typescript
-lrem(key: string, count: number, element: string): number
-```
-
-#### `ltrim(key, start, stop)`
-
-Trims the list to the elements between `start` and `stop`.
-
-```typescript
-ltrim(key: string, start: number, stop: number): void
-```
-
----
-
-### Set commands
-
-#### `sadd(key, ...members)` / `srem(key, ...members)`
-
-Add or remove members. Return the number of members added or removed.
-
-```typescript
-sadd(key: string, ...members: string[]): number
-srem(key: string, ...members: string[]): number
-```
-
-#### `smembers(key)`
-
-Returns all members of the set as an array.
-
-```typescript
-smembers(key: string): string[]
-```
-
-#### `scard(key)`
-
-Returns the number of members.
-
-```typescript
-scard(key: string): number
-```
-
-#### `sismember(key, member)`
-
-Returns `true` if the member exists in the set.
-
-```typescript
-sismember(key: string, member: string): boolean
-```
-
-#### `sinter(...keys)` / `sunion(...keys)` / `sdiff(...keys)`
-
-Returns the intersection, union, or difference of the given sets.
-
-```typescript
-sinter(...keys: string[]): string[]
-sunion(...keys: string[]): string[]
-sdiff(...keys: string[]): string[]
-```
-
----
-
-### Sorted Set commands
-
-#### `zadd(key, score, member)` / `zadd(key, options, score, member, ...)`
-
-Add a member with a score.
-
-```typescript
-zadd(key: string, score: number, member: string): number
-```
-
-#### `zrange(key, start, stop, options?)`
-
-Returns members between ranks `start` and `stop`.
-
-```typescript
-zrange(key: string, start: number, stop: number, options?: { withScores?: boolean }): string[]
-```
-
-#### `zscore(key, member)`
-
-Returns the score of a member, or `null` if the member does not exist.
-
-```typescript
-zscore(key: string, member: string): string | null
-```
-
-#### `zrank(key, member)` / `zrevrank(key, member)`
-
-Returns the rank (ascending or descending) of a member.
-
-```typescript
-zrank(key: string, member: string): number | null
-zrevrank(key: string, member: string): number | null
-```
-
-#### `zcard(key)` / `zcount(key, min, max)`
-
-```typescript
-zcard(key: string): number
-zcount(key: string, min: number | '-inf', max: number | '+inf'): number
-```
+The callback receives no arguments — it signals that _something_ changed. Read the keys you care about inside the callback.
 
 ---
 
 ### Pub/Sub
 
-#### `subscribe(channel, callback)`
+Pub/Sub requires a server connection. Messages are delivered via the WebSocket and routed to subscribers on the receiving end.
 
-Subscribe to a pub/sub channel. The callback is called with the message whenever something is published to the channel.
+#### `subscribe(channel)`
+
+Subscribe to a pub/sub channel. Incoming messages from the server are applied to the local store.
 
 ```typescript
-subscribe(channel: string, callback: (message: string) => void): void
+subscribe(channel: string): void
 ```
 
-#### `unsubscribe(channel?)`
+#### `unsubscribe(channel)`
 
-Unsubscribe from a channel. With no argument, unsubscribes from all channels.
+Unsubscribe from a pub/sub channel.
 
 ```typescript
-unsubscribe(channel?: string): void
+unsubscribe(channel: string): void
 ```
 
 #### `publish(channel, message)`
 
-Publish a message to a channel. Returns the number of clients that received the message.
+Publish a message to a pub/sub channel. All server-side and browser-side subscribers receive it.
 
 ```typescript
-publish(channel: string, message: string): number
-```
-
----
-
-### Observable keys
-
-#### `watch(key, callback)`
-
-Register a callback that fires whenever the given key changes. The callback receives the new value as a string, or `null` if the key was deleted.
-
-The callback fires for changes from any source: local writes, server pushes, or other tabs via BroadcastChannel.
-
-```typescript
-watch(key: string, callback: (value: string | null) => void): void
-```
-
-```typescript
-cache.watch('cart:42:count', (value) => {
-  document.getElementById('cart-count')!.textContent = value ?? '0'
-})
-```
-
-#### `unwatch(key?)`
-
-Stop watching a key. With no argument, clears all watches.
-
-```typescript
-unwatch(key?: string): void
+publish(channel: string, message: string): void
 ```
 
 ---
 
 ### Persistence
 
-#### `enable_persistence(dbName?)`
+#### `clearPersistence()`
 
-Enable IndexedDB WAL persistence. After this call, every write is appended to an IndexedDB WAL. On the next page load, the WAL is replayed before connecting to the server.
+Deletes the IndexedDB WAL database. Use on sign-out so the next session starts clean.
 
 ```typescript
-enable_persistence(dbName?: string): Promise<void>
+clearPersistence(): Promise<void>
 ```
 
 ```typescript
-await cache.enable_persistence('my-app-cache')
+async function signOut() {
+  await cache.clearPersistence()
+  window.location.href = '/login'
+}
 ```
 
-#### `clearPersistence(dbName?)`
-
-Delete the IndexedDB WAL database. Call this on sign-out.
-
-```typescript
-clearPersistence(dbName?: string): Promise<void>
-```
+Persistence is enabled via `createCache({ persistence: true })`, not on the `Cache` instance itself.
 
 ---
 
@@ -709,15 +276,12 @@ clearPersistence(dbName?: string): Promise<void>
 
 #### `cache.raw`
 
-Direct access to the underlying WASM `RecachedCache` instance. Use when you need a command that is not yet exposed in the TypeScript wrapper.
+Direct access to the underlying WASM instance (`RecachedCache` from wasm-bindgen). Use this when you need an operation that is not yet exposed in the TypeScript wrapper.
 
 ```typescript
-get raw(): RecachedCache
+get raw(): RawCache
 ```
 
-```typescript
-// Execute a raw RESP command string
-const result = cache.raw.exec_raw('*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n')
-```
+Available methods on `raw`: `set()`, `set_ex()`, `get()`, `del()`, `ttl()`, `exists()`, `subscribe()`, `unsubscribe()`, `publish()`, `connect()`, `auth()`, `broadcast()`, `enable_persistence()`, `clear_persistence()`, `set_mutation_callback()`, `free()`.
 
-Note: writes through `cache.raw` bypass the BroadcastChannel and persistence layers. Use the typed methods when possible.
+> Writes through `cache.raw` bypass the `onMutation` notification bus. Use the typed `Cache` methods when possible.

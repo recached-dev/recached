@@ -10,8 +10,8 @@ The state machine. No networking, no file I/O, no OS-specific code.
 
 - **RESP parser:** Recursive descent, depth-limited to 128 levels to prevent stack-overflow DoS. Handles partial reads — the server buffers bytes until a complete command arrives.
 - **Command dispatch:** Typed enum over the full command set. Each variant carries its parsed arguments. Dispatch is a match on the enum — no string parsing at execution time.
-- **Store:** `Arc<RwLock<HashMap<String, EntryValue>>>` where `EntryValue` is an enum over `Str(String)`, `Hash(HashMap<String, String>)`, `List(VecDeque<String>)`, `Set(HashSet<String>)`, `ZSet(BTreeMap<OrderedFloat<f64>, String>)`.
-- **TTL engine:** A parallel `HashMap<String, Instant>` tracks expiry times. Expiry is checked lazily on every read (expired keys return nil). A background task sweeps the TTL map every second and removes expired keys actively.
+- **Store:** `Arc<DashMap<String, Entry>>` where each `Entry` holds an `EntryValue` enum (`Str`, `Hash`, `List`, `Set`, `ZSet`) plus `expires_at_ms: Option<u64>` and `written_at_ms: u64` for eviction bookkeeping.
+- **TTL engine:** Expiry is stored inline on each entry as an absolute millisecond timestamp. Expiry is checked lazily on every read (expired entries return nil). A background task sweeps the map every second and removes expired entries actively.
 - **Key cap:** If `RECACHED_MAX_KEYS` is set, every write command checks the store length before inserting. When the cap is reached, the configured eviction policy runs or the command errors.
 
 Because `core-engine` has no network code, it can be embedded anywhere: the Tokio server, a unit test, or a WASM binary.
@@ -68,7 +68,7 @@ This is intentional: the WASM client sends RESP frames over WebSocket, so the se
 2. `server-native` applies the command to the `core-engine` store.
 3. After a successful write, `server-native` serializes the mutation as a RESP push message and sends it to every connected WebSocket client (except the sender, if the write came from a WebSocket connection).
 4. Each browser's `wasm-edge` receives the frame, parses it as RESP, and applies the same command to its local `core-engine` instance.
-5. If the key is being `watch`-ed by a JavaScript callback, the callback fires synchronously.
+5. Any `onMutation` listeners registered via `cache.onMutation()` are notified synchronously, triggering UI re-renders.
 
 ### Browser to server
 
@@ -85,7 +85,7 @@ Any RESP command from any TCP client (backend service, CLI tool, another server)
 
 ## BroadcastChannel cross-tab sync
 
-When persistence is enabled, the `wasm-edge` module also opens a `BroadcastChannel` named `recached-sync`. Every time the local store is mutated (by either a local write or a server push), the mutation is posted to the BroadcastChannel as a serialized RESP frame.
+When a `broadcastChannel` name is provided to `createCache()`, the `wasm-edge` module opens a `BroadcastChannel` with that name. Every time the local store is mutated (by either a local write or a server push), the mutation is posted to the BroadcastChannel as a serialized RESP frame.
 
 Other tabs in the same browser origin listen on the same channel and apply the mutation to their own local `core-engine` instance. This means:
 
@@ -110,7 +110,7 @@ The sequence number is a monotonically increasing integer tracked in the `wasm-e
 
 ### Hydration on page load
 
-When `enable_persistence()` is called and the page loads:
+When `createCache({ persistence: true })` is called and the page loads:
 
 1. `wasm-edge` opens the IndexedDB database.
 2. It replays all WAL entries in sequence order against the local `core-engine` instance.

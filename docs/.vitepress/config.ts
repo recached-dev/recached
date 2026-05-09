@@ -32,6 +32,7 @@ export default defineConfig({
       { text: 'Server', link: '/server/installation' },
       { text: 'Browser', link: '/browser/getting-started' },
       { text: 'React', link: '/react/getting-started' },
+      { text: 'Vue', link: '/vue/getting-started' },
       { text: 'Roadmap', link: '/roadmap' },
     ],
 
@@ -72,6 +73,15 @@ export default defineConfig({
           items: [
             { text: 'Getting Started', link: '/react/getting-started' },
             { text: 'Hooks Reference', link: '/react/hooks-reference' },
+          ],
+        },
+      ],
+      '/vue/': [
+        {
+          text: 'Vue',
+          items: [
+            { text: 'Getting Started', link: '/vue/getting-started' },
+            { text: 'Composables Reference', link: '/vue/composables-reference' },
           ],
         },
       ],

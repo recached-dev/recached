@@ -86,6 +86,8 @@ pub struct RecachedCache {
     seq: Rc<Cell<u64>>,
     /// JS callback invoked after every mutation (local or server/BC-pushed).
     on_mutation: Rc<RefCell<Option<js_sys::Function>>>,
+    /// JS callback invoked when a pub/sub message arrives: `cb(channel, message)`.
+    on_message: Rc<RefCell<Option<js_sys::Function>>>,
     _onmessage: Option<Closure<dyn FnMut(MessageEvent)>>,
     _onbc: Option<Closure<dyn FnMut(MessageEvent)>>,
 }
@@ -129,6 +131,7 @@ impl RecachedCache {
             idb: Rc::new(RefCell::new(None)),
             seq: Rc::new(Cell::new(0)),
             on_mutation: Rc::new(RefCell::new(None)),
+            on_message: Rc::new(RefCell::new(None)),
             _onmessage: None,
             _onbc: None,
         }
@@ -139,6 +142,13 @@ impl RecachedCache {
     /// The SDK's `onMutation()` wires this up automatically.
     pub fn set_mutation_callback(&mut self, cb: js_sys::Function) {
         *self.on_mutation.borrow_mut() = Some(cb);
+    }
+
+    /// Register a JS callback invoked when a pub/sub message arrives.
+    /// Signature: `cb(channel: string, message: string)`.
+    /// The SDK's `onMessage()` wires this up automatically.
+    pub fn set_message_callback(&mut self, cb: js_sys::Function) {
+        *self.on_message.borrow_mut() = Some(cb);
     }
 
     /// Open the IndexedDB WAL, replay all stored commands into the in-memory
@@ -271,48 +281,73 @@ impl RecachedCache {
         let ws = WebSocket::new(url)?;
         let store_clone = Arc::clone(&self.store);
         let on_mut = Rc::clone(&self.on_mutation);
+        let on_msg = Rc::clone(&self.on_message);
 
         let onmessage = Closure::wrap(Box::new(move |e: MessageEvent| {
             if let Ok(text) = e.data().dyn_into::<js_sys::JsString>() {
                 let s = String::from(text);
-                if let Ok((value, _)) = Value::parse(s.as_bytes())
-                    && let Ok(cmd) = Command::from_value(value)
-                {
-                    match cmd {
-                        Command::Set(_, _, _)
-                        | Command::Del(_)
-                        | Command::Unlink(_)
-                        | Command::MSet(_)
-                        | Command::Expire(_, _)
-                        | Command::PExpire(_, _)
-                        | Command::ExpireAt(_, _)
-                        | Command::PExpireAt(_, _)
-                        | Command::Persist(_)
-                        | Command::FlushDb
-                        | Command::Rename(_, _)
-                        | Command::HSet(_, _)
-                        | Command::HDel(_, _)
-                        | Command::HSetNx(_, _, _)
-                        | Command::LPush(_, _)
-                        | Command::RPush(_, _)
-                        | Command::LPop(_, _)
-                        | Command::RPop(_, _)
-                        | Command::LSet(_, _, _)
-                        | Command::LRem(_, _, _)
-                        | Command::LTrim(_, _, _)
-                        | Command::SAdd(_, _)
-                        | Command::SRem(_, _)
-                        | Command::SMove(_, _, _)
-                        | Command::SInterStore(_, _)
-                        | Command::SUnionStore(_, _)
-                        | Command::SDiffStore(_, _)
-                        | Command::ZAdd(_, _, _)
-                        | Command::ZRem(_, _)
-                        | Command::ZIncrBy(_, _, _) => {
-                            store_clone.execute(cmd);
-                            notify_mutation(&on_mut);
+                if let Ok((value, _)) = Value::parse(s.as_bytes()) {
+                    // Detect pub/sub push: ["message", channel, payload]
+                    if let Value::Array(Some(arr)) = &value {
+                        if arr.len() == 3 {
+                            if let (
+                                Value::BulkString(Some(kind)),
+                                Value::BulkString(Some(channel)),
+                                Value::BulkString(Some(payload)),
+                            ) = (&arr[0], &arr[1], &arr[2])
+                            {
+                                if kind.eq_ignore_ascii_case(b"message") {
+                                    if let Some(f) = on_msg.borrow().as_ref() {
+                                        let ch = String::from_utf8_lossy(channel);
+                                        let pl = String::from_utf8_lossy(payload);
+                                        let _ = f.call2(
+                                            &JsValue::NULL,
+                                            &JsValue::from_str(&ch),
+                                            &JsValue::from_str(&pl),
+                                        );
+                                    }
+                                    return;
+                                }
+                            }
                         }
-                        _ => {}
+                    }
+                    if let Ok(cmd) = Command::from_value(value) {
+                        match cmd {
+                            Command::Set(_, _, _)
+                            | Command::Del(_)
+                            | Command::Unlink(_)
+                            | Command::MSet(_)
+                            | Command::Expire(_, _)
+                            | Command::PExpire(_, _)
+                            | Command::ExpireAt(_, _)
+                            | Command::PExpireAt(_, _)
+                            | Command::Persist(_)
+                            | Command::FlushDb
+                            | Command::Rename(_, _)
+                            | Command::HSet(_, _)
+                            | Command::HDel(_, _)
+                            | Command::HSetNx(_, _, _)
+                            | Command::LPush(_, _)
+                            | Command::RPush(_, _)
+                            | Command::LPop(_, _)
+                            | Command::RPop(_, _)
+                            | Command::LSet(_, _, _)
+                            | Command::LRem(_, _, _)
+                            | Command::LTrim(_, _, _)
+                            | Command::SAdd(_, _)
+                            | Command::SRem(_, _)
+                            | Command::SMove(_, _, _)
+                            | Command::SInterStore(_, _)
+                            | Command::SUnionStore(_, _)
+                            | Command::SDiffStore(_, _)
+                            | Command::ZAdd(_, _, _)
+                            | Command::ZRem(_, _)
+                            | Command::ZIncrBy(_, _, _) => {
+                                store_clone.execute(cmd);
+                                notify_mutation(&on_mut);
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }

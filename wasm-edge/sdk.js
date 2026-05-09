@@ -30,13 +30,23 @@ export class Cache {
     /** @internal */
     constructor(raw) {
         this._mutationListeners = new Set();
+        this._messageListeners = new Map();
         /** @internal Arrow function so `this` is always bound when passed as a callback. */
         this._notifyMutation = () => {
             for (const cb of this._mutationListeners)
                 cb();
         };
+        /** @internal */
+        this._notifyMessage = (channel, message) => {
+            const listeners = this._messageListeners.get(channel);
+            if (listeners) {
+                for (const cb of listeners)
+                    cb(message);
+            }
+        };
         this.raw = raw;
         raw.set_mutation_callback(this._notifyMutation);
+        raw.set_message_callback(this._notifyMessage);
     }
     /**
      * Subscribe to store mutations from any source — local writes, server
@@ -56,6 +66,33 @@ export class Cache {
     onMutation(cb) {
         this._mutationListeners.add(cb);
         return () => this._mutationListeners.delete(cb);
+    }
+    /**
+     * Subscribe to pub/sub messages on `channel`.
+     *
+     * Returns an unsubscribe function. Call it to stop receiving messages.
+     * Does not send `UNSUBSCRIBE` to the server — use {@link unsubscribe} for that.
+     *
+     * ```ts
+     * cache.subscribe('notifications');
+     * const stop = cache.onMessage('notifications', (msg) => console.log(msg));
+     * // later:
+     * stop();
+     * cache.unsubscribe('notifications');
+     * ```
+     */
+    onMessage(channel, cb) {
+        let listeners = this._messageListeners.get(channel);
+        if (!listeners) {
+            listeners = new Set();
+            this._messageListeners.set(channel, listeners);
+        }
+        listeners.add(cb);
+        return () => {
+            listeners.delete(cb);
+            if (listeners.size === 0)
+                this._messageListeners.delete(channel);
+        };
     }
     // ── Reads ─────────────────────────────────────────────────────────────────
     /**

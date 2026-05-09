@@ -1,0 +1,68 @@
+import { ref, onUnmounted, type Ref } from 'vue';
+import { useRecached } from './plugin';
+
+/**
+ * Reactively read a string key from the Recached store.
+ *
+ * The returned `Ref` updates automatically whenever the key is written or
+ * deleted — whether the mutation originated locally, from another tab via
+ * BroadcastChannel, or from another client via the server WebSocket.
+ *
+ * Returns `null` when the key does not exist or has expired.
+ * Use `cache.set()` to write; the ref itself is not intended as a writable target.
+ *
+ * ```vue
+ * <script setup lang="ts">
+ * import { useKey, useRecached } from '@recached/vue'
+ *
+ * const theme = useKey('theme')
+ * const cache = useRecached()
+ * function toggle() {
+ *   cache.set('theme', theme.value === 'dark' ? 'light' : 'dark')
+ * }
+ * </script>
+ *
+ * <template>
+ *   <button @click="toggle">{{ theme ?? 'light' }}</button>
+ * </template>
+ * ```
+ */
+export function useKey(key: string): Ref<string | null> {
+  const cache = useRecached();
+  const value = ref<string | null>(cache.get(key));
+  const unsub = cache.onMutation(() => {
+    value.value = cache.get(key);
+  });
+  onUnmounted(unsub);
+  return value;
+}
+
+/**
+ * Reactively read a JSON-parsed value from the Recached store.
+ *
+ * Behaves identically to {@link useKey} but parses the stored string as JSON.
+ * Returns `null` when the key is missing, expired, or contains invalid JSON.
+ *
+ * ```vue
+ * <script setup lang="ts">
+ * import { useKeyJSON } from '@recached/vue'
+ *
+ * interface User { id: number; name: string }
+ * const user = useKeyJSON<User>('user:42')
+ * </script>
+ *
+ * <template>
+ *   <p v-if="user">{{ user.name }}</p>
+ *   <Spinner v-else />
+ * </template>
+ * ```
+ */
+export function useKeyJSON<T>(key: string): Ref<T | null> {
+  const cache = useRecached();
+  const value = ref<T | null>(cache.getJSON<T>(key)) as Ref<T | null>;
+  const unsub = cache.onMutation(() => {
+    value.value = cache.getJSON<T>(key);
+  });
+  onUnmounted(unsub);
+  return value;
+}

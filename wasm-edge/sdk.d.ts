@@ -47,6 +47,7 @@ interface RawCache {
     subscribe(channel: string): void;
     unsubscribe(channel: string): void;
     set_mutation_callback(cb: () => void): void;
+    set_message_callback(cb: (channel: string, message: string) => void): void;
     free(): void;
 }
 /**
@@ -64,8 +65,11 @@ export declare class Cache {
     /** @internal */
     readonly raw: RawCache;
     private readonly _mutationListeners;
+    private readonly _messageListeners;
     /** @internal Arrow function so `this` is always bound when passed as a callback. */
     private readonly _notifyMutation;
+    /** @internal */
+    private readonly _notifyMessage;
     /** @internal */
     constructor(raw: RawCache);
     /**
@@ -84,6 +88,21 @@ export declare class Cache {
      * ```
      */
     onMutation(cb: () => void): () => void;
+    /**
+     * Subscribe to pub/sub messages on `channel`.
+     *
+     * Returns an unsubscribe function. Call it to stop receiving messages.
+     * Does not send `UNSUBSCRIBE` to the server — use {@link unsubscribe} for that.
+     *
+     * ```ts
+     * cache.subscribe('notifications');
+     * const stop = cache.onMessage('notifications', (msg) => console.log(msg));
+     * // later:
+     * stop();
+     * cache.unsubscribe('notifications');
+     * ```
+     */
+    onMessage(channel: string, cb: (msg: string) => void): () => void;
     /**
      * Return the value for `key`, or `null` if the key does not exist or has expired.
      *

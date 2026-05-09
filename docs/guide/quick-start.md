@@ -115,23 +115,19 @@ npm install recached-edge
 Then connect to the WebSocket port:
 
 ```typescript
-import init, { RecachedCache } from 'recached-edge'
+import { createCache } from 'recached-edge'
 
-// Initialize the WASM module (call once at app startup)
-await init()
-
-const cache = new RecachedCache()
-
-// Connect to the server WebSocket port
-// All mutations from the server are pushed here automatically
-cache.connect('ws://127.0.0.1:6380')
+// createCache initializes WASM and connects to the server
+const cache = await createCache({
+  connect: { url: 'ws://127.0.0.1:6380' },
+})
 
 // Reads are local — 0 ms, no network
 cache.set('theme', 'dark')
 console.log(cache.get('theme')) // 'dark'
 
 // Set with expiry (seconds)
-cache.set_ex('api:response:products', JSON.stringify(products), 300)
+cache.setEx('api:response:products', JSON.stringify(products), 300)
 ```
 
 ---
@@ -168,63 +164,58 @@ app.listen(3000)
 ### Browser (TypeScript)
 
 ```typescript
-import init, { RecachedCache } from 'recached-edge'
+import { createCache } from 'recached-edge'
 
-await init()
-const cache = new RecachedCache()
-cache.connect('ws://localhost:6380')
+const cache = await createCache({
+  connect: { url: 'ws://localhost:6380' },
+})
 
 const userId = 42
+const badge = document.getElementById('cart-badge')!
 
-// Watch the cart count key — called automatically whenever it changes on the server
-cache.watch(`cart:${userId}:count`, (newValue) => {
-  const count = newValue ? parseInt(newValue) : 0
-  document.getElementById('cart-badge')!.textContent = String(count)
+// React to any store mutation — fire whenever the key changes
+cache.onMutation(() => {
+  const count = cache.get(`cart:${userId}:count`)
+  badge.textContent = count !== null ? count : '0'
 })
 
 // Initial read (from local WASM memory — 0 ms if already synced)
 const initialCount = cache.get(`cart:${userId}:count`)
 if (initialCount !== null) {
-  document.getElementById('cart-badge')!.textContent = initialCount
+  badge.textContent = initialCount
 }
 ```
 
-When your backend calls `cache.set('cart:42:count', '3')` over RESP, the browser's `watch` callback fires with `'3'` — no polling, no extra endpoint, no client-side invalidation code.
+When your backend calls `SET cart:42:count 3` over RESP, the server pushes the mutation to the browser over WebSocket. The `onMutation` callback fires and the badge updates instantly — no polling, no extra endpoint, no client-side invalidation code.
 
 ---
 
 ## 5. Local-only (no server)
 
-The WASM module works entirely without a server. Never call `connect()` and the cache is a local in-memory store with built-in TTL.
+The WASM module works entirely without a server. Omit `connect` and the cache is a pure in-memory store with built-in TTL.
 
 ```typescript
-import init, { RecachedCache } from 'recached-edge'
+import { createCache } from 'recached-edge'
 
-await init()
-const cache = new RecachedCache()
-// No cache.connect() — purely local, no server, no WebSocket
+// No connect option — purely local, no server, no WebSocket
+const cache = await createCache()
 
 async function getProducts(): Promise<Product[]> {
-  const cached = cache.get('products')
-  if (cached !== null) {
-    return JSON.parse(cached)
-  }
+  const cached = cache.getJSON<Product[]>('products')
+  if (cached !== null) return cached
 
   const data: Product[] = await fetch('/api/products').then(r => r.json())
-
-  // Cache for 5 minutes
-  cache.set_ex('products', JSON.stringify(data), 300)
-
+  cache.setJSON('products', data, 300) // cache for 5 minutes
   return data
 }
 
 async function getUser(id: number): Promise<User> {
   const key = `user:${id}`
-  const cached = cache.get(key)
-  if (cached !== null) return JSON.parse(cached)
+  const cached = cache.getJSON<User>(key)
+  if (cached !== null) return cached
 
   const user: User = await fetch(`/api/users/${id}`).then(r => r.json())
-  cache.set_ex(key, JSON.stringify(user), 60)
+  cache.setJSON(key, user, 60) // cache for 60s
   return user
 }
 

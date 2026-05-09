@@ -20,24 +20,21 @@ The WAL is an append-only log. Reads do not touch it. Only writes (`SET`, `DEL`,
 
 ## Enabling persistence
 
-Call `enable_persistence()` once, before connecting to the server:
+Pass `persistence: true` to `createCache()`:
 
 ```typescript
 import { createCache } from 'recached-edge'
 
 const cache = await createCache({
-  url: 'ws://localhost:6380',
   persistence: true,
-  persistenceKey: 'my-app-cache', // optional — default is 'recached'
+  connect: { url: 'ws://localhost:6380' },
 })
 ```
 
-Or imperatively on an existing instance:
+For a local-only cache (no server), omit `connect`:
 
 ```typescript
-const cache = new RecachedCache()
-await cache.enable_persistence('my-app-cache')
-cache.connect('ws://localhost:6380')
+const cache = await createCache({ persistence: true })
 ```
 
 ---
@@ -97,8 +94,6 @@ Call this on sign-out or when you need to reset the local cache state completely
 
 ```typescript
 await cache.clearPersistence()
-// or, if using a custom db name:
-await cache.clearPersistence('my-app-cache')
 ```
 
 This deletes the IndexedDB database. The next page load starts with an empty local store and syncs fresh from the server.
@@ -107,21 +102,15 @@ This deletes the IndexedDB database. The next page load starts with an empty loc
 
 ```typescript
 async function signOut() {
-  // 1. Disconnect from the server (stop receiving mutations)
-  cache.disconnect()
-
-  // 2. Clear the persisted WAL (user's cached data)
+  // Clear the persisted WAL so the next session starts clean
   await cache.clearPersistence()
 
-  // 3. Flush the in-memory store
-  cache.flushdb()
-
-  // 4. Redirect to login
+  // Redirect to login
   window.location.href = '/login'
 }
 ```
 
-Do not skip step 2 if you handle multiple user accounts on the same device. Without `clearPersistence()`, the next user's session would hydrate with the previous user's cached data.
+Do not skip `clearPersistence()` if you handle multiple user accounts on the same device. Without it, the next user's session would hydrate with the previous user's cached data.
 
 ---
 
