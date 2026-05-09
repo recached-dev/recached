@@ -557,22 +557,56 @@ async fn handle_replica(
 async fn run_repl_client(
     primary_addr: String,
     store: Arc<KeyValueStore>,
+    state: Arc<ServerState>,
     repl_password: Option<String>,
+    failover_timeout_secs: Option<u64>,
 ) {
     let mut backoff_secs = 2u64;
+    let mut unreachable_since: Option<std::time::Instant> = None;
+
     loop {
+        // Stop if already promoted (manual REPLICAOF NO ONE or earlier auto-promotion).
+        if !state.is_replica() {
+            return;
+        }
+
         info!("Replica: connecting to primary at {}", primary_addr);
         match TcpStream::connect(&primary_addr).await {
-            Err(e) => warn!("Replica: connect failed: {}", e),
+            Err(e) => {
+                warn!("Replica: connect failed: {}", e);
+                unreachable_since.get_or_insert_with(std::time::Instant::now);
+            }
             Ok(mut socket) => {
+                // Primary is reachable — reset the unreachable timer.
+                unreachable_since = None;
                 backoff_secs = 2;
                 if let Err(e) =
                     sync_from_primary(&mut socket, &store, repl_password.as_deref()).await
                 {
                     warn!("Replica: sync ended: {}", e);
+                    // Sync dropped — primary may be gone; start tracking if not already.
+                    unreachable_since.get_or_insert_with(std::time::Instant::now);
                 }
             }
         }
+
+        // Auto-failover: promote if primary has been unreachable long enough.
+        if let (Some(timeout), Some(since)) = (failover_timeout_secs, unreachable_since) {
+            let elapsed = since.elapsed().as_secs();
+            if elapsed >= timeout {
+                warn!(
+                    "Replica: primary unreachable for {}s (timeout {}s) — auto-promoting to primary",
+                    elapsed, timeout
+                );
+                state.promote_to_primary();
+                return;
+            }
+            info!(
+                "Replica: primary unreachable for {}s / {}s before auto-failover",
+                elapsed, timeout
+            );
+        }
+
         tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
         backoff_secs = (backoff_secs * 2).min(30);
     }
@@ -1440,6 +1474,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(6381);
     let repl_password: Option<String> = std::env::var("RECACHED_REPL_PASSWORD").ok();
+    let failover_timeout_secs: Option<u64> = std::env::var("RECACHED_FAILOVER_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0);
 
     if repl_password.is_some() {
         info!("Replication auth ENABLED (RECACHED_REPL_PASSWORD is set).");
@@ -1492,11 +1530,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     } else if let Some(primary_addr) = replicaof {
         let store_r = Arc::clone(&store);
+        let state_r = Arc::clone(&state);
         let pwd_r = repl_password.clone();
+        let fo_r = failover_timeout_secs;
         tokio::spawn(async move {
-            run_repl_client(primary_addr, store_r, pwd_r).await;
+            run_repl_client(primary_addr, store_r, state_r, pwd_r, fo_r).await;
         });
-        info!("Running as replica — write commands will be rejected");
+        if let Some(t) = failover_timeout_secs {
+            info!(
+                "Running as replica — auto-failover enabled (promotes after {}s of primary being unreachable)",
+                t
+            );
+        } else {
+            info!("Running as replica — write commands will be rejected (auto-failover disabled; set RECACHED_FAILOVER_TIMEOUT to enable)");
+        }
     }
 
     // ── background eviction ───────────────────────────────────────────────

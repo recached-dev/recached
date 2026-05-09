@@ -56,7 +56,7 @@ Recached is a good fit when:
 ## When Recached is not the right fit
 
 - **You need very high-durability persistence.** Recached supports snapshots (RDB-style) and AOF, but it is still primarily an in-memory cache. If you cannot tolerate any data loss between fsync intervals, a purpose-built database is the right tool.
-- **You need automatic failover.** Recached supports leader–follower replication (`RECACHED_REPLICAOF`) and manual promotion (`REPLICAOF NO ONE`), but does not include sentinel-style automatic leader election.
+- **You need multi-replica consensus failover.** Recached supports leader–follower replication with automatic single-replica failover (`RECACHED_FAILOVER_TIMEOUT`). If the primary is unreachable for the configured duration, the designated replica promotes itself. What it does not include is multi-replica quorum election: in a setup with several replicas, split-brain prevention requires you to designate one replica for auto-failover and keep the others as passive standbys.
 - **You depend on uncommon Redis commands.** Recached implements the commands most applications use, not all 250+. Server introspection (`INFO`, `SLOWLOG`, `COMMAND`), Lua scripting, RESP3, and cluster mode are out of scope.
 - **You need very large datasets.** Recached is an in-memory cache — it is not a database. If your working set does not fit in RAM, Redis with RDB persistence or a proper database is the right tool.
 
@@ -68,7 +68,7 @@ Recached is a good fit when:
 | Browser-side cache | Yes — WASM | No |
 | WebSocket sync | Built-in | Not built-in |
 | Persistence | Snapshot + AOF | RDB + AOF |
-| Replication | Primary/replica | Yes (+ Sentinel/Cluster) |
+| Replication | Primary/replica + auto-failover | Yes (+ Sentinel/Cluster) |
 | Lua scripting | No (WASM scripting on roadmap) | Yes |
 | Cluster mode | No | Yes |
 | Command coverage | ~80 commands | 250+ |

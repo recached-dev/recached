@@ -19,6 +19,7 @@ Recached is configured entirely through environment variables. There is no confi
 | `RECACHED_REPL_PORT` | `6381` | TCP port the primary listens on for incoming replica connections. Only active when `RECACHED_REPLICAOF` is not set (i.e. this server is a primary). |
 | `RECACHED_REPLICAOF` | _(none)_ | Set to `host:port` to run this server as a read-only replica. On startup it connects to the primary, receives a full snapshot, and then streams all subsequent writes. Reconnects automatically with exponential backoff on disconnect. |
 | `RECACHED_REPL_PASSWORD` | _(none)_ | Shared secret for the replication channel. When set, replicas must send this password during the handshake before receiving any data. Must match on both primary and replica. Strongly recommended for any network-exposed replication port. |
+| `RECACHED_FAILOVER_TIMEOUT` | _(disabled)_ | Seconds a replica waits with the primary unreachable before automatically promoting itself to primary. Set on replicas only. `0` or unset disables auto-failover — the replica reconnects indefinitely. See [auto-failover](#auto-failover) below. |
 | `RECACHED_MAX_MEMORY` | _(unlimited)_ | Maximum approximate heap usage for the key-value store. Accepts a byte count or a human-readable suffix: `512mb`, `2gb`, `1073741824`. When the limit is exceeded, the background eviction loop runs the configured eviction policy. Has no effect when `RECACHED_EVICTION` is `noeviction`. |
 | `RECACHED_TLS_CERT` | _(none)_ | Path to a PEM-encoded TLS certificate file. TLS is enabled on both ports when this and `RECACHED_TLS_KEY` are set. |
 | `RECACHED_TLS_KEY` | _(none)_ | Path to a PEM-encoded TLS private key file. If either `RECACHED_TLS_CERT` or `RECACHED_TLS_KEY` is missing, the server falls back to plain TCP/WS. |
@@ -158,6 +159,32 @@ recached-server
 Replicas reconnect automatically with exponential backoff (2s → 4s → … → 30s cap) if the primary is temporarily unavailable. Write commands sent to a replica return `-READONLY`.
 
 To promote a replica to primary at runtime (manual failover), send `REPLICAOF NO ONE` over any RESP connection to the replica. It immediately starts accepting writes.
+
+### With auto-failover {#auto-failover}
+
+Set `RECACHED_FAILOVER_TIMEOUT` on the replica. If the primary is unreachable for that many seconds, the replica promotes itself automatically without any manual intervention.
+
+```bash
+# Primary
+RECACHED_SAVE_PATH="/data/recached.rdb" \
+RECACHED_REPL_PORT="6381" \
+RECACHED_REPL_PASSWORD="repl-secret" \
+recached-server
+
+# Replica — promotes itself after 30s of primary being unreachable
+RECACHED_REPLICAOF="primary-host:6381" \
+RECACHED_REPL_PASSWORD="repl-secret" \
+RECACHED_FAILOVER_TIMEOUT="30" \
+recached-server
+```
+
+**How the timer works.** The `RECACHED_FAILOVER_TIMEOUT` clock starts the first time a connect attempt fails or the live sync stream drops. It resets to zero as soon as the replica successfully reconnects to the primary. This means a brief primary restart (e.g. a rolling deploy) that completes before the timeout elapses does not trigger promotion.
+
+**Split-brain risk.** Auto-failover is safe in a single-replica setup. With multiple replicas, two replicas could both time out simultaneously and both promote — creating two independent primaries accepting diverging writes. To avoid this:
+
+- Use `RECACHED_FAILOVER_TIMEOUT` only on a designated standby replica, not all replicas.
+- Keep the timeout long enough (≥ 2× your typical primary restart time) to avoid spurious promotion on routine restarts.
+- After a failover event, update clients and other replicas to point at the new primary before bringing the old primary back online.
 
 ### With snapshot persistence
 
