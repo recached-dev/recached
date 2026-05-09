@@ -3030,7 +3030,7 @@ mod tests {
         // No new writes → save condition not met → last_save unchanged after 1s
         tokio::time::sleep(tokio::time::Duration::from_millis(1100)).await;
         let last_save_after = srv.state.snap.last_save.load(Ordering::Relaxed);
-        assert_eq!(last_save_before, last_save_after - 0); // no autosave fired (no conditions configured)
+        assert_eq!(last_save_before, last_save_after); // no autosave fired (no conditions configured)
     }
 
     // ── Integration: 3d replication ───────────────────────────────────────────
@@ -3324,10 +3324,8 @@ mod tests {
             let _ = t.await;
         }
 
-        // Store is still intact in memory — some keys should have been written
-        assert!(
-            srv.store.execute(Command::DbSize) != Value::Integer(0) || true // allow 0 if killed before any write landed
-        );
+        // Store is still intact in memory — no panic is the meaningful assertion here;
+        // zero keys is valid if the server was killed before any write landed.
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
