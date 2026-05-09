@@ -31,6 +31,25 @@ EOF
 
 echo "Bumped $CURRENT → $NEW_VERSION in $CARGO_TOML"
 
+# Update package.json files.
+update_package_json() {
+    local pkg="$1"
+    python3 - "$pkg" "$NEW_VERSION" <<'PYEOF'
+import json, sys
+path, version = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    data = json.load(f)
+data['version'] = version
+with open(path, 'w') as f:
+    json.dump(data, f, indent=2)
+    f.write('\n')
+PYEOF
+    echo "Bumped $NEW_VERSION in $pkg"
+}
+
+update_package_json "$ROOT/wasm-edge/package.json"
+update_package_json "$ROOT/recached-react/package.json"
+
 # Verify the workspace resolves cleanly.
 echo "Verifying workspace..."
 cargo check --workspace --exclude wasm-edge --quiet

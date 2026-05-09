@@ -84,6 +84,8 @@ pub struct RecachedCache {
     idb: Rc<RefCell<Option<JsValue>>>,
     /// Monotonically-increasing WAL sequence counter.
     seq: Rc<Cell<u64>>,
+    /// JS callback invoked after every mutation (local or server/BC-pushed).
+    on_mutation: Rc<RefCell<Option<js_sys::Function>>>,
     _onmessage: Option<Closure<dyn FnMut(MessageEvent)>>,
     _onbc: Option<Closure<dyn FnMut(MessageEvent)>>,
 }
@@ -108,6 +110,12 @@ fn persist_cmd(idb: &Rc<RefCell<Option<JsValue>>>, seq: &Rc<Cell<u64>>, encoded:
     }
 }
 
+fn notify_mutation(on_mut: &Rc<RefCell<Option<js_sys::Function>>>) {
+    if let Some(f) = on_mut.borrow().as_ref() {
+        let _ = f.call0(&JsValue::NULL);
+    }
+}
+
 // ── public API ────────────────────────────────────────────────────────────────
 
 #[wasm_bindgen]
@@ -120,9 +128,17 @@ impl RecachedCache {
             bc: None,
             idb: Rc::new(RefCell::new(None)),
             seq: Rc::new(Cell::new(0)),
+            on_mutation: Rc::new(RefCell::new(None)),
             _onmessage: None,
             _onbc: None,
         }
+    }
+
+    /// Register a JS callback invoked after every mutation from any source
+    /// (local write, server WebSocket push, or BroadcastChannel sync).
+    /// The SDK's `onMutation()` wires this up automatically.
+    pub fn set_mutation_callback(&mut self, cb: js_sys::Function) {
+        *self.on_mutation.borrow_mut() = Some(cb);
     }
 
     /// Open the IndexedDB WAL, replay all stored commands into the in-memory
@@ -194,6 +210,7 @@ impl RecachedCache {
     pub fn broadcast(&mut self, channel_name: &str) -> Result<(), JsValue> {
         let bc = BroadcastChannel::new(channel_name)?;
         let store_clone = Arc::clone(&self.store);
+        let on_mut = Rc::clone(&self.on_mutation);
 
         let onbc = Closure::wrap(Box::new(move |e: MessageEvent| {
             if let Ok(text) = e.data().dyn_into::<js_sys::JsString>() {
@@ -233,6 +250,7 @@ impl RecachedCache {
                         | Command::ZRem(_, _)
                         | Command::ZIncrBy(_, _, _) => {
                             store_clone.execute(cmd);
+                            notify_mutation(&on_mut);
                         }
                         _ => {}
                     }
@@ -252,6 +270,7 @@ impl RecachedCache {
     pub fn connect(&mut self, url: &str) -> Result<(), JsValue> {
         let ws = WebSocket::new(url)?;
         let store_clone = Arc::clone(&self.store);
+        let on_mut = Rc::clone(&self.on_mutation);
 
         let onmessage = Closure::wrap(Box::new(move |e: MessageEvent| {
             if let Ok(text) = e.data().dyn_into::<js_sys::JsString>() {
@@ -291,6 +310,7 @@ impl RecachedCache {
                         | Command::ZRem(_, _)
                         | Command::ZIncrBy(_, _, _) => {
                             store_clone.execute(cmd);
+                            notify_mutation(&on_mut);
                         }
                         _ => {}
                     }
@@ -333,6 +353,7 @@ impl RecachedCache {
             let _ = bc.post_message(&JsValue::from_str(&encoded));
         }
         persist_cmd(&self.idb, &self.seq, &encoded);
+        notify_mutation(&self.on_mutation);
 
         match resp {
             Value::SimpleString(s) => s,
@@ -361,6 +382,7 @@ impl RecachedCache {
             let _ = bc.post_message(&JsValue::from_str(&encoded));
         }
         persist_cmd(&self.idb, &self.seq, &encoded);
+        notify_mutation(&self.on_mutation);
 
         match resp {
             Value::SimpleString(s) => s,
@@ -391,6 +413,7 @@ impl RecachedCache {
             let _ = bc.post_message(&JsValue::from_str(&encoded));
         }
         persist_cmd(&self.idb, &self.seq, &encoded);
+        notify_mutation(&self.on_mutation);
 
         match resp {
             Value::Integer(i) => i as i32,

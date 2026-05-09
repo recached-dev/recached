@@ -38,3 +38,35 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace --exclude wasm-edge
+
+  typecheck-react:
+    name: Typecheck @recached/react
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+
+      - name: Generate SDK type declarations
+        run: |
+          cd wasm-edge && npm install
+          # wasm-pack isn't available in this job, so create a minimal stub that
+          # satisfies the TypeScript import so tsc can emit sdk.d.ts for the react step.
+          mkdir -p pkg
+          node -e "
+            require('fs').writeFileSync('pkg/recached_edge.d.ts',
+              'export class RecachedCache {}\nexport default function init(): Promise<void>;\n'
+            );
+          "
+          npx tsc
+
+      - name: Install dependencies
+        run: cd recached-react && npm install --legacy-peer-deps
+
+      - name: Typecheck
+        run: cd recached-react && npm run typecheck

@@ -53,6 +53,7 @@ interface RawCache {
   publish(channel: string, message: string): void;
   subscribe(channel: string): void;
   unsubscribe(channel: string): void;
+  set_mutation_callback(cb: () => void): void;
   free(): void;
 }
 
@@ -93,9 +94,37 @@ export class Cache {
   /** @internal */
   readonly raw: RawCache;
 
+  private readonly _mutationListeners = new Set<() => void>();
+
+  /** @internal Arrow function so `this` is always bound when passed as a callback. */
+  private readonly _notifyMutation = (): void => {
+    for (const cb of this._mutationListeners) cb();
+  };
+
   /** @internal */
   constructor(raw: RawCache) {
     this.raw = raw;
+    raw.set_mutation_callback(this._notifyMutation);
+  }
+
+  /**
+   * Subscribe to store mutations from any source — local writes, server
+   * WebSocket push, and BroadcastChannel cross-tab sync.
+   *
+   * Returns an unsubscribe function. Pass directly to React's
+   * `useSyncExternalStore` `subscribe` parameter.
+   *
+   * ```ts
+   * useSyncExternalStore(
+   *   cache.onMutation.bind(cache),
+   *   () => cache.get('key'),
+   *   () => null,
+   * );
+   * ```
+   */
+  onMutation(cb: () => void): () => void {
+    this._mutationListeners.add(cb);
+    return () => this._mutationListeners.delete(cb);
   }
 
   // ── Reads ─────────────────────────────────────────────────────────────────
@@ -149,6 +178,7 @@ export class Cache {
    */
   set(key: string, value: string): void {
     this.raw.set(key, value);
+    this._notifyMutation();
   }
 
   /**
@@ -157,6 +187,7 @@ export class Cache {
    */
   setEx(key: string, value: string, seconds: number): void {
     this.raw.set_ex(key, value, seconds);
+    this._notifyMutation();
   }
 
   /**
@@ -174,6 +205,7 @@ export class Cache {
     } else {
       this.raw.set(key, serialized);
     }
+    this._notifyMutation();
   }
 
   /**
@@ -183,7 +215,9 @@ export class Cache {
    * Syncs to the server and other tabs when connected.
    */
   del(key: string): boolean {
-    return this.raw.del(key) === 1;
+    const existed = this.raw.del(key) === 1;
+    this._notifyMutation();
+    return existed;
   }
 
   // ── Pub/sub ───────────────────────────────────────────────────────────────

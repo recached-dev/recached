@@ -1,0 +1,50 @@
+{
+  "name": "@recached/react",
+  "version": "0.1.4",
+  "description": "Official React hooks for Recached \u2014 zero-latency reactive cache",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "version:patch": "npm version patch --no-git-tag-version",
+    "version:minor": "npm version minor --no-git-tag-version",
+    "version:major": "npm version major --no-git-tag-version"
+  },
+  "peerDependencies": {
+    "react": ">=18",
+    "recached-edge": ">=0.1.4"
+  },
+  "devDependencies": {
+    "@types/react": "^18",
+    "typescript": "^5.9.3"
+  },
+  "keywords": [
+    "recached",
+    "react",
+    "hooks",
+    "cache",
+    "wasm",
+    "real-time",
+    "zero-latency"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/thinkgrid-labs/recached"
+  },
+  "homepage": "https://github.com/thinkgrid-labs/recached/tree/main/recached-react",
+  "bugs": "https://github.com/thinkgrid-labs/recached/issues"
+}

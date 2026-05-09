@@ -4,6 +4,45 @@ All notable changes to Recached are documented here.
 
 ---
 
+## [0.1.4] — 2026-05-10
+
+### Added
+
+**Snapshot persistence** (`server-native`)
+- New `SAVE` command: blocks until the snapshot is written to disk and returns `+OK`.
+- New `BGSAVE` command: spawns a background Tokio task to write the snapshot and immediately returns `+Background saving started`. The server continues accepting connections during the save.
+- New `LASTSAVE` command: returns the Unix timestamp (seconds) of the most recent successful save as an integer.
+- On startup, the server loads the snapshot from disk before accepting connections. Expired keys are silently skipped during restore.
+- On clean shutdown (SIGTERM or Ctrl-C), a final snapshot is saved before the process exits.
+- Periodic autosave runs every `RECACHED_SAVE_INTERVAL` seconds (default: 900 = 15 min). Set to `0` to disable autosave while keeping `SAVE`/`BGSAVE`/`LASTSAVE` available.
+- Snapshot path is controlled by `RECACHED_SAVE_PATH` (default: `recached.rdb` in the working directory).
+- Snapshot format: [MessagePack](https://msgpack.org/) via `rmp-serde`. Atomic write: data is written to a `.tmp` file then renamed, so a crash mid-save cannot corrupt the previous snapshot.
+- All data types are preserved: strings, hashes, lists, sets, sorted sets, and TTLs.
+- `Command::Save`, `Command::BgSave`, `Command::LastSave` added to `core-engine`; handled by the server before reaching `execute_and_record` since they require async filesystem I/O.
+- `SnapshotEntry` and `SnapshotValue` public types added to `core-engine::store`.
+- `KeyValueStore::snapshot()` and `KeyValueStore::restore()` methods added.
+
+**AOF persistence** (`server-native`)
+- New `RECACHED_AOF_PATH` env var. When set, every successful write is appended to the file as a normalized RESP command immediately after execution, in addition to periodic snapshot saves.
+- New `RECACHED_AOF_SYNC` env var controlling fsync policy: `always` (after every write), `everysec` (background flush once per second, default), `no` (OS-managed).
+- On startup: snapshot is loaded first, then AOF commands are replayed for the delta — recovering writes made after the last snapshot.
+- After each successful snapshot save, the AOF is automatically truncated. The snapshot subsumes the log, so on the next startup only the post-snapshot delta is replayed.
+- Combined with snapshots, the maximum data loss window is bounded by the AOF sync interval (≤1 second with `everysec`) rather than the snapshot interval.
+- `APPEND` command added to the write broadcast path so it is captured by AOF and replication.
+
+**Leader-follower replication** (`server-native`)
+- New `RECACHED_REPLICAOF=host:port` env var. When set, the server runs as a read-only replica: it connects to the primary, loads a full snapshot, then streams all subsequent write commands in real time.
+- New `RECACHED_REPL_PORT` env var (default: `6381`). The primary listens on this port for incoming replica connections.
+- Initial sync protocol: the primary registers the replica's write channel first (so writes during snapshot serialization are buffered), serializes the full store to MessagePack, sends it length-prefixed over TCP, then streams subsequent writes as length-prefixed RESP strings.
+- Replicas reject all write commands with `-READONLY You can't write against a read only replica.`
+- Replicas reconnect automatically with exponential backoff (2 s → 4 s → … → 30 s cap) if the primary is temporarily unavailable.
+- All writes on the primary flow through the unified `ServerState::on_write()` path, which handles AOF append and replica fan-out in a single call.
+
+**Configurable connection limit** (`server-native`)
+- New `RECACHED_MAX_CONNECTIONS` env var (default: `1024`). Raising this allows high-traffic deployments to accept more concurrent clients without rebuilding from source.
+
+---
+
 ## [0.1.3] — 2026-05-09
 
 ### Added
@@ -30,7 +69,7 @@ All notable changes to Recached are documented here.
 
 ---
 
-## [0.1.2] — 2026-05-08
+## [0.1.2] — 2026-05-02
 
 ### Added
 

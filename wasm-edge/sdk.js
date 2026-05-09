@@ -1,0 +1,237 @@
+// ── Types ─────────────────────────────────────────────────────────────────────
+let _module = null;
+let _initPromise = null;
+async function ensureModule() {
+    if (_module)
+        return _module;
+    if (!_initPromise) {
+        _initPromise = (async () => {
+            const mod = await import('./pkg/recached_edge.js');
+            await mod.default(); // initialise WASM — idempotent on repeated calls
+            _module = mod;
+            return mod;
+        })();
+    }
+    return _initPromise;
+}
+// ── Cache ─────────────────────────────────────────────────────────────────────
+/**
+ * A typed wrapper around the Recached WASM cache.
+ *
+ * Obtain an instance via {@link createCache} rather than `new Cache()`.
+ *
+ * ```ts
+ * const cache = await createCache({ persistence: true });
+ * cache.set('theme', 'dark');
+ * cache.get('theme'); // "dark"
+ * ```
+ */
+export class Cache {
+    /** @internal */
+    constructor(raw) {
+        this._mutationListeners = new Set();
+        /** @internal Arrow function so `this` is always bound when passed as a callback. */
+        this._notifyMutation = () => {
+            for (const cb of this._mutationListeners)
+                cb();
+        };
+        this.raw = raw;
+        raw.set_mutation_callback(this._notifyMutation);
+    }
+    /**
+     * Subscribe to store mutations from any source — local writes, server
+     * WebSocket push, and BroadcastChannel cross-tab sync.
+     *
+     * Returns an unsubscribe function. Pass directly to React's
+     * `useSyncExternalStore` `subscribe` parameter.
+     *
+     * ```ts
+     * useSyncExternalStore(
+     *   cache.onMutation.bind(cache),
+     *   () => cache.get('key'),
+     *   () => null,
+     * );
+     * ```
+     */
+    onMutation(cb) {
+        this._mutationListeners.add(cb);
+        return () => this._mutationListeners.delete(cb);
+    }
+    // ── Reads ─────────────────────────────────────────────────────────────────
+    /**
+     * Return the value for `key`, or `null` if the key does not exist or has expired.
+     *
+     * Always served from local WASM memory — zero network latency.
+     */
+    get(key) {
+        return this.raw.get(key) ?? null;
+    }
+    /**
+     * Return a JSON-parsed value stored under `key`, or `null` if the key is
+     * missing, expired, or not valid JSON.
+     *
+     * ```ts
+     * interface User { id: number; name: string }
+     * const user = cache.getJSON<User>('user:42'); // User | null
+     * ```
+     */
+    getJSON(key) {
+        const raw = this.get(key);
+        if (raw === null)
+            return null;
+        try {
+            return JSON.parse(raw);
+        }
+        catch {
+            return null;
+        }
+    }
+    /** Return `true` if `key` exists and has not expired. */
+    exists(key) {
+        return this.raw.exists(key);
+    }
+    /**
+     * Return the remaining TTL in seconds.
+     * - `-1` — key exists with no expiry
+     * - `-2` — key does not exist
+     */
+    ttl(key) {
+        return this.raw.ttl(key);
+    }
+    // ── Writes ────────────────────────────────────────────────────────────────
+    /**
+     * Store a string value. Syncs to the server and other tabs when connected.
+     */
+    set(key, value) {
+        this.raw.set(key, value);
+        this._notifyMutation();
+    }
+    /**
+     * Store a string value with a TTL (seconds). The key is deleted automatically
+     * once the TTL elapses.
+     */
+    setEx(key, value, seconds) {
+        this.raw.set_ex(key, value, seconds);
+        this._notifyMutation();
+    }
+    /**
+     * Serialize `value` as JSON and store it under `key`.
+     * Pass `ttl` (seconds) to have the key expire automatically.
+     *
+     * ```ts
+     * cache.setJSON('user:42', { id: 42, name: 'Alice' }, 300); // expires in 5 min
+     * ```
+     */
+    setJSON(key, value, ttl) {
+        const serialized = JSON.stringify(value);
+        if (ttl !== undefined) {
+            this.raw.set_ex(key, serialized, ttl);
+        }
+        else {
+            this.raw.set(key, serialized);
+        }
+        this._notifyMutation();
+    }
+    /**
+     * Delete `key`.
+     *
+     * Returns `true` if the key existed, `false` if it did not.
+     * Syncs to the server and other tabs when connected.
+     */
+    del(key) {
+        const existed = this.raw.del(key) === 1;
+        this._notifyMutation();
+        return existed;
+    }
+    // ── Pub/sub ───────────────────────────────────────────────────────────────
+    /**
+     * Subscribe to a server pub/sub channel. Push messages arrive via the
+     * WebSocket `onmessage` callback.
+     */
+    subscribe(channel) {
+        this.raw.subscribe(channel);
+    }
+    /** Unsubscribe from a server pub/sub channel. */
+    unsubscribe(channel) {
+        this.raw.unsubscribe(channel);
+    }
+    /**
+     * Publish a message to a server pub/sub channel. All subscribers — browser
+     * and server-side — receive the message.
+     */
+    publish(channel, message) {
+        this.raw.publish(channel, message);
+    }
+    // ── Persistence ───────────────────────────────────────────────────────────
+    /**
+     * Erase the IndexedDB WAL. The in-memory store is not affected.
+     *
+     * Use on sign-out so the next session starts with an empty cache.
+     */
+    clearPersistence() {
+        return this.raw.clear_persistence();
+    }
+}
+// ── Public API ────────────────────────────────────────────────────────────────
+/**
+ * Initialise the WASM module eagerly.
+ *
+ * `createCache` calls this automatically on first use, so calling `init()`
+ * directly is only necessary when you want to front-load the WASM download
+ * (e.g. during a loading screen).
+ *
+ * ```ts
+ * import { init, createCache } from 'recached-edge';
+ *
+ * await init(); // start downloading WASM now
+ * // ... other app setup ...
+ * const cache = await createCache(); // resolves immediately — already loaded
+ * ```
+ */
+export async function init() {
+    await ensureModule();
+}
+/**
+ * Create a {@link Cache} instance.
+ *
+ * Loads and initialises the WASM module on first call (subsequent calls reuse
+ * the existing module). Options are applied in order:
+ * `persistence` → `broadcastChannel` → `connect` + `auth`.
+ *
+ * ```ts
+ * import { createCache } from 'recached-edge';
+ *
+ * // Local-only, survives refresh
+ * const cache = await createCache({ persistence: true });
+ *
+ * // With server sync
+ * const cache = await createCache({
+ *   persistence: true,
+ *   connect: { url: 'ws://localhost:6380', password: 'secret' },
+ * });
+ *
+ * cache.set('theme', 'dark');
+ * cache.getJSON<User>('user:42'); // User | null
+ *
+ * // --- page refresh ---
+ * const cache = await createCache({ persistence: true });
+ * cache.get('theme'); // "dark" — restored from IndexedDB, zero network
+ * ```
+ */
+export async function createCache(options = {}) {
+    const mod = await ensureModule();
+    const raw = new mod.RecachedCache();
+    if (options.persistence) {
+        await raw.enable_persistence();
+    }
+    if (options.broadcastChannel) {
+        raw.broadcast(options.broadcastChannel);
+    }
+    if (options.connect) {
+        raw.connect(options.connect.url);
+        if (options.connect.password) {
+            raw.auth(options.connect.password);
+        }
+    }
+    return new Cache(raw);
+}
