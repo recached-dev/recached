@@ -12,8 +12,8 @@ use std::io::ErrorKind;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -185,7 +185,11 @@ fn make_tcp_listeners(addr: &str, n: usize) -> std::io::Result<Vec<TcpListener>>
     let socket_addr: std::net::SocketAddr = addr
         .parse()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let domain = if socket_addr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+    let domain = if socket_addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         let sock = Socket::new(domain, Type::STREAM, None)?;
@@ -882,7 +886,8 @@ type SharedPubSub = Arc<tokio::sync::Mutex<PubSubHub>>;
 // ── observable keys ───────────────────────────────────────────────────────────
 
 type WatchNotif = (String, Value);
-type WatchRegistry = Arc<tokio::sync::Mutex<HashMap<String, Vec<(u64, mpsc::UnboundedSender<WatchNotif>)>>>>;
+type WatchRegistry =
+    Arc<tokio::sync::Mutex<HashMap<String, Vec<(u64, mpsc::UnboundedSender<WatchNotif>)>>>>;
 
 /// Extract the key(s) that `cmd` writes to, without inspecting the response.
 /// Used together with `broadcast_for()` — only call this when `broadcast_for`
@@ -1725,7 +1730,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── listeners ─────────────────────────────────────────────────────────
     let n_accept = num_cpus::get();
     let tcp_listeners = make_tcp_listeners("0.0.0.0:6379", n_accept)?;
-    info!("TCP server listening on 0.0.0.0:6379 ({} accept loop(s))", n_accept);
+    info!(
+        "TCP server listening on 0.0.0.0:6379 ({} accept loop(s))",
+        n_accept
+    );
 
     let ws_listener = TcpListener::bind("0.0.0.0:6380").await?;
     info!("WebSocket server listening on 0.0.0.0:6380");
@@ -1733,15 +1741,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Spawn one accept loop per CPU core, each with its own SO_REUSEPORT socket.
     // The OS load-balances incoming connections across all loops.
     for tcp_listener in tcp_listeners {
-        let store_tcp   = Arc::clone(&store);
-        let tx_tcp      = tx.clone();
-        let pass_tcp    = Arc::clone(&global_password);
+        let store_tcp = Arc::clone(&store);
+        let tx_tcp = tx.clone();
+        let pass_tcp = Arc::clone(&global_password);
         let allowed_tcp = allowed_ips.clone();
-        let sem_tcp     = Arc::clone(&semaphore);
-        let pubsub_tcp  = Arc::clone(&pubsub);
-        let tls_tcp     = Arc::clone(&tls_acceptor);
-        let watch_tcp   = Arc::clone(&watch_registry);
-        let snap_tcp    = Arc::clone(&state);
+        let sem_tcp = Arc::clone(&semaphore);
+        let pubsub_tcp = Arc::clone(&pubsub);
+        let tls_tcp = Arc::clone(&tls_acceptor);
+        let watch_tcp = Arc::clone(&watch_registry);
+        let snap_tcp = Arc::clone(&state);
 
         tokio::spawn(async move {
             loop {
@@ -1761,9 +1769,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 continue;
                             }
                         };
-                        let s  = Arc::clone(&store_tcp);
-                        let t  = tx_tcp.clone();
-                        let p  = Arc::clone(&pass_tcp);
+                        let s = Arc::clone(&store_tcp);
+                        let t = tx_tcp.clone();
+                        let p = Arc::clone(&pass_tcp);
                         let ps = Arc::clone(&pubsub_tcp);
                         let wr = Arc::clone(&watch_tcp);
                         let tls = Arc::clone(&tls_tcp);
@@ -1772,8 +1780,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let _permit = permit;
                             if let Some(acc) = tls.as_ref() {
                                 match acc.accept(socket).await {
-                                    Ok(tls_stream) => handle_tcp(tls_stream, s, t, p, ps, wr, sc).await,
-                                    Err(e) => warn!("TCP TLS handshake failed from {}: {}", addr, e),
+                                    Ok(tls_stream) => {
+                                        handle_tcp(tls_stream, s, t, p, ps, wr, sc).await
+                                    }
+                                    Err(e) => {
+                                        warn!("TCP TLS handshake failed from {}: {}", addr, e)
+                                    }
                                 }
                             } else {
                                 handle_tcp(socket, s, t, p, ps, wr, sc).await;
@@ -1922,7 +1934,10 @@ async fn handle_tcp<S>(
                                             pwd, &password, &mut is_authenticated, &mut auth_failures,
                                         );
                                         if writer.write_all(&resp).await.is_err() { break 'outer; }
-                                        if disconnect { break 'outer; }
+                                        if disconnect {
+                                            let _ = writer.flush().await;
+                                            break 'outer;
+                                        }
                                         continue 'parse;
                                     }
 

@@ -531,9 +531,9 @@ impl KeyValueStore {
                 Some(m) => Value::BulkString(Some(m.into_bytes())),
                 None => Value::SimpleString("PONG".to_string()),
             },
-            Command::Auth(_) => {
-                Value::Error("ERR AUTH is handled by the connection layer, not the store".to_string())
-            }
+            Command::Auth(_) => Value::Error(
+                "ERR AUTH is handled by the connection layer, not the store".to_string(),
+            ),
 
             // ── Strings ───────────────────────────────────────────────────────
             Command::Set(key, val, opts) => {
@@ -620,11 +620,7 @@ impl KeyValueStore {
                 let now = now_ms();
                 let count = keys
                     .into_iter()
-                    .filter(|k| {
-                        self.data
-                            .remove_if(k, |_, e| !e.is_expired(now))
-                            .is_some()
-                    })
+                    .filter(|k| self.data.remove_if(k, |_, e| !e.is_expired(now)).is_some())
                     .count();
                 Value::Integer(count as i64)
             }

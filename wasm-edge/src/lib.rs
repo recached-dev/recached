@@ -84,7 +84,6 @@ fn to_resp_owned(parts: &[String]) -> String {
 /// snapshot commands so the next replay is fast regardless of write history.
 const WAL_COMPACT_THRESHOLD: u32 = 1000;
 
-
 /// Convert snapshot entries into minimal RESP command strings suitable for
 /// storing in the WAL. Each entry produces one command; entries with a TTL on
 /// collection types produce an extra PEXPIREAT command.
@@ -156,14 +155,14 @@ fn snapshot_to_resp_cmds(entries: &[SnapshotEntry]) -> Vec<String> {
         };
         out.push(to_resp_owned(&data_parts));
         // Non-string types with a TTL need a separate PEXPIREAT command.
-        if !matches!(&e.value, SnapshotValue::Str(_)) {
-            if let Some(exp) = e.expires_at_ms {
-                out.push(to_resp_owned(&[
-                    "PEXPIREAT".to_string(),
-                    e.key.clone(),
-                    exp.to_string(),
-                ]));
-            }
+        if !matches!(&e.value, SnapshotValue::Str(_))
+            && let Some(exp) = e.expires_at_ms
+        {
+            out.push(to_resp_owned(&[
+                "PEXPIREAT".to_string(),
+                e.key.clone(),
+                exp.to_string(),
+            ]));
         }
     }
     out

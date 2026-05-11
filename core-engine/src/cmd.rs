@@ -832,9 +832,7 @@ impl Command {
                                     .to_string(),
                             );
                         }
-                        if (opts.gt || opts.lt)
-                            && opts.condition == Some(ZAddCondition::Nx)
-                        {
+                        if (opts.gt || opts.lt) && opts.condition == Some(ZAddCondition::Nx) {
                             return Err(
                                 "ERR GT, LT, and NX options at the same time are not compatible"
                                     .to_string(),
