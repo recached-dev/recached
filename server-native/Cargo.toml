@@ -16,3 +16,6 @@ tokio-rustls.workspace             = true
 rustls-pemfile.workspace           = true
 serde.workspace                    = true
 rmp-serde.workspace                = true
+socket2.workspace                  = true
+num_cpus.workspace                 = true
+tikv-jemallocator.workspace        = true

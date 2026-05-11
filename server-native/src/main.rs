@@ -1,3 +1,6 @@
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use core_engine::cmd::{Command, SetExpiry, ZAddCondition};
 use core_engine::resp::Value;
 use core_engine::store::{EvictionPolicy, KeyValueStore, SnapshotEntry};
@@ -171,6 +174,33 @@ fn execute_and_record(store: &KeyValueStore, cmd: &Command) -> Value {
     response
 }
 
+// ── TCP listeners ─────────────────────────────────────────────────────────────
+
+/// Binds `n` TCP sockets on `addr`, all with `SO_REUSEPORT`, so the OS can
+/// distribute incoming connections across multiple accept loops — one per
+/// Tokio worker thread. Falls back to a single plain `TcpListener::bind` on
+/// platforms that don't support `SO_REUSEPORT`.
+fn make_tcp_listeners(addr: &str, n: usize) -> std::io::Result<Vec<TcpListener>> {
+    use socket2::{Domain, Socket, Type};
+    let socket_addr: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let domain = if socket_addr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let sock = Socket::new(domain, Type::STREAM, None)?;
+        sock.set_reuse_address(true)?;
+        #[cfg(unix)]
+        sock.set_reuse_port(true)?;
+        sock.set_nonblocking(true)?;
+        sock.bind(&socket_addr.into())?;
+        sock.listen(4096)?;
+        let std_listener: std::net::TcpListener = sock.into();
+        out.push(TcpListener::from_std(std_listener)?);
+    }
+    Ok(out)
+}
+
 // ── TLS ───────────────────────────────────────────────────────────────────────
 
 fn load_certs(path: &str) -> std::io::Result<Vec<CertificateDer<'static>>> {
@@ -205,7 +235,7 @@ fn load_tls_acceptor() -> Option<TlsAcceptor> {
 
 // ── tunables ────────────────────────────────────────────────────────────────
 
-const TCP_READ_BUFFER_BYTES: usize = 4096;
+const TCP_READ_BUFFER_BYTES: usize = 16 * 1024; // 16 KB — matches Redis default
 const MAX_TCP_READ_BUFFER_BYTES: usize = 64 * 1024 * 1024; // 64 MB per connection
 const MAX_MULTI_QUEUE_LEN: usize = 10_000;
 const MAX_WATCHES_PER_CONN: usize = 1_024;
@@ -1693,62 +1723,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tls_acceptor = Arc::new(tls_acceptor);
 
     // ── listeners ─────────────────────────────────────────────────────────
-    let tcp_listener = TcpListener::bind("0.0.0.0:6379").await?;
-    info!("TCP server listening on 0.0.0.0:6379");
+    let n_accept = num_cpus::get();
+    let tcp_listeners = make_tcp_listeners("0.0.0.0:6379", n_accept)?;
+    info!("TCP server listening on 0.0.0.0:6379 ({} accept loop(s))", n_accept);
 
     let ws_listener = TcpListener::bind("0.0.0.0:6380").await?;
     info!("WebSocket server listening on 0.0.0.0:6380");
 
-    let store_tcp = Arc::clone(&store);
-    let tx_tcp = tx.clone();
-    let pass_tcp = Arc::clone(&global_password);
-    let allowed_tcp = allowed_ips.clone();
-    let sem_tcp = Arc::clone(&semaphore);
-    let pubsub_tcp = Arc::clone(&pubsub);
-    let tls_tcp = Arc::clone(&tls_acceptor);
-    let watch_tcp = Arc::clone(&watch_registry);
-    let snap_tcp = Arc::clone(&state);
+    // Spawn one accept loop per CPU core, each with its own SO_REUSEPORT socket.
+    // The OS load-balances incoming connections across all loops.
+    for tcp_listener in tcp_listeners {
+        let store_tcp   = Arc::clone(&store);
+        let tx_tcp      = tx.clone();
+        let pass_tcp    = Arc::clone(&global_password);
+        let allowed_tcp = allowed_ips.clone();
+        let sem_tcp     = Arc::clone(&semaphore);
+        let pubsub_tcp  = Arc::clone(&pubsub);
+        let tls_tcp     = Arc::clone(&tls_acceptor);
+        let watch_tcp   = Arc::clone(&watch_registry);
+        let snap_tcp    = Arc::clone(&state);
 
-    tokio::spawn(async move {
-        loop {
-            match tcp_listener.accept().await {
-                Ok((socket, addr)) => {
-                    if let Some(allowed) = &allowed_tcp
-                        && !allowed.contains(&addr.ip())
-                    {
-                        debug!("TCP: rejected IP {}", addr.ip());
-                        continue;
-                    }
-                    let permit = match Arc::clone(&sem_tcp).try_acquire_owned() {
-                        Ok(p) => p,
-                        Err(_) => {
-                            warn!("TCP: connection limit reached, dropping {}", addr);
+        tokio::spawn(async move {
+            loop {
+                match tcp_listener.accept().await {
+                    Ok((socket, addr)) => {
+                        let _ = socket.set_nodelay(true);
+                        if let Some(allowed) = &allowed_tcp
+                            && !allowed.contains(&addr.ip())
+                        {
+                            debug!("TCP: rejected IP {}", addr.ip());
                             continue;
                         }
-                    };
-                    let s = Arc::clone(&store_tcp);
-                    let t = tx_tcp.clone();
-                    let p = Arc::clone(&pass_tcp);
-                    let ps = Arc::clone(&pubsub_tcp);
-                    let wr = Arc::clone(&watch_tcp);
-                    let tls = Arc::clone(&tls_tcp);
-                    let sc = Arc::clone(&snap_tcp);
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        if let Some(acc) = tls.as_ref() {
-                            match acc.accept(socket).await {
-                                Ok(tls_stream) => handle_tcp(tls_stream, s, t, p, ps, wr, sc).await,
-                                Err(e) => warn!("TCP TLS handshake failed from {}: {}", addr, e),
+                        let permit = match Arc::clone(&sem_tcp).try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                warn!("TCP: connection limit reached, dropping {}", addr);
+                                continue;
                             }
-                        } else {
-                            handle_tcp(socket, s, t, p, ps, wr, sc).await;
-                        }
-                    });
+                        };
+                        let s  = Arc::clone(&store_tcp);
+                        let t  = tx_tcp.clone();
+                        let p  = Arc::clone(&pass_tcp);
+                        let ps = Arc::clone(&pubsub_tcp);
+                        let wr = Arc::clone(&watch_tcp);
+                        let tls = Arc::clone(&tls_tcp);
+                        let sc = Arc::clone(&snap_tcp);
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            if let Some(acc) = tls.as_ref() {
+                                match acc.accept(socket).await {
+                                    Ok(tls_stream) => handle_tcp(tls_stream, s, t, p, ps, wr, sc).await,
+                                    Err(e) => warn!("TCP TLS handshake failed from {}: {}", addr, e),
+                                }
+                            } else {
+                                handle_tcp(socket, s, t, p, ps, wr, sc).await;
+                            }
+                        });
+                    }
+                    Err(e) => warn!("TCP accept error: {}", e),
                 }
-                Err(e) => warn!("TCP accept error: {}", e),
             }
-        }
-    });
+        });
+    }
 
     // ── graceful shutdown via oneshot channel ────────────────────────────
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1777,6 +1813,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             res = ws_listener.accept() => {
                 match res {
                     Ok((socket, addr)) => {
+                        let _ = socket.set_nodelay(true);
                         if let Some(allowed) = &allowed_ips
                             && !allowed.contains(&addr.ip())
                         {
@@ -1840,8 +1877,10 @@ async fn handle_tcp<S>(
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let _guard = ConnectionGuard::tcp();
-    let (mut reader, mut writer) = tokio::io::split(socket);
+    let (mut reader, raw_writer) = tokio::io::split(socket);
+    let mut writer = tokio::io::BufWriter::with_capacity(32 * 1024, raw_writer);
     let mut buf = Vec::<u8>::new();
+    let mut read_pos: usize = 0;
     let mut read_buf = [0u8; TCP_READ_BUFFER_BYTES];
     let mut is_authenticated = password.is_none();
     let mut auth_failures: u32 = 0;
@@ -1859,15 +1898,15 @@ async fn handle_tcp<S>(
                 match result {
                     Ok(0) => break,
                     Ok(n) => {
-                        if buf.len() + n > MAX_TCP_READ_BUFFER_BYTES {
+                        if (buf.len() - read_pos) + n > MAX_TCP_READ_BUFFER_BYTES {
                             warn!("TCP connection exceeded max buffer size, closing");
                             break 'outer;
                         }
                         buf.extend_from_slice(&read_buf[..n]);
                         'parse: loop {
-                            match Value::parse(&buf) {
+                            match Value::parse(&buf[read_pos..]) {
                                 Ok((value, consumed)) => {
-                                    buf.drain(..consumed);
+                                    read_pos += consumed;
                                     let cmd = match Command::from_value(value) {
                                         Ok(c) => c,
                                         Err(e) => {
@@ -2074,14 +2113,24 @@ async fn handle_tcp<S>(
                                         }
                                     }
                                 }
-                                Err(ref e) if e == "Incomplete" => break 'parse,
+                                Err(ref e) if e == "Incomplete" => {
+                                    // Compact: drop already-parsed bytes, reset cursor.
+                                    buf.drain(..read_pos);
+                                    read_pos = 0;
+                                    break 'parse;
+                                }
                                 Err(e) => {
                                     warn!("TCP protocol error: {}", e);
                                     let _ = writer.write_all(b"-ERR Protocol error\r\n").await;
                                     buf.clear();
+                                    read_pos = 0;
                                     break 'parse;
                                 }
                             }
+                        }
+                        // Flush all responses for this read batch in one syscall.
+                        if writer.flush().await.is_err() {
+                            break 'outer;
                         }
                     }
                     Err(e) => {
