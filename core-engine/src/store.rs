@@ -213,7 +213,7 @@ fn encode_zrange(items: &[(&str, f64)], withscores: bool) -> Value {
     Value::Array(Some(out))
 }
 
-fn format_score(s: f64) -> String {
+pub fn format_score(s: f64) -> String {
     if s == f64::INFINITY {
         "inf".to_string()
     } else if s == f64::NEG_INFINITY {
@@ -531,7 +531,9 @@ impl KeyValueStore {
                 Some(m) => Value::BulkString(Some(m.into_bytes())),
                 None => Value::SimpleString("PONG".to_string()),
             },
-            Command::Auth(_) => Value::SimpleString("OK".to_string()),
+            Command::Auth(_) => {
+                Value::Error("ERR AUTH is handled by the connection layer, not the store".to_string())
+            }
 
             // ── Strings ───────────────────────────────────────────────────────
             Command::Set(key, val, opts) => {
@@ -615,9 +617,14 @@ impl KeyValueStore {
             }
 
             Command::Del(keys) | Command::Unlink(keys) => {
+                let now = now_ms();
                 let count = keys
                     .into_iter()
-                    .filter(|k| self.data.remove(k).is_some())
+                    .filter(|k| {
+                        self.data
+                            .remove_if(k, |_, e| !e.is_expired(now))
+                            .is_some()
+                    })
                     .count();
                 Value::Integer(count as i64)
             }
@@ -771,7 +778,7 @@ impl KeyValueStore {
                     Some(e) if e.is_expired(now) => Value::Integer(-2),
                     Some(e) => match e.expires_at_ms {
                         None => Value::Integer(-1),
-                        Some(exp) => Value::Integer(((exp - now) / 1000) as i64),
+                        Some(exp) => Value::Integer((exp.saturating_sub(now) / 1000) as i64),
                     },
                 }
             }
@@ -783,7 +790,7 @@ impl KeyValueStore {
                     Some(e) if e.is_expired(now) => Value::Integer(-2),
                     Some(e) => match e.expires_at_ms {
                         None => Value::Integer(-1),
-                        Some(exp) => Value::Integer((exp - now) as i64),
+                        Some(exp) => Value::Integer(exp.saturating_sub(now) as i64),
                     },
                 }
             }
@@ -2216,24 +2223,53 @@ fn zadd_exec(zset: &mut ZSetInner, opts: ZAddOptions, pairs: Vec<(f64, String)>)
                 }
             }
             Some(ZAddCondition::Xx) => {
-                if let Some(s) = zset.scores.get_mut(&member)
-                    && (*s - score).abs() > f64::EPSILON
-                {
-                    *s = score;
-                    changed += 1;
+                if let Some(old_score) = zset.scores.get_mut(&member) {
+                    let should_update = if opts.gt {
+                        score > *old_score
+                    } else if opts.lt {
+                        score < *old_score
+                    } else {
+                        (score - *old_score).abs() > f64::EPSILON
+                    };
+                    if should_update {
+                        *old_score = score;
+                        changed += 1;
+                    }
                 }
             }
             None => {
-                let old = zset.scores.insert(member, score);
-                match old {
-                    None => {
-                        added += 1;
-                        changed += 1;
+                if opts.gt || opts.lt {
+                    match zset.scores.entry(member) {
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert(score);
+                            added += 1;
+                            changed += 1;
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            let old_score = *e.get();
+                            let should_update = if opts.gt {
+                                score > old_score
+                            } else {
+                                score < old_score
+                            };
+                            if should_update {
+                                e.insert(score);
+                                changed += 1;
+                            }
+                        }
                     }
-                    Some(old_score) if (old_score - score).abs() > f64::EPSILON => {
-                        changed += 1;
+                } else {
+                    let old = zset.scores.insert(member, score);
+                    match old {
+                        None => {
+                            added += 1;
+                            changed += 1;
+                        }
+                        Some(old_score) if (old_score - score).abs() > f64::EPSILON => {
+                            changed += 1;
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
         }

@@ -4,6 +4,32 @@ All notable changes to Recached are documented here.
 
 ---
 
+## [0.1.6] — 2026-05-11
+
+### Fixed
+
+**Correctness**
+- `TTL` / `PTTL`: replaced `exp - now` with `exp.saturating_sub(now)` — a tight race between the expiry check and the subtraction could panic in debug builds or wrap to `u64::MAX` in release, returning a wildly incorrect TTL. (`core-engine/src/store.rs`)
+- `DEL` / `UNLINK`: switched from `data.remove(k)` to `data.remove_if(k, |_, e| !e.is_expired(now))` — expired-but-not-yet-swept keys were counted as deleted, violating Redis semantics which returns 0 for missing/expired keys. (`core-engine/src/store.rs`)
+- `ZADD GT` / `LT` flags were parsed and silently discarded. They are now fully enforced: `GT` updates an existing member only if the new score is greater; `LT` only if lower; new members are always inserted regardless of the flag. Incompatible combinations (`GT`+`LT`, `GT`/`LT`+`NX`) return errors matching Redis. (`core-engine/src/cmd.rs`, `core-engine/src/store.rs`)
+
+**Security**
+- `Command::Auth` reached `store.execute()` and unconditionally returned `+OK`, bypassing authentication during AOF replay and any other path that calls the store directly. `store.execute()` now returns an error for `Auth` — authentication is handled exclusively by the connection-layer `process_auth` function. (`core-engine/src/store.rs`)
+
+**Performance / reliability**
+- `PubSubHub::unsubscribe` left an empty `Vec` in `channel_subs` after the last subscriber left a channel. Over time, high-churn subscriber patterns leaked memory proportional to the total number of unique channels ever seen. Empty entries are now removed immediately in `unsubscribe`, `unsubscribe_all`, and `publish`. (`server-native/src/main.rs`)
+- `SharedPubSub` and `WatchRegistry` used `std::sync::Mutex` (blocking) in async connection handlers. Holding a blocking lock across `.await` points starves the Tokio thread pool under high pub/sub publish rates. Both types now use `tokio::sync::Mutex`; `notify_watchers` is now `async`. (`server-native/src/main.rs`)
+
+### Added
+
+- Key-length validation in `Command::from_value`: keys larger than 512 KB or empty keys are rejected at parse time with a descriptive `ERR` before reaching the store. Validation is applied to all primary-key positions in `GET`, `SET`, `DEL`, `UNLINK`, `MGET`, `MSET`, `EXISTS`, `APPEND`, `STRLEN`, `GETSET`, `SETNX`, `SETEX`, `PSETEX`, `INCR`, `DECR`, `INCRBY`, and all commands that assign `let key = …`. (`core-engine/src/cmd.rs`)
+
+### Changed
+
+- `format_score` (f64 → Redis score string) is now `pub` and exported from `core-engine::store`. The identical private `format_zset_score` function in `wasm-edge` has been removed in favour of the shared implementation. (`core-engine/src/store.rs`, `wasm-edge/src/lib.rs`)
+
+---
+
 ## [0.1.5] — 2026-05-10
 
 ### Added

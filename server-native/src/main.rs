@@ -10,7 +10,7 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -780,6 +780,9 @@ impl PubSubHub {
     fn unsubscribe(&mut self, conn_id: u64, channel: &str) {
         if let Some(v) = self.channel_subs.get_mut(channel) {
             v.retain(|(id, _)| *id != conn_id);
+            if v.is_empty() {
+                self.channel_subs.remove(channel);
+            }
         }
     }
 
@@ -789,9 +792,10 @@ impl PubSubHub {
     }
 
     fn unsubscribe_all(&mut self, conn_id: u64) {
-        for v in self.channel_subs.values_mut() {
+        self.channel_subs.retain(|_, v| {
             v.retain(|(id, _)| *id != conn_id);
-        }
+            !v.is_empty()
+        });
         self.pattern_subs.retain(|(_, id, _)| *id != conn_id);
     }
 
@@ -799,7 +803,10 @@ impl PubSubHub {
     fn publish(&mut self, channel: &str, message: &str) -> i64 {
         let mut count = 0i64;
 
-        if let Some(subs) = self.channel_subs.get_mut(channel) {
+        if let std::collections::hash_map::Entry::Occupied(mut e) =
+            self.channel_subs.entry(channel.to_string())
+        {
+            let subs = e.get_mut();
             subs.retain(|(_, tx)| {
                 let ok = tx
                     .send(PubSubMsg::Message {
@@ -812,6 +819,9 @@ impl PubSubHub {
                 }
                 ok
             });
+            if subs.is_empty() {
+                e.remove();
+            }
         }
 
         let pattern_txs: Vec<(String, PubSubSender)> = self
@@ -837,12 +847,12 @@ impl PubSubHub {
     }
 }
 
-type SharedPubSub = Arc<Mutex<PubSubHub>>;
+type SharedPubSub = Arc<tokio::sync::Mutex<PubSubHub>>;
 
 // ── observable keys ───────────────────────────────────────────────────────────
 
 type WatchNotif = (String, Value);
-type WatchRegistry = Arc<Mutex<HashMap<String, Vec<(u64, mpsc::UnboundedSender<WatchNotif>)>>>>;
+type WatchRegistry = Arc<tokio::sync::Mutex<HashMap<String, Vec<(u64, mpsc::UnboundedSender<WatchNotif>)>>>>;
 
 /// Extract the key(s) that `cmd` writes to, without inspecting the response.
 /// Used together with `broadcast_for()` — only call this when `broadcast_for`
@@ -905,7 +915,7 @@ fn encode_keychange(key: &str, value: &Value) -> Vec<u8> {
     .serialize()
 }
 
-fn notify_watchers(
+async fn notify_watchers(
     registry: &WatchRegistry,
     cmd: &Command,
     response: &Value,
@@ -924,7 +934,7 @@ fn notify_watchers(
         .iter()
         .map(|k| (k.clone(), store.get_current(k)))
         .collect();
-    let mut reg = registry.lock().unwrap();
+    let mut reg = registry.lock().await;
     for (key, value) in &key_values {
         if let Some(subs) = reg.get_mut(key) {
             subs.retain(|(_, tx)| tx.send((key.clone(), value.clone())).is_ok());
@@ -1656,10 +1666,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx, _rx) = broadcast::channel::<(u64, String)>(BROADCAST_CHANNEL_CAPACITY);
 
     // ── pub/sub hub ───────────────────────────────────────────────────────
-    let pubsub: SharedPubSub = Arc::new(Mutex::new(PubSubHub::new()));
+    let pubsub: SharedPubSub = Arc::new(tokio::sync::Mutex::new(PubSubHub::new()));
 
     // ── watch registry ────────────────────────────────────────────────────
-    let watch_registry: WatchRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let watch_registry: WatchRegistry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
     // ── connection limiter ────────────────────────────────────────────────
     let max_connections = std::env::var("RECACHED_MAX_CONNECTIONS")
@@ -1918,7 +1928,7 @@ async fn handle_tcp<S>(
                                                             let _ = tx.send((0, msg.clone()));
                                                             state.on_write(&msg).await;
                                                         }
-                                                        notify_watchers(&watch_registry, &qcmd, &resp, &store);
+                                                        notify_watchers(&watch_registry, &qcmd, &resp, &store).await;
                                                         results.push(resp);
                                                     }
                                                     let out = Value::Array(Some(results)).serialize();
@@ -1958,7 +1968,7 @@ async fn handle_tcp<S>(
                                         Command::Subscribe(channels) => {
                                             for ch in channels {
                                                 subscribed_channels.insert(ch.clone());
-                                                pubsub.lock().unwrap().subscribe(conn_id, &ch, ps_tx.clone());
+                                                pubsub.lock().await.subscribe(conn_id, &ch, ps_tx.clone());
                                                 let count = subscribed_channels.len() + subscribed_patterns.len();
                                                 let ack = resp_subscribe_ack("subscribe", &ch, count);
                                                 if writer.write_all(&ack).await.is_err() { break 'outer; }
@@ -1971,7 +1981,7 @@ async fn handle_tcp<S>(
                                                 channels.into_iter().filter(|c| subscribed_channels.remove(c)).collect()
                                             };
                                             for ch in &targets {
-                                                pubsub.lock().unwrap().unsubscribe(conn_id, ch);
+                                                pubsub.lock().await.unsubscribe(conn_id, ch);
                                                 let count = subscribed_channels.len() + subscribed_patterns.len();
                                                 let ack = resp_subscribe_ack("unsubscribe", ch, count);
                                                 if writer.write_all(&ack).await.is_err() { break 'outer; }
@@ -1984,7 +1994,7 @@ async fn handle_tcp<S>(
                                         Command::PSubscribe(patterns) => {
                                             for pat in patterns {
                                                 subscribed_patterns.insert(pat.clone());
-                                                pubsub.lock().unwrap().psubscribe(conn_id, &pat, ps_tx.clone());
+                                                pubsub.lock().await.psubscribe(conn_id, &pat, ps_tx.clone());
                                                 let count = subscribed_channels.len() + subscribed_patterns.len();
                                                 let ack = resp_subscribe_ack("psubscribe", &pat, count);
                                                 if writer.write_all(&ack).await.is_err() { break 'outer; }
@@ -1997,7 +2007,7 @@ async fn handle_tcp<S>(
                                                 patterns.into_iter().filter(|p| subscribed_patterns.remove(p)).collect()
                                             };
                                             for pat in &targets {
-                                                pubsub.lock().unwrap().punsubscribe(conn_id, pat);
+                                                pubsub.lock().await.punsubscribe(conn_id, pat);
                                                 let count = subscribed_channels.len() + subscribed_patterns.len();
                                                 let ack = resp_subscribe_ack("punsubscribe", pat, count);
                                                 if writer.write_all(&ack).await.is_err() { break 'outer; }
@@ -2008,7 +2018,7 @@ async fn handle_tcp<S>(
                                             }
                                         }
                                         Command::Publish(channel, message) => {
-                                            let count = pubsub.lock().unwrap().publish(&channel, &message);
+                                            let count = pubsub.lock().await.publish(&channel, &message);
                                             let resp = Value::Integer(count).serialize();
                                             if writer.write_all(&resp).await.is_err() { break 'outer; }
                                         }
@@ -2057,7 +2067,7 @@ async fn handle_tcp<S>(
                                                 let _ = tx.send((0, msg.clone()));
                                                 state.on_write(&msg).await;
                                             }
-                                            notify_watchers(&watch_registry, &cmd, &response, &store);
+                                            notify_watchers(&watch_registry, &cmd, &response, &store).await;
                                             if writer.write_all(&response.serialize()).await.is_err() {
                                                 break 'outer;
                                             }
@@ -2095,7 +2105,7 @@ async fn handle_tcp<S>(
     }
 
     if !subscribed_channels.is_empty() || !subscribed_patterns.is_empty() {
-        pubsub.lock().unwrap().unsubscribe_all(conn_id);
+        pubsub.lock().await.unsubscribe_all(conn_id);
     }
 }
 
@@ -2218,7 +2228,7 @@ async fn handle_ws<S>(
                                                 let _ = tx.send((conn_id, msg.clone()));
                                                 state.on_write(&msg).await;
                                             }
-                                            notify_watchers(&watch_registry, &qcmd, &resp, &store);
+                                            notify_watchers(&watch_registry, &qcmd, &resp, &store).await;
                                             results.push(resp);
                                         }
                                         let out = Value::Array(Some(results)).serialize();
@@ -2255,7 +2265,7 @@ async fn handle_ws<S>(
                             Command::Subscribe(channels) => {
                                 for ch in channels {
                                     subscribed_channels.insert(ch.clone());
-                                    pubsub.lock().unwrap().subscribe(conn_id, &ch, ps_tx.clone());
+                                    pubsub.lock().await.subscribe(conn_id, &ch, ps_tx.clone());
                                     let count = subscribed_channels.len() + subscribed_patterns.len();
                                     ws_send!(&resp_subscribe_ack("subscribe", &ch, count));
                                 }
@@ -2267,7 +2277,7 @@ async fn handle_ws<S>(
                                     channels.into_iter().filter(|c| subscribed_channels.remove(c)).collect()
                                 };
                                 for ch in &targets {
-                                    pubsub.lock().unwrap().unsubscribe(conn_id, ch);
+                                    pubsub.lock().await.unsubscribe(conn_id, ch);
                                     let count = subscribed_channels.len() + subscribed_patterns.len();
                                     ws_send!(&resp_subscribe_ack("unsubscribe", ch, count));
                                 }
@@ -2278,7 +2288,7 @@ async fn handle_ws<S>(
                             Command::PSubscribe(patterns) => {
                                 for pat in patterns {
                                     subscribed_patterns.insert(pat.clone());
-                                    pubsub.lock().unwrap().psubscribe(conn_id, &pat, ps_tx.clone());
+                                    pubsub.lock().await.psubscribe(conn_id, &pat, ps_tx.clone());
                                     let count = subscribed_channels.len() + subscribed_patterns.len();
                                     ws_send!(&resp_subscribe_ack("psubscribe", &pat, count));
                                 }
@@ -2290,7 +2300,7 @@ async fn handle_ws<S>(
                                     patterns.into_iter().filter(|p| subscribed_patterns.remove(p)).collect()
                                 };
                                 for pat in &targets {
-                                    pubsub.lock().unwrap().punsubscribe(conn_id, pat);
+                                    pubsub.lock().await.punsubscribe(conn_id, pat);
                                     let count = subscribed_channels.len() + subscribed_patterns.len();
                                     ws_send!(&resp_subscribe_ack("punsubscribe", pat, count));
                                 }
@@ -2299,7 +2309,7 @@ async fn handle_ws<S>(
                                 }
                             }
                             Command::Publish(channel, message) => {
-                                let count = pubsub.lock().unwrap().publish(&channel, &message);
+                                let count = pubsub.lock().await.publish(&channel, &message);
                                 ws_send!(&Value::Integer(count).serialize());
                             }
 
@@ -2312,7 +2322,7 @@ async fn handle_ws<S>(
                                     ws_send!(b"-ERR watch limit per connection reached\r\n");
                                 } else {
                                     {
-                                        let mut reg = watch_registry.lock().unwrap();
+                                        let mut reg = watch_registry.lock().await;
                                         for key in &keys {
                                             if watched_keys.insert(key.clone()) {
                                                 reg.entry(key.clone())
@@ -2331,7 +2341,7 @@ async fn handle_ws<S>(
                                     keys.into_iter().filter(|k| watched_keys.remove(k)).collect()
                                 };
                                 {
-                                    let mut reg = watch_registry.lock().unwrap();
+                                    let mut reg = watch_registry.lock().await;
                                     for key in &targets {
                                         if let Some(subs) = reg.get_mut(key) {
                                             subs.retain(|(id, _)| *id != conn_id);
@@ -2387,7 +2397,7 @@ async fn handle_ws<S>(
                                     }
                                     state.on_write(&b_msg).await;
                                 }
-                                notify_watchers(&watch_registry, &cmd, &response, &store);
+                                notify_watchers(&watch_registry, &cmd, &response, &store).await;
                                 ws_send!(&response.serialize());
                             }
                         }
@@ -2443,10 +2453,10 @@ async fn handle_ws<S>(
     }
 
     if !subscribed_channels.is_empty() || !subscribed_patterns.is_empty() {
-        pubsub.lock().unwrap().unsubscribe_all(conn_id);
+        pubsub.lock().await.unsubscribe_all(conn_id);
     }
     if !watched_keys.is_empty() {
-        let mut reg = watch_registry.lock().unwrap();
+        let mut reg = watch_registry.lock().await;
         for key in &watched_keys {
             if let Some(subs) = reg.get_mut(key) {
                 subs.retain(|(id, _)| *id != conn_id);
@@ -2498,8 +2508,8 @@ mod tests {
     ) -> TestServer {
         let store = Arc::new(KeyValueStore::new());
         let (tx, _rx) = broadcast::channel::<(u64, String)>(256);
-        let pubsub: SharedPubSub = Arc::new(Mutex::new(PubSubHub::new()));
-        let watch_registry: WatchRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let pubsub: SharedPubSub = Arc::new(tokio::sync::Mutex::new(PubSubHub::new()));
+        let watch_registry: WatchRegistry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let semaphore = Arc::new(Semaphore::new(64));
         let snap_cfg = Arc::new(SnapshotConfig {
             path: snap_path.unwrap_or_else(|| tmp_path("test.rdb")),
@@ -3103,8 +3113,8 @@ mod tests {
         let primary2 = {
             let store = Arc::clone(&primary.store);
             let (tx, _rx) = broadcast::channel::<(u64, String)>(256);
-            let pubsub: SharedPubSub = Arc::new(Mutex::new(PubSubHub::new()));
-            let wr: WatchRegistry = Arc::new(Mutex::new(HashMap::new()));
+            let pubsub: SharedPubSub = Arc::new(tokio::sync::Mutex::new(PubSubHub::new()));
+            let wr: WatchRegistry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
             let sem = Arc::new(Semaphore::new(64));
             let snap = Arc::clone(&primary.state.snap);
             let state = Arc::new(ServerState {
@@ -3217,8 +3227,8 @@ mod tests {
         // Small semaphore: only 3 concurrent connections
         let store = Arc::new(KeyValueStore::new());
         let (tx, _rx) = broadcast::channel::<(u64, String)>(16);
-        let pubsub: SharedPubSub = Arc::new(Mutex::new(PubSubHub::new()));
-        let watch_registry: WatchRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let pubsub: SharedPubSub = Arc::new(tokio::sync::Mutex::new(PubSubHub::new()));
+        let watch_registry: WatchRegistry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let semaphore = Arc::new(Semaphore::new(3));
         let state = Arc::new(ServerState {
             snap: Arc::new(SnapshotConfig {

@@ -1,6 +1,6 @@
 use core_engine::cmd::{Command, SetOptions};
 use core_engine::resp::Value;
-use core_engine::store::{KeyValueStore, SnapshotEntry, SnapshotValue};
+use core_engine::store::{KeyValueStore, SnapshotEntry, SnapshotValue, format_score};
 use js_sys::Promise;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -84,17 +84,6 @@ fn to_resp_owned(parts: &[String]) -> String {
 /// snapshot commands so the next replay is fast regardless of write history.
 const WAL_COMPACT_THRESHOLD: u32 = 1000;
 
-fn format_zset_score(s: f64) -> String {
-    if s == f64::INFINITY {
-        "inf".into()
-    } else if s == f64::NEG_INFINITY {
-        "-inf".into()
-    } else if s.fract() == 0.0 && s.abs() < 1e15 {
-        format!("{}", s as i64)
-    } else {
-        format!("{}", s)
-    }
-}
 
 /// Convert snapshot entries into minimal RESP command strings suitable for
 /// storing in the WAL. Each entry produces one command; entries with a TTL on
@@ -159,7 +148,7 @@ fn snapshot_to_resp_cmds(entries: &[SnapshotEntry]) -> Vec<String> {
                 }
                 let mut parts = vec!["ZADD".to_string(), e.key.clone()];
                 for (member, score) in pairs {
-                    parts.push(format_zset_score(*score));
+                    parts.push(format_score(*score));
                     parts.push(member.clone());
                 }
                 parts
