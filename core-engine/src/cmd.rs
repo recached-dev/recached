@@ -371,7 +371,7 @@ impl Command {
                     "DECRBY" => {
                         need!(3);
                         Ok(Command::DecrBy(
-                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_key(&arr[1])?,
                             extract_int(&arr[2])?,
                         ))
                     }

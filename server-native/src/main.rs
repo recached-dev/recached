@@ -603,7 +603,7 @@ async fn handle_replica(
         socket.read_exact(&mut auth_buf).await?;
         let received_pwd = &auth_buf[..pwd.len()];
         let terminator = auth_buf[pwd.len()];
-        if received_pwd != pwd.as_bytes() || terminator != b'\n' {
+        if !ct_eq_bytes(received_pwd, pwd.as_bytes()) || terminator != b'\n' {
             let _ = socket
                 .write_all(b"-ERR invalid replication password\n")
                 .await;
@@ -760,6 +760,16 @@ async fn sync_from_primary(
             Err(e) => warn!("Replica: bad command from primary: {}", e),
         }
     }
+}
+
+// ── security helpers ─────────────────────────────────────────────────────────
+
+/// Constant-time byte slice equality to prevent timing-based password leaks.
+fn ct_eq_bytes(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 // ── connection identity ──────────────────────────────────────────────────────

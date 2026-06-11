@@ -580,7 +580,12 @@ impl KeyValueStore {
 
                 let expires_at_ms = match &opts.expiry {
                     None => None,
-                    Some(SetExpiry::Ex(s)) => Some(now.saturating_add(s.saturating_mul(1000))),
+                    Some(SetExpiry::Ex(s)) => {
+                        if *s > u64::MAX / 1000 {
+                            return Value::Error("ERR TTL overflow".to_string());
+                        }
+                        Some(now.saturating_add(s * 1000))
+                    }
                     Some(SetExpiry::Px(ms)) => Some(now.saturating_add(*ms)),
                     Some(SetExpiry::Exat(ts)) => Some(ts.saturating_mul(1000)),
                     Some(SetExpiry::Pxat(ts_ms)) => Some(*ts_ms),
@@ -1619,6 +1624,9 @@ impl KeyValueStore {
                             Some(n) => {
                                 // Negative: allow repetition, return |n| elements
                                 let members: Vec<&str> = s.iter().map(|m| m.as_str()).collect();
+                                if members.is_empty() {
+                                    return Value::Array(Some(vec![]));
+                                }
                                 let abs = n.unsigned_abs() as usize;
                                 Value::Array(Some(
                                     (0..abs)
@@ -1880,12 +1888,14 @@ impl KeyValueStore {
                     EntryValue::ZSet(z) => z,
                     _ => unreachable!(),
                 };
-                let score = zset
-                    .scores
-                    .entry(member)
-                    .and_modify(|s| *s += delta)
-                    .or_insert(delta);
-                let new_score = *score;
+                let prev_score = zset.scores.get(&member).copied().unwrap_or(0.0);
+                let new_score = prev_score + delta;
+                if new_score.is_nan() || new_score.is_infinite() {
+                    return Value::Error(
+                        "ERR increment would produce NaN or Infinity".to_string(),
+                    );
+                }
+                zset.scores.insert(member, new_score);
                 Value::BulkString(Some(format_score(new_score).into_bytes()))
             }
 
@@ -1976,21 +1986,32 @@ fn set_expiry(data: &DashMap<String, Entry>, key: String, ts_ms: u64) -> Value {
 }
 
 fn glob_match(pattern: &str, s: &str) -> bool {
-    glob_helper(pattern.as_bytes(), s.as_bytes())
-}
+    let pat = pattern.as_bytes();
+    let text = s.as_bytes();
+    let (m, n) = (pat.len(), text.len());
 
-fn glob_helper(pat: &[u8], s: &[u8]) -> bool {
-    match (pat.first(), s.first()) {
-        (None, None) => true,
-        (None, Some(_)) => false,
-        (Some(b'*'), _) => {
-            glob_helper(&pat[1..], s) || (!s.is_empty() && glob_helper(pat, &s[1..]))
+    // Iterative DP: prev[j] = pat[..i] matches text[..j].
+    // This replaces a recursive matcher that had exponential worst-case
+    // backtracking on patterns like "*.*.*x" against long non-matching strings.
+    let mut prev = vec![false; n + 1];
+    let mut curr = vec![false; n + 1];
+    prev[0] = true;
+
+    for i in 1..=m {
+        curr[0] = pat[i - 1] == b'*' && prev[0];
+        for j in 1..=n {
+            curr[j] = if pat[i - 1] == b'*' {
+                prev[j] || curr[j - 1]
+            } else if pat[i - 1] == b'?' || pat[i - 1] == text[j - 1] {
+                prev[j - 1]
+            } else {
+                false
+            };
         }
-        (Some(b'?'), Some(_)) => glob_helper(&pat[1..], &s[1..]),
-        (Some(b'?'), None) => false,
-        (Some(p), Some(c)) if p == c => glob_helper(&pat[1..], &s[1..]),
-        _ => false,
+        std::mem::swap(&mut prev, &mut curr);
     }
+
+    prev[n]
 }
 
 fn no_list_response(count: Option<u64>) -> Value {

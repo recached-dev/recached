@@ -185,6 +185,8 @@ pub struct RecachedCache {
     on_message: Rc<RefCell<Option<js_sys::Function>>>,
     _onmessage: Option<Closure<dyn FnMut(MessageEvent)>>,
     _onbc: Option<Closure<dyn FnMut(MessageEvent)>>,
+    /// True when connected via unencrypted ws:// (not wss://).
+    ws_is_plaintext: bool,
 }
 
 impl Default for RecachedCache {
@@ -229,6 +231,7 @@ impl RecachedCache {
             on_message: Rc::new(RefCell::new(None)),
             _onmessage: None,
             _onbc: None,
+            ws_is_plaintext: false,
         }
     }
 
@@ -286,6 +289,9 @@ impl RecachedCache {
             // If the WAL grew large, compact: rewrite it as minimal snapshot
             // commands. This keeps startup replay fast regardless of how many
             // writes accumulated between refreshes.
+            // Note: there is a brief data-loss window between idb_clear_js and
+            // writing the new snapshot. If the tab is closed during compaction,
+            // the WAL will be empty on next load and in-memory state is lost.
             let next_seq = if entry_count > WAL_COMPACT_THRESHOLD {
                 JsFuture::from(idb_clear_js(&db)).await?;
                 let cmds = snapshot_to_resp_cmds(&store.snapshot());
@@ -391,6 +397,10 @@ impl RecachedCache {
     /// Connect to the native Recached backend via WebSockets.
     /// Calling this a second time cleanly replaces the previous connection.
     pub fn connect(&mut self, url: &str) -> Result<(), JsValue> {
+        if let Some(old_ws) = self.ws.take() {
+            let _ = old_ws.close();
+        }
+        self.ws_is_plaintext = url.starts_with("ws://");
         let ws = WebSocket::new(url)?;
         let store_clone = Arc::clone(&self.store);
         let on_mut = Rc::clone(&self.on_mutation);
@@ -472,6 +482,11 @@ impl RecachedCache {
 
     /// Send an AUTH command to the server. The response arrives asynchronously via onmessage.
     pub fn auth(&self, password: &str) -> String {
+        if self.ws_is_plaintext {
+            let _ = web_sys::console::warn_1(&JsValue::from_str(
+                "recached: AUTH over unencrypted ws:// exposes the password in plaintext; use wss://",
+            ));
+        }
         if let Some(ws) = &self.ws
             && ws.ready_state() == WebSocket::OPEN
         {

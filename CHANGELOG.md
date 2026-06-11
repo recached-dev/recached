@@ -4,6 +4,31 @@ All notable changes to Recached are documented here.
 
 ---
 
+## [0.1.7] — 2026-06-11
+
+### Fixed
+
+**Security**
+- Replication auth password was compared with `!=` (byte-by-byte), leaking timing information an attacker could use to brute-force the password one character at a time. Replaced with a constant-time XOR-fold comparison. (`server-native/src/main.rs`)
+- `auth()` in the WASM SDK now emits a `console.warn` when the active connection is an unencrypted `ws://` URL, alerting developers that the password is sent in plaintext. Production deployments should use `wss://`. (`wasm-edge/src/lib.rs`)
+
+**Correctness**
+- `SRANDMEMBER key -N` panicked with a divide-by-zero when the target key did not exist or the set was empty. An early-return guard now produces an empty array, matching Redis semantics. (`core-engine/src/store.rs`)
+- `ZINCRBY` did not validate the resulting score for NaN or Infinity before writing it into the sorted set, corrupting subsequent range queries when called with `+inf`/`-inf` deltas. The result is now pre-computed and rejected with `ERR increment would produce NaN or Infinity` if invalid — consistent with `HINCRBYFLOAT`. (`core-engine/src/store.rs`)
+- `DECRBY` used `extract_string` (no size limit) for key parsing while `INCRBY` used `extract_key` (≤ 512 KB). Keys larger than 512 KB sent via `DECRBY` now return an error, consistent with all other key-bearing commands. (`core-engine/src/cmd.rs`)
+- `SET … EX <n>` with a TTL value large enough to overflow `u64` when multiplied by 1 000 silently saturated to `u64::MAX`, making the key effectively immortal. Such values now return `ERR TTL overflow`. (`core-engine/src/store.rs`)
+- Vue `useKey` and `useKeyJSON` read the initial value before subscribing to mutations, leaving a narrow window where a write between `get()` and `onMutation()` was missed. The subscription is now registered first, then the initial value is read. (`recached-vue/src/useKey.ts`)
+- React `usePubSub` captured the `handler` closure at subscribe time and held it for the lifetime of the effect. Inline handlers (redefined each render) would go stale and never receive updated closure state. The hook now stores the latest handler in a `useRef` and calls through it — no re-subscribe needed when the handler changes. (`recached-react/src/usePubSub.ts`)
+
+**DoS / resilience**
+- The RESP array parser bounded each bulk string at 64 MB but applied no limit to the total number of elements, making it possible to stream 1 million small strings and force ~64 TB of cumulative allocation before rejection. A 64 MB cumulative-bytes check is now applied across the entire array parse loop. (`core-engine/src/resp.rs`)
+- The glob matcher used by `KEYS` and `SCAN` was a recursive function with no memoization or depth limit. Patterns such as `*.*.*.*x` against a long non-matching string caused exponential backtracking (ReDoS). The implementation is replaced with an iterative two-row DP algorithm that is strictly O(m × n). (`core-engine/src/store.rs`)
+
+**Resource management**
+- Calling `connect()` a second time on a `RecachedCache` instance replaced the internal `WebSocket` field without closing the previous socket. The old connection remained open, receiving stale messages. `connect()` now calls `.close()` on the existing socket before creating the new one. (`wasm-edge/src/lib.rs`)
+
+---
+
 ## [0.1.6] — 2026-05-11
 
 ### Fixed
