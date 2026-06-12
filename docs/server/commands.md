@@ -58,7 +58,7 @@ The most common data type. Values are always stored as byte strings; numeric ope
 | `TYPE key` | Returns the type of the value stored at key: `string`, `hash`, `list`, `set`, `zset`, or `none` if the key does not exist. |
 | `RENAME key newkey` | Renames a key. Returns an error if the source key does not exist. Overwrites `newkey` if it already exists. |
 | `KEYS pattern` | Returns all keys matching the glob pattern. `*` matches any sequence of characters, `?` matches a single character, `[abc]` matches a character class. Warning: `KEYS *` on a large store is slow — prefer `SCAN`. |
-| `SCAN cursor [MATCH pattern] [COUNT count]` | Iterates keys incrementally. Returns the next cursor and a batch of keys. Start with cursor `0`; continue until the returned cursor is `0`. `MATCH` filters results. `COUNT` is a hint for batch size. |
+| `SCAN cursor [MATCH pattern] [COUNT count]` | Iterates keys incrementally, returning at most `COUNT` keys per call (default 10) plus the next cursor. Start with cursor `0` and continue until the returned cursor is `0`. `MATCH` filters results by glob pattern. As in Redis, keys inserted or deleted mid-iteration may be missed or returned twice. |
 | `DBSIZE` | Returns the total number of keys in the store. |
 | `FLUSHDB [ASYNC]` | Removes all keys from the store. `ASYNC` is accepted but does not change behavior (the flush is always synchronous). |
 
@@ -180,8 +180,8 @@ Transactions queue commands and execute them atomically. No other client can int
 | Command | Description |
 |---|---|
 | `MULTI` | Begins a transaction. Subsequent commands are queued, not executed. Returns `OK`. |
-| `EXEC` | Executes all queued commands atomically. Returns an array of results, one per queued command. |
-| `DISCARD` | Abandons the transaction queue. Returns `OK`. |
+| `EXEC` | Executes all queued commands. Returns an array of results, one per queued command — or a nil array if a `WATCH`ed key changed since `WATCH` was issued (optimistic-lock abort). |
+| `DISCARD` | Abandons the transaction queue. Returns `OK`. Also clears any `WATCH`ed keys. |
 
 ### Example
 
@@ -196,7 +196,7 @@ EXEC
 # 3) 2
 ```
 
-Note: Recached transactions do not support optimistic locking (`WATCH` in the Redis sense). `WATCH` in Recached is the key observation command — see [Observable Keys](#observable-keys-websocket-only) below.
+Optimistic locking: `WATCH key [key ...]` before `MULTI` marks those keys. If any watched key is modified by **any** client before `EXEC`, the transaction is aborted and `EXEC` returns a nil array (Redis `WATCH`/`MULTI`/`EXEC` CAS semantics). This works over both the TCP (6379) and WebSocket (6380) ports. `EXEC` and `DISCARD` both clear all watches. Over WebSocket, `WATCH` *additionally* pushes live keychange notifications — see [Observable Keys](#observable-keys) below.
 
 ---
 
@@ -258,16 +258,17 @@ SAVE            # +OK
 
 ---
 
-## Observable Keys (WebSocket-only)
+## Observable Keys
 
-`WATCH` and `UNWATCH` are Recached-specific commands available only over WebSocket connections (port 6380). They have different semantics from Redis's `WATCH` (which is used for optimistic locking with transactions).
+`WATCH` and `UNWATCH` serve two roles in Recached:
 
-In Recached, `WATCH` subscribes the connection to change notifications for a specific key. Whenever the key is mutated — by any client, from any connection — the server sends a push message to all watching connections.
+1. **Optimistic locking (both transports).** Over TCP (6379) and WebSocket (6380), `WATCH` participates in `MULTI`/`EXEC` exactly like Redis: if a watched key changes before `EXEC`, the transaction aborts (nil array). See [Transactions](#transactions).
+2. **Live change notifications (WebSocket only).** Over WebSocket, `WATCH` *additionally* subscribes the connection to keychange pushes: whenever a watched key is mutated by any client, the server sends a push frame to every watching WS connection. TCP connections receive no such push (it would violate the request/response protocol) — they use `WATCH` purely for the CAS guarantee above.
 
 | Command | Description |
 |---|---|
-| `WATCH key [key ...]` | Registers the WebSocket connection to receive push notifications whenever the given key(s) change. |
-| `UNWATCH [key ...]` | Stops watching the given keys. With no arguments, clears all watches for this connection. |
+| `WATCH key [key ...]` | Marks the given key(s) for optimistic locking, and (over WebSocket) registers the connection for keychange push notifications. Not allowed once `MULTI` has started. |
+| `UNWATCH [key ...]` | Stops watching the given keys. With no arguments, clears all watches for this connection. `EXEC` and `DISCARD` also clear all watches. |
 
 ### Push message format
 

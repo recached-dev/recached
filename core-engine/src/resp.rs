@@ -177,6 +177,9 @@ impl Value {
                     let (val, len) = Self::parse_inner(&buffer[offset..], depth + 1)?;
                     arr.push(val);
                     offset += len;
+                    if offset > MAX_TOTAL_MESSAGE_BYTES {
+                        return Err("ERR message too large".to_string());
+                    }
                 }
                 Ok((Value::Push(arr), offset))
             }

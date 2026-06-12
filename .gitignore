@@ -26,9 +26,11 @@ Thumbs.db
 # Logs
 *.log
 
-# Note: Cargo.lock is intentionally NOT ignored. 
-# Because this project contains an executable (server-native), 
+# Note: Cargo.lock is intentionally NOT ignored.
+# Because this project contains an executable (server-native),
 # committing Cargo.lock is best practice to ensure reproducible builds!
 
 PLAN.md
 NOTES.md
+
+scripts/

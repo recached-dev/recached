@@ -215,8 +215,9 @@ export class Cache {
    * Store a string value. Syncs to the server and other tabs when connected.
    */
   set(key: string, value: string): void {
+    // raw.set fires the mutation callback registered in the constructor, so
+    // listeners are already notified — no second _notifyMutation() here.
     this.raw.set(key, value);
-    this._notifyMutation();
   }
 
   /**
@@ -225,7 +226,6 @@ export class Cache {
    */
   setEx(key: string, value: string, seconds: number): void {
     this.raw.set_ex(key, value, seconds);
-    this._notifyMutation();
   }
 
   /**
@@ -243,7 +243,6 @@ export class Cache {
     } else {
       this.raw.set(key, serialized);
     }
-    this._notifyMutation();
   }
 
   /**
@@ -254,7 +253,6 @@ export class Cache {
    */
   del(key: string): boolean {
     const existed = this.raw.del(key) === 1;
-    this._notifyMutation();
     return existed;
   }
 

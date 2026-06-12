@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
-use web_sys::{BroadcastChannel, MessageEvent, WebSocket};
+use web_sys::{BroadcastChannel, Event, MessageEvent, WebSocket};
 
 // ── IndexedDB JS glue ─────────────────────────────────────────────────────────
 //
@@ -185,6 +185,10 @@ pub struct RecachedCache {
     on_message: Rc<RefCell<Option<js_sys::Function>>>,
     _onmessage: Option<Closure<dyn FnMut(MessageEvent)>>,
     _onbc: Option<Closure<dyn FnMut(MessageEvent)>>,
+    _onopen: Option<Closure<dyn FnMut(Event)>>,
+    /// Commands enqueued while the socket is still CONNECTING. Flushed in order
+    /// by the `onopen` handler so AUTH and early writes are never dropped.
+    ws_pending: Rc<RefCell<Vec<String>>>,
     /// True when connected via unencrypted ws:// (not wss://).
     ws_is_plaintext: bool,
 }
@@ -231,7 +235,23 @@ impl RecachedCache {
             on_message: Rc::new(RefCell::new(None)),
             _onmessage: None,
             _onbc: None,
+            _onopen: None,
+            ws_pending: Rc::new(RefCell::new(Vec::new())),
             ws_is_plaintext: false,
+        }
+    }
+
+    /// Send `encoded` to the server if the socket is open, otherwise buffer it
+    /// until `onopen` fires. Without this, anything sent during the CONNECTING
+    /// window (notably the AUTH that `createCache` issues right after connect)
+    /// would be silently dropped.
+    fn ws_enqueue(&self, encoded: &str) {
+        if let Some(ws) = &self.ws {
+            if ws.ready_state() == WebSocket::OPEN {
+                let _ = ws.send_with_str(encoded);
+            } else {
+                self.ws_pending.borrow_mut().push(encoded.to_string());
+            }
         }
     }
 
@@ -475,6 +495,18 @@ impl RecachedCache {
 
         ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
 
+        // Flush commands buffered while the socket was CONNECTING (AUTH first,
+        // then any early writes), preserving FIFO order.
+        let pending = Rc::clone(&self.ws_pending);
+        let ws_for_open = ws.clone();
+        let onopen = Closure::wrap(Box::new(move |_e: Event| {
+            for msg in pending.borrow_mut().drain(..) {
+                let _ = ws_for_open.send_with_str(&msg);
+            }
+        }) as Box<dyn FnMut(Event)>);
+        ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
+
+        self._onopen = Some(onopen);
         self._onmessage = Some(onmessage);
         self.ws = Some(ws);
         Ok(())
@@ -487,11 +519,7 @@ impl RecachedCache {
                 "recached: AUTH over unencrypted ws:// exposes the password in plaintext; use wss://",
             ));
         }
-        if let Some(ws) = &self.ws
-            && ws.ready_state() == WebSocket::OPEN
-        {
-            let _ = ws.send_with_str(&to_resp(&["AUTH", password]));
-        }
+        self.ws_enqueue(&to_resp(&["AUTH", password]));
         "OK".to_string()
     }
 
@@ -504,11 +532,7 @@ impl RecachedCache {
         ));
 
         let encoded = to_resp(&["SET", key, value]);
-        if let Some(ws) = &self.ws
-            && ws.ready_state() == WebSocket::OPEN
-        {
-            let _ = ws.send_with_str(&encoded);
-        }
+        self.ws_enqueue(&encoded);
         if let Some(bc) = &self.bc {
             let _ = bc.post_message(&JsValue::from_str(&encoded));
         }
@@ -533,11 +557,7 @@ impl RecachedCache {
             .execute(Command::Set(key.to_string(), value.to_string(), opts));
 
         let encoded = to_resp(&["SET", key, value, "EX", &seconds.to_string()]);
-        if let Some(ws) = &self.ws
-            && ws.ready_state() == WebSocket::OPEN
-        {
-            let _ = ws.send_with_str(&encoded);
-        }
+        self.ws_enqueue(&encoded);
         if let Some(bc) = &self.bc {
             let _ = bc.post_message(&JsValue::from_str(&encoded));
         }
@@ -564,11 +584,7 @@ impl RecachedCache {
         let resp = self.store.execute(Command::Del(vec![key.to_string()]));
 
         let encoded = to_resp(&["DEL", key]);
-        if let Some(ws) = &self.ws
-            && ws.ready_state() == WebSocket::OPEN
-        {
-            let _ = ws.send_with_str(&encoded);
-        }
+        self.ws_enqueue(&encoded);
         if let Some(bc) = &self.bc {
             let _ = bc.post_message(&JsValue::from_str(&encoded));
         }
@@ -599,28 +615,16 @@ impl RecachedCache {
 
     /// Publish a message to a channel on the server.
     pub fn publish(&self, channel: &str, message: &str) {
-        if let Some(ws) = &self.ws
-            && ws.ready_state() == WebSocket::OPEN
-        {
-            let _ = ws.send_with_str(&to_resp(&["PUBLISH", channel, message]));
-        }
+        self.ws_enqueue(&to_resp(&["PUBLISH", channel, message]));
     }
 
     /// Subscribe to a channel on the server. Push messages arrive via the `onmessage` callback.
     pub fn subscribe(&self, channel: &str) {
-        if let Some(ws) = &self.ws
-            && ws.ready_state() == WebSocket::OPEN
-        {
-            let _ = ws.send_with_str(&to_resp(&["SUBSCRIBE", channel]));
-        }
+        self.ws_enqueue(&to_resp(&["SUBSCRIBE", channel]));
     }
 
     /// Unsubscribe from a channel on the server.
     pub fn unsubscribe(&self, channel: &str) {
-        if let Some(ws) = &self.ws
-            && ws.ready_state() == WebSocket::OPEN
-        {
-            let _ = ws.send_with_str(&to_resp(&["UNSUBSCRIBE", channel]));
-        }
+        self.ws_enqueue(&to_resp(&["UNSUBSCRIBE", channel]));
     }
 }
