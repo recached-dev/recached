@@ -1,3 +1,6 @@
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use core_engine::cmd::{Command, SetExpiry, ZAddCondition};
 use core_engine::resp::Value;
 use core_engine::store::{EvictionPolicy, KeyValueStore, SnapshotEntry};
@@ -9,8 +12,8 @@ use std::io::ErrorKind;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -171,6 +174,42 @@ fn execute_and_record(store: &KeyValueStore, cmd: &Command) -> Value {
     response
 }
 
+// ── TCP listeners ─────────────────────────────────────────────────────────────
+
+/// Binds `n` TCP sockets on `addr`, all with `SO_REUSEPORT`, so the OS can
+/// distribute incoming connections across multiple accept loops — one per
+/// Tokio worker thread. Falls back to a single plain `TcpListener::bind` on
+/// platforms that don't support `SO_REUSEPORT`.
+fn make_tcp_listeners(addr: &str, n: usize) -> std::io::Result<Vec<TcpListener>> {
+    use socket2::{Domain, Socket, Type};
+    let socket_addr: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let domain = if socket_addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    // SO_REUSEPORT — which lets multiple sockets share one port — is Unix-only.
+    // Without it, binding a second socket to the same port fails, so fall back
+    // to a single accept loop on non-Unix platforms.
+    #[cfg(not(unix))]
+    let n = 1;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let sock = Socket::new(domain, Type::STREAM, None)?;
+        sock.set_reuse_address(true)?;
+        #[cfg(unix)]
+        sock.set_reuse_port(true)?;
+        sock.set_nonblocking(true)?;
+        sock.bind(&socket_addr.into())?;
+        sock.listen(4096)?;
+        let std_listener: std::net::TcpListener = sock.into();
+        out.push(TcpListener::from_std(std_listener)?);
+    }
+    Ok(out)
+}
+
 // ── TLS ───────────────────────────────────────────────────────────────────────
 
 fn load_certs(path: &str) -> std::io::Result<Vec<CertificateDer<'static>>> {
@@ -205,7 +244,7 @@ fn load_tls_acceptor() -> Option<TlsAcceptor> {
 
 // ── tunables ────────────────────────────────────────────────────────────────
 
-const TCP_READ_BUFFER_BYTES: usize = 4096;
+const TCP_READ_BUFFER_BYTES: usize = 16 * 1024; // 16 KB — matches Redis default
 const MAX_TCP_READ_BUFFER_BYTES: usize = 64 * 1024 * 1024; // 64 MB per connection
 const MAX_MULTI_QUEUE_LEN: usize = 10_000;
 const MAX_WATCHES_PER_CONN: usize = 1_024;
@@ -358,7 +397,13 @@ async fn replay_aof(store: &KeyValueStore, path: &std::path::Path) -> usize {
         match Value::parse(&bytes[offset..]) {
             Ok((value, consumed)) => {
                 offset += consumed;
-                if let Ok(cmd) = Command::from_value(value) {
+                // Writes are recorded via `on_write` in RESP3 Push form (`>N`);
+                // normalise to Array so Command::from_value can parse them.
+                let normalised = match value {
+                    Value::Push(inner) => Value::Array(Some(inner)),
+                    other => other,
+                };
+                if let Ok(cmd) = Command::from_value(normalised) {
                     store.execute(cmd);
                     replayed += 1;
                 }
@@ -386,6 +431,12 @@ type ReplRegistry = Arc<tokio::sync::Mutex<Vec<ReplSender>>>;
 /// so it can reconnect and receive a fresh snapshot — the primary write path
 /// is never blocked.
 const DEFAULT_REPL_CHANNEL_CAPACITY: usize = 4096;
+
+/// Upper bound on a single length-prefixed replication frame (snapshot or
+/// command). The replication port may be unauthenticated and plaintext, so an
+/// untrusted peer could otherwise send a 4 GB length prefix and force a matching
+/// allocation. 512 MB comfortably covers a large snapshot while bounding abuse.
+const MAX_REPL_FRAME_BYTES: usize = 512 * 1024 * 1024;
 
 // ── Server state ──────────────────────────────────────────────────────────────
 
@@ -512,6 +563,7 @@ fn parse_save_conditions(s: &str) -> Vec<SaveCondition> {
 // ── Replication server (primary side) ────────────────────────────────────────
 
 async fn run_repl_server(
+    bind_host: String,
     port: u16,
     store: Arc<KeyValueStore>,
     snap_cfg: Arc<SnapshotConfig>,
@@ -519,14 +571,14 @@ async fn run_repl_server(
     repl_password: Option<Arc<String>>,
     repl_channel_capacity: usize,
 ) {
-    let listener = match TcpListener::bind(format!("0.0.0.0:{}", port)).await {
+    let listener = match TcpListener::bind(format!("{}:{}", bind_host, port)).await {
         Ok(l) => l,
         Err(e) => {
             warn!("Replication listener failed to bind :{}: {}", port, e);
             return;
         }
     };
-    info!("Replication server listening on 0.0.0.0:{}", port);
+    info!("Replication server listening on {}:{}", bind_host, port);
     loop {
         match listener.accept().await {
             Ok((socket, addr)) => {
@@ -569,7 +621,7 @@ async fn handle_replica(
         socket.read_exact(&mut auth_buf).await?;
         let received_pwd = &auth_buf[..pwd.len()];
         let terminator = auth_buf[pwd.len()];
-        if received_pwd != pwd.as_bytes() || terminator != b'\n' {
+        if !ct_eq_bytes(received_pwd, pwd.as_bytes()) || terminator != b'\n' {
             let _ = socket
                 .write_all(b"-ERR invalid replication password\n")
                 .await;
@@ -612,6 +664,7 @@ async fn run_repl_client(
     state: Arc<ServerState>,
     repl_password: Option<String>,
     failover_timeout_secs: Option<u64>,
+    tx: broadcast::Sender<(u64, String)>,
 ) {
     let mut backoff_secs = 2u64;
     let mut unreachable_since: Option<std::time::Instant> = None;
@@ -633,7 +686,8 @@ async fn run_repl_client(
                 unreachable_since = None;
                 backoff_secs = 2;
                 if let Err(e) =
-                    sync_from_primary(&mut socket, &store, repl_password.as_deref()).await
+                    sync_from_primary(&mut socket, &store, repl_password.as_deref(), &tx, &state)
+                        .await
                 {
                     warn!("Replica: sync ended: {}", e);
                     // Sync dropped — primary may be gone; start tracking if not already.
@@ -668,6 +722,8 @@ async fn sync_from_primary(
     socket: &mut TcpStream,
     store: &KeyValueStore,
     repl_password: Option<&str>,
+    tx: &broadcast::Sender<(u64, String)>,
+    state: &ServerState,
 ) -> std::io::Result<()> {
     // 0. Send auth password if configured
     if let Some(pwd) = repl_password {
@@ -689,6 +745,12 @@ async fn sync_from_primary(
     let mut len_buf = [0u8; 4];
     socket.read_exact(&mut len_buf).await?;
     let snap_len = u32::from_le_bytes(len_buf) as usize;
+    if snap_len > MAX_REPL_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            format!("snapshot frame too large ({snap_len} > {MAX_REPL_FRAME_BYTES} bytes)"),
+        ));
+    }
     let mut snap_bytes = vec![0u8; snap_len];
     socket.read_exact(&mut snap_bytes).await?;
 
@@ -708,6 +770,12 @@ async fn sync_from_primary(
         let mut len_buf = [0u8; 4];
         socket.read_exact(&mut len_buf).await?;
         let cmd_len = u32::from_le_bytes(len_buf) as usize;
+        if cmd_len > MAX_REPL_FRAME_BYTES {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("command frame too large ({cmd_len} > {MAX_REPL_FRAME_BYTES} bytes)"),
+            ));
+        }
         let mut cmd_bytes = vec![0u8; cmd_len];
         socket.read_exact(&mut cmd_bytes).await?;
 
@@ -721,11 +789,30 @@ async fn sync_from_primary(
                 };
                 if let Ok(cmd) = Command::from_value(normalised) {
                     store.execute(cmd);
+                    // Relay the applied write so this replica's own WebSocket
+                    // clients see it, and any sub-replicas / AOF get it too
+                    // (enables multi-tier replication and replica WS push).
+                    let frame = String::from_utf8_lossy(&cmd_bytes).into_owned();
+                    let _ = tx.send((0, frame.clone()));
+                    state.on_write(&frame).await;
                 }
             }
             Err(e) => warn!("Replica: bad command from primary: {}", e),
         }
     }
+}
+
+// ── security helpers ─────────────────────────────────────────────────────────
+
+/// Constant-time byte slice equality to prevent timing-based password leaks.
+fn ct_eq_bytes(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 // ── connection identity ──────────────────────────────────────────────────────
@@ -780,6 +867,9 @@ impl PubSubHub {
     fn unsubscribe(&mut self, conn_id: u64, channel: &str) {
         if let Some(v) = self.channel_subs.get_mut(channel) {
             v.retain(|(id, _)| *id != conn_id);
+            if v.is_empty() {
+                self.channel_subs.remove(channel);
+            }
         }
     }
 
@@ -789,9 +879,10 @@ impl PubSubHub {
     }
 
     fn unsubscribe_all(&mut self, conn_id: u64) {
-        for v in self.channel_subs.values_mut() {
+        self.channel_subs.retain(|_, v| {
             v.retain(|(id, _)| *id != conn_id);
-        }
+            !v.is_empty()
+        });
         self.pattern_subs.retain(|(_, id, _)| *id != conn_id);
     }
 
@@ -799,7 +890,10 @@ impl PubSubHub {
     fn publish(&mut self, channel: &str, message: &str) -> i64 {
         let mut count = 0i64;
 
-        if let Some(subs) = self.channel_subs.get_mut(channel) {
+        if let std::collections::hash_map::Entry::Occupied(mut e) =
+            self.channel_subs.entry(channel.to_string())
+        {
+            let subs = e.get_mut();
             subs.retain(|(_, tx)| {
                 let ok = tx
                     .send(PubSubMsg::Message {
@@ -812,6 +906,9 @@ impl PubSubHub {
                 }
                 ok
             });
+            if subs.is_empty() {
+                e.remove();
+            }
         }
 
         let pattern_txs: Vec<(String, PubSubSender)> = self
@@ -837,12 +934,13 @@ impl PubSubHub {
     }
 }
 
-type SharedPubSub = Arc<Mutex<PubSubHub>>;
+type SharedPubSub = Arc<tokio::sync::Mutex<PubSubHub>>;
 
 // ── observable keys ───────────────────────────────────────────────────────────
 
 type WatchNotif = (String, Value);
-type WatchRegistry = Arc<Mutex<HashMap<String, Vec<(u64, mpsc::UnboundedSender<WatchNotif>)>>>>;
+type WatchRegistry =
+    Arc<tokio::sync::Mutex<HashMap<String, Vec<(u64, mpsc::UnboundedSender<WatchNotif>)>>>>;
 
 /// Extract the key(s) that `cmd` writes to, without inspecting the response.
 /// Used together with `broadcast_for()` — only call this when `broadcast_for`
@@ -905,7 +1003,7 @@ fn encode_keychange(key: &str, value: &Value) -> Vec<u8> {
     .serialize()
 }
 
-fn notify_watchers(
+async fn notify_watchers(
     registry: &WatchRegistry,
     cmd: &Command,
     response: &Value,
@@ -924,12 +1022,34 @@ fn notify_watchers(
         .iter()
         .map(|k| (k.clone(), store.get_current(k)))
         .collect();
-    let mut reg = registry.lock().unwrap();
+    let mut reg = registry.lock().await;
     for (key, value) in &key_values {
         if let Some(subs) = reg.get_mut(key) {
             subs.retain(|(_, tx)| tx.send((key.clone(), value.clone())).is_ok());
             if subs.is_empty() {
                 reg.remove(key);
+            }
+        }
+    }
+}
+
+/// Drop all of `conn_id`'s WATCH registrations and clear `watched_keys`.
+/// Called at every transaction boundary (EXEC, DISCARD) and on connection close,
+/// matching Redis semantics that WATCH state is flushed by EXEC/DISCARD.
+async fn unregister_all_watches(
+    registry: &WatchRegistry,
+    conn_id: u64,
+    watched_keys: &mut HashSet<String>,
+) {
+    if watched_keys.is_empty() {
+        return;
+    }
+    let mut reg = registry.lock().await;
+    for key in watched_keys.drain() {
+        if let Some(subs) = reg.get_mut(&key) {
+            subs.retain(|(id, _)| *id != conn_id);
+            if subs.is_empty() {
+                reg.remove(&key);
             }
         }
     }
@@ -1351,7 +1471,9 @@ fn process_auth(
     failures: &mut u32,
 ) -> (bool, Vec<u8>) {
     match expected.as_ref() {
-        Some(pwd) if provided == pwd => {
+        // Constant-time compare so a network attacker can't recover the password
+        // byte-by-byte from response-timing differences.
+        Some(pwd) if ct_eq_bytes(provided.as_bytes(), pwd.as_bytes()) => {
             *is_authenticated = true;
             *failures = 0;
             (false, b"+OK\r\n".to_vec())
@@ -1382,12 +1504,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    // ── bind address ──────────────────────────────────────────────────────
+    // Host/interface all listeners bind to. Defaults to 0.0.0.0 (all
+    // interfaces) for backwards compatibility; set RECACHED_BIND=127.0.0.1 to
+    // restrict to localhost, which — together with RECACHED_PASSWORD — is
+    // strongly recommended unless the server is deliberately public.
+    let bind_host = std::env::var("RECACHED_BIND").unwrap_or_else(|_| "0.0.0.0".to_string());
+    if bind_host == "0.0.0.0" {
+        warn!(
+            "Binding all interfaces (0.0.0.0). Set RECACHED_BIND=127.0.0.1 and RECACHED_PASSWORD before exposing this host."
+        );
+    } else {
+        info!("Binding interface {}", bind_host);
+    }
+
     // ── Prometheus metrics ────────────────────────────────────────────────
     let metrics_port: u16 = std::env::var("RECACHED_METRICS_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(9091);
-    let metrics_addr: std::net::SocketAddr = format!("0.0.0.0:{}", metrics_port).parse().unwrap();
+    let metrics_addr: std::net::SocketAddr =
+        format!("{}:{}", bind_host, metrics_port).parse().unwrap();
     metrics_exporter_prometheus::PrometheusBuilder::new()
         .with_http_listener(metrics_addr)
         .install()
@@ -1607,23 +1744,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // ── broadcast channel (mutation sync) ────────────────────────────────
+    // Carries (sender_conn_id, resp_encoded_mutation). WS receivers skip their
+    // own messages. Created before replication so a replica can push the writes
+    // it receives from the primary to its own local WebSocket clients.
+    let (tx, _rx) = broadcast::channel::<(u64, String)>(BROADCAST_CHANNEL_CAPACITY);
+
     // ── start replication ─────────────────────────────────────────────────
-    if !is_replica_start {
+    // The replication server runs on every node — including replicas — so a
+    // replica can in turn serve sub-replicas (multi-tier replication).
+    {
         let store_r = Arc::clone(&store);
         let snap_r = Arc::clone(&snap_cfg);
         let reg_r = Arc::clone(&replicas);
         let pwd_r = repl_password.clone().map(Arc::new);
         let cap_r = repl_channel_capacity;
+        let host_r = bind_host.clone();
         tokio::spawn(async move {
-            run_repl_server(repl_port, store_r, snap_r, reg_r, pwd_r, cap_r).await;
+            run_repl_server(host_r, repl_port, store_r, snap_r, reg_r, pwd_r, cap_r).await;
         });
-    } else if let Some(primary_addr) = replicaof {
+    }
+    if is_replica_start && let Some(primary_addr) = replicaof {
         let store_r = Arc::clone(&store);
         let state_r = Arc::clone(&state);
         let pwd_r = repl_password.clone();
         let fo_r = failover_timeout_secs;
+        let tx_r = tx.clone();
         tokio::spawn(async move {
-            run_repl_client(primary_addr, store_r, state_r, pwd_r, fo_r).await;
+            run_repl_client(primary_addr, store_r, state_r, pwd_r, fo_r, tx_r).await;
         });
         if let Some(t) = failover_timeout_secs {
             info!(
@@ -1651,15 +1799,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // ── broadcast channel (mutation sync) ────────────────────────────────
-    // Carries (sender_conn_id, resp_encoded_mutation). WS receivers skip their own messages.
-    let (tx, _rx) = broadcast::channel::<(u64, String)>(BROADCAST_CHANNEL_CAPACITY);
-
     // ── pub/sub hub ───────────────────────────────────────────────────────
-    let pubsub: SharedPubSub = Arc::new(Mutex::new(PubSubHub::new()));
+    let pubsub: SharedPubSub = Arc::new(tokio::sync::Mutex::new(PubSubHub::new()));
 
     // ── watch registry ────────────────────────────────────────────────────
-    let watch_registry: WatchRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let watch_registry: WatchRegistry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
     // ── connection limiter ────────────────────────────────────────────────
     let max_connections = std::env::var("RECACHED_MAX_CONNECTIONS")
@@ -1683,62 +1827,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tls_acceptor = Arc::new(tls_acceptor);
 
     // ── listeners ─────────────────────────────────────────────────────────
-    let tcp_listener = TcpListener::bind("0.0.0.0:6379").await?;
-    info!("TCP server listening on 0.0.0.0:6379");
+    let n_accept = num_cpus::get();
+    let tcp_listeners = make_tcp_listeners(&format!("{}:6379", bind_host), n_accept)?;
+    info!(
+        "TCP server listening on {}:6379 ({} accept loop(s))",
+        bind_host, n_accept
+    );
 
-    let ws_listener = TcpListener::bind("0.0.0.0:6380").await?;
-    info!("WebSocket server listening on 0.0.0.0:6380");
+    let ws_listener = TcpListener::bind(format!("{}:6380", bind_host)).await?;
+    info!("WebSocket server listening on {}:6380", bind_host);
 
-    let store_tcp = Arc::clone(&store);
-    let tx_tcp = tx.clone();
-    let pass_tcp = Arc::clone(&global_password);
-    let allowed_tcp = allowed_ips.clone();
-    let sem_tcp = Arc::clone(&semaphore);
-    let pubsub_tcp = Arc::clone(&pubsub);
-    let tls_tcp = Arc::clone(&tls_acceptor);
-    let watch_tcp = Arc::clone(&watch_registry);
-    let snap_tcp = Arc::clone(&state);
+    // Spawn one accept loop per CPU core, each with its own SO_REUSEPORT socket.
+    // The OS load-balances incoming connections across all loops.
+    for tcp_listener in tcp_listeners {
+        let store_tcp = Arc::clone(&store);
+        let tx_tcp = tx.clone();
+        let pass_tcp = Arc::clone(&global_password);
+        let allowed_tcp = allowed_ips.clone();
+        let sem_tcp = Arc::clone(&semaphore);
+        let pubsub_tcp = Arc::clone(&pubsub);
+        let tls_tcp = Arc::clone(&tls_acceptor);
+        let watch_tcp = Arc::clone(&watch_registry);
+        let snap_tcp = Arc::clone(&state);
 
-    tokio::spawn(async move {
-        loop {
-            match tcp_listener.accept().await {
-                Ok((socket, addr)) => {
-                    if let Some(allowed) = &allowed_tcp
-                        && !allowed.contains(&addr.ip())
-                    {
-                        debug!("TCP: rejected IP {}", addr.ip());
-                        continue;
-                    }
-                    let permit = match Arc::clone(&sem_tcp).try_acquire_owned() {
-                        Ok(p) => p,
-                        Err(_) => {
-                            warn!("TCP: connection limit reached, dropping {}", addr);
+        tokio::spawn(async move {
+            loop {
+                match tcp_listener.accept().await {
+                    Ok((socket, addr)) => {
+                        let _ = socket.set_nodelay(true);
+                        if let Some(allowed) = &allowed_tcp
+                            && !allowed.contains(&addr.ip())
+                        {
+                            debug!("TCP: rejected IP {}", addr.ip());
                             continue;
                         }
-                    };
-                    let s = Arc::clone(&store_tcp);
-                    let t = tx_tcp.clone();
-                    let p = Arc::clone(&pass_tcp);
-                    let ps = Arc::clone(&pubsub_tcp);
-                    let wr = Arc::clone(&watch_tcp);
-                    let tls = Arc::clone(&tls_tcp);
-                    let sc = Arc::clone(&snap_tcp);
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        if let Some(acc) = tls.as_ref() {
-                            match acc.accept(socket).await {
-                                Ok(tls_stream) => handle_tcp(tls_stream, s, t, p, ps, wr, sc).await,
-                                Err(e) => warn!("TCP TLS handshake failed from {}: {}", addr, e),
+                        let permit = match Arc::clone(&sem_tcp).try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                warn!("TCP: connection limit reached, dropping {}", addr);
+                                continue;
                             }
-                        } else {
-                            handle_tcp(socket, s, t, p, ps, wr, sc).await;
-                        }
-                    });
+                        };
+                        let s = Arc::clone(&store_tcp);
+                        let t = tx_tcp.clone();
+                        let p = Arc::clone(&pass_tcp);
+                        let ps = Arc::clone(&pubsub_tcp);
+                        let wr = Arc::clone(&watch_tcp);
+                        let tls = Arc::clone(&tls_tcp);
+                        let sc = Arc::clone(&snap_tcp);
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            if let Some(acc) = tls.as_ref() {
+                                match acc.accept(socket).await {
+                                    Ok(tls_stream) => {
+                                        handle_tcp(tls_stream, s, t, p, ps, wr, sc).await
+                                    }
+                                    Err(e) => {
+                                        warn!("TCP TLS handshake failed from {}: {}", addr, e)
+                                    }
+                                }
+                            } else {
+                                handle_tcp(socket, s, t, p, ps, wr, sc).await;
+                            }
+                        });
+                    }
+                    Err(e) => warn!("TCP accept error: {}", e),
                 }
-                Err(e) => warn!("TCP accept error: {}", e),
             }
-        }
-    });
+        });
+    }
 
     // ── graceful shutdown via oneshot channel ────────────────────────────
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1767,6 +1924,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             res = ws_listener.accept() => {
                 match res {
                     Ok((socket, addr)) => {
+                        let _ = socket.set_nodelay(true);
                         if let Some(allowed) = &allowed_ips
                             && !allowed.contains(&addr.ip())
                         {
@@ -1830,8 +1988,10 @@ async fn handle_tcp<S>(
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let _guard = ConnectionGuard::tcp();
-    let (mut reader, mut writer) = tokio::io::split(socket);
+    let (mut reader, raw_writer) = tokio::io::split(socket);
+    let mut writer = tokio::io::BufWriter::with_capacity(32 * 1024, raw_writer);
     let mut buf = Vec::<u8>::new();
+    let mut read_pos: usize = 0;
     let mut read_buf = [0u8; TCP_READ_BUFFER_BYTES];
     let mut is_authenticated = password.is_none();
     let mut auth_failures: u32 = 0;
@@ -1839,6 +1999,11 @@ async fn handle_tcp<S>(
     let mut subscribed_channels: HashSet<String> = HashSet::new();
     let mut subscribed_patterns: HashSet<String> = HashSet::new();
     let (ps_tx, mut ps_rx) = mpsc::unbounded_channel::<PubSubMsg>();
+    // WATCH state for optimistic-lock transactions over TCP. Unlike the WS
+    // handler, TCP clients are not sent keychange pushes — WATCH is pure CAS.
+    let mut watched_keys: HashSet<String> = HashSet::new();
+    let mut watch_dirty = false;
+    let (watch_tx, mut watch_rx) = mpsc::unbounded_channel::<WatchNotif>();
     let conn_id = next_conn_id();
 
     'outer: loop {
@@ -1849,15 +2014,15 @@ async fn handle_tcp<S>(
                 match result {
                     Ok(0) => break,
                     Ok(n) => {
-                        if buf.len() + n > MAX_TCP_READ_BUFFER_BYTES {
+                        if (buf.len() - read_pos) + n > MAX_TCP_READ_BUFFER_BYTES {
                             warn!("TCP connection exceeded max buffer size, closing");
                             break 'outer;
                         }
                         buf.extend_from_slice(&read_buf[..n]);
                         'parse: loop {
-                            match Value::parse(&buf) {
+                            match Value::parse(&buf[read_pos..]) {
                                 Ok((value, consumed)) => {
-                                    buf.drain(..consumed);
+                                    read_pos += consumed;
                                     let cmd = match Command::from_value(value) {
                                         Ok(c) => c,
                                         Err(e) => {
@@ -1873,7 +2038,10 @@ async fn handle_tcp<S>(
                                             pwd, &password, &mut is_authenticated, &mut auth_failures,
                                         );
                                         if writer.write_all(&resp).await.is_err() { break 'outer; }
-                                        if disconnect { break 'outer; }
+                                        if disconnect {
+                                            let _ = writer.flush().await;
+                                            break 'outer;
+                                        }
                                         continue 'parse;
                                     }
 
@@ -1898,6 +2066,10 @@ async fn handle_tcp<S>(
                                         }
                                         Command::Discard => {
                                             let resp = if multi_queue.take().is_some() {
+                                                // DISCARD also flushes WATCH state.
+                                                unregister_all_watches(&watch_registry, conn_id, &mut watched_keys).await;
+                                                while watch_rx.try_recv().is_ok() {}
+                                                watch_dirty = false;
                                                 b"+OK\r\n".to_vec()
                                             } else {
                                                 b"-ERR DISCARD without MULTI\r\n".to_vec()
@@ -1911,18 +2083,33 @@ async fn handle_tcp<S>(
                                                     if writer.write_all(b"-ERR EXEC without MULTI\r\n").await.is_err() { break 'outer; }
                                                 }
                                                 Some(queue) => {
-                                                    let mut results = Vec::with_capacity(queue.len());
-                                                    for qcmd in queue {
-                                                        let resp = execute_and_record(&store, &qcmd);
-                                                        if let Some(msg) = broadcast_for(&qcmd, &resp) {
-                                                            let _ = tx.send((0, msg.clone()));
-                                                            state.on_write(&msg).await;
-                                                        }
-                                                        notify_watchers(&watch_registry, &qcmd, &resp, &store);
-                                                        results.push(resp);
+                                                    // Drain pending notifications so the CAS check isn't racy.
+                                                    while watch_rx.try_recv().is_ok() {
+                                                        watch_dirty = true;
                                                     }
-                                                    let out = Value::Array(Some(results)).serialize();
-                                                    if writer.write_all(&out).await.is_err() { break 'outer; }
+                                                    if watch_dirty {
+                                                        // A watched key changed since WATCH — abort with nil array.
+                                                        unregister_all_watches(&watch_registry, conn_id, &mut watched_keys).await;
+                                                        while watch_rx.try_recv().is_ok() {}
+                                                        watch_dirty = false;
+                                                        if writer.write_all(&Value::Array(None).serialize()).await.is_err() { break 'outer; }
+                                                    } else {
+                                                        let mut results = Vec::with_capacity(queue.len());
+                                                        for qcmd in queue {
+                                                            let resp = execute_and_record(&store, &qcmd);
+                                                            if let Some(msg) = broadcast_for(&qcmd, &resp) {
+                                                                let _ = tx.send((0, msg.clone()));
+                                                                state.on_write(&msg).await;
+                                                            }
+                                                            notify_watchers(&watch_registry, &qcmd, &resp, &store).await;
+                                                            results.push(resp);
+                                                        }
+                                                        unregister_all_watches(&watch_registry, conn_id, &mut watched_keys).await;
+                                                        while watch_rx.try_recv().is_ok() {}
+                                                        watch_dirty = false;
+                                                        let out = Value::Array(Some(results)).serialize();
+                                                        if writer.write_all(&out).await.is_err() { break 'outer; }
+                                                    }
                                                 }
                                             }
                                             continue 'parse;
@@ -1932,11 +2119,12 @@ async fn handle_tcp<S>(
 
                                     // If inside MULTI, queue the command
                                     if let Some(ref mut queue) = multi_queue {
-                                        // Pub/sub commands cannot be queued
+                                        // Pub/sub and WATCH commands cannot be queued
                                         match &cmd {
                                             Command::Subscribe(_) | Command::Unsubscribe(_)
                                             | Command::PSubscribe(_) | Command::PUnsubscribe(_)
-                                            | Command::Publish(_, _) => {
+                                            | Command::Publish(_, _)
+                                            | Command::Watch(_) | Command::Unwatch(_) => {
                                                 let err = b"-ERR Command not allowed inside a transaction\r\n";
                                                 if writer.write_all(err).await.is_err() { break 'outer; }
                                             }
@@ -1958,7 +2146,7 @@ async fn handle_tcp<S>(
                                         Command::Subscribe(channels) => {
                                             for ch in channels {
                                                 subscribed_channels.insert(ch.clone());
-                                                pubsub.lock().unwrap().subscribe(conn_id, &ch, ps_tx.clone());
+                                                pubsub.lock().await.subscribe(conn_id, &ch, ps_tx.clone());
                                                 let count = subscribed_channels.len() + subscribed_patterns.len();
                                                 let ack = resp_subscribe_ack("subscribe", &ch, count);
                                                 if writer.write_all(&ack).await.is_err() { break 'outer; }
@@ -1971,7 +2159,7 @@ async fn handle_tcp<S>(
                                                 channels.into_iter().filter(|c| subscribed_channels.remove(c)).collect()
                                             };
                                             for ch in &targets {
-                                                pubsub.lock().unwrap().unsubscribe(conn_id, ch);
+                                                pubsub.lock().await.unsubscribe(conn_id, ch);
                                                 let count = subscribed_channels.len() + subscribed_patterns.len();
                                                 let ack = resp_subscribe_ack("unsubscribe", ch, count);
                                                 if writer.write_all(&ack).await.is_err() { break 'outer; }
@@ -1984,7 +2172,7 @@ async fn handle_tcp<S>(
                                         Command::PSubscribe(patterns) => {
                                             for pat in patterns {
                                                 subscribed_patterns.insert(pat.clone());
-                                                pubsub.lock().unwrap().psubscribe(conn_id, &pat, ps_tx.clone());
+                                                pubsub.lock().await.psubscribe(conn_id, &pat, ps_tx.clone());
                                                 let count = subscribed_channels.len() + subscribed_patterns.len();
                                                 let ack = resp_subscribe_ack("psubscribe", &pat, count);
                                                 if writer.write_all(&ack).await.is_err() { break 'outer; }
@@ -1997,7 +2185,7 @@ async fn handle_tcp<S>(
                                                 patterns.into_iter().filter(|p| subscribed_patterns.remove(p)).collect()
                                             };
                                             for pat in &targets {
-                                                pubsub.lock().unwrap().punsubscribe(conn_id, pat);
+                                                pubsub.lock().await.punsubscribe(conn_id, pat);
                                                 let count = subscribed_channels.len() + subscribed_patterns.len();
                                                 let ack = resp_subscribe_ack("punsubscribe", pat, count);
                                                 if writer.write_all(&ack).await.is_err() { break 'outer; }
@@ -2008,9 +2196,47 @@ async fn handle_tcp<S>(
                                             }
                                         }
                                         Command::Publish(channel, message) => {
-                                            let count = pubsub.lock().unwrap().publish(&channel, &message);
+                                            let count = pubsub.lock().await.publish(&channel, &message);
                                             let resp = Value::Integer(count).serialize();
                                             if writer.write_all(&resp).await.is_err() { break 'outer; }
+                                        }
+
+                                        Command::Watch(keys) => {
+                                            let new_count = keys.iter().filter(|k| !watched_keys.contains(*k)).count();
+                                            if watched_keys.len() + new_count > MAX_WATCHES_PER_CONN {
+                                                if writer.write_all(b"-ERR watch limit per connection reached\r\n").await.is_err() { break 'outer; }
+                                            } else {
+                                                {
+                                                    let mut reg = watch_registry.lock().await;
+                                                    for key in &keys {
+                                                        if watched_keys.insert(key.clone()) {
+                                                            reg.entry(key.clone()).or_default().push((conn_id, watch_tx.clone()));
+                                                        }
+                                                    }
+                                                }
+                                                if writer.write_all(b"+OK\r\n").await.is_err() { break 'outer; }
+                                            }
+                                        }
+                                        Command::Unwatch(keys) => {
+                                            let targets: Vec<String> = if keys.is_empty() {
+                                                watched_keys.drain().collect()
+                                            } else {
+                                                keys.into_iter().filter(|k| watched_keys.remove(k)).collect()
+                                            };
+                                            {
+                                                let mut reg = watch_registry.lock().await;
+                                                for key in &targets {
+                                                    if let Some(subs) = reg.get_mut(key) {
+                                                        subs.retain(|(id, _)| *id != conn_id);
+                                                        if subs.is_empty() { reg.remove(key); }
+                                                    }
+                                                }
+                                            }
+                                            if watched_keys.is_empty() {
+                                                while watch_rx.try_recv().is_ok() {}
+                                                watch_dirty = false;
+                                            }
+                                            if writer.write_all(b"+OK\r\n").await.is_err() { break 'outer; }
                                         }
 
                                         cmd => {
@@ -2057,21 +2283,31 @@ async fn handle_tcp<S>(
                                                 let _ = tx.send((0, msg.clone()));
                                                 state.on_write(&msg).await;
                                             }
-                                            notify_watchers(&watch_registry, &cmd, &response, &store);
+                                            notify_watchers(&watch_registry, &cmd, &response, &store).await;
                                             if writer.write_all(&response.serialize()).await.is_err() {
                                                 break 'outer;
                                             }
                                         }
                                     }
                                 }
-                                Err(ref e) if e == "Incomplete" => break 'parse,
+                                Err(ref e) if e == "Incomplete" => {
+                                    // Compact: drop already-parsed bytes, reset cursor.
+                                    buf.drain(..read_pos);
+                                    read_pos = 0;
+                                    break 'parse;
+                                }
                                 Err(e) => {
                                     warn!("TCP protocol error: {}", e);
                                     let _ = writer.write_all(b"-ERR Protocol error\r\n").await;
                                     buf.clear();
+                                    read_pos = 0;
                                     break 'parse;
                                 }
                             }
+                        }
+                        // Flush all responses for this read batch in one syscall.
+                        if writer.flush().await.is_err() {
+                            break 'outer;
                         }
                     }
                     Err(e) => {
@@ -2091,12 +2327,21 @@ async fn handle_tcp<S>(
                     None => break,
                 }
             }
+
+            // A watched key changed: mark the transaction dirty so a following
+            // EXEC aborts. TCP clients get no keychange push (WATCH is pure CAS).
+            notif = watch_rx.recv(), if !watched_keys.is_empty() => {
+                if notif.is_some() {
+                    watch_dirty = true;
+                }
+            }
         }
     }
 
     if !subscribed_channels.is_empty() || !subscribed_patterns.is_empty() {
-        pubsub.lock().unwrap().unsubscribe_all(conn_id);
+        pubsub.lock().await.unsubscribe_all(conn_id);
     }
+    unregister_all_watches(&watch_registry, conn_id, &mut watched_keys).await;
 }
 
 // ── WebSocket handler ─────────────────────────────────────────────────────────
@@ -2132,8 +2377,14 @@ async fn handle_ws<S>(
     let mut subscribed_patterns: HashSet<String> = HashSet::new();
     let (ps_tx, mut ps_rx) = mpsc::unbounded_channel::<PubSubMsg>();
     let mut watched_keys: HashSet<String> = HashSet::new();
+    // Set when any watched key changes; EXEC aborts (returns nil) if true.
+    let mut watch_dirty = false;
     let (watch_tx, mut watch_rx) = mpsc::unbounded_channel::<WatchNotif>();
 
+    // NOTE: the WebSocket transport uses *text* frames, so values must be valid
+    // UTF-8. Non-UTF-8 bytes are replaced (lossy) on the way out. This is safe
+    // for the SDK, whose `set(key, value)` API only accepts `&str` values; raw
+    // binary values are only fully round-trippable over the TCP (RESP) port.
     macro_rules! ws_send {
         ($bytes:expr) => {{
             let text = String::from_utf8_lossy($bytes).into_owned();
@@ -2198,6 +2449,10 @@ async fn handle_ws<S>(
                             }
                             Command::Discard => {
                                 let resp = if multi_queue.take().is_some() {
+                                    // DISCARD also flushes WATCH state.
+                                    unregister_all_watches(&watch_registry, conn_id, &mut watched_keys).await;
+                                    while watch_rx.try_recv().is_ok() {} // drop stale notifications
+                                    watch_dirty = false;
                                     b"+OK\r\n".to_vec()
                                 } else {
                                     b"-ERR DISCARD without MULTI\r\n".to_vec()
@@ -2211,18 +2466,38 @@ async fn handle_ws<S>(
                                         ws_send!(b"-ERR EXEC without MULTI\r\n");
                                     }
                                     Some(queue) => {
-                                        let mut results = Vec::with_capacity(queue.len());
-                                        for qcmd in queue {
-                                            let resp = execute_and_record(&store, &qcmd);
-                                            if let Some(msg) = broadcast_for(&qcmd, &resp) {
-                                                let _ = tx.send((conn_id, msg.clone()));
-                                                state.on_write(&msg).await;
-                                            }
-                                            notify_watchers(&watch_registry, &qcmd, &resp, &store);
-                                            results.push(resp);
+                                        // Catch watched-key changes that arrived but the select
+                                        // loop hasn't drained yet, so the CAS check isn't racy.
+                                        while watch_rx.try_recv().is_ok() {
+                                            watch_dirty = true;
                                         }
-                                        let out = Value::Array(Some(results)).serialize();
-                                        ws_send!(&out);
+                                        if watch_dirty {
+                                            // A watched key changed since WATCH — abort: return
+                                            // a nil array and run nothing (Redis CAS semantics).
+                                            unregister_all_watches(&watch_registry, conn_id, &mut watched_keys).await;
+                                            while watch_rx.try_recv().is_ok() {} // drop stale notifications
+                                            watch_dirty = false;
+                                            ws_send!(&Value::Array(None).serialize());
+                                        } else {
+                                            let mut results = Vec::with_capacity(queue.len());
+                                            for qcmd in queue {
+                                                let resp = execute_and_record(&store, &qcmd);
+                                                if let Some(msg) = broadcast_for(&qcmd, &resp) {
+                                                    let _ = tx.send((conn_id, msg.clone()));
+                                                    state.on_write(&msg).await;
+                                                }
+                                                notify_watchers(&watch_registry, &qcmd, &resp, &store).await;
+                                                results.push(resp);
+                                            }
+                                            // EXEC always flushes WATCH state. Drain any
+                                            // self-notifications the queued writes produced so
+                                            // they can't dirty a later transaction.
+                                            unregister_all_watches(&watch_registry, conn_id, &mut watched_keys).await;
+                                            while watch_rx.try_recv().is_ok() {}
+                                            watch_dirty = false;
+                                            let out = Value::Array(Some(results)).serialize();
+                                            ws_send!(&out);
+                                        }
                                     }
                                 }
                                 continue;
@@ -2235,7 +2510,8 @@ async fn handle_ws<S>(
                             match &cmd {
                                 Command::Subscribe(_) | Command::Unsubscribe(_)
                                 | Command::PSubscribe(_) | Command::PUnsubscribe(_)
-                                | Command::Publish(_, _) => {
+                                | Command::Publish(_, _)
+                                | Command::Watch(_) | Command::Unwatch(_) => {
                                     ws_send!(b"-ERR Command not allowed inside a transaction\r\n");
                                 }
                                 _ => {
@@ -2255,7 +2531,7 @@ async fn handle_ws<S>(
                             Command::Subscribe(channels) => {
                                 for ch in channels {
                                     subscribed_channels.insert(ch.clone());
-                                    pubsub.lock().unwrap().subscribe(conn_id, &ch, ps_tx.clone());
+                                    pubsub.lock().await.subscribe(conn_id, &ch, ps_tx.clone());
                                     let count = subscribed_channels.len() + subscribed_patterns.len();
                                     ws_send!(&resp_subscribe_ack("subscribe", &ch, count));
                                 }
@@ -2267,7 +2543,7 @@ async fn handle_ws<S>(
                                     channels.into_iter().filter(|c| subscribed_channels.remove(c)).collect()
                                 };
                                 for ch in &targets {
-                                    pubsub.lock().unwrap().unsubscribe(conn_id, ch);
+                                    pubsub.lock().await.unsubscribe(conn_id, ch);
                                     let count = subscribed_channels.len() + subscribed_patterns.len();
                                     ws_send!(&resp_subscribe_ack("unsubscribe", ch, count));
                                 }
@@ -2278,7 +2554,7 @@ async fn handle_ws<S>(
                             Command::PSubscribe(patterns) => {
                                 for pat in patterns {
                                     subscribed_patterns.insert(pat.clone());
-                                    pubsub.lock().unwrap().psubscribe(conn_id, &pat, ps_tx.clone());
+                                    pubsub.lock().await.psubscribe(conn_id, &pat, ps_tx.clone());
                                     let count = subscribed_channels.len() + subscribed_patterns.len();
                                     ws_send!(&resp_subscribe_ack("psubscribe", &pat, count));
                                 }
@@ -2290,7 +2566,7 @@ async fn handle_ws<S>(
                                     patterns.into_iter().filter(|p| subscribed_patterns.remove(p)).collect()
                                 };
                                 for pat in &targets {
-                                    pubsub.lock().unwrap().punsubscribe(conn_id, pat);
+                                    pubsub.lock().await.punsubscribe(conn_id, pat);
                                     let count = subscribed_channels.len() + subscribed_patterns.len();
                                     ws_send!(&resp_subscribe_ack("punsubscribe", pat, count));
                                 }
@@ -2299,7 +2575,7 @@ async fn handle_ws<S>(
                                 }
                             }
                             Command::Publish(channel, message) => {
-                                let count = pubsub.lock().unwrap().publish(&channel, &message);
+                                let count = pubsub.lock().await.publish(&channel, &message);
                                 ws_send!(&Value::Integer(count).serialize());
                             }
 
@@ -2312,7 +2588,7 @@ async fn handle_ws<S>(
                                     ws_send!(b"-ERR watch limit per connection reached\r\n");
                                 } else {
                                     {
-                                        let mut reg = watch_registry.lock().unwrap();
+                                        let mut reg = watch_registry.lock().await;
                                         for key in &keys {
                                             if watched_keys.insert(key.clone()) {
                                                 reg.entry(key.clone())
@@ -2331,7 +2607,7 @@ async fn handle_ws<S>(
                                     keys.into_iter().filter(|k| watched_keys.remove(k)).collect()
                                 };
                                 {
-                                    let mut reg = watch_registry.lock().unwrap();
+                                    let mut reg = watch_registry.lock().await;
                                     for key in &targets {
                                         if let Some(subs) = reg.get_mut(key) {
                                             subs.retain(|(id, _)| *id != conn_id);
@@ -2340,6 +2616,12 @@ async fn handle_ws<S>(
                                             }
                                         }
                                     }
+                                }
+                                // Once nothing is watched, clear the dirty flag and drop any
+                                // queued notifications so a later WATCH/MULTI/EXEC starts clean.
+                                if watched_keys.is_empty() {
+                                    while watch_rx.try_recv().is_ok() {}
+                                    watch_dirty = false;
                                 }
                                 ws_send!(b"+OK\r\n");
                             }
@@ -2387,7 +2669,7 @@ async fn handle_ws<S>(
                                     }
                                     state.on_write(&b_msg).await;
                                 }
-                                notify_watchers(&watch_registry, &cmd, &response, &store);
+                                notify_watchers(&watch_registry, &cmd, &response, &store).await;
                                 ws_send!(&response.serialize());
                             }
                         }
@@ -2432,6 +2714,10 @@ async fn handle_ws<S>(
 
             notif = watch_rx.recv(), if !watched_keys.is_empty() => {
                 if let Some((key, value)) = notif {
+                    // A watched key changed: mark the transaction dirty (so a
+                    // following EXEC aborts) and still push the keychange to the
+                    // client for the observable-keys feature.
+                    watch_dirty = true;
                     let bytes = encode_keychange(&key, &value);
                     let text = String::from_utf8_lossy(&bytes).into_owned();
                     if ws_sender.send(Message::Text(text.into())).await.is_err() {
@@ -2443,10 +2729,10 @@ async fn handle_ws<S>(
     }
 
     if !subscribed_channels.is_empty() || !subscribed_patterns.is_empty() {
-        pubsub.lock().unwrap().unsubscribe_all(conn_id);
+        pubsub.lock().await.unsubscribe_all(conn_id);
     }
     if !watched_keys.is_empty() {
-        let mut reg = watch_registry.lock().unwrap();
+        let mut reg = watch_registry.lock().await;
         for key in &watched_keys {
             if let Some(subs) = reg.get_mut(key) {
                 subs.retain(|(id, _)| *id != conn_id);
@@ -2498,8 +2784,8 @@ mod tests {
     ) -> TestServer {
         let store = Arc::new(KeyValueStore::new());
         let (tx, _rx) = broadcast::channel::<(u64, String)>(256);
-        let pubsub: SharedPubSub = Arc::new(Mutex::new(PubSubHub::new()));
-        let watch_registry: WatchRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let pubsub: SharedPubSub = Arc::new(tokio::sync::Mutex::new(PubSubHub::new()));
+        let watch_registry: WatchRegistry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let semaphore = Arc::new(Semaphore::new(64));
         let snap_cfg = Arc::new(SnapshotConfig {
             path: snap_path.unwrap_or_else(|| tmp_path("test.rdb")),
@@ -2674,6 +2960,23 @@ mod tests {
         let count = replay_aof(&store, &path).await;
         assert_eq!(count, 2);
         assert_eq!(store.execute(Command::DbSize), Value::Integer(2));
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn replay_aof_push_frames() {
+        // The live server records writes via `on_write`, which stores them in
+        // RESP3 Push (`>`) form. Replay must accept those, not just `*` arrays.
+        let store = KeyValueStore::new();
+        let path = tmp_path("aof_push.aof");
+        let resp = ">3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
+        tokio::fs::write(&path, resp.as_bytes()).await.unwrap();
+        let count = replay_aof(&store, &path).await;
+        assert_eq!(count, 1);
+        assert_eq!(
+            store.execute(Command::Get("foo".into())),
+            Value::BulkString(Some(b"bar".to_vec()))
+        );
         let _ = tokio::fs::remove_file(&path).await;
     }
 
@@ -3103,8 +3406,8 @@ mod tests {
         let primary2 = {
             let store = Arc::clone(&primary.store);
             let (tx, _rx) = broadcast::channel::<(u64, String)>(256);
-            let pubsub: SharedPubSub = Arc::new(Mutex::new(PubSubHub::new()));
-            let wr: WatchRegistry = Arc::new(Mutex::new(HashMap::new()));
+            let pubsub: SharedPubSub = Arc::new(tokio::sync::Mutex::new(PubSubHub::new()));
+            let wr: WatchRegistry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
             let sem = Arc::new(Semaphore::new(64));
             let snap = Arc::clone(&primary.state.snap);
             let state = Arc::new(ServerState {
@@ -3162,8 +3465,9 @@ mod tests {
         let rs = Arc::clone(&replica_store);
         let rst = Arc::clone(&replica_state);
         let repl_addr = format!("127.0.0.1:{repl_port}");
+        let rtx = broadcast::channel::<(u64, String)>(16).0;
         tokio::spawn(async move {
-            run_repl_client(repl_addr, rs, rst, None, None).await;
+            run_repl_client(repl_addr, rs, rst, None, None, rtx).await;
         });
 
         // Give replica time to connect and receive initial snapshot
@@ -3217,8 +3521,8 @@ mod tests {
         // Small semaphore: only 3 concurrent connections
         let store = Arc::new(KeyValueStore::new());
         let (tx, _rx) = broadcast::channel::<(u64, String)>(16);
-        let pubsub: SharedPubSub = Arc::new(Mutex::new(PubSubHub::new()));
-        let watch_registry: WatchRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let pubsub: SharedPubSub = Arc::new(tokio::sync::Mutex::new(PubSubHub::new()));
+        let watch_registry: WatchRegistry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let semaphore = Arc::new(Semaphore::new(3));
         let state = Arc::new(ServerState {
             snap: Arc::new(SnapshotConfig {
@@ -3352,8 +3656,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
         drop(listener);
+        let rtx = broadcast::channel::<(u64, String)>(16).0;
         tokio::spawn(async move {
-            run_repl_client(dead_addr, rs, rst, None, Some(1)).await;
+            run_repl_client(dead_addr, rs, rst, None, Some(1), rtx).await;
         });
 
         // Wait for 2 backoff cycles (initial fail + 2s sleep + retry fail → promote)
@@ -3363,5 +3668,199 @@ mod tests {
             !replica_state.is_replica(),
             "replica should have promoted after primary was unreachable for >1s"
         );
+    }
+
+    // ── WebSocket WATCH/EXEC harness ──────────────────────────────────────────
+
+    /// Spawn a WebSocket server sharing one store + watch registry across all
+    /// connections, so WATCH notifications fan out between clients.
+    async fn spawn_ws_server() -> TestServer {
+        let store = Arc::new(KeyValueStore::new());
+        let (tx, _rx) = broadcast::channel::<(u64, String)>(256);
+        let pubsub: SharedPubSub = Arc::new(tokio::sync::Mutex::new(PubSubHub::new()));
+        let watch_registry: WatchRegistry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let snap_cfg = Arc::new(SnapshotConfig {
+            path: tmp_path("ws_test.rdb"),
+            last_save: AtomicI64::new(now_unix_secs()),
+        });
+        let state = Arc::new(ServerState {
+            snap: snap_cfg,
+            aof: None,
+            replicas: Arc::new(tokio::sync::Mutex::new(vec![])),
+            is_replica: AtomicBool::new(false),
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let store2 = Arc::clone(&store);
+        let state2 = Arc::clone(&state);
+
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let (s, t, ps, wr, st) = (
+                    Arc::clone(&store2),
+                    tx.clone(),
+                    Arc::clone(&pubsub),
+                    Arc::clone(&watch_registry),
+                    Arc::clone(&state2),
+                );
+                let id = next_conn_id();
+                tokio::spawn(async move {
+                    handle_ws(socket, s, t, Arc::new(None), id, ps, wr, st).await;
+                });
+            }
+        });
+
+        TestServer {
+            tcp_addr: addr,
+            store,
+            state,
+            _task: task,
+        }
+    }
+
+    struct WsClient {
+        ws: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+    }
+
+    impl WsClient {
+        async fn connect(addr: std::net::SocketAddr) -> Self {
+            let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+                .await
+                .unwrap();
+            Self { ws }
+        }
+
+        async fn cmd(&mut self, args: &[&str]) -> Value {
+            let mut req = format!("*{}\r\n", args.len());
+            for a in args {
+                req.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+            }
+            self.ws.send(Message::Text(req.into())).await.unwrap();
+            self.next_reply().await
+        }
+
+        /// Read the next *command reply*, skipping server-initiated frames
+        /// (RESP3 Push broadcasts and `keychange` observable-key pushes).
+        async fn next_reply(&mut self) -> Value {
+            loop {
+                match self.ws.next().await {
+                    Some(Ok(Message::Text(t))) => {
+                        let Ok((v, _)) = Value::parse(t.as_bytes()) else {
+                            continue;
+                        };
+                        if matches!(v, Value::Push(_)) {
+                            continue;
+                        }
+                        if let Value::Array(Some(items)) = &v
+                            && matches!(items.first(), Some(Value::BulkString(Some(k))) if k == b"keychange")
+                        {
+                            continue;
+                        }
+                        return v;
+                    }
+                    Some(Ok(_)) => continue,
+                    _ => panic!("ws closed unexpectedly"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn integration_ws_watch_exec_aborts_on_change() {
+        let srv = spawn_ws_server().await;
+        let mut watcher = WsClient::connect(srv.tcp_addr).await;
+        let mut writer = WsClient::connect(srv.tcp_addr).await;
+
+        assert_eq!(watcher.cmd(&["SET", "k", "v0"]).await, ok());
+        assert_eq!(watcher.cmd(&["WATCH", "k"]).await, ok());
+
+        // Another client mutates the watched key.
+        assert_eq!(writer.cmd(&["SET", "k", "v1"]).await, ok());
+        // Give the notification time to reach the watcher's registry channel.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        assert_eq!(
+            watcher.cmd(&["MULTI"]).await,
+            Value::SimpleString("OK".into())
+        );
+        assert_eq!(
+            watcher.cmd(&["SET", "k", "v2"]).await,
+            Value::SimpleString("QUEUED".into())
+        );
+        // EXEC must abort with a nil array because k changed since WATCH.
+        assert_eq!(watcher.cmd(&["EXEC"]).await, Value::Array(None));
+        // The transaction did not run.
+        assert_eq!(srv.store.execute(Command::Get("k".into())), bulk("v1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn integration_ws_watch_exec_runs_when_unchanged() {
+        let srv = spawn_ws_server().await;
+        let mut c = WsClient::connect(srv.tcp_addr).await;
+
+        assert_eq!(c.cmd(&["WATCH", "k"]).await, ok());
+        assert_eq!(c.cmd(&["MULTI"]).await, ok());
+        assert_eq!(
+            c.cmd(&["SET", "k", "v1"]).await,
+            Value::SimpleString("QUEUED".into())
+        );
+        // No one touched k → EXEC runs and returns the queued results.
+        assert_eq!(
+            c.cmd(&["EXEC"]).await,
+            Value::Array(Some(vec![Value::SimpleString("OK".into())]))
+        );
+        assert_eq!(srv.store.execute(Command::Get("k".into())), bulk("v1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn integration_tcp_watch_exec_aborts_on_change() {
+        let srv = spawn_server().await;
+        let mut watcher = RespClient::connect(srv.tcp_addr).await;
+        let mut writer = RespClient::connect(srv.tcp_addr).await;
+
+        assert_eq!(watcher.cmd(&["SET", "k", "v0"]).await, ok());
+        assert_eq!(watcher.cmd(&["WATCH", "k"]).await, ok());
+        // Another client mutates the watched key (reply awaited → notification queued).
+        assert_eq!(writer.cmd(&["SET", "k", "v1"]).await, ok());
+
+        assert_eq!(watcher.cmd(&["MULTI"]).await, ok());
+        assert_eq!(
+            watcher.cmd(&["SET", "k", "v2"]).await,
+            Value::SimpleString("QUEUED".into())
+        );
+        // k changed since WATCH → EXEC aborts with a nil array.
+        assert_eq!(watcher.cmd(&["EXEC"]).await, Value::Array(None));
+        assert_eq!(watcher.cmd(&["GET", "k"]).await, bulk("v1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn integration_tcp_watch_exec_runs_when_unchanged() {
+        let srv = spawn_server().await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        assert_eq!(c.cmd(&["WATCH", "k"]).await, ok());
+        assert_eq!(c.cmd(&["MULTI"]).await, ok());
+        assert_eq!(
+            c.cmd(&["SET", "k", "v1"]).await,
+            Value::SimpleString("QUEUED".into())
+        );
+        assert_eq!(
+            c.cmd(&["EXEC"]).await,
+            Value::Array(Some(vec![Value::SimpleString("OK".into())]))
+        );
+        assert_eq!(c.cmd(&["GET", "k"]).await, bulk("v1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn integration_tcp_watch_inside_multi_rejected() {
+        let srv = spawn_server().await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+        assert_eq!(c.cmd(&["MULTI"]).await, ok());
+        // WATCH is not allowed once a transaction has started.
+        assert!(matches!(c.cmd(&["WATCH", "k"]).await, Value::Error(_)));
     }
 }

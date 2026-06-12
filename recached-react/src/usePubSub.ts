@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { useRecached } from './context';
 
 /**
@@ -22,16 +22,15 @@ import { useRecached } from './context';
  */
 export function usePubSub(channel: string, handler: (msg: string) => void): void {
   const cache = useRecached();
+  const handlerRef = useRef(handler);
+  handlerRef.current = handler;
 
   useEffect(() => {
     cache.subscribe(channel);
-    const unsub = cache.onMessage(channel, handler);
+    const unsub = cache.onMessage(channel, (msg) => handlerRef.current(msg));
     return () => {
       unsub();
       cache.unsubscribe(channel);
     };
-  // channel is the stable dependency; handler intentionally excluded to
-  // avoid re-subscribing on every render when defined inline
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [channel]);
 }

@@ -29,10 +29,11 @@ import { useRecached } from './plugin';
  */
 export function useKey(key: string): Ref<string | null> {
   const cache = useRecached();
-  const value = ref<string | null>(cache.get(key));
+  const value = ref<string | null>(null);
   const unsub = cache.onMutation(() => {
     value.value = cache.get(key);
   });
+  value.value = cache.get(key);
   onUnmounted(unsub);
   return value;
 }
@@ -59,10 +60,11 @@ export function useKey(key: string): Ref<string | null> {
  */
 export function useKeyJSON<T>(key: string): Ref<T | null> {
   const cache = useRecached();
-  const value = ref<T | null>(cache.getJSON<T>(key)) as Ref<T | null>;
+  const value = ref<T | null>(null) as Ref<T | null>;
   const unsub = cache.onMutation(() => {
     value.value = cache.getJSON<T>(key);
   });
+  value.value = cache.getJSON<T>(key);
   onUnmounted(unsub);
   return value;
 }

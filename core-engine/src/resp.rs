@@ -1,6 +1,7 @@
 const MAX_ARRAY_DEPTH: usize = 16;
 const MAX_ARRAY_ELEMENTS: usize = 1_000_000;
 const MAX_BULK_STRING_BYTES: usize = 64 * 1024 * 1024; // 64 MB
+const MAX_TOTAL_MESSAGE_BYTES: usize = 64 * 1024 * 1024; // 64 MB total per message
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -176,6 +177,9 @@ impl Value {
                     let (val, len) = Self::parse_inner(&buffer[offset..], depth + 1)?;
                     arr.push(val);
                     offset += len;
+                    if offset > MAX_TOTAL_MESSAGE_BYTES {
+                        return Err("ERR message too large".to_string());
+                    }
                 }
                 Ok((Value::Push(arr), offset))
             }
@@ -211,6 +215,9 @@ impl Value {
                     let (val, len) = Self::parse_inner(&buffer[offset..], depth + 1)?;
                     arr.push(val);
                     offset += len;
+                    if offset > MAX_TOTAL_MESSAGE_BYTES {
+                        return Err("ERR message too large".to_string());
+                    }
                 }
 
                 Ok((Value::Array(Some(arr)), offset))

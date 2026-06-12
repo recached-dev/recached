@@ -35,6 +35,8 @@ pub enum ZAddCondition {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ZAddOptions {
     pub condition: Option<ZAddCondition>,
+    pub gt: bool,
+    pub lt: bool,
     pub ch: bool,
     pub incr: bool,
 }
@@ -198,7 +200,7 @@ impl Command {
                     // ── Strings ───────────────────────────────────────────────
                     "SET" => {
                         need!(3);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let key = extract_key(&arr[1])?;
                         let val = extract_string(&arr[2]).unwrap_or_default();
                         let mut opts = SetOptions::default();
                         let mut i = 3usize;
@@ -271,43 +273,37 @@ impl Command {
                     }
                     "GET" => {
                         need!(2);
-                        Ok(Command::Get(extract_string(&arr[1]).unwrap_or_default()))
+                        Ok(Command::Get(extract_key(&arr[1])?))
                     }
                     "DEL" => {
                         need!(2);
-                        Ok(Command::Del(
-                            arr[1..].iter().filter_map(extract_string).collect(),
-                        ))
+                        Ok(Command::Del(extract_keys(&arr[1..])?))
                     }
                     "UNLINK" => {
                         need!(2);
-                        Ok(Command::Unlink(
-                            arr[1..].iter().filter_map(extract_string).collect(),
-                        ))
+                        Ok(Command::Unlink(extract_keys(&arr[1..])?))
                     }
                     "APPEND" => {
                         need!(3);
                         Ok(Command::Append(
-                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_key(&arr[1])?,
                             extract_string(&arr[2]).unwrap_or_default(),
                         ))
                     }
                     "STRLEN" => {
                         need!(2);
-                        Ok(Command::Strlen(extract_string(&arr[1]).unwrap_or_default()))
+                        Ok(Command::Strlen(extract_key(&arr[1])?))
                     }
                     "GETSET" => {
                         need!(3);
                         Ok(Command::GetSet(
-                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_key(&arr[1])?,
                             extract_string(&arr[2]).unwrap_or_default(),
                         ))
                     }
                     "MGET" => {
                         need!(2);
-                        Ok(Command::MGet(
-                            arr[1..].iter().filter_map(extract_string).collect(),
-                        ))
+                        Ok(Command::MGet(extract_keys(&arr[1..])?))
                     }
                     "MSET" => {
                         if arr.len() < 3 || (arr.len() - 1) % 2 != 0 {
@@ -318,18 +314,18 @@ impl Command {
                         let pairs = arr[1..]
                             .chunks(2)
                             .map(|c| {
-                                (
-                                    extract_string(&c[0]).unwrap_or_default(),
+                                Ok((
+                                    extract_key(&c[0])?,
                                     extract_string(&c[1]).unwrap_or_default(),
-                                )
+                                ))
                             })
-                            .collect();
+                            .collect::<Result<Vec<_>, String>>()?;
                         Ok(Command::MSet(pairs))
                     }
                     "SETNX" => {
                         need!(3);
                         Ok(Command::SetNx(
-                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_key(&arr[1])?,
                             extract_string(&arr[2]).unwrap_or_default(),
                         ))
                     }
@@ -340,7 +336,7 @@ impl Command {
                             return Err("ERR invalid expire time in 'setex' command".to_string());
                         }
                         Ok(Command::SetEx(
-                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_key(&arr[1])?,
                             secs as u64,
                             extract_string(&arr[3]).unwrap_or_default(),
                         ))
@@ -352,30 +348,30 @@ impl Command {
                             return Err("ERR invalid expire time in 'psetex' command".to_string());
                         }
                         Ok(Command::PSetEx(
-                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_key(&arr[1])?,
                             ms as u64,
                             extract_string(&arr[3]).unwrap_or_default(),
                         ))
                     }
                     "INCR" => {
                         need!(2);
-                        Ok(Command::Incr(extract_string(&arr[1]).unwrap_or_default()))
+                        Ok(Command::Incr(extract_key(&arr[1])?))
                     }
                     "DECR" => {
                         need!(2);
-                        Ok(Command::Decr(extract_string(&arr[1]).unwrap_or_default()))
+                        Ok(Command::Decr(extract_key(&arr[1])?))
                     }
                     "INCRBY" => {
                         need!(3);
                         Ok(Command::IncrBy(
-                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_key(&arr[1])?,
                             extract_int(&arr[2])?,
                         ))
                     }
                     "DECRBY" => {
                         need!(3);
                         Ok(Command::DecrBy(
-                            extract_string(&arr[1]).unwrap_or_default(),
+                            extract_key(&arr[1])?,
                             extract_int(&arr[2])?,
                         ))
                     }
@@ -445,9 +441,7 @@ impl Command {
                     // ── Keys ───────────────────────────────────────────────────
                     "EXISTS" => {
                         need!(2);
-                        Ok(Command::Exists(
-                            arr[1..].iter().filter_map(extract_string).collect(),
-                        ))
+                        Ok(Command::Exists(extract_keys(&arr[1..])?))
                     }
                     "KEYS" => {
                         need!(2);
@@ -509,7 +503,7 @@ impl Command {
                                 cmd_name.to_lowercase()
                             ));
                         }
-                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let key = extract_key(&arr[1])?;
                         let pairs = arr[2..]
                             .chunks(2)
                             .map(|c| {
@@ -536,7 +530,7 @@ impl Command {
                     }
                     "HDEL" => {
                         need!(3);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let key = extract_key(&arr[1])?;
                         let fields = arr[2..].iter().filter_map(extract_string).collect();
                         Ok(Command::HDel(key, fields))
                     }
@@ -586,7 +580,7 @@ impl Command {
                     }
                     "HMGET" => {
                         need!(3);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let key = extract_key(&arr[1])?;
                         let fields = arr[2..].iter().filter_map(extract_string).collect();
                         Ok(Command::HMGet(key, fields))
                     }
@@ -594,31 +588,31 @@ impl Command {
                     // ── List ───────────────────────────────────────────────────
                     "LPUSH" => {
                         need!(3);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let key = extract_key(&arr[1])?;
                         let vals = arr[2..].iter().filter_map(extract_string).collect();
                         Ok(Command::LPush(key, vals))
                     }
                     "RPUSH" => {
                         need!(3);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let key = extract_key(&arr[1])?;
                         let vals = arr[2..].iter().filter_map(extract_string).collect();
                         Ok(Command::RPush(key, vals))
                     }
                     "LPUSHX" => {
                         need!(3);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let key = extract_key(&arr[1])?;
                         let vals = arr[2..].iter().filter_map(extract_string).collect();
                         Ok(Command::LPushX(key, vals))
                     }
                     "RPUSHX" => {
                         need!(3);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let key = extract_key(&arr[1])?;
                         let vals = arr[2..].iter().filter_map(extract_string).collect();
                         Ok(Command::RPushX(key, vals))
                     }
                     "LPOP" => {
                         need!(2);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let key = extract_key(&arr[1])?;
                         let count = if arr.len() > 2 {
                             Some(extract_int(&arr[2])? as u64)
                         } else {
@@ -628,7 +622,7 @@ impl Command {
                     }
                     "RPOP" => {
                         need!(2);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let key = extract_key(&arr[1])?;
                         let count = if arr.len() > 2 {
                             Some(extract_int(&arr[2])? as u64)
                         } else {
@@ -683,7 +677,7 @@ impl Command {
                     // ── Set ────────────────────────────────────────────────────
                     "SADD" => {
                         need!(3);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let key = extract_key(&arr[1])?;
                         let members = arr[2..].iter().filter_map(extract_string).collect();
                         Ok(Command::SAdd(key, members))
                     }
@@ -695,7 +689,7 @@ impl Command {
                     }
                     "SREM" => {
                         need!(3);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let key = extract_key(&arr[1])?;
                         let members = arr[2..].iter().filter_map(extract_string).collect();
                         Ok(Command::SRem(key, members))
                     }
@@ -712,7 +706,7 @@ impl Command {
                     }
                     "SMISMEMBER" => {
                         need!(3);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let key = extract_key(&arr[1])?;
                         let members = arr[2..].iter().filter_map(extract_string).collect();
                         Ok(Command::SMIsMember(key, members))
                     }
@@ -754,7 +748,7 @@ impl Command {
                     }
                     "SPOP" => {
                         need!(2);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let key = extract_key(&arr[1])?;
                         let count = if arr.len() > 2 {
                             Some(extract_int(&arr[2])? as u64)
                         } else {
@@ -764,7 +758,7 @@ impl Command {
                     }
                     "SRANDMEMBER" => {
                         need!(2);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let key = extract_key(&arr[1])?;
                         let count = if arr.len() > 2 {
                             Some(extract_int(&arr[2])?)
                         } else {
@@ -784,7 +778,7 @@ impl Command {
                     // ── Sorted Set ─────────────────────────────────────────────
                     "ZADD" => {
                         need!(4);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let key = extract_key(&arr[1])?;
                         let mut opts = ZAddOptions::default();
                         let mut i = 2usize;
 
@@ -800,8 +794,13 @@ impl Command {
                                     opts.condition = Some(ZAddCondition::Xx);
                                     i += 1;
                                 }
-                                "GT" | "LT" => {
-                                    i += 1; // recognised but not yet enforced
+                                "GT" => {
+                                    opts.gt = true;
+                                    i += 1;
+                                }
+                                "LT" => {
+                                    opts.lt = true;
+                                    i += 1;
                                 }
                                 "CH" => {
                                     opts.ch = true;
@@ -827,6 +826,19 @@ impl Command {
                             i += 2;
                         }
 
+                        if opts.gt && opts.lt {
+                            return Err(
+                                "ERR GT and LT options at the same time are not compatible"
+                                    .to_string(),
+                            );
+                        }
+                        if (opts.gt || opts.lt) && opts.condition == Some(ZAddCondition::Nx) {
+                            return Err(
+                                "ERR GT, LT, and NX options at the same time are not compatible"
+                                    .to_string(),
+                            );
+                        }
+
                         if opts.incr && pairs.len() != 1 {
                             return Err("ERR INCR option supports a single increment-element pair"
                                 .to_string());
@@ -836,7 +848,7 @@ impl Command {
                     }
                     "ZRANGE" => {
                         need!(4);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let key = extract_key(&arr[1])?;
                         let start = extract_int(&arr[2])?;
                         let stop = extract_int(&arr[3])?;
                         let withscores = arr
@@ -848,7 +860,7 @@ impl Command {
                     }
                     "ZREVRANGE" => {
                         need!(4);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let key = extract_key(&arr[1])?;
                         let start = extract_int(&arr[2])?;
                         let stop = extract_int(&arr[3])?;
                         let withscores = arr
@@ -860,7 +872,7 @@ impl Command {
                     }
                     "ZRANGEBYSCORE" => {
                         need!(4);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let key = extract_key(&arr[1])?;
                         let min = extract_string(&arr[2]).unwrap_or_default();
                         let max = extract_string(&arr[3]).unwrap_or_default();
                         let (withscores, limit) = parse_zrange_opts(&arr[4..])?;
@@ -868,7 +880,7 @@ impl Command {
                     }
                     "ZREVRANGEBYSCORE" => {
                         need!(4);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let key = extract_key(&arr[1])?;
                         let max = extract_string(&arr[2]).unwrap_or_default();
                         let min = extract_string(&arr[3]).unwrap_or_default();
                         let (withscores, limit) = parse_zrange_opts(&arr[4..])?;
@@ -883,7 +895,7 @@ impl Command {
                     }
                     "ZMSCORE" => {
                         need!(3);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let key = extract_key(&arr[1])?;
                         let members = arr[2..].iter().filter_map(extract_string).collect();
                         Ok(Command::ZMScore(key, members))
                     }
@@ -903,7 +915,7 @@ impl Command {
                     }
                     "ZREM" => {
                         need!(3);
-                        let key = extract_string(&arr[1]).unwrap_or_default();
+                        let key = extract_key(&arr[1])?;
                         let members = arr[2..].iter().filter_map(extract_string).collect();
                         Ok(Command::ZRem(key, members))
                     }
@@ -999,6 +1011,32 @@ impl Command {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+const MAX_KEY_BYTES: usize = 512 * 1024; // 512 KB
+
+fn validate_key(key: &str) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("ERR key cannot be empty".to_string());
+    }
+    if key.len() > MAX_KEY_BYTES {
+        return Err(format!(
+            "ERR key too large ({} > {} bytes)",
+            key.len(),
+            MAX_KEY_BYTES
+        ));
+    }
+    Ok(())
+}
+
+fn extract_key(val: &Value) -> Result<String, String> {
+    let key = extract_string(val).unwrap_or_default();
+    validate_key(&key)?;
+    Ok(key)
+}
+
+fn extract_keys(vals: &[Value]) -> Result<Vec<String>, String> {
+    vals.iter().map(extract_key).collect()
+}
 
 fn extract_string(val: &Value) -> Option<String> {
     match val {
@@ -1225,6 +1263,8 @@ mod tests {
                 "z".into(),
                 ZAddOptions {
                     condition: Some(ZAddCondition::Nx),
+                    gt: false,
+                    lt: false,
                     ch: true,
                     incr: false
                 },

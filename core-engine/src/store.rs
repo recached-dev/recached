@@ -113,11 +113,23 @@ impl EntryValue {
 
 // ── Entry ─────────────────────────────────────────────────────────────────────
 
-#[derive(Clone)]
 struct Entry {
     value: EntryValue,
     expires_at_ms: Option<u64>,
-    written_at_ms: u64,
+    /// Last time this entry was read or written, in ms. Drives LRU eviction.
+    /// Atomic so reads can refresh recency while holding only a shared
+    /// (DashMap read-lock) reference — no writer lock on the GET path.
+    last_access_ms: AtomicU64,
+}
+
+impl Clone for Entry {
+    fn clone(&self) -> Self {
+        Self {
+            value: self.value.clone(),
+            expires_at_ms: self.expires_at_ms,
+            last_access_ms: AtomicU64::new(self.last_access_ms.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 impl Entry {
@@ -125,7 +137,7 @@ impl Entry {
         Self {
             value: EntryValue::Str(value),
             expires_at_ms: None,
-            written_at_ms: now_ms(),
+            last_access_ms: AtomicU64::new(now_ms()),
         }
     }
 
@@ -133,12 +145,17 @@ impl Entry {
         Self {
             value: EntryValue::Str(value),
             expires_at_ms: Some(expires_at_ms),
-            written_at_ms: now_ms(),
+            last_access_ms: AtomicU64::new(now_ms()),
         }
     }
 
     fn is_expired(&self, now: u64) -> bool {
         self.expires_at_ms.is_some_and(|exp| now >= exp)
+    }
+
+    /// Mark this entry as just-used so LRU eviction treats it as recent.
+    fn touch(&self, now: u64) {
+        self.last_access_ms.store(now, Ordering::Relaxed);
     }
 }
 
@@ -213,7 +230,7 @@ fn encode_zrange(items: &[(&str, f64)], withscores: bool) -> Value {
     Value::Array(Some(out))
 }
 
-fn format_score(s: f64) -> String {
+pub fn format_score(s: f64) -> String {
     if s == f64::INFINITY {
         "inf".to_string()
     } else if s == f64::NEG_INFINITY {
@@ -349,35 +366,40 @@ impl KeyValueStore {
     pub fn approximate_memory_bytes(&self) -> usize {
         self.data
             .iter()
-            .map(|r| {
-                let val_size = match &r.value().value {
-                    EntryValue::Str(s) => s.len(),
-                    EntryValue::Hash(m) => m.iter().map(|(k, v)| k.len() + v.len()).sum(),
-                    EntryValue::List(l) => l.iter().map(|s| s.len()).sum(),
-                    EntryValue::Set(s) => s.iter().map(|m| m.len()).sum::<usize>(),
-                    EntryValue::ZSet(z) => z.scores.keys().map(|m| m.len() + 8).sum(),
-                };
-                r.key().len() + val_size + 64
-            })
+            .map(|r| entry_size(r.key(), r.value()))
             .sum()
     }
 
     /// Evict entries until memory usage is below `max_memory_bytes`, or the
     /// eviction policy cannot free any more. Returns true if under limit.
+    ///
+    /// The total is scanned once up front, then maintained incrementally by
+    /// subtracting each evicted entry's measured size. The previous version
+    /// re-scanned the whole keyspace after every single eviction (O(N) per
+    /// eviction → O(N²) overall) — catastrophic under memory pressure. We
+    /// periodically re-scan to correct for drift from concurrent writes.
     pub fn try_evict_for_memory(&self) -> bool {
         let limit = match self.max_memory_bytes {
             Some(l) => l,
             None => return true,
         };
         let now = now_ms();
-        loop {
-            if self.approximate_memory_bytes() <= limit {
-                return true;
-            }
-            if !self.evict_one(now) {
-                return false;
+        let mut current = self.approximate_memory_bytes();
+        let mut since_resync = 0u32;
+        while current > limit {
+            match self.evict_one(now) {
+                None => return false, // policy can't free anything more
+                Some(freed) => {
+                    current = current.saturating_sub(freed);
+                    since_resync += 1;
+                    if since_resync >= 64 {
+                        current = self.approximate_memory_bytes();
+                        since_resync = 0;
+                    }
+                }
             }
         }
+        true
     }
 
     /// Returns the current value of a key for watch push notifications.
@@ -404,49 +426,42 @@ impl KeyValueStore {
         self.data.retain(|_, e| !e.is_expired(now));
     }
 
-    fn evict_one(&self, now: u64) -> bool {
+    /// Evict a single entry per the configured policy. Returns the number of
+    /// bytes freed (`Some`), or `None` if nothing could be evicted.
+    fn evict_one(&self, now: u64) -> Option<usize> {
         const SAMPLE: usize = 10;
         let mut rng = rand::rng();
-        match self.eviction_policy {
-            EvictionPolicy::NoEviction => false,
+        let chosen: Option<String> = match self.eviction_policy {
+            EvictionPolicy::NoEviction => None,
             EvictionPolicy::AllKeysLru => {
                 let sample: Vec<(String, u64)> = self
                     .data
                     .iter()
-                    .map(|r| (r.key().clone(), r.value().written_at_ms))
+                    .map(|r| {
+                        (
+                            r.key().clone(),
+                            r.value().last_access_ms.load(Ordering::Relaxed),
+                        )
+                    })
                     .choose_multiple(&mut rng, SAMPLE);
-                match sample.into_iter().min_by_key(|(_, w)| *w) {
-                    Some((k, _)) => {
-                        self.data.remove(&k);
-                        true
-                    }
-                    None => false,
-                }
+                sample.into_iter().min_by_key(|(_, w)| *w).map(|(k, _)| k)
             }
             EvictionPolicy::AllKeysRandom => {
-                let key = self.data.iter().map(|r| r.key().clone()).choose(&mut rng);
-                match key {
-                    Some(k) => {
-                        self.data.remove(&k);
-                        true
-                    }
-                    None => false,
-                }
+                self.data.iter().map(|r| r.key().clone()).choose(&mut rng)
             }
             EvictionPolicy::VolatileLru => {
                 let sample: Vec<(String, u64)> = self
                     .data
                     .iter()
                     .filter(|r| r.value().expires_at_ms.is_some() && !r.value().is_expired(now))
-                    .map(|r| (r.key().clone(), r.value().written_at_ms))
+                    .map(|r| {
+                        (
+                            r.key().clone(),
+                            r.value().last_access_ms.load(Ordering::Relaxed),
+                        )
+                    })
                     .choose_multiple(&mut rng, SAMPLE);
-                match sample.into_iter().min_by_key(|(_, w)| *w) {
-                    Some((k, _)) => {
-                        self.data.remove(&k);
-                        true
-                    }
-                    None => false,
-                }
+                sample.into_iter().min_by_key(|(_, w)| *w).map(|(k, _)| k)
             }
             EvictionPolicy::VolatileTtl => {
                 let sample: Vec<(String, u64)> = self
@@ -461,15 +476,20 @@ impl KeyValueStore {
                         }
                     })
                     .choose_multiple(&mut rng, SAMPLE);
-                match sample.into_iter().min_by_key(|(_, exp)| *exp) {
-                    Some((k, _)) => {
-                        self.data.remove(&k);
-                        true
-                    }
-                    None => false,
-                }
+                sample
+                    .into_iter()
+                    .min_by_key(|(_, exp)| *exp)
+                    .map(|(k, _)| k)
             }
-        }
+        };
+        let key = chosen?;
+        // Treat a lost race (key already gone) as a successful eviction that
+        // freed nothing, so callers don't spin.
+        Some(
+            self.data
+                .remove(&key)
+                .map_or(0, |(k, e)| entry_size(&k, &e)),
+        )
     }
 
     pub fn snapshot(&self) -> Vec<SnapshotEntry> {
@@ -518,7 +538,7 @@ impl KeyValueStore {
                 Entry {
                     value,
                     expires_at_ms: e.expires_at_ms,
-                    written_at_ms: now,
+                    last_access_ms: AtomicU64::new(now),
                 },
             );
         }
@@ -531,7 +551,9 @@ impl KeyValueStore {
                 Some(m) => Value::BulkString(Some(m.into_bytes())),
                 None => Value::SimpleString("PONG".to_string()),
             },
-            Command::Auth(_) => Value::SimpleString("OK".to_string()),
+            Command::Auth(_) => Value::Error(
+                "ERR AUTH is handled by the connection layer, not the store".to_string(),
+            ),
 
             // ── Strings ───────────────────────────────────────────────────────
             Command::Set(key, val, opts) => {
@@ -571,14 +593,19 @@ impl KeyValueStore {
                 if let Some(max) = self.max_keys
                     && self.data.len() >= max
                     && !self.data.contains_key(&key)
-                    && !self.evict_one(now)
+                    && self.evict_one(now).is_none()
                 {
                     return Value::Error("ERR max keys limit reached".to_string());
                 }
 
                 let expires_at_ms = match &opts.expiry {
                     None => None,
-                    Some(SetExpiry::Ex(s)) => Some(now.saturating_add(s.saturating_mul(1000))),
+                    Some(SetExpiry::Ex(s)) => {
+                        if *s > u64::MAX / 1000 {
+                            return Value::Error("ERR TTL overflow".to_string());
+                        }
+                        Some(now.saturating_add(s * 1000))
+                    }
                     Some(SetExpiry::Px(ms)) => Some(now.saturating_add(*ms)),
                     Some(SetExpiry::Exat(ts)) => Some(ts.saturating_mul(1000)),
                     Some(SetExpiry::Pxat(ts_ms)) => Some(*ts_ms),
@@ -590,7 +617,7 @@ impl KeyValueStore {
                     Entry {
                         value: EntryValue::Str(val),
                         expires_at_ms,
-                        written_at_ms: now,
+                        last_access_ms: AtomicU64::new(now),
                     },
                 );
 
@@ -607,7 +634,10 @@ impl KeyValueStore {
                 let now = now_ms();
                 match self.data.get(&key) {
                     Some(e) if !e.is_expired(now) => match &e.value {
-                        EntryValue::Str(s) => Value::BulkString(Some(s.clone().into_bytes())),
+                        EntryValue::Str(s) => {
+                            e.touch(now);
+                            Value::BulkString(Some(s.clone().into_bytes()))
+                        }
                         _ => Value::Error(WRONGTYPE.to_string()),
                     },
                     _ => Value::BulkString(None),
@@ -615,9 +645,10 @@ impl KeyValueStore {
             }
 
             Command::Del(keys) | Command::Unlink(keys) => {
+                let now = now_ms();
                 let count = keys
                     .into_iter()
-                    .filter(|k| self.data.remove(k).is_some())
+                    .filter(|k| self.data.remove_if(k, |_, e| !e.is_expired(now)).is_some())
                     .count();
                 Value::Integer(count as i64)
             }
@@ -672,7 +703,10 @@ impl KeyValueStore {
                     .iter()
                     .map(|k| match self.data.get(k) {
                         Some(e) if !e.is_expired(now) => match &e.value {
-                            EntryValue::Str(s) => Value::BulkString(Some(s.clone().into_bytes())),
+                            EntryValue::Str(s) => {
+                                e.touch(now);
+                                Value::BulkString(Some(s.clone().into_bytes()))
+                            }
                             _ => Value::BulkString(None),
                         },
                         _ => Value::BulkString(None),
@@ -692,7 +726,7 @@ impl KeyValueStore {
                     if new_count > available {
                         let needed = new_count - available;
                         for _ in 0..needed {
-                            if !self.evict_one(now) {
+                            if self.evict_one(now).is_none() {
                                 return Value::Error("ERR max keys limit reached".to_string());
                             }
                         }
@@ -713,7 +747,7 @@ impl KeyValueStore {
                 if let Some(max) = self.max_keys
                     && self.data.len() >= max
                     && !self.data.contains_key(&key)
-                    && !self.evict_one(now)
+                    && self.evict_one(now).is_none()
                 {
                     return Value::Error("ERR max keys limit reached".to_string());
                 }
@@ -727,7 +761,7 @@ impl KeyValueStore {
                 if let Some(max) = self.max_keys
                     && self.data.len() >= max
                     && !self.data.contains_key(&key)
-                    && !self.evict_one(now)
+                    && self.evict_one(now).is_none()
                 {
                     return Value::Error("ERR max keys limit reached".to_string());
                 }
@@ -741,7 +775,7 @@ impl KeyValueStore {
                 if let Some(max) = self.max_keys
                     && self.data.len() >= max
                     && !self.data.contains_key(&key)
-                    && !self.evict_one(now)
+                    && self.evict_one(now).is_none()
                 {
                     return Value::Error("ERR max keys limit reached".to_string());
                 }
@@ -771,7 +805,7 @@ impl KeyValueStore {
                     Some(e) if e.is_expired(now) => Value::Integer(-2),
                     Some(e) => match e.expires_at_ms {
                         None => Value::Integer(-1),
-                        Some(exp) => Value::Integer(((exp - now) / 1000) as i64),
+                        Some(exp) => Value::Integer((exp.saturating_sub(now) / 1000) as i64),
                     },
                 }
             }
@@ -783,7 +817,7 @@ impl KeyValueStore {
                     Some(e) if e.is_expired(now) => Value::Integer(-2),
                     Some(e) => match e.expires_at_ms {
                         None => Value::Integer(-1),
-                        Some(exp) => Value::Integer((exp - now) as i64),
+                        Some(exp) => Value::Integer(exp.saturating_sub(now) as i64),
                     },
                 }
             }
@@ -834,24 +868,38 @@ impl KeyValueStore {
                 Value::Array(Some(keys))
             }
 
-            Command::Scan(cursor, pattern, _count) => {
-                if cursor != 0 {
-                    return Value::Array(Some(vec![
-                        Value::BulkString(Some(b"0".to_vec())),
-                        Value::Array(Some(vec![])),
-                    ]));
-                }
+            Command::Scan(cursor, pattern, count) => {
                 let now = now_ms();
                 let pat = pattern.as_deref().unwrap_or("*");
-                let keys: Vec<Value> = self
+                let batch = count.unwrap_or(10).max(1);
+                // Sort for a stable order so the numeric cursor is a meaningful
+                // offset across calls and COUNT actually paginates. This is
+                // O(N log N) per call (like KEYS), but each reply is bounded to
+                // `batch` keys instead of dumping the whole keyspace at once.
+                // As with Redis, concurrent inserts/deletes between calls may
+                // cause a key to be skipped or returned twice.
+                let mut all: Vec<String> = self
                     .data
                     .iter()
                     .filter(|r| !r.value().is_expired(now) && glob_match(pat, r.key()))
-                    .map(|r| Value::BulkString(Some(r.key().as_bytes().to_vec())))
+                    .map(|r| r.key().clone())
+                    .collect();
+                all.sort_unstable();
+                let start = cursor as usize;
+                let end = start.saturating_add(batch).min(all.len());
+                let page: &[String] = if start < all.len() {
+                    &all[start..end]
+                } else {
+                    &[]
+                };
+                let next_cursor = if end >= all.len() { 0 } else { end as u64 };
+                let out: Vec<Value> = page
+                    .iter()
+                    .map(|k| Value::BulkString(Some(k.as_bytes().to_vec())))
                     .collect();
                 Value::Array(Some(vec![
-                    Value::BulkString(Some(b"0".to_vec())),
-                    Value::Array(Some(keys)),
+                    Value::BulkString(Some(next_cursor.to_string().into_bytes())),
+                    Value::Array(Some(out)),
                 ]))
             }
 
@@ -901,7 +949,7 @@ impl KeyValueStore {
                 let mut entry = self.data.entry(key).or_insert_with(|| Entry {
                     value: EntryValue::Hash(HashMap::new()),
                     expires_at_ms: None,
-                    written_at_ms: now_ms(),
+                    last_access_ms: AtomicU64::new(now_ms()),
                 });
                 if was_expired {
                     entry.value = EntryValue::Hash(HashMap::new());
@@ -927,10 +975,12 @@ impl KeyValueStore {
                     None => Value::BulkString(None),
                     Some(e) if e.is_expired(now) => Value::BulkString(None),
                     Some(e) => match &e.value {
-                        EntryValue::Hash(h) => h
-                            .get(&field)
-                            .map(|v| Value::BulkString(Some(v.clone().into_bytes())))
-                            .unwrap_or(Value::BulkString(None)),
+                        EntryValue::Hash(h) => {
+                            e.touch(now);
+                            h.get(&field)
+                                .map(|v| Value::BulkString(Some(v.clone().into_bytes())))
+                                .unwrap_or(Value::BulkString(None))
+                        }
                         _ => Value::Error(WRONGTYPE.to_string()),
                     },
                 }
@@ -943,6 +993,7 @@ impl KeyValueStore {
                     Some(e) if e.is_expired(now) => Value::Array(Some(vec![])),
                     Some(e) => match &e.value {
                         EntryValue::Hash(h) => {
+                            e.touch(now);
                             let mut pairs: Vec<(&str, &str)> =
                                 h.iter().map(|(f, v)| (f.as_str(), v.as_str())).collect();
                             pairs.sort_unstable_by_key(|(f, _)| *f);
@@ -1058,7 +1109,7 @@ impl KeyValueStore {
                 let mut entry = self.data.entry(key).or_insert_with(|| Entry {
                     value: EntryValue::Hash(HashMap::new()),
                     expires_at_ms: None,
-                    written_at_ms: now_ms(),
+                    last_access_ms: AtomicU64::new(now_ms()),
                 });
                 if was_expired {
                     entry.value = EntryValue::Hash(HashMap::new());
@@ -1108,7 +1159,7 @@ impl KeyValueStore {
                 let mut entry = self.data.entry(key).or_insert_with(|| Entry {
                     value: EntryValue::List(VecDeque::new()),
                     expires_at_ms: None,
-                    written_at_ms: now_ms(),
+                    last_access_ms: AtomicU64::new(now_ms()),
                 });
                 if was_expired {
                     entry.value = EntryValue::List(VecDeque::new());
@@ -1130,7 +1181,7 @@ impl KeyValueStore {
                 let mut entry = self.data.entry(key).or_insert_with(|| Entry {
                     value: EntryValue::List(VecDeque::new()),
                     expires_at_ms: None,
-                    written_at_ms: now_ms(),
+                    last_access_ms: AtomicU64::new(now_ms()),
                 });
                 if was_expired {
                     entry.value = EntryValue::List(VecDeque::new());
@@ -1239,6 +1290,7 @@ impl KeyValueStore {
                     Some(e) if e.is_expired(now) => Value::Array(Some(vec![])),
                     Some(e) => match &e.value {
                         EntryValue::List(list) => {
+                            e.touch(now);
                             let slice: Vec<&String> = list.iter().collect();
                             match resolve_range(start, stop, slice.len()) {
                                 None => Value::Array(Some(vec![])),
@@ -1370,7 +1422,7 @@ impl KeyValueStore {
                 let mut entry = self.data.entry(key).or_insert_with(|| Entry {
                     value: EntryValue::Set(HashSet::new()),
                     expires_at_ms: None,
-                    written_at_ms: now_ms(),
+                    last_access_ms: AtomicU64::new(now_ms()),
                 });
                 if was_expired {
                     entry.value = EntryValue::Set(HashSet::new());
@@ -1394,6 +1446,7 @@ impl KeyValueStore {
                     Some(e) if e.is_expired(now) => Value::Array(Some(vec![])),
                     Some(e) => match &e.value {
                         EntryValue::Set(s) => {
+                            e.touch(now);
                             let mut members: Vec<&str> = s.iter().map(|m| m.as_str()).collect();
                             members.sort_unstable();
                             Value::Array(Some(
@@ -1442,6 +1495,7 @@ impl KeyValueStore {
                     Some(e) if e.is_expired(now) => Value::Integer(0),
                     Some(e) => match &e.value {
                         EntryValue::Set(s) => {
+                            e.touch(now);
                             Value::Integer(if s.contains(&member) { 1 } else { 0 })
                         }
                         _ => Value::Error(WRONGTYPE.to_string()),
@@ -1490,7 +1544,7 @@ impl KeyValueStore {
                     Entry {
                         value: EntryValue::Set(result),
                         expires_at_ms: None,
-                        written_at_ms: now_ms(),
+                        last_access_ms: AtomicU64::new(now_ms()),
                     },
                 );
                 Value::Integer(len as i64)
@@ -1518,7 +1572,7 @@ impl KeyValueStore {
                     Entry {
                         value: EntryValue::Set(result),
                         expires_at_ms: None,
-                        written_at_ms: now_ms(),
+                        last_access_ms: AtomicU64::new(now_ms()),
                     },
                 );
                 Value::Integer(len as i64)
@@ -1546,7 +1600,7 @@ impl KeyValueStore {
                     Entry {
                         value: EntryValue::Set(result),
                         expires_at_ms: None,
-                        written_at_ms: now_ms(),
+                        last_access_ms: AtomicU64::new(now_ms()),
                     },
                 );
                 Value::Integer(len as i64)
@@ -1560,7 +1614,10 @@ impl KeyValueStore {
                     Some(mut e) => match &mut e.value {
                         EntryValue::Set(s) => {
                             let n = count.unwrap_or(1) as usize;
-                            let popped: Vec<String> = s.iter().take(n).cloned().collect();
+                            let mut rng = rand::rng();
+                            // SPOP removes *random* members, not iteration-order ones.
+                            let popped: Vec<String> =
+                                s.iter().cloned().choose_multiple(&mut rng, n);
                             for m in &popped {
                                 s.remove(m);
                             }
@@ -1597,15 +1654,20 @@ impl KeyValueStore {
                     },
                     Some(e) => match &e.value {
                         EntryValue::Set(s) => match count {
-                            None => s
-                                .iter()
-                                .next()
-                                .map(|m| Value::BulkString(Some(m.as_bytes().to_vec())))
-                                .unwrap_or(Value::BulkString(None)),
+                            None => {
+                                let mut rng = rand::rng();
+                                s.iter()
+                                    .choose(&mut rng)
+                                    .map(|m| Value::BulkString(Some(m.as_bytes().to_vec())))
+                                    .unwrap_or(Value::BulkString(None))
+                            }
                             Some(n) if n >= 0 => {
-                                let mut members: Vec<&str> =
-                                    s.iter().map(|m| m.as_str()).take(n as usize).collect();
-                                members.sort_unstable();
+                                // Positive count: up to n *distinct* random members.
+                                let mut rng = rand::rng();
+                                let members: Vec<&str> = s
+                                    .iter()
+                                    .map(|m| m.as_str())
+                                    .choose_multiple(&mut rng, n as usize);
                                 Value::Array(Some(
                                     members
                                         .into_iter()
@@ -1614,13 +1676,18 @@ impl KeyValueStore {
                                 ))
                             }
                             Some(n) => {
-                                // Negative: allow repetition, return |n| elements
+                                // Negative: allow repetition, return |n| random elements.
                                 let members: Vec<&str> = s.iter().map(|m| m.as_str()).collect();
+                                if members.is_empty() {
+                                    return Value::Array(Some(vec![]));
+                                }
+                                let mut rng = rand::rng();
                                 let abs = n.unsigned_abs() as usize;
                                 Value::Array(Some(
                                     (0..abs)
-                                        .map(|i| {
-                                            let m = members[i % members.len()];
+                                        .map(|_| {
+                                            let m =
+                                                members.iter().copied().choose(&mut rng).unwrap();
                                             Value::BulkString(Some(m.as_bytes().to_vec()))
                                         })
                                         .collect(),
@@ -1667,7 +1734,7 @@ impl KeyValueStore {
                 let mut dst_entry = self.data.entry(dst).or_insert_with(|| Entry {
                     value: EntryValue::Set(HashSet::new()),
                     expires_at_ms: None,
-                    written_at_ms: now_ms(),
+                    last_access_ms: AtomicU64::new(now_ms()),
                 });
                 if was_expired_dst {
                     dst_entry.value = EntryValue::Set(HashSet::new());
@@ -1686,7 +1753,7 @@ impl KeyValueStore {
                 let mut entry = self.data.entry(key).or_insert_with(|| Entry {
                     value: EntryValue::ZSet(ZSetInner::new()),
                     expires_at_ms: None,
-                    written_at_ms: now_ms(),
+                    last_access_ms: AtomicU64::new(now_ms()),
                 });
                 if was_expired {
                     entry.value = EntryValue::ZSet(ZSetInner::new());
@@ -1756,11 +1823,13 @@ impl KeyValueStore {
                     None => Value::BulkString(None),
                     Some(e) if e.is_expired(now) => Value::BulkString(None),
                     Some(e) => match &e.value {
-                        EntryValue::ZSet(z) => z
-                            .scores
-                            .get(&member)
-                            .map(|s| Value::BulkString(Some(format_score(*s).into_bytes())))
-                            .unwrap_or(Value::BulkString(None)),
+                        EntryValue::ZSet(z) => {
+                            e.touch(now);
+                            z.scores
+                                .get(&member)
+                                .map(|s| Value::BulkString(Some(format_score(*s).into_bytes())))
+                                .unwrap_or(Value::BulkString(None))
+                        }
                         _ => Value::Error(WRONGTYPE.to_string()),
                     },
                 }
@@ -1867,7 +1936,7 @@ impl KeyValueStore {
                 let mut entry = self.data.entry(key).or_insert_with(|| Entry {
                     value: EntryValue::ZSet(ZSetInner::new()),
                     expires_at_ms: None,
-                    written_at_ms: now_ms(),
+                    last_access_ms: AtomicU64::new(now_ms()),
                 });
                 if was_expired {
                     entry.value = EntryValue::ZSet(ZSetInner::new());
@@ -1877,12 +1946,12 @@ impl KeyValueStore {
                     EntryValue::ZSet(z) => z,
                     _ => unreachable!(),
                 };
-                let score = zset
-                    .scores
-                    .entry(member)
-                    .and_modify(|s| *s += delta)
-                    .or_insert(delta);
-                let new_score = *score;
+                let prev_score = zset.scores.get(&member).copied().unwrap_or(0.0);
+                let new_score = prev_score + delta;
+                if new_score.is_nan() || new_score.is_infinite() {
+                    return Value::Error("ERR increment would produce NaN or Infinity".to_string());
+                }
+                zset.scores.insert(member, new_score);
                 Value::BulkString(Some(format_score(new_score).into_bytes()))
             }
 
@@ -1927,6 +1996,20 @@ impl KeyValueStore {
 }
 
 // ── Free helpers ──────────────────────────────────────────────────────────────
+
+/// Approximate heap footprint of a single entry: key + value bytes plus a fixed
+/// per-entry overhead. Shared by `approximate_memory_bytes` and the eviction
+/// loop so both agree on what a key "costs".
+fn entry_size(key: &str, e: &Entry) -> usize {
+    let val_size = match &e.value {
+        EntryValue::Str(s) => s.len(),
+        EntryValue::Hash(m) => m.iter().map(|(k, v)| k.len() + v.len()).sum(),
+        EntryValue::List(l) => l.iter().map(|s| s.len()).sum(),
+        EntryValue::Set(s) => s.iter().map(|m| m.len()).sum::<usize>(),
+        EntryValue::ZSet(z) => z.scores.keys().map(|m| m.len() + 8).sum(),
+    };
+    key.len() + val_size + 64
+}
 
 fn incr_by(data: &DashMap<String, Entry>, key: String, delta: i64) -> Value {
     let now = now_ms();
@@ -1973,21 +2056,32 @@ fn set_expiry(data: &DashMap<String, Entry>, key: String, ts_ms: u64) -> Value {
 }
 
 fn glob_match(pattern: &str, s: &str) -> bool {
-    glob_helper(pattern.as_bytes(), s.as_bytes())
-}
+    let pat = pattern.as_bytes();
+    let text = s.as_bytes();
+    let (m, n) = (pat.len(), text.len());
 
-fn glob_helper(pat: &[u8], s: &[u8]) -> bool {
-    match (pat.first(), s.first()) {
-        (None, None) => true,
-        (None, Some(_)) => false,
-        (Some(b'*'), _) => {
-            glob_helper(&pat[1..], s) || (!s.is_empty() && glob_helper(pat, &s[1..]))
+    // Iterative DP: prev[j] = pat[..i] matches text[..j].
+    // This replaces a recursive matcher that had exponential worst-case
+    // backtracking on patterns like "*.*.*x" against long non-matching strings.
+    let mut prev = vec![false; n + 1];
+    let mut curr = vec![false; n + 1];
+    prev[0] = true;
+
+    for i in 1..=m {
+        curr[0] = pat[i - 1] == b'*' && prev[0];
+        for j in 1..=n {
+            curr[j] = if pat[i - 1] == b'*' {
+                prev[j] || curr[j - 1]
+            } else if pat[i - 1] == b'?' || pat[i - 1] == text[j - 1] {
+                prev[j - 1]
+            } else {
+                false
+            };
         }
-        (Some(b'?'), Some(_)) => glob_helper(&pat[1..], &s[1..]),
-        (Some(b'?'), None) => false,
-        (Some(p), Some(c)) if p == c => glob_helper(&pat[1..], &s[1..]),
-        _ => false,
+        std::mem::swap(&mut prev, &mut curr);
     }
+
+    prev[n]
 }
 
 fn no_list_response(count: Option<u64>) -> Value {
@@ -2116,7 +2210,7 @@ fn hash_incr_int(data: &DashMap<String, Entry>, key: String, field: String, delt
     let mut entry = data.entry(key).or_insert_with(|| Entry {
         value: EntryValue::Hash(HashMap::new()),
         expires_at_ms: None,
-        written_at_ms: now_ms(),
+        last_access_ms: AtomicU64::new(now_ms()),
     });
     if was_expired {
         entry.value = EntryValue::Hash(HashMap::new());
@@ -2149,7 +2243,7 @@ fn hash_incr_float(data: &DashMap<String, Entry>, key: String, field: String, de
     let mut entry = data.entry(key).or_insert_with(|| Entry {
         value: EntryValue::Hash(HashMap::new()),
         expires_at_ms: None,
-        written_at_ms: now_ms(),
+        last_access_ms: AtomicU64::new(now_ms()),
     });
     if was_expired {
         entry.value = EntryValue::Hash(HashMap::new());
@@ -2179,7 +2273,10 @@ where
         None => f(&empty),
         Some(e) if e.is_expired(now) => f(&empty),
         Some(e) => match &e.value {
-            EntryValue::ZSet(z) => f(z),
+            EntryValue::ZSet(z) => {
+                e.touch(now);
+                f(z)
+            }
             _ => return Value::Error(WRONGTYPE.to_string()),
         },
     };
@@ -2216,24 +2313,53 @@ fn zadd_exec(zset: &mut ZSetInner, opts: ZAddOptions, pairs: Vec<(f64, String)>)
                 }
             }
             Some(ZAddCondition::Xx) => {
-                if let Some(s) = zset.scores.get_mut(&member)
-                    && (*s - score).abs() > f64::EPSILON
-                {
-                    *s = score;
-                    changed += 1;
+                if let Some(old_score) = zset.scores.get_mut(&member) {
+                    let should_update = if opts.gt {
+                        score > *old_score
+                    } else if opts.lt {
+                        score < *old_score
+                    } else {
+                        (score - *old_score).abs() > f64::EPSILON
+                    };
+                    if should_update {
+                        *old_score = score;
+                        changed += 1;
+                    }
                 }
             }
             None => {
-                let old = zset.scores.insert(member, score);
-                match old {
-                    None => {
-                        added += 1;
-                        changed += 1;
+                if opts.gt || opts.lt {
+                    match zset.scores.entry(member) {
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert(score);
+                            added += 1;
+                            changed += 1;
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            let old_score = *e.get();
+                            let should_update = if opts.gt {
+                                score > old_score
+                            } else {
+                                score < old_score
+                            };
+                            if should_update {
+                                e.insert(score);
+                                changed += 1;
+                            }
+                        }
                     }
-                    Some(old_score) if (old_score - score).abs() > f64::EPSILON => {
-                        changed += 1;
+                } else {
+                    let old = zset.scores.insert(member, score);
+                    match old {
+                        None => {
+                            added += 1;
+                            changed += 1;
+                        }
+                        Some(old_score) if (old_score - score).abs() > f64::EPSILON => {
+                            changed += 1;
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
         }
@@ -3030,6 +3156,49 @@ mod tests {
             }
             _ => panic!("expected array"),
         }
+    }
+
+    #[test]
+    fn scan_paginates_with_count() {
+        let s = store();
+        for i in 0..5 {
+            s.execute(Command::Set(
+                format!("k{i}"),
+                "v".into(),
+                SetOptions::default(),
+            ));
+        }
+        // Walk the cursor in pages of 2, collecting every key exactly once.
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor = 0u64;
+        let mut iterations = 0;
+        loop {
+            let res = s.execute(Command::Scan(cursor, None, Some(2)));
+            let Value::Array(Some(parts)) = res else {
+                panic!("expected array")
+            };
+            let Value::BulkString(Some(c)) = &parts[0] else {
+                panic!("expected cursor bulk")
+            };
+            let next: u64 = String::from_utf8_lossy(c).parse().unwrap();
+            let Value::Array(Some(keys)) = &parts[1] else {
+                panic!("expected keys array")
+            };
+            assert!(keys.len() <= 2, "page must honour COUNT");
+            for k in keys {
+                if let Value::BulkString(Some(d)) = k {
+                    seen.push(String::from_utf8_lossy(d).into_owned());
+                }
+            }
+            cursor = next;
+            iterations += 1;
+            if cursor == 0 {
+                break;
+            }
+            assert!(iterations < 10, "cursor should terminate");
+        }
+        seen.sort();
+        assert_eq!(seen, vec!["k0", "k1", "k2", "k3", "k4"]);
     }
 
     // ── Expiry ────────────────────────────────────────────────────────────────

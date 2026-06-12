@@ -1,13 +1,13 @@
 use core_engine::cmd::{Command, SetOptions};
 use core_engine::resp::Value;
-use core_engine::store::{KeyValueStore, SnapshotEntry, SnapshotValue};
+use core_engine::store::{KeyValueStore, SnapshotEntry, SnapshotValue, format_score};
 use js_sys::Promise;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
-use web_sys::{BroadcastChannel, MessageEvent, WebSocket};
+use web_sys::{BroadcastChannel, Event, MessageEvent, WebSocket};
 
 // ── IndexedDB JS glue ─────────────────────────────────────────────────────────
 //
@@ -84,18 +84,6 @@ fn to_resp_owned(parts: &[String]) -> String {
 /// snapshot commands so the next replay is fast regardless of write history.
 const WAL_COMPACT_THRESHOLD: u32 = 1000;
 
-fn format_zset_score(s: f64) -> String {
-    if s == f64::INFINITY {
-        "inf".into()
-    } else if s == f64::NEG_INFINITY {
-        "-inf".into()
-    } else if s.fract() == 0.0 && s.abs() < 1e15 {
-        format!("{}", s as i64)
-    } else {
-        format!("{}", s)
-    }
-}
-
 /// Convert snapshot entries into minimal RESP command strings suitable for
 /// storing in the WAL. Each entry produces one command; entries with a TTL on
 /// collection types produce an extra PEXPIREAT command.
@@ -159,7 +147,7 @@ fn snapshot_to_resp_cmds(entries: &[SnapshotEntry]) -> Vec<String> {
                 }
                 let mut parts = vec!["ZADD".to_string(), e.key.clone()];
                 for (member, score) in pairs {
-                    parts.push(format_zset_score(*score));
+                    parts.push(format_score(*score));
                     parts.push(member.clone());
                 }
                 parts
@@ -167,14 +155,14 @@ fn snapshot_to_resp_cmds(entries: &[SnapshotEntry]) -> Vec<String> {
         };
         out.push(to_resp_owned(&data_parts));
         // Non-string types with a TTL need a separate PEXPIREAT command.
-        if !matches!(&e.value, SnapshotValue::Str(_)) {
-            if let Some(exp) = e.expires_at_ms {
-                out.push(to_resp_owned(&[
-                    "PEXPIREAT".to_string(),
-                    e.key.clone(),
-                    exp.to_string(),
-                ]));
-            }
+        if !matches!(&e.value, SnapshotValue::Str(_))
+            && let Some(exp) = e.expires_at_ms
+        {
+            out.push(to_resp_owned(&[
+                "PEXPIREAT".to_string(),
+                e.key.clone(),
+                exp.to_string(),
+            ]));
         }
     }
     out
@@ -197,6 +185,12 @@ pub struct RecachedCache {
     on_message: Rc<RefCell<Option<js_sys::Function>>>,
     _onmessage: Option<Closure<dyn FnMut(MessageEvent)>>,
     _onbc: Option<Closure<dyn FnMut(MessageEvent)>>,
+    _onopen: Option<Closure<dyn FnMut(Event)>>,
+    /// Commands enqueued while the socket is still CONNECTING. Flushed in order
+    /// by the `onopen` handler so AUTH and early writes are never dropped.
+    ws_pending: Rc<RefCell<Vec<String>>>,
+    /// True when connected via unencrypted ws:// (not wss://).
+    ws_is_plaintext: bool,
 }
 
 impl Default for RecachedCache {
@@ -241,6 +235,23 @@ impl RecachedCache {
             on_message: Rc::new(RefCell::new(None)),
             _onmessage: None,
             _onbc: None,
+            _onopen: None,
+            ws_pending: Rc::new(RefCell::new(Vec::new())),
+            ws_is_plaintext: false,
+        }
+    }
+
+    /// Send `encoded` to the server if the socket is open, otherwise buffer it
+    /// until `onopen` fires. Without this, anything sent during the CONNECTING
+    /// window (notably the AUTH that `createCache` issues right after connect)
+    /// would be silently dropped.
+    fn ws_enqueue(&self, encoded: &str) {
+        if let Some(ws) = &self.ws {
+            if ws.ready_state() == WebSocket::OPEN {
+                let _ = ws.send_with_str(encoded);
+            } else {
+                self.ws_pending.borrow_mut().push(encoded.to_string());
+            }
         }
     }
 
@@ -298,6 +309,9 @@ impl RecachedCache {
             // If the WAL grew large, compact: rewrite it as minimal snapshot
             // commands. This keeps startup replay fast regardless of how many
             // writes accumulated between refreshes.
+            // Note: there is a brief data-loss window between idb_clear_js and
+            // writing the new snapshot. If the tab is closed during compaction,
+            // the WAL will be empty on next load and in-memory state is lost.
             let next_seq = if entry_count > WAL_COMPACT_THRESHOLD {
                 JsFuture::from(idb_clear_js(&db)).await?;
                 let cmds = snapshot_to_resp_cmds(&store.snapshot());
@@ -403,6 +417,10 @@ impl RecachedCache {
     /// Connect to the native Recached backend via WebSockets.
     /// Calling this a second time cleanly replaces the previous connection.
     pub fn connect(&mut self, url: &str) -> Result<(), JsValue> {
+        if let Some(old_ws) = self.ws.take() {
+            let _ = old_ws.close();
+        }
+        self.ws_is_plaintext = url.starts_with("ws://");
         let ws = WebSocket::new(url)?;
         let store_clone = Arc::clone(&self.store);
         let on_mut = Rc::clone(&self.on_mutation);
@@ -477,6 +495,18 @@ impl RecachedCache {
 
         ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
 
+        // Flush commands buffered while the socket was CONNECTING (AUTH first,
+        // then any early writes), preserving FIFO order.
+        let pending = Rc::clone(&self.ws_pending);
+        let ws_for_open = ws.clone();
+        let onopen = Closure::wrap(Box::new(move |_e: Event| {
+            for msg in pending.borrow_mut().drain(..) {
+                let _ = ws_for_open.send_with_str(&msg);
+            }
+        }) as Box<dyn FnMut(Event)>);
+        ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
+
+        self._onopen = Some(onopen);
         self._onmessage = Some(onmessage);
         self.ws = Some(ws);
         Ok(())
@@ -484,11 +514,12 @@ impl RecachedCache {
 
     /// Send an AUTH command to the server. The response arrives asynchronously via onmessage.
     pub fn auth(&self, password: &str) -> String {
-        if let Some(ws) = &self.ws
-            && ws.ready_state() == WebSocket::OPEN
-        {
-            let _ = ws.send_with_str(&to_resp(&["AUTH", password]));
+        if self.ws_is_plaintext {
+            let _ = web_sys::console::warn_1(&JsValue::from_str(
+                "recached: AUTH over unencrypted ws:// exposes the password in plaintext; use wss://",
+            ));
         }
+        self.ws_enqueue(&to_resp(&["AUTH", password]));
         "OK".to_string()
     }
 
@@ -501,11 +532,7 @@ impl RecachedCache {
         ));
 
         let encoded = to_resp(&["SET", key, value]);
-        if let Some(ws) = &self.ws
-            && ws.ready_state() == WebSocket::OPEN
-        {
-            let _ = ws.send_with_str(&encoded);
-        }
+        self.ws_enqueue(&encoded);
         if let Some(bc) = &self.bc {
             let _ = bc.post_message(&JsValue::from_str(&encoded));
         }
@@ -530,11 +557,7 @@ impl RecachedCache {
             .execute(Command::Set(key.to_string(), value.to_string(), opts));
 
         let encoded = to_resp(&["SET", key, value, "EX", &seconds.to_string()]);
-        if let Some(ws) = &self.ws
-            && ws.ready_state() == WebSocket::OPEN
-        {
-            let _ = ws.send_with_str(&encoded);
-        }
+        self.ws_enqueue(&encoded);
         if let Some(bc) = &self.bc {
             let _ = bc.post_message(&JsValue::from_str(&encoded));
         }
@@ -561,11 +584,7 @@ impl RecachedCache {
         let resp = self.store.execute(Command::Del(vec![key.to_string()]));
 
         let encoded = to_resp(&["DEL", key]);
-        if let Some(ws) = &self.ws
-            && ws.ready_state() == WebSocket::OPEN
-        {
-            let _ = ws.send_with_str(&encoded);
-        }
+        self.ws_enqueue(&encoded);
         if let Some(bc) = &self.bc {
             let _ = bc.post_message(&JsValue::from_str(&encoded));
         }
@@ -596,28 +615,16 @@ impl RecachedCache {
 
     /// Publish a message to a channel on the server.
     pub fn publish(&self, channel: &str, message: &str) {
-        if let Some(ws) = &self.ws
-            && ws.ready_state() == WebSocket::OPEN
-        {
-            let _ = ws.send_with_str(&to_resp(&["PUBLISH", channel, message]));
-        }
+        self.ws_enqueue(&to_resp(&["PUBLISH", channel, message]));
     }
 
     /// Subscribe to a channel on the server. Push messages arrive via the `onmessage` callback.
     pub fn subscribe(&self, channel: &str) {
-        if let Some(ws) = &self.ws
-            && ws.ready_state() == WebSocket::OPEN
-        {
-            let _ = ws.send_with_str(&to_resp(&["SUBSCRIBE", channel]));
-        }
+        self.ws_enqueue(&to_resp(&["SUBSCRIBE", channel]));
     }
 
     /// Unsubscribe from a channel on the server.
     pub fn unsubscribe(&self, channel: &str) {
-        if let Some(ws) = &self.ws
-            && ws.ready_state() == WebSocket::OPEN
-        {
-            let _ = ws.send_with_str(&to_resp(&["UNSUBSCRIBE", channel]));
-        }
+        self.ws_enqueue(&to_resp(&["UNSUBSCRIBE", channel]));
     }
 }
