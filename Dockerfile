@@ -2,6 +2,12 @@
 # Use a recent stable image — edition 2024 and let-chains require Rust ≥ 1.88.
 FROM rust:1-slim-bookworm AS builder
 
+# tikv-jemalloc-sys compiles jemalloc from C source, which needs a C toolchain
+# (gcc + make). The slim image doesn't ship one.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends build-essential && \
+    rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # Cache dependencies separately so they aren't re-downloaded on every code change.

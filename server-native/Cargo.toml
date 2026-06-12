@@ -18,4 +18,8 @@ serde.workspace                    = true
 rmp-serde.workspace                = true
 socket2.workspace                  = true
 num_cpus.workspace                 = true
+
+# jemalloc does not build under MSVC (its C build needs a Unix-like toolchain),
+# so it is only pulled in off-MSVC; Windows MSVC uses the system allocator.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator.workspace        = true
