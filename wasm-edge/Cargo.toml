@@ -26,3 +26,14 @@ features = [
 # the JS globalThis.crypto backend (pulled transitively via rand in core-engine).
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.3", features = ["wasm_js"] }
+
+# Recent Rust toolchains emit newer wasm features (bulk-memory, nontrapping
+# float-to-int, …) that the older `wasm-opt` wasm-pack downloads rejects during
+# validation. Disabling wasm-opt avoids the version mismatch entirely; the
+# release build is already optimized by rustc's release profile, so the size
+# difference is small. Re-enable with an up-to-date wasm-opt if desired.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[package.metadata.wasm-pack.profile.profiling]
+wasm-opt = false
