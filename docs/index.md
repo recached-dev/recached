@@ -20,6 +20,9 @@ hero:
     - theme: alt
       text: GitHub
       link: https://github.com/thinkgrid-labs/recached
+    - theme: alt
+      text: npm
+      link: https://www.npmjs.com/package/recached-edge
 
 features:
   - icon: ⚡
@@ -44,26 +47,23 @@ features:
 
 ## What is Recached?
 
-Recached is an in-memory cache written in Rust that solves a problem no other cache tool addresses: the same engine runs natively on your server **and** as WebAssembly inside the browser, with both sides kept in sync over WebSockets.
+Every caching solution forces a choice: server-side caches like Redis mean every frontend read is a network round-trip; client-side state like Zustand or SWR means two caches — one on the server and one in every client, with manual staleness code gluing them together. **Recached removes the choice.**
 
-On the backend, it speaks RESP on port 6379 — any Redis client works against it today without code changes. In the browser, you import it as a `.wasm` module and get zero-latency local reads with automatic background sync to the server.
+The same Rust cache engine runs natively on your server (RESP on port 6379 — any Redis client works today, zero code changes) and as WebAssembly inside the browser. Reads always come from local WASM memory. The WebSocket is only a sync path, not a read path.
 
 ```typescript
-import init, { RecachedCache } from 'recached-edge'
+import { createCache } from 'recached-edge'
 
-await init()
-const cache = new RecachedCache()
+const cache = await createCache({
+  persistence: true,                          // survives page refresh via IndexedDB
+  connect: { url: 'ws://localhost:6380' },    // syncs with the server
+})
 
-// Connect to the server — mutations sync both ways automatically
-cache.connect('ws://localhost:6380')
+cache.get('inventory:item:99') // "42" — from local WASM memory, 0 ms
 
-cache.set('user:theme', 'dark')
-console.log(cache.get('user:theme')) // 'dark' — read from local WASM memory, 0 ms
-
-// When your backend does SET user:theme light over RESP,
-// this browser instance receives the update automatically.
-cache.watch('user:theme', (newValue) => {
-  document.body.dataset.theme = newValue ?? 'light'
+// React to any store mutation — local writes, server push, or cross-tab sync
+cache.onMutation(() => {
+  document.body.dataset.theme = cache.get('user:theme') ?? 'light'
 })
 ```
 

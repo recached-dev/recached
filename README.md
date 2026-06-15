@@ -1,25 +1,25 @@
 <div align="center">
   <img src="recached.jpg" alt="Recached" width="800" />
-  <h1>Recached ⚡</h1>
+  <h1>Recached</h1>
   <p><b>A Rust cache server that runs on your backend <em>and</em> inside the browser.</b></p>
 
   <a href="https://recached.dev"><img src="https://img.shields.io/badge/Docs-recached.dev-blue.svg" alt="Docs"></a>
-  <a href="#"><img src="https://img.shields.io/badge/Language-Rust-orange.svg" alt="Rust"></a>
-  <a href="#"><img src="https://img.shields.io/badge/Architecture-Multi--Core-blue.svg" alt="Multi-Core"></a>
-  <a href="#"><img src="https://img.shields.io/badge/Ecosystem-WebAssembly-yellow.svg" alt="Wasm"></a>
-  <a href="#"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="MIT"></a>
+  <a href="https://www.npmjs.com/package/recached-edge"><img src="https://img.shields.io/npm/v/recached-edge?label=npm" alt="npm"></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Language-Rust-orange.svg?logo=rust" alt="Rust"></a>
+  <a href="https://webassembly.org"><img src="https://img.shields.io/badge/Ecosystem-WebAssembly-yellow.svg" alt="Wasm"></a>
+  <a href="LICENSE.md"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="MIT"></a>
 </div>
 
 ---
 
-**Recached** is an in-memory cache written in Rust that compiles to WebAssembly. The same cache engine runs natively on your server and directly inside the browser, with the two sides kept in sync over WebSockets.
+Every caching solution forces a choice: server-side caches like Redis mean every frontend read is a network round-trip; client-side state like Zustand or SWR means two caches — one on the server and one in every client, with manual staleness code gluing them together. **Recached removes the choice.**
 
-On the backend it speaks RESP, so any Redis client works against it today. In the browser, you import it as a `.wasm` module and get zero-latency local reads with automatic background sync — no polling, no external state management library, no stale data.
+The same Rust cache engine runs natively on your server (RESP on port 6379 — any Redis client works today, zero code changes) and as WebAssembly inside the browser. Reads always come from local WASM memory. The WebSocket is only a sync path, not a read path.
 
 > [!NOTE]
 > Recached is not a full Redis replacement. It covers the subset most applications actually need: strings, expiry, counters, all collection types, transactions, pub/sub, and observable keys. Best fit: reactive UIs, session caches, browser-side API response caching, and rate limiting.
 
-**→ Full documentation, use cases, API reference, and guides at [recached.io](https://thinkgrid-labs.github.io/recached/)**
+**→ Full documentation, use cases, API reference, and guides at [recached.dev](https://recached.dev)**
 
 ---
 
@@ -90,11 +90,26 @@ cache.get('inventory:item:99'); // "42" — from local WASM memory, 0 ms
 
 ## Contributing
 
-1. **Benchmarks** — `redis-benchmark` against Redis 7 on multi-core hardware
-2. **Client examples** — React, Vue, or SvelteKit demos using `recached-edge`
-3. **Bug reports** — edge cases in the RESP parser, TTL eviction, pub/sub delivery, or WebSocket sync
+Recached is maintained by Dennis. Bug reports, PRs, and feedback are all welcome.
 
-Open a PR or file an issue. See [recached.dev/roadmap](https://recached.dev/roadmap) for what's planned.
+1. Fork the repo and create a branch: `git checkout -b feat/my-feature`
+2. Make your changes — server logic lives in `server-native/`, WASM bindings in `wasm-edge/`
+3. Run `cargo test --workspace` before opening a PR
+4. Open a pull request with a clear description
+
+Open an issue before large features or architectural changes. Areas where contributions are especially welcome:
+
+- **Benchmarks** — `redis-benchmark` against Redis 7 on multi-core hardware
+- **Client examples** — React, Vue, or SvelteKit demos using `recached-edge`
+- **Bug reports** — edge cases in the RESP parser, TTL eviction, pub/sub delivery, or WebSocket sync
+
+See [recached.dev/roadmap](https://recached.dev/roadmap) for what's planned.
+
+Reach out: [dennis@thinkgrid.dev](mailto:dennis@thinkgrid.dev)
+
+## Support Recached
+
+Recached is free and open-source, maintained by one person. If it saves you infrastructure cost or development time, [sponsoring on GitHub](https://github.com/sponsors/thinkgrid-labs) directly funds continued development: more Redis commands, RESP3, cluster support, and performance work.
 
 ## License
 
