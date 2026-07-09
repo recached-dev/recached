@@ -4,6 +4,14 @@ All notable changes to Recached are documented here.
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Built-in sliding-window rate limiting** — `RLSET key limit window` configures a limiter (persists until `DEL`/`EXPIRE`); `RLCHECK key [limit window]` records an attempt and returns `[allowed, remaining, retry_after_ms]`, mapping directly onto `X-RateLimit-*` / `Retry-After` HTTP headers. The optional inline `limit window` pair creates the limiter on first use for per-IP/per-user keys, and such auto-created limiters expire one window after the last attempt so they self-clean. Internally a new `ratelimit` entry type stores attempt timestamps in a monotonic deque — O(1) amortized per check, length bounded by `limit` (denied attempts are not recorded). `RLSET` config replicates to AOF/replicas; attempt state is deliberately transient. Snapshot format gains a new trailing enum variant (old snapshots remain readable). (`core-engine/src/cmd.rs`, `core-engine/src/store.rs`, `server-native/src/main.rs`, `docs/server/commands.md`)
+
+---
+
 ## [0.1.8] — 2026-07-09
 
 ### Fixed

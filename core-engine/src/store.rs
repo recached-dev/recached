@@ -101,6 +101,7 @@ enum EntryValue {
     // random member by index, which a hash table cannot provide.
     Set(IndexSet<String>),
     ZSet(ZSetInner),
+    RateLimiter(RateLimiterInner),
 }
 
 impl EntryValue {
@@ -111,6 +112,52 @@ impl EntryValue {
             EntryValue::List(_) => "list",
             EntryValue::Set(_) => "set",
             EntryValue::ZSet(_) => "zset",
+            EntryValue::RateLimiter(_) => "ratelimit",
+        }
+    }
+}
+
+// ── Sliding-window rate limiter (RLSET / RLCHECK) ─────────────────────────────
+
+#[derive(Clone)]
+struct RateLimiterInner {
+    limit: u64,
+    window_ms: u64,
+    /// Timestamps (ms) of recorded attempts, oldest first. Attempts arrive in
+    /// monotonically non-decreasing time, so the deque stays sorted and window
+    /// pruning is O(pruned) pops from the front — no sorted-set machinery
+    /// needed. Length is bounded by `limit` (denied attempts are not recorded).
+    events: VecDeque<u64>,
+}
+
+impl RateLimiterInner {
+    fn new(limit: u64, window_ms: u64) -> Self {
+        Self {
+            limit,
+            window_ms,
+            events: VecDeque::new(),
+        }
+    }
+
+    /// Record an attempt at `now`, returning `(allowed, remaining, retry_after_ms)`.
+    /// Denied attempts are not recorded — a client hammering a full limiter
+    /// does not push its own recovery further away.
+    fn check(&mut self, now: u64) -> (i64, u64, u64) {
+        let cutoff = now.saturating_sub(self.window_ms);
+        while self.events.front().is_some_and(|&t| t <= cutoff) {
+            self.events.pop_front();
+        }
+        if (self.events.len() as u64) < self.limit {
+            self.events.push_back(now);
+            let remaining = self.limit - self.events.len() as u64;
+            (1, remaining, 0)
+        } else {
+            let retry_after = self
+                .events
+                .front()
+                .map(|&t| (t + self.window_ms).saturating_sub(now))
+                .unwrap_or(0);
+            (0, 0, retry_after)
         }
     }
 }
@@ -290,6 +337,13 @@ pub enum SnapshotValue {
     List(Vec<String>),
     Set(Vec<String>),
     ZSet(Vec<(String, f64)>),
+    // Appended after the original variants: rmp-serde encodes variants by
+    // index, so new variants must go last to keep old snapshots readable.
+    RateLimiter {
+        limit: u64,
+        window_ms: u64,
+        events: Vec<u64>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -421,6 +475,7 @@ impl KeyValueStore {
                 EntryValue::List(_) => Value::SimpleString("list".to_string()),
                 EntryValue::Set(_) => Value::SimpleString("set".to_string()),
                 EntryValue::ZSet(_) => Value::SimpleString("zset".to_string()),
+                EntryValue::RateLimiter(_) => Value::SimpleString("ratelimit".to_string()),
             },
         }
     }
@@ -510,6 +565,11 @@ impl KeyValueStore {
                     EntryValue::ZSet(z) => {
                         SnapshotValue::ZSet(z.scores.iter().map(|(k, &v)| (k.clone(), v)).collect())
                     }
+                    EntryValue::RateLimiter(rl) => SnapshotValue::RateLimiter {
+                        limit: rl.limit,
+                        window_ms: rl.window_ms,
+                        events: rl.events.iter().copied().collect(),
+                    },
                 };
                 SnapshotEntry {
                     key: e.key().clone(),
@@ -535,6 +595,15 @@ impl KeyValueStore {
                 SnapshotValue::Set(s) => EntryValue::Set(s.into_iter().collect()),
                 SnapshotValue::ZSet(pairs) => EntryValue::ZSet(ZSetInner {
                     scores: pairs.into_iter().collect(),
+                }),
+                SnapshotValue::RateLimiter {
+                    limit,
+                    window_ms,
+                    events,
+                } => EntryValue::RateLimiter(RateLimiterInner {
+                    limit,
+                    window_ms,
+                    events: events.into(),
                 }),
             };
             self.data.insert(
@@ -1973,6 +2042,88 @@ impl KeyValueStore {
                 Ok(Value::Integer(count as i64))
             }),
 
+            // ── Rate limiting ─────────────────────────────────────────────────
+            Command::RlSet(key, limit, window_secs) => {
+                let now = now_ms();
+                let was_expired = type_guard!(self.data, &key, EntryValue::RateLimiter(_), now);
+                let window_ms = window_secs.saturating_mul(1000);
+                let mut entry = self.data.entry(key).or_insert_with(|| Entry {
+                    value: EntryValue::RateLimiter(RateLimiterInner::new(limit, window_ms)),
+                    expires_at_ms: None,
+                    last_access_ms: AtomicU64::new(now_ms()),
+                });
+                if was_expired {
+                    entry.value = EntryValue::RateLimiter(RateLimiterInner::new(limit, window_ms));
+                }
+                match &mut entry.value {
+                    EntryValue::RateLimiter(rl) => {
+                        // Reconfigure in place; recorded attempts are kept so a
+                        // live limiter is not reset by a config change.
+                        rl.limit = limit;
+                        rl.window_ms = window_ms;
+                    }
+                    _ => unreachable!(),
+                }
+                // Explicitly configured limiters persist until DEL/EXPIRE, unlike
+                // limiters auto-created by inline RLCHECK config.
+                entry.expires_at_ms = None;
+                Value::SimpleString("OK".to_string())
+            }
+
+            Command::RlCheck(key, config) => {
+                let now = now_ms();
+                let was_expired = type_guard!(self.data, &key, EntryValue::RateLimiter(_), now);
+                let missing = was_expired
+                    || match self.data.get(&key) {
+                        None => true,
+                        Some(e) => e.is_expired(now),
+                    };
+                if missing {
+                    let Some((limit, window_secs)) = config else {
+                        return Value::Error(format!(
+                            "ERR no rate limit configured for '{}'; call RLSET first or use RLCHECK key limit window",
+                            key
+                        ));
+                    };
+                    let window_ms = window_secs.saturating_mul(1000);
+                    // Auto-created limiters self-clean: they expire one window
+                    // after the last attempt, so per-IP / per-user keys don't
+                    // accumulate forever.
+                    self.data.insert(
+                        key.clone(),
+                        Entry {
+                            value: EntryValue::RateLimiter(RateLimiterInner::new(limit, window_ms)),
+                            expires_at_ms: Some(now.saturating_add(window_ms)),
+                            last_access_ms: AtomicU64::new(now),
+                        },
+                    );
+                }
+                match self.data.get_mut(&key) {
+                    Some(mut e) => match &mut e.value {
+                        EntryValue::RateLimiter(rl) => {
+                            if let Some((limit, window_secs)) = config {
+                                // Inline config wins: middleware config changes
+                                // propagate without a separate RLSET.
+                                rl.limit = limit;
+                                rl.window_ms = window_secs.saturating_mul(1000);
+                            }
+                            let (allowed, remaining, retry_after_ms) = rl.check(now);
+                            let window_ms = rl.window_ms;
+                            if e.expires_at_ms.is_some() {
+                                e.expires_at_ms = Some(now.saturating_add(window_ms));
+                            }
+                            Value::Array(Some(vec![
+                                Value::Integer(allowed),
+                                Value::Integer(remaining as i64),
+                                Value::Integer(retry_after_ms as i64),
+                            ]))
+                        }
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                    None => Value::Error("ERR rate limiter vanished mid-check".to_string()),
+                }
+            }
+
             // ── Transactions ─────────────────────────────────────────────────
             // These are handled at the server layer before reaching the store.
             // The arms below are fallback-only (e.g. store used in tests).
@@ -2014,6 +2165,7 @@ fn entry_size(key: &str, e: &Entry) -> usize {
         EntryValue::List(l) => l.iter().map(|s| s.len()).sum(),
         EntryValue::Set(s) => s.iter().map(|m| m.len()).sum::<usize>(),
         EntryValue::ZSet(z) => z.scores.keys().map(|m| m.len() + 8).sum(),
+        EntryValue::RateLimiter(rl) => rl.events.len() * 8 + 16,
     };
     key.len() + val_size + 64
 }
@@ -3614,5 +3766,130 @@ mod tests {
 
         let ttl = s2.execute(Command::Ttl("k".into()));
         assert!(matches!(ttl, Value::Integer(n) if n > 0 && n <= 60));
+    }
+
+    // ── Rate limiting (RLSET / RLCHECK) ───────────────────────────────────────
+
+    /// Unpack an RLCHECK reply into (allowed, remaining, retry_after_ms).
+    fn rl(v: Value) -> (i64, i64, i64) {
+        match v {
+            Value::Array(Some(items)) => match items.as_slice() {
+                [Value::Integer(a), Value::Integer(r), Value::Integer(t)] => (*a, *r, *t),
+                other => panic!("unexpected RLCHECK reply shape: {:?}", other),
+            },
+            other => panic!("unexpected RLCHECK reply: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rlset_and_check_enforce_limit() {
+        let s = store();
+        assert_eq!(s.execute(Command::RlSet("api".into(), 3, 60)), ok());
+        for expected_remaining in [2, 1, 0] {
+            let (allowed, remaining, retry) = rl(s.execute(Command::RlCheck("api".into(), None)));
+            assert_eq!(allowed, 1);
+            assert_eq!(remaining, expected_remaining);
+            assert_eq!(retry, 0);
+        }
+        let (allowed, remaining, retry) = rl(s.execute(Command::RlCheck("api".into(), None)));
+        assert_eq!(allowed, 0);
+        assert_eq!(remaining, 0);
+        assert!(retry > 0 && retry <= 60_000, "retry_after_ms = {}", retry);
+    }
+
+    #[test]
+    fn rlcheck_inline_config_creates_limiter() {
+        let s = store();
+        let key = "ip:10.0.0.1".to_string();
+        let (allowed, _, _) = rl(s.execute(Command::RlCheck(key.clone(), Some((2, 60)))));
+        assert_eq!(allowed, 1);
+        let (allowed, _, _) = rl(s.execute(Command::RlCheck(key.clone(), Some((2, 60)))));
+        assert_eq!(allowed, 1);
+        let (allowed, _, _) = rl(s.execute(Command::RlCheck(key, Some((2, 60)))));
+        assert_eq!(allowed, 0);
+    }
+
+    #[test]
+    fn rlcheck_unconfigured_errors() {
+        let s = store();
+        let r = s.execute(Command::RlCheck("nope".into(), None));
+        assert!(matches!(&r, Value::Error(e) if e.contains("no rate limit configured")));
+    }
+
+    #[test]
+    fn rl_wrongtype_interactions() {
+        let s = store();
+        s.execute(Command::Set(
+            "str".into(),
+            "v".into(),
+            SetOptions::default(),
+        ));
+        let r = s.execute(Command::RlCheck("str".into(), Some((5, 60))));
+        assert!(matches!(&r, Value::Error(e) if e.contains("WRONGTYPE")));
+        let r = s.execute(Command::RlSet("str".into(), 5, 60));
+        assert!(matches!(&r, Value::Error(e) if e.contains("WRONGTYPE")));
+
+        s.execute(Command::RlSet("rl".into(), 5, 60));
+        let r = s.execute(Command::Get("rl".into()));
+        assert!(matches!(&r, Value::Error(e) if e.contains("WRONGTYPE")));
+        assert_eq!(
+            s.execute(Command::Type("rl".into())),
+            Value::SimpleString("ratelimit".into())
+        );
+    }
+
+    #[test]
+    fn rlset_reconfig_keeps_recorded_attempts() {
+        let s = store();
+        s.execute(Command::RlSet("api".into(), 2, 60));
+        rl(s.execute(Command::RlCheck("api".into(), None)));
+        // Raise the limit: the one recorded attempt still counts against it.
+        s.execute(Command::RlSet("api".into(), 3, 60));
+        let (allowed, remaining, _) = rl(s.execute(Command::RlCheck("api".into(), None)));
+        assert_eq!((allowed, remaining), (1, 1));
+        let (allowed, _, _) = rl(s.execute(Command::RlCheck("api".into(), None)));
+        assert_eq!(allowed, 1);
+        let (allowed, _, _) = rl(s.execute(Command::RlCheck("api".into(), None)));
+        assert_eq!(allowed, 0);
+    }
+
+    #[test]
+    fn rl_snapshot_roundtrip_preserves_state() {
+        let s = store();
+        s.execute(Command::RlSet("api".into(), 2, 60));
+        rl(s.execute(Command::RlCheck("api".into(), None)));
+        rl(s.execute(Command::RlCheck("api".into(), None)));
+
+        let s2 = store();
+        s2.restore(s.snapshot());
+        let (allowed, remaining, retry) = rl(s2.execute(Command::RlCheck("api".into(), None)));
+        assert_eq!((allowed, remaining), (0, 0));
+        assert!(retry > 0);
+    }
+
+    #[test]
+    fn rl_window_slides_and_inline_limiter_expires() {
+        use std::time::Duration;
+        let s = store();
+        // Persistent limiter: 1 attempt per 1-second window.
+        s.execute(Command::RlSet("persist".into(), 1, 1));
+        let (allowed, _, _) = rl(s.execute(Command::RlCheck("persist".into(), None)));
+        assert_eq!(allowed, 1);
+        let (allowed, _, retry) = rl(s.execute(Command::RlCheck("persist".into(), None)));
+        assert_eq!(allowed, 0);
+        assert!(retry > 0 && retry <= 1_000);
+        // Auto-created limiter with a 1-second window.
+        let (allowed, _, _) = rl(s.execute(Command::RlCheck("perip".into(), Some((1, 1)))));
+        assert_eq!(allowed, 1);
+
+        std::thread::sleep(Duration::from_millis(1_050));
+
+        // The window slid past the recorded attempt: allowed again.
+        let (allowed, _, _) = rl(s.execute(Command::RlCheck("persist".into(), None)));
+        assert_eq!(allowed, 1);
+        // The auto-created limiter expired with its window — bare RLCHECK
+        // finds no config.
+        let r = s.execute(Command::RlCheck("perip".into(), None));
+        assert!(matches!(&r, Value::Error(e) if e.contains("no rate limit configured")));
     }
 }

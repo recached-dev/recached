@@ -154,6 +154,8 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::BgSave => "bgsave",
         Command::LastSave => "lastsave",
         Command::ReplicaOfNoOne => "replicaof",
+        Command::RlSet(_, _, _) => "rlset",
+        Command::RlCheck(_, _) => "rlcheck",
         Command::Unknown(_) => "unknown",
     }
 }
@@ -609,6 +611,8 @@ fn is_write_command(cmd: &Command) -> bool {
             | Command::ZAdd(..)
             | Command::ZRem(..)
             | Command::ZIncrBy(..)
+            | Command::RlSet(..)
+            | Command::RlCheck(..)
     )
 }
 
@@ -1090,7 +1094,8 @@ fn primary_keys(cmd: &Command) -> Vec<String> {
         | Command::SDiffStore(k, _)
         | Command::ZAdd(k, _, _)
         | Command::ZRem(k, _)
-        | Command::ZIncrBy(k, _, _) => vec![k.clone()],
+        | Command::ZIncrBy(k, _, _)
+        | Command::RlSet(k, _, _) => vec![k.clone()],
         Command::Del(keys) | Command::Unlink(keys) => keys.clone(),
         Command::MSet(pairs) => pairs.iter().map(|(k, _)| k.clone()).collect(),
         Command::Rename(src, dst) | Command::SMove(src, dst, _) => {
@@ -1580,6 +1585,17 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
         Command::ZIncrBy(k, delta, member) => {
             let delta_s = format_f64_score(*delta);
             Some(resp_push(&["ZINCRBY", k, &delta_s, member]))
+        }
+
+        // ── Rate limiting ────────────────────────────────────────────────────
+        // RLSET replicates so limiter *config* survives AOF replay / reaches
+        // replicas. RLCHECK is deliberately not replicated: attempt state is
+        // transient and high-frequency — streaming every check would flood the
+        // AOF and the sync fan-out for state that expires within one window.
+        Command::RlSet(k, limit, window_secs) => {
+            let limit_s = limit.to_string();
+            let window_s = window_secs.to_string();
+            Some(resp_push(&["RLSET", k, &limit_s, &window_s]))
         }
 
         // Pub/Sub and transactions carry no store state — no broadcast needed.

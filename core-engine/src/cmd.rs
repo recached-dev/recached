@@ -136,6 +136,14 @@ pub enum Command {
     ZCard(String),
     ZIncrBy(String, f64, String),
     ZCount(String, String, String),
+    // ── Rate limiting ─────────────────────────────────────────────────────────
+    /// RLSET key limit window_secs — configure a sliding-window rate limiter.
+    RlSet(String, u64, u64),
+    /// RLCHECK key [limit window_secs] — record an attempt and report
+    /// [allowed, remaining, retry_after_ms]. The optional limit/window pair
+    /// configures the limiter on first use (upsert), for per-IP/per-user keys
+    /// where a separate RLSET round-trip per key is impractical.
+    RlCheck(String, Option<(u64, u64)>),
     // ── Transactions ─────────────────────────────────────────────────────────
     Multi,
     Exec,
@@ -493,6 +501,27 @@ impl Command {
                     "TYPE" => {
                         need!(2);
                         Ok(Command::Type(extract_string(&arr[1]).unwrap_or_default()))
+                    }
+
+                    // ── Rate limiting ──────────────────────────────────────────
+                    "RLSET" => {
+                        need!(4);
+                        let key = extract_key(&arr[1])?;
+                        let (limit, window) = parse_rl_config(&arr[2], &arr[3], "rlset")?;
+                        Ok(Command::RlSet(key, limit, window))
+                    }
+                    "RLCHECK" => {
+                        need!(2);
+                        let key = extract_key(&arr[1])?;
+                        let config = match arr.len() {
+                            2 => None,
+                            4 => Some(parse_rl_config(&arr[2], &arr[3], "rlcheck")?),
+                            _ => {
+                                return Err("ERR wrong number of arguments for 'rlcheck' command"
+                                    .to_string());
+                            }
+                        };
+                        Ok(Command::RlCheck(key, config))
                     }
 
                     // ── Hash ───────────────────────────────────────────────────
@@ -1026,6 +1055,19 @@ fn validate_key(key: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Parse and validate the `limit window_secs` pair shared by RLSET and RLCHECK.
+fn parse_rl_config(limit: &Value, window: &Value, cmd: &str) -> Result<(u64, u64), String> {
+    let limit = extract_int(limit)?;
+    let window = extract_int(window)?;
+    if limit <= 0 {
+        return Err(format!("ERR limit must be >= 1 in '{}' command", cmd));
+    }
+    if window <= 0 {
+        return Err(format!("ERR window must be >= 1 in '{}' command", cmd));
+    }
+    Ok((limit as u64, window as u64))
 }
 
 fn extract_key(val: &Value) -> Result<String, String> {
@@ -1766,6 +1808,45 @@ mod tests {
             Command::from_value(array(&["ZCOUNT", "z", "-inf", "+inf"])).unwrap(),
             Command::ZCount("z".into(), "-inf".into(), "+inf".into())
         );
+    }
+
+    // ── Rate limiting ───────────────────────────────────────────────────────
+
+    #[test]
+    fn rlset_parse() {
+        assert_eq!(
+            Command::from_value(array(&["RLSET", "api", "100", "60"])).unwrap(),
+            Command::RlSet("api".into(), 100, 60)
+        );
+    }
+
+    #[test]
+    fn rlset_rejects_non_positive_config() {
+        assert!(Command::from_value(array(&["RLSET", "api", "0", "60"])).is_err());
+        assert!(Command::from_value(array(&["RLSET", "api", "10", "0"])).is_err());
+        assert!(Command::from_value(array(&["RLSET", "api", "-1", "60"])).is_err());
+    }
+
+    #[test]
+    fn rlcheck_bare_parse() {
+        assert_eq!(
+            Command::from_value(array(&["RLCHECK", "api"])).unwrap(),
+            Command::RlCheck("api".into(), None)
+        );
+    }
+
+    #[test]
+    fn rlcheck_inline_config_parse() {
+        assert_eq!(
+            Command::from_value(array(&["RLCHECK", "ip:1.2.3.4", "5", "60"])).unwrap(),
+            Command::RlCheck("ip:1.2.3.4".into(), Some((5, 60)))
+        );
+    }
+
+    #[test]
+    fn rlcheck_partial_config_errors() {
+        assert!(Command::from_value(array(&["RLCHECK", "api", "5"])).is_err());
+        assert!(Command::from_value(array(&["RLCHECK"])).is_err());
     }
 
     // ── Persistence ───────────────────────────────────────────────────────────

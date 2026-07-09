@@ -4,9 +4,9 @@ Recached competes on **where the data can live** — the same engine on the serv
 
 Ordered by priority.
 
-## 1. Rate-limiting commands
+## 1. Rate-limiting commands ✅ shipped
 
-`RLSET key limit window` / `RLCHECK key`. A built-in sliding-window rate limiter that replaces hand-rolled INCR+EXPIRE (racy) or Lua script approaches. The window is stored as a sorted set internally; the API is a single command.
+`RLSET key limit window` / `RLCHECK key [limit window]`. A built-in sliding-window rate limiter that replaces hand-rolled INCR+EXPIRE (racy) or Lua script approaches. `RLCHECK` returns `[allowed, remaining, retry_after_ms]` — a direct fit for `X-RateLimit-*` / `Retry-After` headers — and the inline config form auto-creates self-cleaning per-IP/per-user limiters in a single command. See [Commands → Rate Limiting](/server/commands#rate-limiting).
 
 ## 2. Scoped sync and per-client auth
 

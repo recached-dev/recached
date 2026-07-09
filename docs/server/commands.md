@@ -55,7 +55,7 @@ The most common data type. Values are always stored as byte strings; numeric ope
 | `DEL key [key ...]` | Deletes one or more keys. Returns the number of keys that were deleted. Keys that do not exist are ignored. |
 | `UNLINK key [key ...]` | Non-blocking delete. Semantically equivalent to `DEL` (Recached does not implement async deletion, but `UNLINK` is accepted for client compatibility). |
 | `EXISTS key [key ...]` | Returns the number of keys that exist among the provided arguments. A key listed multiple times counts multiple times. |
-| `TYPE key` | Returns the type of the value stored at key: `string`, `hash`, `list`, `set`, `zset`, or `none` if the key does not exist. |
+| `TYPE key` | Returns the type of the value stored at key: `string`, `hash`, `list`, `set`, `zset`, `ratelimit`, or `none` if the key does not exist. |
 | `RENAME key newkey` | Renames a key. Returns an error if the source key does not exist. Overwrites `newkey` if it already exists. |
 | `KEYS pattern` | Returns all keys matching the glob pattern. `*` matches any sequence of characters, `?` matches a single character, `[abc]` matches a character class. Warning: `KEYS *` on a large store is slow — prefer `SCAN`. |
 | `SCAN cursor [MATCH pattern] [COUNT count]` | Iterates keys incrementally, returning at most `COUNT` keys per call (default 10) plus the next cursor. Start with cursor `0` and continue until the returned cursor is `0`. `MATCH` filters results by glob pattern. As in Redis, keys inserted or deleted mid-iteration may be missed or returned twice. |
@@ -170,6 +170,44 @@ ZREVRANGE leaderboard 0 2 WITHSCORES
 ZINCRBY leaderboard 300 carol
 ZREVRANK leaderboard carol    # 2 → 1 (moved up)
 ```
+
+---
+
+## Rate Limiting
+
+A built-in sliding-window rate limiter — no INCR+EXPIRE races, no Lua scripts. Internally a limiter key stores its config plus the timestamps of allowed attempts inside the window (type name: `ratelimit`). Denied attempts are not recorded, so a client hammering a full limiter does not push its own recovery further away.
+
+| Command | Description |
+|---|---|
+| `RLSET key limit window` | Configure a limiter: at most `limit` attempts per `window` seconds. Reconfiguring in place keeps already-recorded attempts. Limiters created with `RLSET` persist until `DEL`/`EXPIRE`. |
+| `RLCHECK key [limit window]` | Record an attempt. Returns a 3-element array: `[allowed (1\|0), remaining, retry_after_ms]`. With the optional `limit window` pair, the limiter is created on first use — ideal for per-IP or per-user keys where a separate `RLSET` round-trip per key is impractical. Auto-created limiters self-clean: they expire one window after the last attempt. Bare `RLCHECK` on an unconfigured key returns an error. |
+
+The reply maps directly onto standard HTTP rate-limit headers: `remaining` → `X-RateLimit-Remaining`, `retry_after_ms` → `Retry-After`.
+
+### Example: per-IP request limiting
+
+```bash
+# 100 requests per minute per client IP — one command per request,
+# limiter auto-created on the first attempt and self-cleans when idle.
+RLCHECK ip:203.0.113.7 100 60
+# 1) (integer) 1        allowed
+# 2) (integer) 99       remaining in window
+# 3) (integer) 0        retry_after_ms
+
+# ...101st request within the minute:
+# 1) (integer) 0
+# 2) (integer) 0
+# 3) (integer) 58211    → Retry-After: 59
+```
+
+### Example: named app-level limiter
+
+```bash
+RLSET login:alice 5 300      # 5 login attempts per 5 minutes
+RLCHECK login:alice          # check + record one attempt
+```
+
+Replication note: `RLSET` config replicates to AOF and replicas; recorded attempts are transient and deliberately do not (streaming every check would flood the write log for state that expires within one window).
 
 ---
 

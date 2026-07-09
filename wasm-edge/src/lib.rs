@@ -152,6 +152,9 @@ fn snapshot_to_resp_cmds(entries: &[SnapshotEntry]) -> Vec<String> {
                 }
                 parts
             }
+            // Rate-limiter attempt state is transient and server-side; it is
+            // not persisted in the browser WAL.
+            SnapshotValue::RateLimiter { .. } => continue,
         };
         out.push(to_resp_owned(&data_parts));
         // Non-string types with a TTL need a separate PEXPIREAT command.
