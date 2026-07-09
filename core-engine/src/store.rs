@@ -1472,8 +1472,7 @@ impl KeyValueStore {
                     Some(e) if e.is_expired(now) => Value::Integer(0),
                     Some(mut e) => match &mut e.value {
                         EntryValue::Set(s) => {
-                            let removed =
-                                members.into_iter().filter(|m| s.swap_remove(m)).count();
+                            let removed = members.into_iter().filter(|m| s.swap_remove(m)).count();
                             Value::Integer(removed as i64)
                         }
                         _ => Value::Error(WRONGTYPE.to_string()),
