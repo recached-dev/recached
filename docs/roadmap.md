@@ -40,12 +40,20 @@ Browser clients already persist through IndexedDB and read locally. The missing 
 - Default policy: last-write-wins with server timestamps.
 - CRDT semantics where the data type makes them natural: `INCR`/`DECR` as a PN-counter (offline increments merge additively instead of clobbering), `SADD`/`SREM` as an observed-remove set.
 
-## 6. WASM server-side scripting
+## 6. Mobile SDKs — React Native, Flutter, Kotlin, Swift
+
+
+- **Kotlin + Swift first**, via a single `uniffi`-annotated Rust crate that generates bindings for both. The platform WebSocket (OkHttp / URLSession) feeds RESP frames into the engine's existing parser — no embedded async runtime. Persistence reuses the existing snapshot format as a file. Reactivity: Kotlin `Flow` / Swift `Observation` over keychange pushes.
+- **Flutter** via `flutter_rust_bridge`: synchronous local reads into Rust memory, `watchKey()` → `Stream` for rebuilds.
+- **React Native** last (Hermes has no WASM): `uniffi-bindgen-react-native` reuses the same binding layer, and the existing React hooks API carries over — same `useKey` in React DOM and React Native.
+
+
+## 7. WASM server-side scripting
 
 Run `.wasm` stored procedures in place of Lua scripts. The scripting VM would be sandboxed (no network, no file I/O, bounded execution time), accept any WASM module that exports a specific entry function, and execute it against the cache store. Supports any language that compiles to WASM: Rust, Go (TinyGo), AssemblyScript, Python.
 
 
-## 7. WASI target
+## 8. WASI target
 
 A `wasm32-wasip1` build of `wasm-edge` for Cloudflare Workers and Deno Deploy, running Recached as a cache layer at the edge with the same API as the browser client.
 
