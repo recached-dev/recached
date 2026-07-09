@@ -19,45 +19,53 @@ impl Value {
     /// Serializes the Value back into RESP format.
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::new();
+        self.serialize_into(&mut buf);
+        buf
+    }
+
+    /// Appends the RESP encoding of `self` to `out`. Unlike `serialize`, this
+    /// allocates nothing of its own — array elements are encoded in place —
+    /// so hot paths can reuse one output buffer across responses.
+    pub fn serialize_into(&self, out: &mut Vec<u8>) {
+        use std::io::Write;
         match self {
             Value::SimpleString(s) => {
-                buf.extend_from_slice(b"+");
-                buf.extend_from_slice(s.as_bytes());
-                buf.extend_from_slice(b"\r\n");
+                out.push(b'+');
+                out.extend_from_slice(s.as_bytes());
+                out.extend_from_slice(b"\r\n");
             }
             Value::Error(s) => {
-                buf.extend_from_slice(b"-");
-                buf.extend_from_slice(s.as_bytes());
-                buf.extend_from_slice(b"\r\n");
+                out.push(b'-');
+                out.extend_from_slice(s.as_bytes());
+                out.extend_from_slice(b"\r\n");
             }
             Value::Integer(i) => {
-                buf.extend_from_slice(format!(":{}\r\n", i).as_bytes());
+                let _ = write!(out, ":{}\r\n", i);
             }
             Value::BulkString(None) => {
-                buf.extend_from_slice(b"$-1\r\n");
+                out.extend_from_slice(b"$-1\r\n");
             }
             Value::BulkString(Some(data)) => {
-                buf.extend_from_slice(format!("${}\r\n", data.len()).as_bytes());
-                buf.extend_from_slice(data);
-                buf.extend_from_slice(b"\r\n");
+                let _ = write!(out, "${}\r\n", data.len());
+                out.extend_from_slice(data);
+                out.extend_from_slice(b"\r\n");
             }
             Value::Array(None) => {
-                buf.extend_from_slice(b"*-1\r\n");
+                out.extend_from_slice(b"*-1\r\n");
             }
             Value::Array(Some(arr)) => {
-                buf.extend_from_slice(format!("*{}\r\n", arr.len()).as_bytes());
+                let _ = write!(out, "*{}\r\n", arr.len());
                 for v in arr {
-                    buf.extend_from_slice(&v.serialize());
+                    v.serialize_into(out);
                 }
             }
             Value::Push(arr) => {
-                buf.extend_from_slice(format!(">{}\r\n", arr.len()).as_bytes());
+                let _ = write!(out, ">{}\r\n", arr.len());
                 for v in arr {
-                    buf.extend_from_slice(&v.serialize());
+                    v.serialize_into(out);
                 }
             }
         }
-        buf
     }
 
     /// Parses a byte slice into a RESP Value, returning the Value and the number of bytes consumed.

@@ -16,7 +16,7 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -158,23 +158,63 @@ fn command_name(cmd: &Command) -> &'static str {
     }
 }
 
-fn execute_and_record(store: &KeyValueStore, cmd: &Command) -> Value {
-    let name = command_name(cmd);
-    let response = store.execute(cmd.clone());
-    counter!("recached_commands_total", "command" => name).increment(1);
+/// Per-command counter handles, resolved through the metrics registry once and
+/// then reused — the registry lookup (key construction + shard lock) is too
+/// expensive to pay on every command. Keyed by the `&'static str` from
+/// `command_name`. Populated lazily after the recorder is installed in `main`.
+static CMD_COUNTERS: std::sync::LazyLock<
+    std::sync::RwLock<HashMap<&'static str, metrics::Counter>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn record_command(name: &'static str) {
+    if let Some(c) = CMD_COUNTERS.read().unwrap().get(name) {
+        c.increment(1);
+        return;
+    }
+    let c = counter!("recached_commands_total", "command" => name);
+    c.increment(1);
+    CMD_COUNTERS.write().unwrap().insert(name, c);
+}
+
+static KEYSPACE_HITS: std::sync::LazyLock<metrics::Counter> =
+    std::sync::LazyLock::new(|| counter!("recached_keyspace_hits_total"));
+static KEYSPACE_MISSES: std::sync::LazyLock<metrics::Counter> =
+    std::sync::LazyLock::new(|| counter!("recached_keyspace_misses_total"));
+
+/// Executes `cmd`, recording metrics and the dirty counter. Takes the command
+/// by value — the hot path hands it straight to the store without a clone;
+/// callers that still need the command afterwards (write fan-out) clone first.
+fn execute_and_record(store: &KeyValueStore, cmd: Command) -> Value {
+    let name = command_name(&cmd);
+    let is_write = is_write_command(&cmd);
+    let is_get = matches!(cmd, Command::Get(_));
+    let response = store.execute(cmd);
+    record_command(name);
     if matches!(response, Value::Error(_)) {
         counter!("recached_command_errors_total", "command" => name).increment(1);
-    } else if is_write_command(cmd) {
+    } else if is_write {
         store.mark_dirty();
     }
-    if matches!(cmd, Command::Get(_)) {
+    if is_get {
         match &response {
-            Value::BulkString(Some(_)) => counter!("recached_keyspace_hits_total").increment(1),
-            Value::BulkString(None) => counter!("recached_keyspace_misses_total").increment(1),
+            Value::BulkString(Some(_)) => KEYSPACE_HITS.increment(1),
+            Value::BulkString(None) => KEYSPACE_MISSES.increment(1),
             _ => {}
         }
     }
     response
+}
+
+/// True when at least one consumer of write effects exists (WebSocket peers,
+/// AOF, replicas, or watched keys). When false — the common standalone case —
+/// the caller can move the command into `execute_and_record` without cloning
+/// and skip `apply_write_effects` entirely.
+fn write_effects_armed(
+    tx: &broadcast::Sender<(u64, String)>,
+    state: &ServerState,
+    watch_registry: &WatchRegistry,
+) -> bool {
+    tx.receiver_count() > 0 || state.needs_write_log() || !watch_registry.is_empty()
 }
 
 // ── TCP listeners ─────────────────────────────────────────────────────────────
@@ -427,7 +467,29 @@ async fn replay_aof(store: &KeyValueStore, path: &std::path::Path) -> usize {
 // ── Replication ───────────────────────────────────────────────────────────────
 
 type ReplSender = mpsc::Sender<Vec<u8>>;
-type ReplRegistry = Arc<tokio::sync::Mutex<Vec<ReplSender>>>;
+
+/// Connected-replica registry. `count` mirrors `senders.len()` (updated by
+/// every writer while holding the lock) so the per-write hot path can skip
+/// the mutex entirely when no replica is connected.
+struct ReplHub {
+    senders: tokio::sync::Mutex<Vec<ReplSender>>,
+    count: AtomicUsize,
+}
+
+impl ReplHub {
+    fn new() -> ReplRegistry {
+        Arc::new(ReplHub {
+            senders: tokio::sync::Mutex::new(Vec::new()),
+            count: AtomicUsize::new(0),
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.count.load(Ordering::Relaxed) == 0
+    }
+}
+
+type ReplRegistry = Arc<ReplHub>;
 
 /// Default per-replica channel capacity (number of pending write frames).
 /// When a replica falls this many writes behind the primary it is disconnected
@@ -461,13 +523,22 @@ impl ServerState {
         info!("REPLICAOF NO ONE: promoted to primary — writes now accepted");
     }
 
+    /// True when a write must be RESP-encoded for the durability/replication
+    /// path even if no other consumer needs it.
+    fn needs_write_log(&self) -> bool {
+        self.aof.is_some() || !self.replicas.is_empty()
+    }
+
     /// Called after every successful write: appends to AOF and fans out to replicas.
     async fn on_write(&self, resp: &str) {
         if let Some(aof) = &self.aof {
             aof.append(resp).await;
         }
+        if self.replicas.is_empty() {
+            return;
+        }
         let bytes = resp.as_bytes().to_vec();
-        let mut reg = self.replicas.lock().await;
+        let mut reg = self.replicas.senders.lock().await;
         reg.retain(|tx| match tx.try_send(bytes.clone()) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -478,6 +549,7 @@ impl ServerState {
             }
             Err(mpsc::error::TrySendError::Closed(_)) => false,
         });
+        self.replicas.count.store(reg.len(), Ordering::Relaxed);
     }
 
     /// Save snapshot, reset the dirty counter, then truncate AOF (snapshot subsumes the log).
@@ -639,7 +711,11 @@ async fn handle_replica(
 
     // 1. Register channel first so subsequent writes are buffered
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(repl_channel_capacity);
-    replicas.lock().await.push(tx);
+    {
+        let mut reg = replicas.senders.lock().await;
+        reg.push(tx);
+        replicas.count.store(reg.len(), Ordering::Relaxed);
+    }
 
     // 2. Take snapshot and send (writes since snapshot are in channel)
     let snap_bytes =
@@ -942,8 +1018,35 @@ type SharedPubSub = Arc<tokio::sync::Mutex<PubSubHub>>;
 // ── observable keys ───────────────────────────────────────────────────────────
 
 type WatchNotif = (String, Value);
-type WatchRegistry =
-    Arc<tokio::sync::Mutex<HashMap<String, Vec<(u64, mpsc::UnboundedSender<WatchNotif>)>>>>;
+type WatchMap = HashMap<String, Vec<(u64, mpsc::UnboundedSender<WatchNotif>)>>;
+
+/// Watched-key registry. `watched_keys` mirrors `map.len()` (updated by every
+/// writer while holding the lock) so the per-write hot path can skip the mutex
+/// entirely when nothing is watched.
+struct WatchHub {
+    map: tokio::sync::Mutex<WatchMap>,
+    watched_keys: AtomicUsize,
+}
+
+impl WatchHub {
+    fn new() -> WatchRegistry {
+        Arc::new(WatchHub {
+            map: tokio::sync::Mutex::new(HashMap::new()),
+            watched_keys: AtomicUsize::new(0),
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.watched_keys.load(Ordering::Relaxed) == 0
+    }
+
+    /// Call after mutating the map, while still holding the lock.
+    fn sync_len(&self, map: &WatchMap) {
+        self.watched_keys.store(map.len(), Ordering::Relaxed);
+    }
+}
+
+type WatchRegistry = Arc<WatchHub>;
 
 /// Extract the key(s) that `cmd` writes to, without inspecting the response.
 /// Used together with `broadcast_for()` — only call this when `broadcast_for`
@@ -1006,13 +1109,10 @@ fn encode_keychange(key: &str, value: &Value) -> Vec<u8> {
     .serialize()
 }
 
-async fn notify_watchers(
-    registry: &WatchRegistry,
-    cmd: &Command,
-    response: &Value,
-    store: &KeyValueStore,
-) {
-    if broadcast_for(cmd, response).is_none() {
+/// Push keychange notifications for a *confirmed* mutation. Callers must have
+/// already established that `cmd` mutated the store (via `broadcast_for`).
+async fn notify_watchers(registry: &WatchRegistry, cmd: &Command, store: &KeyValueStore) {
+    if registry.is_empty() {
         return;
     }
     let keys = primary_keys(cmd);
@@ -1025,7 +1125,7 @@ async fn notify_watchers(
         .iter()
         .map(|k| (k.clone(), store.get_current(k)))
         .collect();
-    let mut reg = registry.lock().await;
+    let mut reg = registry.map.lock().await;
     for (key, value) in &key_values {
         if let Some(subs) = reg.get_mut(key) {
             subs.retain(|(_, tx)| tx.send((key.clone(), value.clone())).is_ok());
@@ -1033,6 +1133,40 @@ async fn notify_watchers(
                 reg.remove(key);
             }
         }
+    }
+    registry.sync_len(&reg);
+}
+
+/// Post-write fan-out shared by the TCP and WS command paths: WebSocket sync
+/// broadcast, AOF/replication log, and watch notifications. Structured so that
+/// with no WS clients, no replicas, no AOF, and no watched keys — the common
+/// standalone-server case — a write costs zero locks and zero allocations here.
+async fn apply_write_effects(
+    cmd: &Command,
+    response: &Value,
+    tx: &broadcast::Sender<(u64, String)>,
+    origin: u64,
+    state: &ServerState,
+    watch_registry: &WatchRegistry,
+    store: &KeyValueStore,
+) {
+    let has_ws = tx.receiver_count() > 0;
+    let needs_log = state.needs_write_log();
+    let has_watch = !watch_registry.is_empty();
+    if !has_ws && !needs_log && !has_watch {
+        return;
+    }
+    let Some(msg) = broadcast_for(cmd, response) else {
+        return;
+    };
+    if needs_log {
+        state.on_write(&msg).await;
+    }
+    if has_watch {
+        notify_watchers(watch_registry, cmd, store).await;
+    }
+    if has_ws {
+        let _ = tx.send((origin, msg));
     }
 }
 
@@ -1047,7 +1181,7 @@ async fn unregister_all_watches(
     if watched_keys.is_empty() {
         return;
     }
-    let mut reg = registry.lock().await;
+    let mut reg = registry.map.lock().await;
     for key in watched_keys.drain() {
         if let Some(subs) = reg.get_mut(&key) {
             subs.retain(|(id, _)| *id != conn_id);
@@ -1056,6 +1190,7 @@ async fn unregister_all_watches(
             }
         }
     }
+    registry.sync_len(&reg);
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -1500,6 +1635,13 @@ fn process_auth(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // All runtime configuration is via RECACHED_* env vars; the only flags are
+    // --version/-V (required by e.g. the Homebrew formula's install test).
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("recached-server {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -1707,7 +1849,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let is_replica_start = replicaof.is_some();
-    let replicas: ReplRegistry = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let replicas: ReplRegistry = ReplHub::new();
 
     // ── server state ──────────────────────────────────────────────────────
     let state = Arc::new(ServerState {
@@ -1806,7 +1948,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pubsub: SharedPubSub = Arc::new(tokio::sync::Mutex::new(PubSubHub::new()));
 
     // ── watch registry ────────────────────────────────────────────────────
-    let watch_registry: WatchRegistry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let watch_registry: WatchRegistry = WatchHub::new();
 
     // ── connection limiter ────────────────────────────────────────────────
     let max_connections = std::env::var("RECACHED_MAX_CONNECTIONS")
@@ -1996,6 +2138,9 @@ async fn handle_tcp<S>(
     let mut buf = Vec::<u8>::new();
     let mut read_pos: usize = 0;
     let mut read_buf = [0u8; TCP_READ_BUFFER_BYTES];
+    // Reused for every response on this connection — avoids a Vec allocation
+    // per command (significant under pipelining).
+    let mut resp_buf = Vec::<u8>::with_capacity(4 * 1024);
     let mut is_authenticated = password.is_none();
     let mut auth_failures: u32 = 0;
     let mut multi_queue: Option<Vec<Command>> = None;
@@ -2098,13 +2243,15 @@ async fn handle_tcp<S>(
                                                         if writer.write_all(&Value::Array(None).serialize()).await.is_err() { break 'outer; }
                                                     } else {
                                                         let mut results = Vec::with_capacity(queue.len());
+                                                        let armed = write_effects_armed(&tx, &state, &watch_registry);
                                                         for qcmd in queue {
-                                                            let resp = execute_and_record(&store, &qcmd);
-                                                            if let Some(msg) = broadcast_for(&qcmd, &resp) {
-                                                                let _ = tx.send((0, msg.clone()));
-                                                                state.on_write(&msg).await;
-                                                            }
-                                                            notify_watchers(&watch_registry, &qcmd, &resp, &store).await;
+                                                            let resp = if armed && is_write_command(&qcmd) {
+                                                                let resp = execute_and_record(&store, qcmd.clone());
+                                                                apply_write_effects(&qcmd, &resp, &tx, 0, &state, &watch_registry, &store).await;
+                                                                resp
+                                                            } else {
+                                                                execute_and_record(&store, qcmd)
+                                                            };
                                                             results.push(resp);
                                                         }
                                                         unregister_all_watches(&watch_registry, conn_id, &mut watched_keys).await;
@@ -2210,12 +2357,13 @@ async fn handle_tcp<S>(
                                                 if writer.write_all(b"-ERR watch limit per connection reached\r\n").await.is_err() { break 'outer; }
                                             } else {
                                                 {
-                                                    let mut reg = watch_registry.lock().await;
+                                                    let mut reg = watch_registry.map.lock().await;
                                                     for key in &keys {
                                                         if watched_keys.insert(key.clone()) {
                                                             reg.entry(key.clone()).or_default().push((conn_id, watch_tx.clone()));
                                                         }
                                                     }
+                                                    watch_registry.sync_len(&reg);
                                                 }
                                                 if writer.write_all(b"+OK\r\n").await.is_err() { break 'outer; }
                                             }
@@ -2227,13 +2375,14 @@ async fn handle_tcp<S>(
                                                 keys.into_iter().filter(|k| watched_keys.remove(k)).collect()
                                             };
                                             {
-                                                let mut reg = watch_registry.lock().await;
+                                                let mut reg = watch_registry.map.lock().await;
                                                 for key in &targets {
                                                     if let Some(subs) = reg.get_mut(key) {
                                                         subs.retain(|(id, _)| *id != conn_id);
                                                         if subs.is_empty() { reg.remove(key); }
                                                     }
                                                 }
+                                                watch_registry.sync_len(&reg);
                                             }
                                             if watched_keys.is_empty() {
                                                 while watch_rx.try_recv().is_ok() {}
@@ -2281,13 +2430,18 @@ async fn handle_tcp<S>(
                                                 }
                                                 _ => {}
                                             }
-                                            let response = execute_and_record(&store, &cmd);
-                                            if let Some(msg) = broadcast_for(&cmd, &response) {
-                                                let _ = tx.send((0, msg.clone()));
-                                                state.on_write(&msg).await;
-                                            }
-                                            notify_watchers(&watch_registry, &cmd, &response, &store).await;
-                                            if writer.write_all(&response.serialize()).await.is_err() {
+                                            let response = if is_write_command(&cmd)
+                                                && write_effects_armed(&tx, &state, &watch_registry)
+                                            {
+                                                let response = execute_and_record(&store, cmd.clone());
+                                                apply_write_effects(&cmd, &response, &tx, 0, &state, &watch_registry, &store).await;
+                                                response
+                                            } else {
+                                                execute_and_record(&store, cmd)
+                                            };
+                                            resp_buf.clear();
+                                            response.serialize_into(&mut resp_buf);
+                                            if writer.write_all(&resp_buf).await.is_err() {
                                                 break 'outer;
                                             }
                                         }
@@ -2483,13 +2637,15 @@ async fn handle_ws<S>(
                                             ws_send!(&Value::Array(None).serialize());
                                         } else {
                                             let mut results = Vec::with_capacity(queue.len());
+                                            let armed = write_effects_armed(&tx, &state, &watch_registry);
                                             for qcmd in queue {
-                                                let resp = execute_and_record(&store, &qcmd);
-                                                if let Some(msg) = broadcast_for(&qcmd, &resp) {
-                                                    let _ = tx.send((conn_id, msg.clone()));
-                                                    state.on_write(&msg).await;
-                                                }
-                                                notify_watchers(&watch_registry, &qcmd, &resp, &store).await;
+                                                let resp = if armed && is_write_command(&qcmd) {
+                                                    let resp = execute_and_record(&store, qcmd.clone());
+                                                    apply_write_effects(&qcmd, &resp, &tx, conn_id, &state, &watch_registry, &store).await;
+                                                    resp
+                                                } else {
+                                                    execute_and_record(&store, qcmd)
+                                                };
                                                 results.push(resp);
                                             }
                                             // EXEC always flushes WATCH state. Drain any
@@ -2591,7 +2747,7 @@ async fn handle_ws<S>(
                                     ws_send!(b"-ERR watch limit per connection reached\r\n");
                                 } else {
                                     {
-                                        let mut reg = watch_registry.lock().await;
+                                        let mut reg = watch_registry.map.lock().await;
                                         for key in &keys {
                                             if watched_keys.insert(key.clone()) {
                                                 reg.entry(key.clone())
@@ -2599,6 +2755,7 @@ async fn handle_ws<S>(
                                                     .push((conn_id, watch_tx.clone()));
                                             }
                                         }
+                                        watch_registry.sync_len(&reg);
                                     } // reg dropped before await
                                     ws_send!(b"+OK\r\n");
                                 }
@@ -2610,7 +2767,7 @@ async fn handle_ws<S>(
                                     keys.into_iter().filter(|k| watched_keys.remove(k)).collect()
                                 };
                                 {
-                                    let mut reg = watch_registry.lock().await;
+                                    let mut reg = watch_registry.map.lock().await;
                                     for key in &targets {
                                         if let Some(subs) = reg.get_mut(key) {
                                             subs.retain(|(id, _)| *id != conn_id);
@@ -2619,6 +2776,7 @@ async fn handle_ws<S>(
                                             }
                                         }
                                     }
+                                    watch_registry.sync_len(&reg);
                                 }
                                 // Once nothing is watched, clear the dirty flag and drop any
                                 // queued notifications so a later WATCH/MULTI/EXEC starts clean.
@@ -2665,14 +2823,15 @@ async fn handle_ws<S>(
                                     }
                                     _ => {}
                                 }
-                                let response = execute_and_record(&store, &cmd);
-                                if let Some(b_msg) = broadcast_for(&cmd, &response) {
-                                    if let Err(e) = tx.send((conn_id, b_msg.clone())) {
-                                        debug!("WS broadcast on conn {} had no receivers: {}", conn_id, e);
-                                    }
-                                    state.on_write(&b_msg).await;
-                                }
-                                notify_watchers(&watch_registry, &cmd, &response, &store).await;
+                                let response = if is_write_command(&cmd)
+                                    && write_effects_armed(&tx, &state, &watch_registry)
+                                {
+                                    let response = execute_and_record(&store, cmd.clone());
+                                    apply_write_effects(&cmd, &response, &tx, conn_id, &state, &watch_registry, &store).await;
+                                    response
+                                } else {
+                                    execute_and_record(&store, cmd)
+                                };
                                 ws_send!(&response.serialize());
                             }
                         }
@@ -2735,7 +2894,7 @@ async fn handle_ws<S>(
         pubsub.lock().await.unsubscribe_all(conn_id);
     }
     if !watched_keys.is_empty() {
-        let mut reg = watch_registry.lock().await;
+        let mut reg = watch_registry.map.lock().await;
         for key in &watched_keys {
             if let Some(subs) = reg.get_mut(key) {
                 subs.retain(|(id, _)| *id != conn_id);
@@ -2744,6 +2903,7 @@ async fn handle_ws<S>(
                 }
             }
         }
+        watch_registry.sync_len(&reg);
     }
 }
 
@@ -2788,7 +2948,7 @@ mod tests {
         let store = Arc::new(KeyValueStore::new());
         let (tx, _rx) = broadcast::channel::<(u64, String)>(256);
         let pubsub: SharedPubSub = Arc::new(tokio::sync::Mutex::new(PubSubHub::new()));
-        let watch_registry: WatchRegistry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let watch_registry: WatchRegistry = WatchHub::new();
         let semaphore = Arc::new(Semaphore::new(64));
         let snap_cfg = Arc::new(SnapshotConfig {
             path: snap_path.unwrap_or_else(|| tmp_path("test.rdb")),
@@ -2797,7 +2957,7 @@ mod tests {
         let state = Arc::new(ServerState {
             snap: snap_cfg,
             aof: None,
-            replicas: Arc::new(tokio::sync::Mutex::new(vec![])),
+            replicas: ReplHub::new(),
             is_replica: AtomicBool::new(start_as_replica),
         });
 
@@ -3289,7 +3449,7 @@ mod tests {
         let state = Arc::new(ServerState {
             snap: snap_cfg,
             aof: Some(Arc::new(aof)),
-            replicas: Arc::new(tokio::sync::Mutex::new(vec![])),
+            replicas: ReplHub::new(),
             is_replica: AtomicBool::new(false),
         });
 
@@ -3369,7 +3529,7 @@ mod tests {
     async fn integration_replica_receives_write() {
         // Spawn primary with a separate replication listener on a random port
         let primary = spawn_server().await;
-        let repl_registry: ReplRegistry = Arc::new(tokio::sync::Mutex::new(vec![]));
+        let repl_registry: ReplRegistry = ReplHub::new();
         let snap_cfg = Arc::clone(&primary.state.snap);
         let primary_store = Arc::clone(&primary.store);
         let reg = Arc::clone(&repl_registry);
@@ -3410,7 +3570,7 @@ mod tests {
             let store = Arc::clone(&primary.store);
             let (tx, _rx) = broadcast::channel::<(u64, String)>(256);
             let pubsub: SharedPubSub = Arc::new(tokio::sync::Mutex::new(PubSubHub::new()));
-            let wr: WatchRegistry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+            let wr: WatchRegistry = WatchHub::new();
             let sem = Arc::new(Semaphore::new(64));
             let snap = Arc::clone(&primary.state.snap);
             let state = Arc::new(ServerState {
@@ -3462,7 +3622,7 @@ mod tests {
                 last_save: AtomicI64::new(0),
             }),
             aof: None,
-            replicas: Arc::new(tokio::sync::Mutex::new(vec![])),
+            replicas: ReplHub::new(),
             is_replica: AtomicBool::new(true),
         });
         let rs = Arc::clone(&replica_store);
@@ -3525,7 +3685,7 @@ mod tests {
         let store = Arc::new(KeyValueStore::new());
         let (tx, _rx) = broadcast::channel::<(u64, String)>(16);
         let pubsub: SharedPubSub = Arc::new(tokio::sync::Mutex::new(PubSubHub::new()));
-        let watch_registry: WatchRegistry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let watch_registry: WatchRegistry = WatchHub::new();
         let semaphore = Arc::new(Semaphore::new(3));
         let state = Arc::new(ServerState {
             snap: Arc::new(SnapshotConfig {
@@ -3533,7 +3693,7 @@ mod tests {
                 last_save: AtomicI64::new(0),
             }),
             aof: None,
-            replicas: Arc::new(tokio::sync::Mutex::new(vec![])),
+            replicas: ReplHub::new(),
             is_replica: AtomicBool::new(false),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3649,7 +3809,7 @@ mod tests {
                 last_save: AtomicI64::new(0),
             }),
             aof: None,
-            replicas: Arc::new(tokio::sync::Mutex::new(vec![])),
+            replicas: ReplHub::new(),
             is_replica: AtomicBool::new(true),
         });
         let replica_store = Arc::new(KeyValueStore::new());
@@ -3681,7 +3841,7 @@ mod tests {
         let store = Arc::new(KeyValueStore::new());
         let (tx, _rx) = broadcast::channel::<(u64, String)>(256);
         let pubsub: SharedPubSub = Arc::new(tokio::sync::Mutex::new(PubSubHub::new()));
-        let watch_registry: WatchRegistry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let watch_registry: WatchRegistry = WatchHub::new();
         let snap_cfg = Arc::new(SnapshotConfig {
             path: tmp_path("ws_test.rdb"),
             last_save: AtomicI64::new(now_unix_secs()),
@@ -3689,7 +3849,7 @@ mod tests {
         let state = Arc::new(ServerState {
             snap: snap_cfg,
             aof: None,
-            replicas: Arc::new(tokio::sync::Mutex::new(vec![])),
+            replicas: ReplHub::new(),
             is_replica: AtomicBool::new(false),
         });
 

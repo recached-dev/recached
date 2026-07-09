@@ -1,9 +1,11 @@
 use crate::cmd::{Command, SetCondition, SetExpiry, ZAddOptions};
 use crate::resp::Value;
 use dashmap::DashMap;
+use indexmap::IndexSet;
+use rand::Rng;
 use rand::seq::IteratorRandom;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -95,7 +97,9 @@ enum EntryValue {
     Str(String),
     Hash(HashMap<String, String>),
     List(VecDeque<String>),
-    Set(HashSet<String>),
+    // IndexSet rather than HashSet: SPOP / SRANDMEMBER need O(1) access to a
+    // random member by index, which a hash table cannot provide.
+    Set(IndexSet<String>),
     ZSet(ZSetInner),
 }
 
@@ -1420,12 +1424,12 @@ impl KeyValueStore {
                 let now = now_ms();
                 let was_expired = type_guard!(self.data, &key, EntryValue::Set(_), now);
                 let mut entry = self.data.entry(key).or_insert_with(|| Entry {
-                    value: EntryValue::Set(HashSet::new()),
+                    value: EntryValue::Set(IndexSet::new()),
                     expires_at_ms: None,
                     last_access_ms: AtomicU64::new(now_ms()),
                 });
                 if was_expired {
-                    entry.value = EntryValue::Set(HashSet::new());
+                    entry.value = EntryValue::Set(IndexSet::new());
                     entry.expires_at_ms = None;
                 }
                 let set = match &mut entry.value {
@@ -1468,7 +1472,8 @@ impl KeyValueStore {
                     Some(e) if e.is_expired(now) => Value::Integer(0),
                     Some(mut e) => match &mut e.value {
                         EntryValue::Set(s) => {
-                            let removed = members.into_iter().filter(|m| s.remove(m)).count();
+                            let removed =
+                                members.into_iter().filter(|m| s.swap_remove(m)).count();
                             Value::Integer(removed as i64)
                         }
                         _ => Value::Error(WRONGTYPE.to_string()),
@@ -1616,11 +1621,18 @@ impl KeyValueStore {
                             let n = count.unwrap_or(1) as usize;
                             let mut rng = rand::rng();
                             // SPOP removes *random* members, not iteration-order ones.
-                            let popped: Vec<String> =
-                                s.iter().cloned().choose_multiple(&mut rng, n);
-                            for m in &popped {
-                                s.remove(m);
-                            }
+                            // swap_remove_index is O(1), so popping k members costs
+                            // O(k) regardless of set size.
+                            let popped: Vec<String> = if n >= s.len() {
+                                s.drain(..).collect()
+                            } else {
+                                (0..n)
+                                    .map(|_| {
+                                        let idx = rng.random_range(0..s.len());
+                                        s.swap_remove_index(idx).expect("index in range")
+                                    })
+                                    .collect()
+                            };
                             if count.is_some() {
                                 Value::Array(Some(
                                     popped
@@ -1655,30 +1667,27 @@ impl KeyValueStore {
                     Some(e) => match &e.value {
                         EntryValue::Set(s) => match count {
                             None => {
+                                if s.is_empty() {
+                                    return Value::BulkString(None);
+                                }
                                 let mut rng = rand::rng();
-                                s.iter()
-                                    .choose(&mut rng)
-                                    .map(|m| Value::BulkString(Some(m.as_bytes().to_vec())))
-                                    .unwrap_or(Value::BulkString(None))
+                                let idx = rng.random_range(0..s.len());
+                                Value::BulkString(Some(s[idx].as_bytes().to_vec()))
                             }
                             Some(n) if n >= 0 => {
                                 // Positive count: up to n *distinct* random members.
                                 let mut rng = rand::rng();
-                                let members: Vec<&str> = s
-                                    .iter()
-                                    .map(|m| m.as_str())
-                                    .choose_multiple(&mut rng, n as usize);
+                                let amount = (n as usize).min(s.len());
+                                let idxs = rand::seq::index::sample(&mut rng, s.len(), amount);
                                 Value::Array(Some(
-                                    members
-                                        .into_iter()
-                                        .map(|m| Value::BulkString(Some(m.as_bytes().to_vec())))
+                                    idxs.iter()
+                                        .map(|i| Value::BulkString(Some(s[i].as_bytes().to_vec())))
                                         .collect(),
                                 ))
                             }
                             Some(n) => {
                                 // Negative: allow repetition, return |n| random elements.
-                                let members: Vec<&str> = s.iter().map(|m| m.as_str()).collect();
-                                if members.is_empty() {
+                                if s.is_empty() {
                                     return Value::Array(Some(vec![]));
                                 }
                                 let mut rng = rand::rng();
@@ -1686,9 +1695,8 @@ impl KeyValueStore {
                                 Value::Array(Some(
                                     (0..abs)
                                         .map(|_| {
-                                            let m =
-                                                members.iter().copied().choose(&mut rng).unwrap();
-                                            Value::BulkString(Some(m.as_bytes().to_vec()))
+                                            let idx = rng.random_range(0..s.len());
+                                            Value::BulkString(Some(s[idx].as_bytes().to_vec()))
                                         })
                                         .collect(),
                                 ))
@@ -1719,7 +1727,7 @@ impl KeyValueStore {
                 let removed = match self.data.get_mut(&src) {
                     Some(mut e) if !e.is_expired(now) => {
                         if let EntryValue::Set(s) = &mut e.value {
-                            s.remove(&member)
+                            s.swap_remove(&member)
                         } else {
                             false
                         }
@@ -1732,12 +1740,12 @@ impl KeyValueStore {
                 // Add to destination
                 let was_expired_dst = matches!(self.data.get(&dst), Some(e) if e.is_expired(now));
                 let mut dst_entry = self.data.entry(dst).or_insert_with(|| Entry {
-                    value: EntryValue::Set(HashSet::new()),
+                    value: EntryValue::Set(IndexSet::new()),
                     expires_at_ms: None,
                     last_access_ms: AtomicU64::new(now_ms()),
                 });
                 if was_expired_dst {
-                    dst_entry.value = EntryValue::Set(HashSet::new());
+                    dst_entry.value = EntryValue::Set(IndexSet::new());
                     dst_entry.expires_at_ms = None;
                 }
                 if let EntryValue::Set(s) = &mut dst_entry.value {
@@ -2092,8 +2100,8 @@ fn no_list_response(count: Option<u64>) -> Value {
     }
 }
 
-fn set_to_value(mut result: HashSet<String>) -> Value {
-    let mut members: Vec<String> = result.drain().collect();
+fn set_to_value(mut result: IndexSet<String>) -> Value {
+    let mut members: Vec<String> = result.drain(..).collect();
     members.sort_unstable();
     Value::Array(Some(
         members
@@ -2107,11 +2115,11 @@ fn set_inter(
     data: &DashMap<String, Entry>,
     keys: &[String],
     now: u64,
-) -> Result<HashSet<String>, Value> {
+) -> Result<IndexSet<String>, Value> {
     if keys.is_empty() {
-        return Ok(HashSet::new());
+        return Ok(IndexSet::new());
     }
-    let mut sets: Vec<Option<HashSet<String>>> = Vec::with_capacity(keys.len());
+    let mut sets: Vec<Option<IndexSet<String>>> = Vec::with_capacity(keys.len());
     for k in keys {
         let cloned = {
             let entry = data.get(k);
@@ -2127,10 +2135,10 @@ fn set_inter(
         sets.push(cloned);
     }
     if sets.iter().any(|s| s.is_none()) {
-        return Ok(HashSet::new());
+        return Ok(IndexSet::new());
     }
-    let non_empty: Vec<HashSet<String>> = sets.into_iter().flatten().collect();
-    let mut result: HashSet<String> = non_empty[0].iter().cloned().collect();
+    let non_empty: Vec<IndexSet<String>> = sets.into_iter().flatten().collect();
+    let mut result: IndexSet<String> = non_empty[0].iter().cloned().collect();
     for s in &non_empty[1..] {
         result.retain(|m| s.contains(m));
     }
@@ -2141,8 +2149,8 @@ fn set_union(
     data: &DashMap<String, Entry>,
     keys: &[String],
     now: u64,
-) -> Result<HashSet<String>, Value> {
-    let mut result: HashSet<String> = HashSet::new();
+) -> Result<IndexSet<String>, Value> {
+    let mut result: IndexSet<String> = IndexSet::new();
     for k in keys {
         let s_clone = {
             let entry = data.get(k);
@@ -2166,13 +2174,13 @@ fn set_diff(
     data: &DashMap<String, Entry>,
     keys: &[String],
     now: u64,
-) -> Result<HashSet<String>, Value> {
+) -> Result<IndexSet<String>, Value> {
     if keys.is_empty() {
-        return Ok(HashSet::new());
+        return Ok(IndexSet::new());
     }
-    let mut result: HashSet<String> = match data.get(&keys[0]) {
-        None => HashSet::new(),
-        Some(e) if e.is_expired(now) => HashSet::new(),
+    let mut result: IndexSet<String> = match data.get(&keys[0]) {
+        None => IndexSet::new(),
+        Some(e) if e.is_expired(now) => IndexSet::new(),
         Some(e) => match &e.value {
             EntryValue::Set(s) => s.iter().cloned().collect(),
             _ => return Err(Value::Error(WRONGTYPE.to_string())),

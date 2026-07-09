@@ -88,9 +88,31 @@ cache.get('inventory:item:99'); // "42" — from local WASM memory, 0 ms
 
 ---
 
+## Benchmarks
+
+Measured with `redis-benchmark` (100k requests, 50 connections, 64-byte values, randomized keys, persistence disabled on all servers) on a 4-core Intel i5-8259U laptop, July 2026 — Recached v0.1.8 vs Redis 7.2.5 vs Valkey 9.1.0, one server at a time.
+
+Pipelined (`-P 16`) — raw command throughput, requests/sec, **bold** = best per row:
+
+| Command | Recached | Redis 7.2.5 | Valkey 9.1.0 |
+|---|---:|---:|---:|
+| SET | **421,941** | 375,940 | 294,118 |
+| GET | **546,448** | 512,821 | 483,092 |
+| INCR | **448,430** | 421,941 | 413,223 |
+| LPUSH | **473,934** | 409,836 | 386,100 |
+| SADD | 421,941 | **462,963** | 378,788 |
+| HSET | **408,163** | 324,675 | 287,356 |
+| ZADD | **414,938** | 197,628 | 221,239 |
+
+Recached's multi-threaded runtime spreads connections across all cores, while Redis and Valkey execute commands on one — pipelined, Recached comes out ahead of Redis on 6 of 7 commands and ahead of Valkey on all 7, on the same hardware. Unpipelined (one command per round-trip — the traffic shape of typical request-scoped cache calls), the localhost round-trip dominates and Recached runs at 46–96% of Redis with sub-millisecond p50 latency on every common command (GET 58.1k vs 61.6k rps; HSET is the weakest at 46%).
+
+Full tables with latency percentiles, pipelined results, methodology, and known hotspots: **[recached.dev/guide/benchmarks](https://recached.dev/guide/benchmarks)**. Reproduce with [`scripts/benchmark.sh`](scripts/benchmark.sh) — results from server-grade hardware welcome.
+
+---
+
 ## Contributing
 
-Recached is maintained by Dennis. Bug reports, PRs, and feedback are all welcome.
+Bug reports, PRs, and feedback are all welcome.
 
 1. Fork the repo and create a branch: `git checkout -b feat/my-feature`
 2. Make your changes — server logic lives in `server-native/`, WASM bindings in `wasm-edge/`
@@ -99,7 +121,7 @@ Recached is maintained by Dennis. Bug reports, PRs, and feedback are all welcome
 
 Open an issue before large features or architectural changes. Areas where contributions are especially welcome:
 
-- **Benchmarks** — `redis-benchmark` against Redis 7 on multi-core hardware
+- **Benchmarks** — run [`scripts/benchmark.sh`](scripts/benchmark.sh) on multi-core server hardware and share the results
 - **Client examples** — React, Vue, or SvelteKit demos using `recached-edge`
 - **Bug reports** — edge cases in the RESP parser, TTL eviction, pub/sub delivery, or WebSocket sync
 

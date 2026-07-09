@@ -4,6 +4,22 @@ All notable changes to Recached are documented here.
 
 ---
 
+## [0.1.8] — 2026-07-09
+
+### Fixed
+
+**Performance**
+- `SPOP` and `SRANDMEMBER` were O(n) in set size per call: random members were selected by iterating (and for `SPOP`, cloning) every member of the set. On a 100k-member set `SPOP` managed ~800 ops/sec. Sets are now backed by `IndexSet` instead of `HashSet`, giving O(1) random access by index and O(1) `swap_remove` — `SPOP`/`SRANDMEMBER` now cost O(k) in the number of members requested, independent of set size. Snapshot format is unchanged. (`core-engine/src/store.rs`)
+- Every write paid for sync machinery it often didn't need: the RESP push message for WebSocket sync was built (and cloned) even with zero browser clients connected; `on_write` locked the global replica registry even with no replicas and no AOF; the watch registry's global mutex was locked on every mutation even with nothing watched; and `broadcast_for` ran twice per write (once at the call site, once inside `notify_watchers`). The post-write fan-out is now consolidated in `apply_write_effects`, gated by atomic counters — with no WS clients, no replicas, no AOF, and no watched keys, a write skips all of it: zero locks, zero allocations, one `broadcast_for` at most. (`server-native/src/main.rs`)
+- Command execution hot path, three fixes: **(a)** every command did 1–2 metrics-registry lookups per execution (`counter!` key construction + a lock in the global recorder) — under 8 worker threads this contention was the dominant per-command cost and the cause of pipelined throughput decaying within seconds of sustained load, with stalls up to 3 s; counter handles are now resolved once and cached (`record_command`, cached `KEYSPACE_HITS`/`KEYSPACE_MISSES`). **(b)** `execute_and_record` cloned every `Command` before execution; it now takes the command by value and callers clone only when a write-effect consumer (WebSocket peer, replica, AOF, watched key) actually exists. **(c)** `Value::serialize` allocated a fresh `Vec` per response — and one per array element — per command; the new `Value::serialize_into` encodes in place and the TCP handler reuses one response buffer per connection. Combined result on a 4-core i5 (`redis-benchmark -P 16`, suite run): SET 200.8k → 421.9k, GET 33.9k → 546.4k, INCR 13.5k → 448.4k, LPUSH 9.8k → 473.9k, SADD 30.0k → 421.9k, HSET 25.5k → 408.2k, ZADD 26.2k → 414.9k ops/sec — ahead of Redis 7.2.5 on 6 of 7 pipelined commands and ahead of Valkey 9.1.0 on all 7, with the multi-second stalls gone (suite p99 ≤ 5.1 ms). Unpipelined: GET 38.9k → 58.1k, LPUSH 27.1k → 49.1k, SADD 31.1k → 51.6k, MSET 24.9k → 34.5k ops/sec. (`server-native/src/main.rs`, `core-engine/src/resp.rs`)
+
+### Added
+
+- `scripts/benchmark.sh` — reproducible `redis-benchmark` suite used for the published numbers; docs gained a Benchmarks page (`docs/guide/benchmarks.md`) comparing against Redis 7.2.5 and Valkey 9.1.0.
+- `recached-server --version` / `-V` prints the version and exits. Previously the flag was ignored and the server booted — which also made the Homebrew formula's `test do` block hang. The formula now installs per-architecture binaries (`on_intel` / `on_arm`) for v0.1.8. (`server-native/src/main.rs`, `Formula/recached.rb`)
+
+---
+
 ## [0.1.7] — 2026-06-12
 
 ### Fixed
