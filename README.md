@@ -110,6 +110,17 @@ Full tables with latency percentiles, pipelined results, methodology, and known 
 
 ---
 
+## Maturity
+
+Being honest about where things stand:
+
+- **The cache server is production-ready for cache workloads** — persistence, replication with auto-failover, TLS, hardened parsers, metrics, and a load/chaos CI suite. Treat it as a cache, not a system of record.
+- **The sync layer (browser sync, live queries, offline outbox, scoped auth) is beta** — the invariants are [specified](https://recached.dev/server/protocol) and tested end-to-end, but the code is young and hasn't had real-world miles or third-party security review yet. Don't put the WebSocket port on the public internet for multi-tenant data without reading [Sync Scopes](https://recached.dev/server/sync-scopes) first.
+
+The road to 1.0 is hardening, not features. Bug reports from production-like use are the most valuable contribution right now.
+
+---
+
 ## Contributing
 
 Bug reports, PRs, and feedback are all welcome.
