@@ -173,6 +173,34 @@ ZREVRANK leaderboard carol    # 2 → 1 (moved up)
 
 ---
 
+## JSON
+
+A native JSON document type — no RedisJSON module needed. Documents are stored parsed, so path reads and partial updates never re-serialize the whole value, and only the change travels to replicas, the AOF, and connected browsers.
+
+| Command | Description |
+|---|---|
+| `JSET key path value` | Set JSON at a path. `$` is the whole document, `$.user.name` a nested field, `$.items[2].qty` an array element. Intermediate objects are auto-created; array indices must exist. `value` must be valid JSON text. |
+| `JGET key [path]` | Read the JSON at a path (default `$`), serialized. Returns nil when the key or path does not exist. Object keys serialize in sorted order — deterministic output. |
+| `JMERGE key patch` | RFC 7386 JSON Merge Patch against the whole document: objects merge recursively, `null` fields are removed, arrays and scalars are replaced. A `null` patch deletes the key. Creates the document if missing. |
+
+Paths address exactly one location — wildcards, slices, and filters are not supported. `TYPE` reports `json`.
+
+### Example: partial updates
+
+```bash
+JSET doc:42 $ '{"title":"Draft","meta":{"views":0,"draft":true}}'
+JGET doc:42 $.meta.views          # "0"
+JSET doc:42 $.meta.views 17       # only this field changes
+JMERGE doc:42 '{"title":"Final","meta":{"draft":null}}'
+JGET doc:42                       # {"meta":{"views":17},"title":"Final"}
+```
+
+The browser SDK exposes the same commands as [`jset` / `jget` / `jmerge`](/browser/api-reference#json-documents) with `JSON.stringify`/`parse` handled for you — a `JMERGE` from any client updates every connected browser's local document.
+
+In live queries (`QSUB` / `useKeys`), JSON keys appear with a `json` type marker rather than the document — subscribe for change signals and read the document with `JGET`/`jget`.
+
+---
+
 ## Rate Limiting
 
 A built-in sliding-window rate limiter — no INCR+EXPIRE races, no Lua scripts. Internally a limiter key stores its config plus the timestamps of allowed attempts inside the window (type name: `ratelimit`). Denied attempts are not recorded, so a client hammering a full limiter does not push its own recovery further away.

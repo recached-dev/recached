@@ -155,6 +155,9 @@ fn snapshot_to_resp_cmds(entries: &[SnapshotEntry]) -> Vec<String> {
             // Rate-limiter attempt state is transient and server-side; it is
             // not persisted in the browser WAL.
             SnapshotValue::RateLimiter { .. } => continue,
+            SnapshotValue::Json(doc) => {
+                vec!["JSET".into(), e.key.clone(), "$".into(), doc.clone()]
+            }
         };
         out.push(to_resp_owned(&data_parts));
         // Non-string types with a TTL need a separate PEXPIREAT command.
@@ -457,7 +460,9 @@ impl RecachedCache {
                         | Command::SDiffStore(_, _)
                         | Command::ZAdd(_, _, _)
                         | Command::ZRem(_, _)
-                        | Command::ZIncrBy(_, _, _) => {
+                        | Command::ZIncrBy(_, _, _)
+                        | Command::JSet(_, _, _)
+                        | Command::JMerge(_, _) => {
                             store_clone.execute(cmd);
                             notify_mutation(&on_mut);
                         }
@@ -548,7 +553,9 @@ impl RecachedCache {
                             | Command::SDiffStore(_, _)
                             | Command::ZAdd(_, _, _)
                             | Command::ZRem(_, _)
-                            | Command::ZIncrBy(_, _, _) => {
+                            | Command::ZIncrBy(_, _, _)
+                            | Command::JSet(_, _, _)
+                            | Command::JMerge(_, _) => {
                                 store_clone.execute(cmd);
                                 notify_mutation(&on_mut);
                             }
@@ -628,6 +635,60 @@ impl RecachedCache {
             Some(p) => self.ws_enqueue(&to_resp(&["QUNSUB", &p])),
             None => self.ws_enqueue(&to_resp(&["QUNSUB"])),
         }
+    }
+
+    /// Set JSON at a path (`"$"` = whole document) — locally, on the server,
+    /// and across tabs. `value` must be valid JSON text. Returns "OK" or an
+    /// error string.
+    pub fn jset(&self, key: &str, path: &str, value: &str) -> String {
+        let resp = self.store.execute(Command::JSet(
+            key.to_string(),
+            path.to_string(),
+            value.to_string(),
+        ));
+        if let Value::Error(e) = resp {
+            return e;
+        }
+        let encoded = to_resp(&["JSET", key, path, value]);
+        self.ws_enqueue(&encoded);
+        if let Some(bc) = &self.bc {
+            let _ = bc.post_message(&JsValue::from_str(&encoded));
+        }
+        persist_cmd(&self.idb, &self.seq, &encoded);
+        notify_mutation(&self.on_mutation);
+        "OK".to_string()
+    }
+
+    /// Read JSON at a path from the local store, serialized. `None` when the
+    /// key or path does not exist.
+    pub fn jget(&self, key: &str, path: Option<String>) -> Option<String> {
+        match self
+            .store
+            .execute(Command::JGet(key.to_string(), path.clone()))
+        {
+            Value::BulkString(Some(bytes)) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+            _ => None,
+        }
+    }
+
+    /// RFC 7386 JSON Merge Patch against the whole document — locally, on the
+    /// server, and across tabs. `null` fields remove keys; a `null` patch
+    /// deletes the document. Returns "OK" or an error string.
+    pub fn jmerge(&self, key: &str, patch: &str) -> String {
+        let resp = self
+            .store
+            .execute(Command::JMerge(key.to_string(), patch.to_string()));
+        if let Value::Error(e) = resp {
+            return e;
+        }
+        let encoded = to_resp(&["JMERGE", key, patch]);
+        self.ws_enqueue(&encoded);
+        if let Some(bc) = &self.bc {
+            let _ = bc.post_message(&JsValue::from_str(&encoded));
+        }
+        persist_cmd(&self.idb, &self.seq, &encoded);
+        notify_mutation(&self.on_mutation);
+        "OK".to_string()
     }
 
     /// Snapshot of local keys matching a glob pattern, as an array of

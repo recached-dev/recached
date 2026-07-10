@@ -102,6 +102,7 @@ enum EntryValue {
     Set(IndexSet<String>),
     ZSet(ZSetInner),
     RateLimiter(RateLimiterInner),
+    Json(serde_json::Value),
 }
 
 impl EntryValue {
@@ -113,6 +114,140 @@ impl EntryValue {
             EntryValue::Set(_) => "set",
             EntryValue::ZSet(_) => "zset",
             EntryValue::RateLimiter(_) => "ratelimit",
+            EntryValue::Json(_) => "json",
+        }
+    }
+}
+
+// ── JSON paths & merge (JSET / JGET / JMERGE) ─────────────────────────────────
+
+enum JsonPathSeg {
+    Field(String),
+    Index(usize),
+}
+
+const MAX_JSON_PATH_DEPTH: usize = 128;
+
+/// Parse a deterministic JSON path: `$` (whole document), `$.user.name`,
+/// `$.items[2].qty`. The leading `$` is optional. Wildcards, slices, and
+/// filters are not supported — every path addresses exactly one location.
+fn parse_json_path(path: &str) -> Result<Vec<JsonPathSeg>, String> {
+    let mut rest = path.strip_prefix('$').unwrap_or(path);
+    let mut segs = Vec::new();
+    while !rest.is_empty() {
+        if segs.len() >= MAX_JSON_PATH_DEPTH {
+            return Err("ERR JSON path too deep".to_string());
+        }
+        if let Some(r) = rest.strip_prefix('.') {
+            let end = r.find(['.', '[']).unwrap_or(r.len());
+            let field = &r[..end];
+            if field.is_empty() {
+                return Err("ERR invalid JSON path: empty field".to_string());
+            }
+            segs.push(JsonPathSeg::Field(field.to_string()));
+            rest = &r[end..];
+        } else if let Some(r) = rest.strip_prefix('[') {
+            let end = r
+                .find(']')
+                .ok_or_else(|| "ERR invalid JSON path: unterminated index".to_string())?;
+            let idx: usize = r[..end]
+                .parse()
+                .map_err(|_| "ERR invalid JSON path: bad index".to_string())?;
+            segs.push(JsonPathSeg::Index(idx));
+            rest = &r[end + 1..];
+        } else {
+            // Bare leading field, e.g. `user.name` without `$.`.
+            let end = rest.find(['.', '[']).unwrap_or(rest.len());
+            segs.push(JsonPathSeg::Field(rest[..end].to_string()));
+            rest = &rest[end..];
+        }
+    }
+    Ok(segs)
+}
+
+/// Set `value` at the path. Intermediate objects are auto-created when a
+/// field segment hits `null`; array indices must already exist.
+fn json_set_at(
+    cur: &mut serde_json::Value,
+    segs: &[JsonPathSeg],
+    value: serde_json::Value,
+) -> Result<(), String> {
+    let Some((seg, rest)) = segs.split_first() else {
+        *cur = value;
+        return Ok(());
+    };
+    match seg {
+        JsonPathSeg::Field(f) => {
+            if cur.is_null() {
+                *cur = serde_json::Value::Object(serde_json::Map::new());
+            }
+            let obj = cur
+                .as_object_mut()
+                .ok_or_else(|| format!("ERR path segment '.{}' is not an object", f))?;
+            let slot = obj.entry(f.clone()).or_insert(serde_json::Value::Null);
+            json_set_at(slot, rest, value)
+        }
+        JsonPathSeg::Index(i) => {
+            let arr = cur
+                .as_array_mut()
+                .ok_or_else(|| format!("ERR path segment '[{}]' is not an array", i))?;
+            let len = arr.len();
+            let slot = arr
+                .get_mut(*i)
+                .ok_or_else(|| format!("ERR index {} out of bounds (len {})", i, len))?;
+            json_set_at(slot, rest, value)
+        }
+    }
+}
+
+fn json_get_at<'a>(
+    cur: &'a serde_json::Value,
+    segs: &[JsonPathSeg],
+) -> Option<&'a serde_json::Value> {
+    let mut c = cur;
+    for seg in segs {
+        c = match seg {
+            JsonPathSeg::Field(f) => c.get(f.as_str())?,
+            JsonPathSeg::Index(i) => c.get(*i)?,
+        };
+    }
+    Some(c)
+}
+
+/// RFC 7386 JSON Merge Patch: objects merge recursively, `null` removes the
+/// field, and any non-object patch replaces the target wholesale.
+fn json_merge_patch(target: &mut serde_json::Value, patch: serde_json::Value) {
+    match patch {
+        serde_json::Value::Object(pobj) => {
+            if !target.is_object() {
+                *target = serde_json::Value::Object(serde_json::Map::new());
+            }
+            let tobj = target.as_object_mut().expect("just ensured object");
+            for (k, v) in pobj {
+                if v.is_null() {
+                    tobj.remove(&k);
+                } else {
+                    let slot = tobj.entry(k).or_insert(serde_json::Value::Null);
+                    json_merge_patch(slot, v);
+                }
+            }
+        }
+        other => *target = other,
+    }
+}
+
+fn json_approx_size(v: &serde_json::Value) -> usize {
+    use serde_json::Value as J;
+    match v {
+        J::Null | J::Bool(_) => 8,
+        J::Number(_) => 16,
+        J::String(s) => s.len() + 8,
+        J::Array(a) => 8 + a.iter().map(json_approx_size).sum::<usize>(),
+        J::Object(o) => {
+            8 + o
+                .iter()
+                .map(|(k, val)| k.len() + json_approx_size(val))
+                .sum::<usize>()
         }
     }
 }
@@ -344,6 +479,8 @@ pub enum SnapshotValue {
         window_ms: u64,
         events: Vec<u64>,
     },
+    /// JSON document, stored serialized.
+    Json(String),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -476,6 +613,7 @@ impl KeyValueStore {
                 EntryValue::Set(_) => Value::SimpleString("set".to_string()),
                 EntryValue::ZSet(_) => Value::SimpleString("zset".to_string()),
                 EntryValue::RateLimiter(_) => Value::SimpleString("ratelimit".to_string()),
+                EntryValue::Json(_) => Value::SimpleString("json".to_string()),
             },
         }
     }
@@ -498,6 +636,7 @@ impl KeyValueStore {
                     EntryValue::Set(_) => Value::SimpleString("set".to_string()),
                     EntryValue::ZSet(_) => Value::SimpleString("zset".to_string()),
                     EntryValue::RateLimiter(_) => Value::SimpleString("ratelimit".to_string()),
+                    EntryValue::Json(_) => Value::SimpleString("json".to_string()),
                 };
                 (e.key().clone(), value)
             })
@@ -594,6 +733,9 @@ impl KeyValueStore {
                         window_ms: rl.window_ms,
                         events: rl.events.iter().copied().collect(),
                     },
+                    EntryValue::Json(doc) => {
+                        SnapshotValue::Json(serde_json::to_string(doc).unwrap_or_default())
+                    }
                 };
                 SnapshotEntry {
                     key: e.key().clone(),
@@ -629,6 +771,9 @@ impl KeyValueStore {
                     window_ms,
                     events: events.into(),
                 }),
+                SnapshotValue::Json(s) => {
+                    EntryValue::Json(serde_json::from_str(&s).unwrap_or(serde_json::Value::Null))
+                }
             };
             self.data.insert(
                 e.key,
@@ -2066,6 +2211,99 @@ impl KeyValueStore {
                 Ok(Value::Integer(count as i64))
             }),
 
+            // ── JSON ──────────────────────────────────────────────────────────
+            Command::JSet(key, path, value) => {
+                let now = now_ms();
+                let was_expired = type_guard!(self.data, &key, EntryValue::Json(_), now);
+                let segs = match parse_json_path(&path) {
+                    Ok(s) => s,
+                    Err(e) => return Value::Error(e),
+                };
+                let val: serde_json::Value = match serde_json::from_str(&value) {
+                    Ok(v) => v,
+                    Err(e) => return Value::Error(format!("ERR invalid JSON value: {}", e)),
+                };
+                // A fresh document starts as null; a leading index segment can
+                // never apply to it — reject before creating the key.
+                let is_fresh = was_expired || !self.data.contains_key(&key);
+                if is_fresh && matches!(segs.first(), Some(JsonPathSeg::Index(_))) {
+                    return Value::Error(
+                        "ERR path segment '[..]' is not an array (key does not exist)".to_string(),
+                    );
+                }
+                let mut entry = self.data.entry(key).or_insert_with(|| Entry {
+                    value: EntryValue::Json(serde_json::Value::Null),
+                    expires_at_ms: None,
+                    last_access_ms: AtomicU64::new(now_ms()),
+                });
+                if was_expired {
+                    entry.value = EntryValue::Json(serde_json::Value::Null);
+                    entry.expires_at_ms = None;
+                }
+                let doc = match &mut entry.value {
+                    EntryValue::Json(d) => d,
+                    _ => unreachable!(),
+                };
+                match json_set_at(doc, &segs, val) {
+                    Ok(()) => Value::SimpleString("OK".to_string()),
+                    Err(e) => Value::Error(e),
+                }
+            }
+
+            Command::JGet(key, path) => {
+                let now = now_ms();
+                match self.data.get(&key) {
+                    None => Value::BulkString(None),
+                    Some(e) if e.is_expired(now) => Value::BulkString(None),
+                    Some(e) => match &e.value {
+                        EntryValue::Json(doc) => {
+                            e.touch(now);
+                            let segs = match parse_json_path(path.as_deref().unwrap_or("$")) {
+                                Ok(s) => s,
+                                Err(err) => return Value::Error(err),
+                            };
+                            match json_get_at(doc, &segs) {
+                                Some(v) => Value::BulkString(Some(
+                                    serde_json::to_string(v).unwrap_or_default().into_bytes(),
+                                )),
+                                None => Value::BulkString(None),
+                            }
+                        }
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::JMerge(key, patch) => {
+                let now = now_ms();
+                let was_expired = type_guard!(self.data, &key, EntryValue::Json(_), now);
+                let patch: serde_json::Value = match serde_json::from_str(&patch) {
+                    Ok(v) => v,
+                    Err(e) => return Value::Error(format!("ERR invalid JSON patch: {}", e)),
+                };
+                if patch.is_null() {
+                    // RFC 7386: a null patch replaces the target — the key is
+                    // deleted rather than left holding a bare null.
+                    self.data.remove(&key);
+                    return Value::SimpleString("OK".to_string());
+                }
+                let mut entry = self.data.entry(key).or_insert_with(|| Entry {
+                    value: EntryValue::Json(serde_json::Value::Null),
+                    expires_at_ms: None,
+                    last_access_ms: AtomicU64::new(now_ms()),
+                });
+                if was_expired {
+                    entry.value = EntryValue::Json(serde_json::Value::Null);
+                    entry.expires_at_ms = None;
+                }
+                let doc = match &mut entry.value {
+                    EntryValue::Json(d) => d,
+                    _ => unreachable!(),
+                };
+                json_merge_patch(doc, patch);
+                Value::SimpleString("OK".to_string())
+            }
+
             // ── Rate limiting ─────────────────────────────────────────────────
             Command::RlSet(key, limit, window_secs) => {
                 let now = now_ms();
@@ -2199,6 +2437,7 @@ fn entry_size(key: &str, e: &Entry) -> usize {
         EntryValue::Set(s) => s.iter().map(|m| m.len()).sum::<usize>(),
         EntryValue::ZSet(z) => z.scores.keys().map(|m| m.len() + 8).sum(),
         EntryValue::RateLimiter(rl) => rl.events.len() * 8 + 16,
+        EntryValue::Json(doc) => json_approx_size(doc),
     };
     key.len() + val_size + 64
 }
@@ -3901,6 +4140,134 @@ mod tests {
         let (allowed, remaining, retry) = rl(s2.execute(Command::RlCheck("api".into(), None)));
         assert_eq!((allowed, remaining), (0, 0));
         assert!(retry > 0);
+    }
+
+    // ── JSON (JSET / JGET / JMERGE) ───────────────────────────────────────────
+
+    fn jset(s: &KeyValueStore, key: &str, path: &str, value: &str) -> Value {
+        s.execute(Command::JSet(key.into(), path.into(), value.into()))
+    }
+    fn jget(s: &KeyValueStore, key: &str, path: Option<&str>) -> Value {
+        s.execute(Command::JGet(key.into(), path.map(String::from)))
+    }
+
+    #[test]
+    fn jset_jget_root_and_paths() {
+        let s = store();
+        assert_eq!(
+            jset(&s, "doc", "$", r#"{"user":{"name":"amy"},"items":[1,2,3]}"#),
+            ok()
+        );
+        // serde_json serializes object keys in sorted order — deterministic
+        // output regardless of insertion order.
+        assert_eq!(
+            jget(&s, "doc", None),
+            bulk(r#"{"items":[1,2,3],"user":{"name":"amy"}}"#)
+        );
+        assert_eq!(jget(&s, "doc", Some("$.user.name")), bulk(r#""amy""#));
+        assert_eq!(jget(&s, "doc", Some("$.items[1]")), bulk("2"));
+        // Set a nested field and an array element in place.
+        assert_eq!(jset(&s, "doc", "$.user.age", "30"), ok());
+        assert_eq!(jget(&s, "doc", Some("$.user.age")), bulk("30"));
+        assert_eq!(jset(&s, "doc", "$.items[0]", "9"), ok());
+        assert_eq!(jget(&s, "doc", Some("$.items")), bulk("[9,2,3]"));
+        // Missing path → nil; missing key → nil.
+        assert_eq!(jget(&s, "doc", Some("$.nope.deep")), nil());
+        assert_eq!(jget(&s, "ghost", None), nil());
+        // TYPE reports json.
+        assert_eq!(
+            s.execute(Command::Type("doc".into())),
+            Value::SimpleString("json".into())
+        );
+    }
+
+    #[test]
+    fn jset_autocreates_intermediate_objects() {
+        let s = store();
+        // Fresh key, deep field path: intermediate objects are created.
+        assert_eq!(jset(&s, "doc", "$.a.b.c", "1"), ok());
+        assert_eq!(jget(&s, "doc", None), bulk(r#"{"a":{"b":{"c":1}}}"#));
+        // Fresh key with a leading index cannot apply — and must not create
+        // the key as a side effect.
+        let r = jset(&s, "fresh", "$[0]", "1");
+        assert!(matches!(&r, Value::Error(_)));
+        assert_eq!(s.execute(Command::Exists(vec!["fresh".into()])), int(0));
+        // Index out of bounds errors.
+        let r = jset(&s, "doc", "$.a.b.c[5]", "1");
+        assert!(matches!(&r, Value::Error(e) if e.contains("not an array")));
+    }
+
+    #[test]
+    fn jmerge_rfc7386_semantics() {
+        let s = store();
+        jset(
+            &s,
+            "doc",
+            "$",
+            r#"{"title":"old","meta":{"draft":true,"v":1}}"#,
+        );
+        // Deep merge + null removal.
+        assert_eq!(
+            s.execute(Command::JMerge(
+                "doc".into(),
+                r#"{"title":"new","meta":{"draft":null}}"#.into()
+            )),
+            ok()
+        );
+        assert_eq!(
+            jget(&s, "doc", None),
+            bulk(r#"{"meta":{"v":1},"title":"new"}"#)
+        );
+        // Merge into a missing key creates the document.
+        assert_eq!(
+            s.execute(Command::JMerge("fresh".into(), r#"{"a":1}"#.into())),
+            ok()
+        );
+        assert_eq!(jget(&s, "fresh", None), bulk(r#"{"a":1}"#));
+        // A null patch deletes the key.
+        assert_eq!(
+            s.execute(Command::JMerge("fresh".into(), "null".into())),
+            ok()
+        );
+        assert_eq!(jget(&s, "fresh", None), nil());
+    }
+
+    #[test]
+    fn json_wrongtype_and_invalid_input() {
+        let s = store();
+        s.execute(Command::Set(
+            "str".into(),
+            "v".into(),
+            SetOptions::default(),
+        ));
+        assert!(matches!(&jset(&s, "str", "$", "1"), Value::Error(e) if e.contains("WRONGTYPE")));
+        assert!(matches!(&jget(&s, "str", None), Value::Error(e) if e.contains("WRONGTYPE")));
+        jset(&s, "doc", "$", "{}");
+        let r = s.execute(Command::Get("doc".into()));
+        assert!(matches!(&r, Value::Error(e) if e.contains("WRONGTYPE")));
+        // Invalid JSON / invalid path.
+        assert!(
+            matches!(&jset(&s, "doc", "$", "{oops"), Value::Error(e) if e.contains("invalid JSON"))
+        );
+        assert!(
+            matches!(&jset(&s, "doc", "$.a[x]", "1"), Value::Error(e) if e.contains("bad index"))
+        );
+    }
+
+    #[test]
+    fn json_snapshot_roundtrip() {
+        let s = store();
+        jset(&s, "doc", "$", r#"{"n":42,"arr":[true,null,"x"]}"#);
+        let s2 = store();
+        s2.restore(s.snapshot());
+        assert_eq!(
+            s2.execute(Command::JGet("doc".into(), None)),
+            bulk(r#"{"arr":[true,null,"x"],"n":42}"#)
+        );
+        assert_eq!(
+            s2.execute(Command::Type("doc".into())),
+            Value::SimpleString("json".into())
+        );
     }
 
     // ── Live-query initial state ──────────────────────────────────────────────

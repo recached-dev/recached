@@ -221,6 +221,50 @@ The callback receives no arguments — it signals that _something_ changed. Read
 
 ---
 
+### JSON documents {#json-documents}
+
+Native JSON documents shared between server and browser. A `jset`/`jmerge` from any client — or `JSET`/`JMERGE` from the backend over TCP — updates every connected browser's local copy automatically.
+
+#### `jset(key, path, value)`
+
+Set part of a document. `"$"` is the whole document, `"$.user.name"` a nested field, `"$.items[2]"` an array element. Intermediate objects are auto-created. The value is `JSON.stringify`-ed for you. Throws on invalid paths.
+
+```typescript
+jset<T>(key: string, path: string, value: T): void
+```
+
+```typescript
+cache.jset('doc:42', '$', { title: 'Hello', meta: { views: 0 } })
+cache.jset('doc:42', '$.meta.views', 17)
+```
+
+#### `jget(key, path?)`
+
+Read part of a document from local WASM memory, parsed. Returns `null` when the key or path does not exist.
+
+```typescript
+jget<T>(key: string, path?: string): T | null
+```
+
+```typescript
+const views = cache.jget<number>('doc:42', '$.meta.views') // 17
+const doc = cache.jget<Doc>('doc:42')
+```
+
+#### `jmerge(key, patch)`
+
+RFC 7386 JSON Merge Patch: objects merge recursively, `null` fields are removed, arrays and scalars are replaced. Only the patch travels over the wire.
+
+```typescript
+jmerge<T>(key: string, patch: T): void
+```
+
+```typescript
+cache.jmerge('doc:42', { title: 'Final', draft: null })
+```
+
+---
+
 ### Live queries & sync scoping
 
 #### `liveQuery(pattern)`

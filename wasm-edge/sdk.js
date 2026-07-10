@@ -181,6 +181,60 @@ export class Cache {
         const existed = this.raw.del(key) === 1;
         return existed;
     }
+    // ── JSON documents ────────────────────────────────────────────────────────
+    /**
+     * Set part of a JSON document. `path` addresses one location: `"$"` is the
+     * whole document, `"$.user.name"` a nested field, `"$.items[2].qty"` an
+     * array element. Intermediate objects are created automatically.
+     *
+     * The value is serialized with `JSON.stringify`. Syncs to the server and
+     * other tabs when connected.
+     *
+     * ```ts
+     * cache.jset('doc:42', '$', { title: 'Hello', tags: ['a'] })
+     * cache.jset('doc:42', '$.title', 'Hello world')
+     * ```
+     */
+    jset(key, path, value) {
+        const err = this.raw.jset(key, path, JSON.stringify(value));
+        if (err !== 'OK')
+            throw new Error(err);
+    }
+    /**
+     * Read part of a JSON document from local memory. Returns the parsed value
+     * at `path` (default: the whole document), or `null` when the key or path
+     * does not exist.
+     *
+     * ```ts
+     * const title = cache.jget<string>('doc:42', '$.title')
+     * const doc = cache.jget<Doc>('doc:42')
+     * ```
+     */
+    jget(key, path) {
+        const raw = this.raw.jget(key, path);
+        if (raw === undefined)
+            return null;
+        try {
+            return JSON.parse(raw);
+        }
+        catch {
+            return null;
+        }
+    }
+    /**
+     * Apply an RFC 7386 JSON Merge Patch to a document: objects merge
+     * recursively, `null` fields are removed, arrays and scalars are replaced.
+     * Only the patch travels over the wire — not the whole document.
+     *
+     * ```ts
+     * cache.jmerge('doc:42', { title: 'New title', draft: null })
+     * ```
+     */
+    jmerge(key, patch) {
+        const err = this.raw.jmerge(key, JSON.stringify(patch));
+        if (err !== 'OK')
+            throw new Error(err);
+    }
     // ── Pub/sub ───────────────────────────────────────────────────────────────
     /**
      * Subscribe to a server pub/sub channel. Push messages arrive via the

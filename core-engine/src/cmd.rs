@@ -136,6 +136,13 @@ pub enum Command {
     ZCard(String),
     ZIncrBy(String, f64, String),
     ZCount(String, String, String),
+    // ── JSON ──────────────────────────────────────────────────────────────────
+    /// JSET key path value — set JSON at a path (`$` = whole document).
+    JSet(String, String, String),
+    /// JGET key [path] — read JSON at a path, serialized. Defaults to `$`.
+    JGet(String, Option<String>),
+    /// JMERGE key patch — RFC 7386 JSON Merge Patch against the whole document.
+    JMerge(String, String),
     // ── Rate limiting ─────────────────────────────────────────────────────────
     /// RLSET key limit window_secs — configure a sliding-window rate limiter.
     RlSet(String, u64, u64),
@@ -540,6 +547,32 @@ impl Command {
                             None
                         };
                         Ok(Command::QUnsub(pattern))
+                    }
+
+                    // ── JSON ───────────────────────────────────────────────────
+                    "JSET" => {
+                        need!(4);
+                        Ok(Command::JSet(
+                            extract_key(&arr[1])?,
+                            extract_string(&arr[2]).unwrap_or_default(),
+                            extract_string(&arr[3]).unwrap_or_default(),
+                        ))
+                    }
+                    "JGET" => {
+                        need!(2);
+                        let path = if arr.len() > 2 {
+                            Some(extract_string(&arr[2]).unwrap_or_default())
+                        } else {
+                            None
+                        };
+                        Ok(Command::JGet(extract_key(&arr[1])?, path))
+                    }
+                    "JMERGE" => {
+                        need!(3);
+                        Ok(Command::JMerge(
+                            extract_key(&arr[1])?,
+                            extract_string(&arr[2]).unwrap_or_default(),
+                        ))
                     }
 
                     // ── Rate limiting ──────────────────────────────────────────

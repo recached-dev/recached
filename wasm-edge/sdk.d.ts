@@ -59,6 +59,9 @@ interface RawCache {
     publish(channel: string, message: string): void;
     subscribe(channel: string): void;
     unsubscribe(channel: string): void;
+    jset(key: string, path: string, value: string): string;
+    jget(key: string, path?: string): string | undefined;
+    jmerge(key: string, patch: string): string;
     sync_token(token: string): void;
     sync_scopes(patterns_csv: string): void;
     live_query(pattern: string): void;
@@ -170,6 +173,41 @@ export declare class Cache {
      * Syncs to the server and other tabs when connected.
      */
     del(key: string): boolean;
+    /**
+     * Set part of a JSON document. `path` addresses one location: `"$"` is the
+     * whole document, `"$.user.name"` a nested field, `"$.items[2].qty"` an
+     * array element. Intermediate objects are created automatically.
+     *
+     * The value is serialized with `JSON.stringify`. Syncs to the server and
+     * other tabs when connected.
+     *
+     * ```ts
+     * cache.jset('doc:42', '$', { title: 'Hello', tags: ['a'] })
+     * cache.jset('doc:42', '$.title', 'Hello world')
+     * ```
+     */
+    jset<T>(key: string, path: string, value: T): void;
+    /**
+     * Read part of a JSON document from local memory. Returns the parsed value
+     * at `path` (default: the whole document), or `null` when the key or path
+     * does not exist.
+     *
+     * ```ts
+     * const title = cache.jget<string>('doc:42', '$.title')
+     * const doc = cache.jget<Doc>('doc:42')
+     * ```
+     */
+    jget<T>(key: string, path?: string): T | null;
+    /**
+     * Apply an RFC 7386 JSON Merge Patch to a document: objects merge
+     * recursively, `null` fields are removed, arrays and scalars are replaced.
+     * Only the patch travels over the wire — not the whole document.
+     *
+     * ```ts
+     * cache.jmerge('doc:42', { title: 'New title', draft: null })
+     * ```
+     */
+    jmerge<T>(key: string, patch: T): void;
     /**
      * Subscribe to a server pub/sub channel. Push messages arrive via the
      * WebSocket `onmessage` callback.

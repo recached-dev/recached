@@ -24,9 +24,9 @@ const cart = useKeys('cart:item:*'); // current matching keys + live updates
 Server write → diff over WebSocket → local WASM cache → component re-render, with zero application glue. See [Commands → Live Queries](/server/commands#live-queries-websocket-only) and [`useKeys`](/react/hooks-reference#usekeys-pattern).
 
 
-## 4. Native JSON type
+## 4. Native JSON type ✅ shipped
 
-`JSET key path value`, `JGET key path`, `JMERGE key patch`. JSONPath-based access to nested JSON structures stored as a native type, without RedisJSON. Avoids the serialize-deserialize round-trip for complex objects where only part of the document changes.
+`JSET key path value`, `JGET key [path]`, `JMERGE key patch` — nested JSON stored as a native type, without RedisJSON. Path reads and partial updates never re-serialize the whole document, and only the change travels over the wire. `JMERGE` follows RFC 7386 (deep merge, `null` removes fields). The browser SDK mirrors all three (`jset`/`jget`/`jmerge`), so a merge from any client updates every connected browser's local document. See [Commands → JSON](/server/commands#json).
 
 
 ## 5. Offline-first writes with merge semantics

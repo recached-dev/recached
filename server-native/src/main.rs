@@ -154,6 +154,9 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::BgSave => "bgsave",
         Command::LastSave => "lastsave",
         Command::ReplicaOfNoOne => "replicaof",
+        Command::JSet(_, _, _) => "jset",
+        Command::JGet(_, _) => "jget",
+        Command::JMerge(_, _) => "jmerge",
         Command::RlSet(_, _, _) => "rlset",
         Command::RlCheck(_, _) => "rlcheck",
         Command::Sync(_) => "sync",
@@ -620,6 +623,8 @@ fn is_write_command(cmd: &Command) -> bool {
             | Command::ZIncrBy(..)
             | Command::RlSet(..)
             | Command::RlCheck(..)
+            | Command::JSet(..)
+            | Command::JMerge(..)
     )
 }
 
@@ -1088,7 +1093,10 @@ fn command_scope(cmd: &Command) -> CommandScope {
         | Command::ZIncrBy(k, _, _)
         | Command::ZCount(k, _, _)
         | Command::RlSet(k, _, _)
-        | Command::RlCheck(k, _) => CommandScope::Keys(vec![k.clone()]),
+        | Command::RlCheck(k, _)
+        | Command::JSet(k, _, _)
+        | Command::JGet(k, _)
+        | Command::JMerge(k, _) => CommandScope::Keys(vec![k.clone()]),
 
         Command::Del(keys)
         | Command::Unlink(keys)
@@ -1381,7 +1389,9 @@ fn primary_keys(cmd: &Command) -> Vec<String> {
         | Command::ZAdd(k, _, _)
         | Command::ZRem(k, _)
         | Command::ZIncrBy(k, _, _)
-        | Command::RlSet(k, _, _) => vec![k.clone()],
+        | Command::RlSet(k, _, _)
+        | Command::JSet(k, _, _)
+        | Command::JMerge(k, _) => vec![k.clone()],
         Command::Del(keys) | Command::Unlink(keys) => keys.clone(),
         Command::MSet(pairs) => pairs.iter().map(|(k, _)| k.clone()).collect(),
         Command::Rename(src, dst) | Command::SMove(src, dst, _) => {
@@ -1918,6 +1928,18 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
             let delta_s = format_f64_score(*delta);
             Some(resp_push(&["ZINCRBY", k, &delta_s, member]))
         }
+
+        // ── JSON ─────────────────────────────────────────────────────────────
+        // Replayable as-is on replicas, AOF, and browser stores. Only
+        // successful writes replicate (errors reply -ERR, not +OK).
+        Command::JSet(k, path, value) => match response {
+            Value::SimpleString(_) => Some(resp_push(&["JSET", k, path, value])),
+            _ => None,
+        },
+        Command::JMerge(k, patch) => match response {
+            Value::SimpleString(_) => Some(resp_push(&["JMERGE", k, patch])),
+            _ => None,
+        },
 
         // ── Rate limiting ────────────────────────────────────────────────────
         // RLSET replicates so limiter *config* survives AOF replay / reaches
@@ -4779,6 +4801,39 @@ mod tests {
             client.recv_push(300).await.is_none(),
             "out-of-scope push leaked on strict connection"
         );
+    }
+
+    // ── JSON over the wire ────────────────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn integration_json_commands_and_fanout() {
+        let srv = spawn_ws_server().await;
+        let mut writer = WsClient::connect(srv.tcp_addr).await;
+        let mut peer = WsClient::connect(srv.tcp_addr).await;
+
+        assert_eq!(
+            writer.cmd(&["JSET", "doc:1", "$", r#"{"a":1}"#]).await,
+            ok()
+        );
+        assert_eq!(writer.cmd(&["JGET", "doc:1", "$.a"]).await, bulk("1"));
+        assert_eq!(
+            writer
+                .cmd(&["JMERGE", "doc:1", r#"{"b":2,"a":null}"#])
+                .await,
+            ok()
+        );
+        assert_eq!(writer.cmd(&["JGET", "doc:1"]).await, bulk(r#"{"b":2}"#));
+
+        // Peers receive the writes as replayable pushes.
+        let p = peer.recv_push(1000).await.expect("JSET push");
+        assert!(p.contains("JSET") && p.contains("doc:1"), "push: {p}");
+        let p2 = peer.recv_push(1000).await.expect("JMERGE push");
+        assert!(p2.contains("JMERGE"), "push: {p2}");
+
+        // Failed writes are not broadcast.
+        let r = writer.cmd(&["JSET", "doc:1", "$", "{bad"]).await;
+        assert!(matches!(&r, Value::Error(e) if e.contains("invalid JSON")));
+        assert!(peer.recv_push(300).await.is_none());
     }
 
     // ── Live queries (QSUB / QUNSUB) ──────────────────────────────────────────
