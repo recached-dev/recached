@@ -54,6 +54,44 @@ A `wasm32-wasip1` build of `wasm-edge` for Cloudflare Workers and Deno Deploy, r
 
 ---
 
+## AI-era features
+
+Recached's unfair advantage is *where the data lives* — so the winning AI features put the intelligence layer **next to the user** instead of behind another network hop. Ordered by intended sequence.
+
+### 9. Token-cost rate limiting
+
+AI providers meter tokens, not requests. One optional argument extends the existing limiter to weighted budgets:
+
+```bash
+RLCHECK user:42 100000 3600 COST 1850   # consume 1,850 tokens of a 100k/hour budget
+```
+
+
+### 10. Semantic caching (`SEMSET` / `SEMGET`)
+
+LLM calls are expensive and repeats are *paraphrases*, so exact-key caching misses them. A semantic cache returns a hit when a query's embedding is close enough to a cached one:
+
+```bash
+SEMSET prompts <embedding> "<cached LLM response>" EX 3600
+SEMGET prompts <embedding> 0.92          # → cached response or nil
+```
+
+### 11. Streaming values — "watch the agent think"
+
+An agent streams tokens into a key with `APPEND`; every subscribed browser renders it live. Live queries already deliver the subscription — the missing piece is an append *delta* frame (keychange currently re-sends the whole value) plus catch-up-then-follow on reconnect. `useKey('agent:run:42:output')` becomes a live-typing agent visible to any number of viewers. Redis Streams end at the backend; this reaches the UI.
+
+### 12. Vector search in the browser
+
+Server-side vector search is table stakes now (Redis 8 has it). What only Recached's architecture allows: the same vector index compiled to WASM and synced via scoped sync — **on-device semantic search over the user's own data, offline, zero-latency**. Personal RAG memory that works on a plane. A server-only tool structurally cannot copy this.
+
+### 13. Computed keys — the reactive cache
+
+Declare a key as a function of other keys; the server recomputes on change and the diff flows through live queries — cache becomes spreadsheet. `cart:42:total` recomputes when any `cart:42:item:*` changes, and every subscribed UI updates. Uses WASM scripting (#7) as the function runtime. Biggest lift, biggest ceiling.
+
+Under consideration behind these: a CRDT text type for collaborative editing (likely embedding an existing Rust CRDT rather than building one), and per-key undo/history on top of the existing op-log machinery.
+
+---
+
 ## Ongoing: drop-in credibility
 
 Not features, but continuous work that keeps "any Redis client works today" honest:
