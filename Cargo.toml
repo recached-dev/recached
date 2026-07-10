@@ -2,6 +2,7 @@
 members = [
     "core-engine",
     "server-native",
+    "sync-client",
     "wasm-edge",
 ]
 resolver = "2"
@@ -20,6 +21,7 @@ repository = "https://github.com/thinkgrid-labs/recached"
 [workspace.dependencies]
 # internal
 core-engine = { path = "core-engine" }
+sync-client = { path = "sync-client" }
 dashmap        = "6"
 indexmap       = "2"
 rand           = { version = "0.9", features = ["thread_rng"] }

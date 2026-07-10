@@ -1,0 +1,7 @@
+[package]
+name    = "sync-client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+core-engine.workspace = true

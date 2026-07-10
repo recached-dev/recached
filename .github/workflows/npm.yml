@@ -79,21 +79,21 @@ jobs:
           registry-url: "https://registry.npmjs.org"
 
       - name: Install dependencies
-        run: cd recached-react && npm install --legacy-peer-deps
+        run: cd sdks/recached-react && npm install --legacy-peer-deps
 
       - name: Typecheck
-        run: cd recached-react && npm run typecheck
+        run: cd sdks/recached-react && npm run typecheck
 
       - name: Build
-        run: cd recached-react && npm run build
+        run: cd sdks/recached-react && npm run build
 
       - name: Copy LICENSE into package
-        run: cp LICENSE.md recached-react/LICENSE.md
+        run: cp LICENSE.md sdks/recached-react/LICENSE.md
 
       - name: Publish to NPM
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: cd recached-react && npm publish --access public
+        run: cd sdks/recached-react && npm publish --access public
 
   publish-vue:
     name: Build and publish @recached/vue to NPM
@@ -111,18 +111,18 @@ jobs:
           registry-url: "https://registry.npmjs.org"
 
       - name: Install dependencies
-        run: cd recached-vue && npm install --legacy-peer-deps
+        run: cd sdks/recached-vue && npm install --legacy-peer-deps
 
       - name: Typecheck
-        run: cd recached-vue && npm run typecheck
+        run: cd sdks/recached-vue && npm run typecheck
 
       - name: Build
-        run: cd recached-vue && npm run build
+        run: cd sdks/recached-vue && npm run build
 
       - name: Copy LICENSE into package
-        run: cp LICENSE.md recached-vue/LICENSE.md
+        run: cp LICENSE.md sdks/recached-vue/LICENSE.md
 
       - name: Publish to NPM
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: cd recached-vue && npm publish --access public
+        run: cd sdks/recached-vue && npm publish --access public

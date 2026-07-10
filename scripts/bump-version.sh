@@ -48,8 +48,8 @@ PYEOF
 }
 
 update_package_json "$ROOT/wasm-edge/package.json"
-update_package_json "$ROOT/recached-react/package.json"
-update_package_json "$ROOT/recached-vue/package.json"
+update_package_json "$ROOT/sdks/recached-react/package.json"
+update_package_json "$ROOT/sdks/recached-vue/package.json"
 
 # Verify the workspace resolves cleanly.
 echo "Verifying workspace..."

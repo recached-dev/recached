@@ -5,6 +5,7 @@ use js_sys::Promise;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
+use sync_client::{Incoming, SyncClient, is_replayable_mutation, to_resp};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{BroadcastChannel, Event, MessageEvent, WebSocket};
@@ -127,14 +128,6 @@ extern "C" {
 
 // ── RESP helper ───────────────────────────────────────────────────────────────
 
-fn to_resp(parts: &[&str]) -> String {
-    let mut s = format!("*{}\r\n", parts.len());
-    for part in parts {
-        s.push_str(&format!("${}\r\n{}\r\n", part.len(), part));
-    }
-    s
-}
-
 fn to_resp_owned(parts: &[String]) -> String {
     let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
     to_resp(&refs)
@@ -236,89 +229,6 @@ fn snapshot_to_resp_cmds(entries: &[SnapshotEntry]) -> Vec<String> {
     out
 }
 
-/// Handle one incoming WebSocket frame.
-///
-/// Frames are either *pushes* (RESP3 Push mutations/pub-sub, and `keychange`
-/// Arrays) or *replies*. The server answers every command with exactly one
-/// reply, in order — so each reply acknowledges the oldest inflight command,
-/// and acknowledged writes are retired from the durable outbox. `qstate`
-/// Arrays are both the reply to a QSUB *and* state to apply.
-fn handle_ws_frame(sh: &WsShared, e: MessageEvent) {
-    let Ok(text) = e.data().dyn_into::<js_sys::JsString>() else {
-        return;
-    };
-    let s = String::from(text);
-    match Value::parse(s.as_bytes()) {
-        Ok((Value::Push(arr), _)) => {
-            // Pub/sub message: >3 ["message", channel, payload]
-            if arr.len() == 3
-                && let (
-                    Value::BulkString(Some(kind)),
-                    Value::BulkString(Some(channel)),
-                    Value::BulkString(Some(payload)),
-                ) = (&arr[0], &arr[1], &arr[2])
-                && kind.eq_ignore_ascii_case(b"message")
-            {
-                if let Some(f) = sh.on_message.borrow().as_ref() {
-                    let ch = String::from_utf8_lossy(channel);
-                    let pl = String::from_utf8_lossy(payload);
-                    let _ = f.call2(
-                        &JsValue::NULL,
-                        &JsValue::from_str(&ch),
-                        &JsValue::from_str(&pl),
-                    );
-                }
-                return;
-            }
-            // Mutation push: convert to Array for command dispatch
-            if let Ok(cmd) = Command::from_value(Value::Array(Some(arr)))
-                && is_replayable_mutation(&cmd)
-            {
-                sh.store.execute(cmd);
-                notify_mutation(&sh.on_mutation);
-            }
-        }
-        Ok((Value::Array(Some(items)), _)) => {
-            let tag = match items.first() {
-                Some(Value::BulkString(Some(t))) => t.as_slice(),
-                _ => &[],
-            };
-            if tag == b"keychange" {
-                // Server-initiated push, not a reply.
-                apply_server_array(&sh.store, &sh.on_mutation, items);
-            } else if tag == b"qstate" {
-                // Reply to QSUB *and* state to apply.
-                ack_reply(sh);
-                apply_server_array(&sh.store, &sh.on_mutation, items);
-            } else {
-                // Some other command reply shaped as an array (e.g. SYNC).
-                ack_reply(sh);
-            }
-        }
-        // Simple strings, errors, integers, bulk strings: command replies.
-        Ok(_) => ack_reply(sh),
-        Err(_) => {}
-    }
-}
-
-/// A command reply arrived: acknowledge the oldest inflight command. If it
-/// was a data write, retire it from the durable outbox — it has definitively
-/// reached the server.
-fn ack_reply(sh: &WsShared) {
-    let Some(front) = sh.inflight.borrow_mut().pop_front() else {
-        return;
-    };
-    let Some(id) = front else {
-        return; // session command — nothing to retire
-    };
-    sh.outbox.borrow_mut().retain(|(i, _)| *i != id);
-    if let Some(db) = sh.idb.borrow().clone() {
-        spawn_local(async move {
-            let _ = JsFuture::from(idb_outbox_delete_js(&db, id as f64)).await;
-        });
-    }
-}
-
 /// Unguessable client id: `crypto.randomUUID()` when available (unguessability
 /// is what stops another authenticated client from poisoning this client's
 /// dedup high-water mark), with a Math.random+timestamp fallback.
@@ -342,124 +252,13 @@ fn random_client_id() -> String {
     )
 }
 
-/// Splice a `DEDUP <client> <wire-id>` envelope into an already-encoded RESP
-/// array: bump the element count and prepend three elements. Avoids threading
-/// parts through every write path.
-fn wrap_dedup(sh: &WsShared, plain: &str, outbox_id: u64) -> String {
-    let Some((head, rest)) = plain.split_once("\r\n") else {
-        return plain.to_string();
-    };
-    let n: usize = head.trim_start_matches('*').parse().unwrap_or(0);
-    if n == 0 {
-        return plain.to_string();
-    }
-    let client = sh.client_id.borrow();
-    let wire_id = ((sh.epoch.get() as u64) << 32) | (outbox_id & 0xFFFF_FFFF);
-    let id_s = wire_id.to_string();
-    format!(
-        "*{}\r\n$5\r\nDEDUP\r\n${}\r\n{}\r\n${}\r\n{}\r\n{}",
-        n + 3,
-        client.len(),
-        client,
-        id_s.len(),
-        id_s,
-        rest
-    )
-}
-
-/// Append a write to the durable outbox and send it if the socket is open.
-/// The entry is retired only when the server's reply acknowledges it.
-/// `dedup` wraps the write in an exactly-once envelope — used for store
-/// writes; connection-scoped commands (pub/sub) must not be deduplicated or
-/// a legitimate re-subscribe after reconnect would be skipped.
-fn enqueue_write(sh: &WsShared, encoded: &str, dedup: bool) {
-    let id = sh.outbox_seq.get();
-    sh.outbox_seq.set(id + 1);
-    let encoded: String = if dedup {
-        wrap_dedup(sh, encoded, id)
-    } else {
-        encoded.to_string()
-    };
-    let encoded = encoded.as_str();
-    {
-        let mut ob = sh.outbox.borrow_mut();
-        if ob.len() >= MAX_PENDING_WRITES {
-            if let Some((old_id, _)) = ob.pop_front() {
-                if let Some(db) = sh.idb.borrow().clone() {
-                    spawn_local(async move {
-                        let _ = JsFuture::from(idb_outbox_delete_js(&db, old_id as f64)).await;
-                    });
-                }
-                let _ = web_sys::console::warn_1(&JsValue::from_str(
-                    "recached: offline write queue full — dropped the oldest queued write",
-                ));
-            }
-        }
-        ob.push_back((id, encoded.to_string()));
-    }
-    if let Some(db) = sh.idb.borrow().clone() {
-        let cmd = encoded.to_string();
-        spawn_local(async move {
-            let _ = JsFuture::from(idb_outbox_put_js(&db, id as f64, &cmd)).await;
-        });
-    }
-    if let Some(ws) = sh.ws.borrow().as_ref()
-        && ws.ready_state() == WebSocket::OPEN
-    {
-        let _ = ws.send_with_str(encoded);
-        sh.inflight.borrow_mut().push_back(Some(id));
-    }
-}
-
-/// Mutations another peer may push at us that are safe to replay into the
-/// local store. Everything else (command replies, admin, unknown) is ignored.
-fn is_replayable_mutation(cmd: &Command) -> bool {
-    matches!(
-        cmd,
-        Command::Set(_, _, _)
-            | Command::Del(_)
-            | Command::Unlink(_)
-            | Command::MSet(_)
-            | Command::Incr(_)
-            | Command::Decr(_)
-            | Command::IncrBy(_, _)
-            | Command::DecrBy(_, _)
-            | Command::Expire(_, _)
-            | Command::PExpire(_, _)
-            | Command::ExpireAt(_, _)
-            | Command::PExpireAt(_, _)
-            | Command::Persist(_)
-            | Command::FlushDb
-            | Command::Rename(_, _)
-            | Command::HSet(_, _)
-            | Command::HDel(_, _)
-            | Command::HSetNx(_, _, _)
-            | Command::LPush(_, _)
-            | Command::RPush(_, _)
-            | Command::LPop(_, _)
-            | Command::RPop(_, _)
-            | Command::LSet(_, _, _)
-            | Command::LRem(_, _, _)
-            | Command::LTrim(_, _, _)
-            | Command::SAdd(_, _)
-            | Command::SRem(_, _)
-            | Command::SMove(_, _, _)
-            | Command::SInterStore(_, _)
-            | Command::SUnionStore(_, _)
-            | Command::SDiffStore(_, _)
-            | Command::ZAdd(_, _, _)
-            | Command::ZRem(_, _)
-            | Command::ZIncrBy(_, _, _)
-            | Command::JSet(_, _, _)
-            | Command::JMerge(_, _)
-    )
-}
-
 // ── WebSocket connection state ────────────────────────────────────────────────
-
-/// Cap on offline-queued write commands. When full, the oldest queued write
-/// is dropped (with a console warning) rather than growing without bound.
-const MAX_PENDING_WRITES: usize = 10_000;
+//
+// The sync logic itself — outbox, dedup envelopes, reply/ack correlation,
+// session re-establishment, backoff — lives in the platform-neutral
+// `sync-client` crate (shared with the planned mobile bindings). This layer
+// only adapts it to the browser: WebSocket I/O, IndexedDB persistence,
+// setTimeout reconnect timers, and JS callbacks.
 
 /// Event closures for the *current* socket. Replaced wholesale on reconnect;
 /// dropping the old ones detaches them.
@@ -475,40 +274,15 @@ struct WsHandlers {
 /// an event handler can replace it.
 #[derive(Clone)]
 struct WsShared {
-    store: Arc<KeyValueStore>,
+    /// The platform-neutral sync state machine.
+    core: Rc<RefCell<SyncClient>>,
     on_mutation: Rc<RefCell<Option<js_sys::Function>>>,
     on_message: Rc<RefCell<Option<js_sys::Function>>>,
     ws: Rc<RefCell<Option<WebSocket>>>,
     handlers: Rc<RefCell<WsHandlers>>,
-    /// Durable outbox: writes not yet *acknowledged* by the server, as
-    /// `(id, encoded)` in send order. Mirrored to IndexedDB when persistence
-    /// is enabled, so offline writes survive a page reload and re-send.
-    outbox: Rc<RefCell<std::collections::VecDeque<(u64, String)>>>,
-    outbox_seq: Rc<Cell<u64>>,
-    /// One entry per command sent on the *current* socket, in order. Server
-    /// replies arrive in the same order (pushes are distinguishable), so each
-    /// reply acknowledges the front entry: `Some(id)` = outbox write to
-    /// retire, `None` = session command (AUTH/SYNC/QSUB).
-    inflight: Rc<RefCell<std::collections::VecDeque<Option<u64>>>>,
     /// Shared with `RecachedCache.idb` — the open IndexedDB handle, if any.
     idb: Rc<RefCell<Option<JsValue>>>,
-    /// Stable client identity for exactly-once writes (persisted in IDB meta
-    /// when persistence is on; random per instance otherwise, which is safe
-    /// because a memory-only outbox cannot survive into a new session).
-    client_id: Rc<RefCell<String>>,
-    /// Session epoch, upper 32 bits of every dedup wire id. Incremented and
-    /// persisted on each `enable_persistence`, so a new session's ids are
-    /// always above the previous session's server-side high-water mark.
-    epoch: Rc<Cell<u32>>,
     url: Rc<RefCell<Option<String>>>,
-    /// Session state re-established on every (re)connect, in this order:
-    /// AUTH → SYNC TOKEN / scopes → QSUBs → queued writes.
-    password: Rc<RefCell<Option<String>>>,
-    sync_token: Rc<RefCell<Option<String>>>,
-    sync_scopes_csv: Rc<RefCell<Option<String>>>,
-    live_queries: Rc<RefCell<Vec<String>>>,
-    /// Consecutive failed connection attempts, for exponential backoff.
-    attempts: Rc<Cell<u32>>,
     auto_reconnect: Rc<Cell<bool>>,
     /// Socket generation: bumped by `open_socket`. Stale sockets' close events
     /// (e.g. one replaced by an explicit `connect`) must not schedule
@@ -516,6 +290,82 @@ struct WsShared {
     generation: Rc<Cell<u64>>,
     /// Keeps the pending reconnect timer's callback alive until it fires.
     reconnect_cb: Rc<RefCell<Option<Closure<dyn FnMut()>>>>,
+}
+
+/// Delete an acknowledged (or evicted) outbox row from durable storage.
+fn outbox_delete(sh: &WsShared, id: u64) {
+    if let Some(db) = sh.idb.borrow().clone() {
+        spawn_local(async move {
+            let _ = JsFuture::from(idb_outbox_delete_js(&db, id as f64)).await;
+        });
+    }
+}
+
+/// Persist an outbox row to durable storage.
+fn outbox_put(sh: &WsShared, id: u64, frame: &str) {
+    if let Some(db) = sh.idb.borrow().clone() {
+        let cmd = frame.to_string();
+        spawn_local(async move {
+            let _ = JsFuture::from(idb_outbox_put_js(&db, id as f64, &cmd)).await;
+        });
+    }
+}
+
+/// Execute the effects the core requested for an incoming frame.
+fn dispatch_incoming(sh: &WsShared, incoming: Incoming) {
+    match incoming {
+        Incoming::Applied => notify_mutation(&sh.on_mutation),
+        Incoming::PubSub { channel, message } => {
+            if let Some(f) = sh.on_message.borrow().as_ref() {
+                let _ = f.call2(
+                    &JsValue::NULL,
+                    &JsValue::from_str(&channel),
+                    &JsValue::from_str(&message),
+                );
+            }
+        }
+        Incoming::Reply { retired } => {
+            if let Some(id) = retired {
+                outbox_delete(sh, id);
+            }
+        }
+        Incoming::AppliedReply { retired } => {
+            if let Some(id) = retired {
+                outbox_delete(sh, id);
+            }
+            notify_mutation(&sh.on_mutation);
+        }
+        Incoming::Ignored => {}
+    }
+}
+
+/// Queue a write through the core and mirror its effects: durable outbox row,
+/// possible overflow eviction, and an immediate send when connected.
+fn queue_write(sh: &WsShared, encoded: &str, dedup: bool) {
+    // Local-only mode (no connect() and no persistence): nothing to sync to.
+    if sh.url.borrow().is_none() && sh.idb.borrow().is_none() {
+        return;
+    }
+    let connected = matches!(
+        sh.ws.borrow().as_ref(),
+        Some(ws) if ws.ready_state() == WebSocket::OPEN
+    );
+    let e = sh
+        .core
+        .borrow_mut()
+        .enqueue_write(encoded, dedup, connected);
+    if let Some(old) = e.dropped {
+        outbox_delete(sh, old);
+        let _ = web_sys::console::warn_1(&JsValue::from_str(
+            "recached: offline write queue full — dropped the oldest queued write",
+        ));
+    }
+    outbox_put(sh, e.id, &e.frame);
+    if e.send_now
+        && let Some(ws) = sh.ws.borrow().as_ref()
+    {
+        let _ = ws.send_with_str(&e.frame);
+    }
 }
 
 /// Open a socket to the stored URL and wire its event handlers. Called on
@@ -535,56 +385,22 @@ fn open_socket(sh: &WsShared) {
         }
     };
 
-    // ── onmessage: apply server frames to the local store ────────────────
+    // ── onmessage: classify + apply via the core, execute its effects ────
     let sh_msg = sh.clone();
     let onmessage = Closure::wrap(Box::new(move |e: MessageEvent| {
-        handle_ws_frame(&sh_msg, e);
+        if let Ok(text) = e.data().dyn_into::<js_sys::JsString>() {
+            let incoming = sh_msg.core.borrow_mut().handle_frame(&String::from(text));
+            dispatch_incoming(&sh_msg, incoming);
+        }
     }) as Box<dyn FnMut(MessageEvent)>);
     ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
 
-    // ── onopen: re-establish the session, then replay the outbox ─────────
+    // ── onopen: the core decides what to send (session, then outbox) ─────
     let sh_open = sh.clone();
     let ws_for_open = ws.clone();
     let onopen = Closure::wrap(Box::new(move |_e: Event| {
-        sh_open.attempts.set(0);
-        // Fresh socket, fresh reply bookkeeping. Every command sent below
-        // must push one inflight marker — replies arrive in send order and
-        // each acknowledges the front entry.
-        sh_open.inflight.borrow_mut().clear();
-        let send_session = |encoded: &str| {
-            let _ = ws_for_open.send_with_str(encoded);
-            sh_open.inflight.borrow_mut().push_back(None);
-        };
-        if let Some(pwd) = sh_open.password.borrow().as_ref() {
-            send_session(&to_resp(&["AUTH", pwd]));
-        }
-        if let Some(tok) = sh_open.sync_token.borrow().as_ref() {
-            send_session(&to_resp(&["SYNC", "TOKEN", tok]));
-        } else if let Some(csv) = sh_open.sync_scopes_csv.borrow().as_ref() {
-            let pats: Vec<&str> = csv
-                .split(',')
-                .map(str::trim)
-                .filter(|p| !p.is_empty())
-                .collect();
-            if !pats.is_empty() {
-                let mut parts = vec!["SYNC"];
-                parts.extend(pats);
-                send_session(&to_resp(&parts));
-            }
-        }
-        // Re-subscribing live queries pulls fresh qstate, reconciling local
-        // state with whatever happened server-side while we were away —
-        // *after* the outbox below replays, the server pushes its effects
-        // back through the same subscriptions.
-        for pat in sh_open.live_queries.borrow().iter() {
-            let _ = ws_for_open.send_with_str(&to_resp(&["QSUB", pat]));
-            sh_open.inflight.borrow_mut().push_back(None);
-        }
-        // Replay every unacknowledged write in order. Entries stay in the
-        // outbox until their reply arrives (at-least-once delivery).
-        for (id, msg) in sh_open.outbox.borrow().iter() {
-            let _ = ws_for_open.send_with_str(msg);
-            sh_open.inflight.borrow_mut().push_back(Some(*id));
+        for frame in sh_open.core.borrow_mut().on_open() {
+            let _ = ws_for_open.send_with_str(&frame);
         }
     }) as Box<dyn FnMut(Event)>);
     ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
@@ -605,15 +421,13 @@ fn open_socket(sh: &WsShared) {
     *sh.ws.borrow_mut() = Some(ws);
 }
 
-/// Schedule an `open_socket` retry: 500 ms doubling to a 30 s cap. No-op when
+/// Schedule an `open_socket` retry at the core's backoff delay. No-op when
 /// auto-reconnect is off or there is no window (non-browser contexts).
 fn schedule_reconnect(sh: &WsShared) {
     if !sh.auto_reconnect.get() {
         return;
     }
-    let attempts = sh.attempts.get();
-    sh.attempts.set(attempts.saturating_add(1));
-    let delay = 500u32.saturating_mul(1u32 << attempts.min(6)).min(30_000);
+    let delay = sh.core.borrow_mut().on_close();
     let Some(window) = web_sys::window() else {
         return;
     };
@@ -677,63 +491,6 @@ fn notify_mutation(on_mut: &Rc<RefCell<Option<js_sys::Function>>>) {
     }
 }
 
-/// Apply a server-initiated Array frame to the local store: `keychange`
-/// pushes (WATCH / live queries) and `qstate` initial-state replies (QSUB).
-/// Silently ignores anything else — ordinary command replies, acks, errors.
-fn apply_server_array(
-    store: &KeyValueStore,
-    on_mut: &Rc<RefCell<Option<js_sys::Function>>>,
-    items: Vec<Value>,
-) {
-    let tag = match items.first() {
-        Some(Value::BulkString(Some(t))) => t.clone(),
-        _ => return,
-    };
-    match tag.as_slice() {
-        b"keychange" if items.len() == 3 => {
-            let Value::BulkString(Some(key)) = &items[1] else {
-                return;
-            };
-            let key = String::from_utf8_lossy(key).into_owned();
-            match &items[2] {
-                Value::BulkString(Some(v)) => {
-                    store.execute(Command::Set(
-                        key,
-                        String::from_utf8_lossy(v).into_owned(),
-                        SetOptions::default(),
-                    ));
-                }
-                Value::BulkString(None) => {
-                    store.execute(Command::Del(vec![key]));
-                }
-                // Collection-type marker: the value is not carried in the
-                // keychange; the regular mutation push keeps collections in
-                // sync — this frame only needs to trigger a re-render.
-                _ => {}
-            }
-            notify_mutation(on_mut);
-        }
-        b"qstate" if items.len() >= 2 => {
-            for pair in items[2..].chunks_exact(2) {
-                let Value::BulkString(Some(k)) = &pair[0] else {
-                    continue;
-                };
-                // String values are applied; collection-typed keys arrive as
-                // type-name markers and are hydrated by mutation pushes.
-                if let Value::BulkString(Some(v)) = &pair[1] {
-                    store.execute(Command::Set(
-                        String::from_utf8_lossy(k).into_owned(),
-                        String::from_utf8_lossy(v).into_owned(),
-                        SetOptions::default(),
-                    ));
-                }
-            }
-            notify_mutation(on_mut);
-        }
-        _ => {}
-    }
-}
-
 // ── public API ────────────────────────────────────────────────────────────────
 
 #[wasm_bindgen]
@@ -744,25 +501,19 @@ impl RecachedCache {
         let on_mutation = Rc::new(RefCell::new(None));
         let on_message = Rc::new(RefCell::new(None));
         let idb = Rc::new(RefCell::new(None));
+        let core = Rc::new(RefCell::new(SyncClient::new(
+            Arc::clone(&store),
+            random_client_id(),
+        )));
         RecachedCache {
             shared: WsShared {
-                store: Arc::clone(&store),
+                core,
                 on_mutation: Rc::clone(&on_mutation),
                 on_message: Rc::clone(&on_message),
                 ws: Rc::new(RefCell::new(None)),
                 handlers: Rc::new(RefCell::new(WsHandlers::default())),
-                outbox: Rc::new(RefCell::new(std::collections::VecDeque::new())),
-                outbox_seq: Rc::new(Cell::new(0)),
-                inflight: Rc::new(RefCell::new(std::collections::VecDeque::new())),
                 idb: Rc::clone(&idb),
-                client_id: Rc::new(RefCell::new(random_client_id())),
-                epoch: Rc::new(Cell::new(0)),
                 url: Rc::new(RefCell::new(None)),
-                password: Rc::new(RefCell::new(None)),
-                sync_token: Rc::new(RefCell::new(None)),
-                sync_scopes_csv: Rc::new(RefCell::new(None)),
-                live_queries: Rc::new(RefCell::new(Vec::new())),
-                attempts: Rc::new(Cell::new(0)),
                 auto_reconnect: Rc::new(Cell::new(false)),
                 generation: Rc::new(Cell::new(0)),
                 reconnect_cb: Rc::new(RefCell::new(None)),
@@ -778,30 +529,16 @@ impl RecachedCache {
         }
     }
 
-    /// Send `encoded` to the server if the socket is open, otherwise buffer it
-    /// until `onopen` fires. Without this, anything sent during the CONNECTING
-    /// window (notably the AUTH that `createCache` issues right after connect)
-    /// would be silently dropped.
     /// Queue a store write (dedup-wrapped for exactly-once delivery).
     fn ws_enqueue(&self, encoded: &str) {
-        // Local-only mode (no connect() yet and no persistence): nothing to
-        // sync to. With persistence enabled the write still goes into the
-        // durable outbox so it reaches the server whenever a connection is
-        // eventually configured.
-        if self.shared.url.borrow().is_none() && self.shared.idb.borrow().is_none() {
-            return;
-        }
-        enqueue_write(&self.shared, encoded, true);
+        queue_write(&self.shared, encoded, true);
     }
 
     /// Queue a connection-scoped command (pub/sub) — replayed on reconnect
     /// but never dedup-wrapped: skipping a re-sent SUBSCRIBE would silently
     /// drop the subscription.
     fn ws_enqueue_nodedup(&self, encoded: &str) {
-        if self.shared.url.borrow().is_none() && self.shared.idb.borrow().is_none() {
-            return;
-        }
-        enqueue_write(&self.shared, encoded, false);
+        queue_write(&self.shared, encoded, false);
     }
 
     /// Register a JS callback invoked after every mutation from any source
@@ -831,10 +568,7 @@ impl RecachedCache {
         let store = Arc::clone(&self.store);
         let idb_cell = Rc::clone(&self.idb);
         let seq_cell = Rc::clone(&self.seq);
-        let outbox = Rc::clone(&self.shared.outbox);
-        let outbox_seq = Rc::clone(&self.shared.outbox_seq);
-        let client_id = Rc::clone(&self.shared.client_id);
-        let epoch = Rc::clone(&self.shared.epoch);
+        let core = Rc::clone(&self.shared.core);
 
         wasm_bindgen_futures::future_to_promise(async move {
             let db = JsFuture::from(open_recached_db()).await?;
@@ -845,20 +579,18 @@ impl RecachedCache {
             // random one — switching ids mid-stream would fragment the mark.
             {
                 let stored = JsFuture::from(idb_meta_get(&db, "client_id")).await?;
-                let no_writes_yet = outbox_seq.get() == 0 && outbox.borrow().is_empty();
-                match stored.as_string() {
-                    Some(cid) if !cid.is_empty() && no_writes_yet => {
-                        *client_id.borrow_mut() = cid;
-                    }
-                    _ => {
-                        let current = client_id.borrow().clone();
-                        let _ = JsFuture::from(idb_meta_put(
-                            &db,
-                            "client_id",
-                            &JsValue::from_str(&current),
-                        ))
-                        .await;
-                    }
+                let adopted = match stored.as_string() {
+                    Some(cid) if !cid.is_empty() => core.borrow_mut().adopt_client_id(cid),
+                    _ => false,
+                };
+                if !adopted {
+                    let current = core.borrow().client_id().to_string();
+                    let _ = JsFuture::from(idb_meta_put(
+                        &db,
+                        "client_id",
+                        &JsValue::from_str(&current),
+                    ))
+                    .await;
                 }
                 // Bump the session epoch so this session's dedup ids are
                 // strictly above every id the previous session ever sent.
@@ -867,7 +599,7 @@ impl RecachedCache {
                     .as_f64()
                     .unwrap_or(0.0) as u32;
                 let next = prev.saturating_add(1);
-                epoch.set(next);
+                core.borrow_mut().set_epoch(next);
                 let _ = JsFuture::from(idb_meta_put(&db, "epoch", &JsValue::from_f64(next as f64)))
                     .await;
             }
@@ -891,16 +623,11 @@ impl RecachedCache {
                         restored.push((id, cmd));
                     }
                 }
-                restored.sort_by_key(|(id, _)| *id);
-                let mut ob = outbox.borrow_mut();
-                for (old_id, cmd) in restored.into_iter().rev() {
-                    let new_id = outbox_seq.get();
-                    outbox_seq.set(new_id + 1);
+                for (old_id, new_id, frame) in core.borrow_mut().restore_outbox(restored) {
                     if new_id != old_id {
                         let _ = JsFuture::from(idb_outbox_delete_js(&db, old_id as f64)).await;
-                        let _ = JsFuture::from(idb_outbox_put_js(&db, new_id as f64, &cmd)).await;
+                        let _ = JsFuture::from(idb_outbox_put_js(&db, new_id as f64, &frame)).await;
                     }
-                    ob.push_front((new_id, cmd));
                 }
             }
 
@@ -962,8 +689,7 @@ impl RecachedCache {
     /// ```
     pub fn clear_persistence(&self) -> Promise {
         // Sign-out semantics: unsent offline writes are discarded too.
-        self.shared.outbox.borrow_mut().clear();
-        self.shared.inflight.borrow_mut().clear();
+        self.shared.core.borrow_mut().clear_outbox();
         let maybe_db = self.idb.borrow().as_ref().cloned();
         if let Some(db) = maybe_db {
             wasm_bindgen_futures::future_to_promise(async move {
@@ -1016,7 +742,6 @@ impl RecachedCache {
             let _ = old_ws.close();
         }
         *self.shared.url.borrow_mut() = Some(url.to_string());
-        self.shared.attempts.set(0);
         self.shared.auto_reconnect.set(true);
         open_socket(&self.shared);
         Ok(())
@@ -1040,14 +765,21 @@ impl RecachedCache {
     /// Send a session command now if the socket is open; otherwise it will be
     /// sent by `onopen` from the stored session state — session commands must
     /// not sit in the offline write queue or they would be sent twice.
-    fn send_if_open(&self, encoded: &str) {
-        if let Some(ws) = self.shared.ws.borrow().as_ref()
-            && ws.ready_state() == WebSocket::OPEN
+    /// True when the socket exists and is OPEN.
+    fn socket_open(&self) -> bool {
+        matches!(
+            self.shared.ws.borrow().as_ref(),
+            Some(ws) if ws.ready_state() == WebSocket::OPEN
+        )
+    }
+
+    /// Send a session frame the core produced (it has already recorded the
+    /// inflight reply slot).
+    fn send_session_frame(&self, frame: Option<String>) {
+        if let Some(frame) = frame
+            && let Some(ws) = self.shared.ws.borrow().as_ref()
         {
-            let _ = ws.send_with_str(encoded);
-            // Session commands get replies too — they must occupy an inflight
-            // slot or their reply would falsely acknowledge a data write.
-            self.shared.inflight.borrow_mut().push_back(None);
+            let _ = ws.send_with_str(&frame);
         }
     }
 
@@ -1060,8 +792,9 @@ impl RecachedCache {
                 "recached: AUTH over unencrypted ws:// exposes the password in plaintext; use wss://",
             ));
         }
-        *self.shared.password.borrow_mut() = Some(password.to_string());
-        self.send_if_open(&to_resp(&["AUTH", password]));
+        let open = self.socket_open();
+        let frame = self.shared.core.borrow_mut().set_password(password, open);
+        self.send_session_frame(frame);
         "OK".to_string()
     }
 
@@ -1070,26 +803,22 @@ impl RecachedCache {
     /// automatically on every reconnect. The grant confirmation arrives
     /// asynchronously.
     pub fn sync_token(&self, token: &str) {
-        *self.shared.sync_token.borrow_mut() = Some(token.to_string());
-        self.send_if_open(&to_resp(&["SYNC", "TOKEN", token]));
+        let open = self.socket_open();
+        let frame = self.shared.core.borrow_mut().set_sync_token(token, open);
+        self.send_session_frame(frame);
     }
 
     /// Set sync scopes directly from comma-separated glob patterns. Only
     /// honoured by servers without a sync secret — a bandwidth filter, not an
     /// authorization boundary. Re-applied automatically on reconnect.
     pub fn sync_scopes(&self, patterns_csv: &str) {
-        let pats: Vec<&str> = patterns_csv
-            .split(',')
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .collect();
-        if pats.is_empty() {
-            return;
-        }
-        *self.shared.sync_scopes_csv.borrow_mut() = Some(patterns_csv.to_string());
-        let mut parts = vec!["SYNC"];
-        parts.extend(pats);
-        self.send_if_open(&to_resp(&parts));
+        let open = self.socket_open();
+        let frame = self
+            .shared
+            .core
+            .borrow_mut()
+            .set_sync_scopes(patterns_csv, open);
+        self.send_session_frame(frame);
     }
 
     /// Subscribe to a live query. The server replies with the current state
@@ -1099,27 +828,20 @@ impl RecachedCache {
     /// callback fires on the initial state and on each change; read the data
     /// with `get_matching`.
     pub fn live_query(&self, pattern: &str) {
-        {
-            let mut lqs = self.shared.live_queries.borrow_mut();
-            if !lqs.iter().any(|p| p == pattern) {
-                lqs.push(pattern.to_string());
-            }
-        }
-        self.send_if_open(&to_resp(&["QSUB", pattern]));
+        let open = self.socket_open();
+        let frame = self.shared.core.borrow_mut().add_live_query(pattern, open);
+        self.send_session_frame(frame);
     }
 
     /// Drop one live query, or all of them when `pattern` is omitted.
     pub fn live_unquery(&self, pattern: Option<String>) {
-        match pattern {
-            Some(p) => {
-                self.shared.live_queries.borrow_mut().retain(|q| q != &p);
-                self.send_if_open(&to_resp(&["QUNSUB", &p]));
-            }
-            None => {
-                self.shared.live_queries.borrow_mut().clear();
-                self.send_if_open(&to_resp(&["QUNSUB"]));
-            }
-        }
+        let open = self.socket_open();
+        let frame = self
+            .shared
+            .core
+            .borrow_mut()
+            .remove_live_query(pattern.as_deref(), open);
+        self.send_session_frame(frame);
     }
 
     /// Increment (or with a negative delta, decrement) an integer counter —
