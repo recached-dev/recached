@@ -14,14 +14,16 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY core-engine/Cargo.toml   core-engine/Cargo.toml
 COPY server-native/Cargo.toml server-native/Cargo.toml
+COPY sync-client/Cargo.toml   sync-client/Cargo.toml
 COPY wasm-edge/Cargo.toml     wasm-edge/Cargo.toml
 
 # Dummy source files so the dep-only build can resolve the workspace.
-# wasm-edge/src is kept as a stub — Cargo parses it as a workspace member
-# even when only building server-native, so lib.rs must exist.
-RUN mkdir -p core-engine/src server-native/src wasm-edge/src && \
+# sync-client/src and wasm-edge/src are kept as stubs — Cargo parses every
+# workspace member even when only building server-native, so lib.rs must exist.
+RUN mkdir -p core-engine/src server-native/src sync-client/src wasm-edge/src && \
     echo "fn main() {}" > server-native/src/main.rs && \
     echo "" > core-engine/src/lib.rs && \
+    echo "" > sync-client/src/lib.rs && \
     echo "" > wasm-edge/src/lib.rs && \
     cargo build --release --package server-native && \
     rm -rf core-engine/src server-native/src
@@ -30,7 +32,11 @@ RUN mkdir -p core-engine/src server-native/src wasm-edge/src && \
 COPY core-engine/src   core-engine/src
 COPY server-native/src server-native/src
 
-RUN cargo build --release --package server-native
+# COPY preserves source mtimes, which can be *older* than the dummy build
+# above — cargo would then consider the crates unchanged and ship the dummy
+# binary. Touch the roots so both crates always recompile.
+RUN touch core-engine/src/lib.rs server-native/src/main.rs && \
+    cargo build --release --package server-native
 
 # ── Stage 2: Runtime ─────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
