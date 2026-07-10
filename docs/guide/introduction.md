@@ -60,6 +60,15 @@ Recached is a good fit when:
 - **You depend on uncommon Redis commands.** Recached implements the commands most applications use, not all 250+. Server introspection (`INFO`, `SLOWLOG`, `COMMAND`), Lua scripting, RESP3, and cluster mode are out of scope.
 - **You need very large datasets.** Recached is an in-memory cache — it is not a database. If your working set does not fit in RAM, Redis with RDB persistence or a proper database is the right tool.
 
+## Maturity
+
+Honest status, per layer:
+
+- **The cache server is production-ready for cache workloads.** Persistence (atomic snapshots + AOF), replication with auto-failover, TLS, constant-time auth, hardened parsers, Prometheus metrics, and a load/chaos suite in CI. Cache workloads also have a forgiving failure contract by nature — treat it as a cache, not a system of record.
+- **The sync layer (browser sync, live queries, offline outbox, scoped auth) is beta.** The invariants are [specified](/server/protocol), tested, and verified end-to-end — but the code is young and hasn't accumulated real-world miles or third-party security review yet. Concretely: don't expose the WebSocket port to the public internet for multi-tenant data until you've read [Sync Scopes](/server/sync-scopes) and understood the model, and expect occasional sharp edges.
+
+The road to 1.0 is hardening, not features: fuzzing the parser surfaces, automated browser testing, a security pass on the token path, and a protocol freeze once real-world usage has confirmed the design. Bug reports from production-like use are the most valuable contribution the project can receive right now.
+
 ## Recached vs Redis
 
 | | Recached | Redis |
