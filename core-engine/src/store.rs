@@ -480,6 +480,30 @@ impl KeyValueStore {
         }
     }
 
+    /// Current state of every live key matching the glob pattern, in
+    /// `get_current` form (strings in full; collection types as type-name
+    /// markers), capped at `limit` entries. Backs live-query (QSUB) initial
+    /// state.
+    pub fn matching_key_values(&self, pattern: &str, limit: usize) -> Vec<(String, Value)> {
+        let now = now_ms();
+        self.data
+            .iter()
+            .filter(|e| !e.is_expired(now) && glob_match(pattern, e.key()))
+            .take(limit)
+            .map(|e| {
+                let value = match &e.value {
+                    EntryValue::Str(s) => Value::BulkString(Some(s.clone().into_bytes())),
+                    EntryValue::Hash(_) => Value::SimpleString("hash".to_string()),
+                    EntryValue::List(_) => Value::SimpleString("list".to_string()),
+                    EntryValue::Set(_) => Value::SimpleString("set".to_string()),
+                    EntryValue::ZSet(_) => Value::SimpleString("zset".to_string()),
+                    EntryValue::RateLimiter(_) => Value::SimpleString("ratelimit".to_string()),
+                };
+                (e.key().clone(), value)
+            })
+            .collect()
+    }
+
     pub fn sweep_expired(&self) {
         let now = now_ms();
         self.data.retain(|_, e| !e.is_expired(now));
@@ -2142,6 +2166,10 @@ impl KeyValueStore {
             Command::Sync(_) => {
                 Value::Error("ERR SYNC is only available on the WebSocket port".to_string())
             }
+            // Live queries are likewise per-WebSocket-connection state.
+            Command::QSub(_) | Command::QUnsub(_) => Value::Error(
+                "ERR live queries are only available on the WebSocket port".to_string(),
+            ),
             Command::Publish(_, _) => Value::Integer(0),
 
             Command::Unknown(name) => Value::Error(format!("ERR unknown command '{}'", name)),
@@ -3873,6 +3901,50 @@ mod tests {
         let (allowed, remaining, retry) = rl(s2.execute(Command::RlCheck("api".into(), None)));
         assert_eq!((allowed, remaining), (0, 0));
         assert!(retry > 0);
+    }
+
+    // ── Live-query initial state ──────────────────────────────────────────────
+
+    #[test]
+    fn matching_key_values_globs_caps_and_skips_expired() {
+        use std::time::Duration;
+        let s = store();
+        s.execute(Command::Set(
+            "cart:1".into(),
+            "a".into(),
+            SetOptions::default(),
+        ));
+        s.execute(Command::Set(
+            "cart:2".into(),
+            "b".into(),
+            SetOptions::default(),
+        ));
+        s.execute(Command::Set(
+            "other:1".into(),
+            "c".into(),
+            SetOptions::default(),
+        ));
+        s.execute(Command::LPush("cart:list".into(), vec!["x".into()]));
+        s.execute(Command::PSetEx("cart:dead".into(), 1, "d".into()));
+        std::thread::sleep(Duration::from_millis(10));
+
+        let mut kvs = s.matching_key_values("cart:*", 100);
+        kvs.sort_by(|(a, _), (b, _)| a.cmp(b));
+        assert_eq!(kvs.len(), 3, "expired key must be skipped: {kvs:?}");
+        assert_eq!(kvs[0], ("cart:1".to_string(), bulk("a")));
+        assert_eq!(kvs[1], ("cart:2".to_string(), bulk("b")));
+        // Collection types come back as type-name markers, like get_current.
+        assert_eq!(
+            kvs[2],
+            (
+                "cart:list".to_string(),
+                Value::SimpleString("list".to_string())
+            )
+        );
+        // Cap respected.
+        assert_eq!(s.matching_key_values("cart:*", 2).len(), 2);
+        // Non-matching pattern.
+        assert!(s.matching_key_values("nope:*", 100).is_empty());
     }
 
     #[test]

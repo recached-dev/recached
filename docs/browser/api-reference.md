@@ -221,6 +221,48 @@ The callback receives no arguments — it signals that _something_ changed. Read
 
 ---
 
+### Live queries & sync scoping
+
+#### `liveQuery(pattern)`
+
+Start a live query: the server sends the current state of every key matching the glob pattern (merged into the local store), then streams every change to matching keys — including keys created after subscribing. The mutation callback fires on each change.
+
+Returns a stop function. Calls are ref-counted per pattern: the server subscription ends when the last caller stops.
+
+```typescript
+liveQuery(pattern: string): () => void
+```
+
+```typescript
+const stop = cache.liveQuery('cart:42:*')
+const unsub = cache.onMutation(() => {
+  render(cache.getMatching('cart:42:*'))
+})
+// later:
+unsub(); stop()
+```
+
+Using React or Vue? [`useKeys(pattern)`](/react/hooks-reference#usekeys-pattern) wraps this in one line.
+
+#### `getMatching(pattern)`
+
+Snapshot of local keys matching a glob pattern, as `[key, value]` pairs sorted by key. Values are strings; keys holding collection types come back as `null`. Served entirely from local WASM memory.
+
+```typescript
+getMatching(pattern: string): Array<[string, string | null]>
+```
+
+#### `syncToken(token)` / `syncScopes(patterns)`
+
+Scope this connection's sync. `syncToken` presents a signed scope token — required on servers running with `RECACHED_SYNC_SECRET`; `syncScopes` sets plain glob patterns as a bandwidth filter on servers without one. Usually you pass these via `createCache({ connect: { syncToken } })` instead. See [Sync Scopes](/server/sync-scopes).
+
+```typescript
+syncToken(token: string): void
+syncScopes(patterns: string[]): void
+```
+
+---
+
 ### Pub/Sub
 
 Pub/Sub requires a server connection. Messages are delivered via the WebSocket and routed to subscribers on the receiving end.

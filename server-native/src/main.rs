@@ -157,6 +157,8 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::RlSet(_, _, _) => "rlset",
         Command::RlCheck(_, _) => "rlcheck",
         Command::Sync(_) => "sync",
+        Command::QSub(_) => "qsub",
+        Command::QUnsub(_) => "qunsub",
         Command::Unknown(_) => "unknown",
     }
 }
@@ -294,6 +296,10 @@ const TCP_READ_BUFFER_BYTES: usize = 16 * 1024; // 16 KB — matches Redis defau
 const MAX_TCP_READ_BUFFER_BYTES: usize = 64 * 1024 * 1024; // 64 MB per connection
 const MAX_MULTI_QUEUE_LEN: usize = 10_000;
 const MAX_WATCHES_PER_CONN: usize = 1_024;
+const MAX_QSUBS_PER_CONN: usize = 64;
+/// Cap on the number of key/value pairs returned as QSUB initial state, so a
+/// pattern matching a huge keyspace cannot produce an unbounded reply frame.
+const MAX_QSUB_INITIAL_KEYS: usize = 10_000;
 const BROADCAST_CHANNEL_CAPACITY: usize = 512;
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 const MAX_AUTH_FAILURES: u32 = 5;
@@ -1002,6 +1008,9 @@ fn command_scope(cmd: &Command) -> CommandScope {
         | Command::PUnsubscribe(_)
         | Command::Publish(_, _)
         | Command::Sync(_)
+        // QSUB patterns are scope-checked against the grant in the WS handler.
+        | Command::QSub(_)
+        | Command::QUnsub(_)
         | Command::Unknown(_) => CommandScope::KeyLess,
 
         Command::Keys(_)
@@ -1288,12 +1297,17 @@ type SharedPubSub = Arc<tokio::sync::Mutex<PubSubHub>>;
 type WatchNotif = (String, Value);
 type WatchMap = HashMap<String, Vec<(u64, mpsc::UnboundedSender<WatchNotif>)>>;
 
-/// Watched-key registry. `watched_keys` mirrors `map.len()` (updated by every
-/// writer while holding the lock) so the per-write hot path can skip the mutex
-/// entirely when nothing is watched.
+/// Watched-key and live-query registry. `watched_keys` / `watched_patterns`
+/// mirror the map lengths (updated by every writer while holding the lock) so
+/// the per-write hot path can skip the mutexes entirely when nothing is
+/// watched.
 struct WatchHub {
+    /// Exact-key watchers (WATCH).
     map: tokio::sync::Mutex<WatchMap>,
     watched_keys: AtomicUsize,
+    /// Glob-pattern subscribers (QSUB live queries), keyed by pattern.
+    patterns: tokio::sync::Mutex<WatchMap>,
+    watched_patterns: AtomicUsize,
 }
 
 impl WatchHub {
@@ -1301,16 +1315,24 @@ impl WatchHub {
         Arc::new(WatchHub {
             map: tokio::sync::Mutex::new(HashMap::new()),
             watched_keys: AtomicUsize::new(0),
+            patterns: tokio::sync::Mutex::new(HashMap::new()),
+            watched_patterns: AtomicUsize::new(0),
         })
     }
 
     fn is_empty(&self) -> bool {
         self.watched_keys.load(Ordering::Relaxed) == 0
+            && self.watched_patterns.load(Ordering::Relaxed) == 0
     }
 
-    /// Call after mutating the map, while still holding the lock.
+    /// Call after mutating the key map, while still holding the lock.
     fn sync_len(&self, map: &WatchMap) {
         self.watched_keys.store(map.len(), Ordering::Relaxed);
+    }
+
+    /// Call after mutating the pattern map, while still holding the lock.
+    fn sync_patterns_len(&self, map: &WatchMap) {
+        self.watched_patterns.store(map.len(), Ordering::Relaxed);
     }
 }
 
@@ -1394,16 +1416,58 @@ async fn notify_watchers(registry: &WatchRegistry, cmd: &Command, store: &KeyVal
         .iter()
         .map(|k| (k.clone(), store.get_current(k)))
         .collect();
-    let mut reg = registry.map.lock().await;
-    for (key, value) in &key_values {
-        if let Some(subs) = reg.get_mut(key) {
-            subs.retain(|(_, tx)| tx.send((key.clone(), value.clone())).is_ok());
+    if registry.watched_keys.load(Ordering::Relaxed) > 0 {
+        let mut reg = registry.map.lock().await;
+        for (key, value) in &key_values {
+            if let Some(subs) = reg.get_mut(key) {
+                subs.retain(|(_, tx)| tx.send((key.clone(), value.clone())).is_ok());
+                if subs.is_empty() {
+                    reg.remove(key);
+                }
+            }
+        }
+        registry.sync_len(&reg);
+    }
+    // Live queries: any registered glob pattern matching a touched key gets
+    // the same keychange notification.
+    if registry.watched_patterns.load(Ordering::Relaxed) > 0 {
+        let mut pats = registry.patterns.lock().await;
+        let mut emptied = false;
+        for (pattern, subs) in pats.iter_mut() {
+            for (key, value) in &key_values {
+                if core_engine::store::glob_match(pattern, key) {
+                    subs.retain(|(_, tx)| tx.send((key.clone(), value.clone())).is_ok());
+                }
+            }
+            emptied |= subs.is_empty();
+        }
+        if emptied {
+            pats.retain(|_, subs| !subs.is_empty());
+        }
+        registry.sync_patterns_len(&pats);
+    }
+}
+
+/// Drop all of `conn_id`'s live-query subscriptions. Called on QUNSUB (all
+/// form) and on connection close.
+async fn unregister_all_qsubs(
+    registry: &WatchRegistry,
+    conn_id: u64,
+    qsub_patterns: &mut HashSet<String>,
+) {
+    if qsub_patterns.is_empty() {
+        return;
+    }
+    let mut pats = registry.patterns.lock().await;
+    for p in qsub_patterns.drain() {
+        if let Some(subs) = pats.get_mut(&p) {
+            subs.retain(|(id, _)| *id != conn_id);
             if subs.is_empty() {
-                reg.remove(key);
+                pats.remove(&p);
             }
         }
     }
-    registry.sync_len(&reg);
+    registry.sync_patterns_len(&pats);
 }
 
 /// Post-write fan-out shared by the TCP and WS command paths: WebSocket sync
@@ -2575,7 +2639,8 @@ async fn handle_tcp<S>(
                                             Command::Subscribe(_) | Command::Unsubscribe(_)
                                             | Command::PSubscribe(_) | Command::PUnsubscribe(_)
                                             | Command::Publish(_, _)
-                                            | Command::Watch(_) | Command::Unwatch(_) => {
+                                            | Command::Watch(_) | Command::Unwatch(_)
+                                            | Command::QSub(_) | Command::QUnsub(_) => {
                                                 let err = b"-ERR Command not allowed inside a transaction\r\n";
                                                 if writer.write_all(err).await.is_err() { break 'outer; }
                                             }
@@ -2845,6 +2910,10 @@ async fn handle_ws<S>(
     // of everything when None).
     let strict = sync_secret.is_some();
     let mut sync_scopes: Option<Vec<String>> = None;
+    // Live-query subscriptions (QSUB). Keychange notifications for matching
+    // keys arrive on their own channel so they never dirty WATCH transactions.
+    let mut qsub_patterns: HashSet<String> = HashSet::new();
+    let (q_tx, mut q_rx) = mpsc::unbounded_channel::<WatchNotif>();
 
     // NOTE: the WebSocket transport uses *text* frames, so values must be valid
     // UTF-8. Non-UTF-8 bytes are replaced (lossy) on the way out. This is safe
@@ -3015,7 +3084,8 @@ async fn handle_ws<S>(
                                 Command::Subscribe(_) | Command::Unsubscribe(_)
                                 | Command::PSubscribe(_) | Command::PUnsubscribe(_)
                                 | Command::Publish(_, _)
-                                | Command::Watch(_) | Command::Unwatch(_) => {
+                                | Command::Watch(_) | Command::Unwatch(_)
+                                | Command::QSub(_) | Command::QUnsub(_) => {
                                     ws_send!(b"-ERR Command not allowed inside a transaction\r\n");
                                 }
                                 _ => {
@@ -3132,6 +3202,78 @@ async fn handle_ws<S>(
                                 ws_send!(b"+OK\r\n");
                             }
 
+                            Command::QSub(pattern) => {
+                                // Strict mode: the requested pattern must sit inside a
+                                // granted scope. A grant covers the request when it is
+                                // identical or glob-matches the request as literal text
+                                // (prefix-style grants: `cart:*` covers `cart:42:*`).
+                                if strict {
+                                    let allowed = sync_scopes.as_ref().is_some_and(|scopes| {
+                                        scopes.iter().any(|s| {
+                                            s == &pattern
+                                                || core_engine::store::glob_match(s, &pattern)
+                                        })
+                                    });
+                                    if !allowed {
+                                        ws_send!(b"-NOSCOPE pattern is outside this connection's sync scopes\r\n");
+                                        continue 'outer;
+                                    }
+                                }
+                                if !qsub_patterns.contains(&pattern)
+                                    && qsub_patterns.len() >= MAX_QSUBS_PER_CONN
+                                {
+                                    ws_send!(b"-ERR live query limit per connection reached\r\n");
+                                    continue 'outer;
+                                }
+                                // Register *before* snapshotting: a write landing in
+                                // between is delivered as a keychange after the initial
+                                // state, which is idempotent — the reverse order would
+                                // lose it.
+                                if qsub_patterns.insert(pattern.clone()) {
+                                    let mut pats = watch_registry.patterns.lock().await;
+                                    pats.entry(pattern.clone())
+                                        .or_default()
+                                        .push((conn_id, q_tx.clone()));
+                                    watch_registry.sync_patterns_len(&pats);
+                                }
+                                let kvs = store.matching_key_values(&pattern, MAX_QSUB_INITIAL_KEYS);
+                                // Tagged reply so clients can recognise it among
+                                // interleaved frames: ["qstate", pattern, k, v, ...]
+                                let mut items = Vec::with_capacity(kvs.len() * 2 + 2);
+                                items.push(Value::BulkString(Some(b"qstate".to_vec())));
+                                items.push(Value::BulkString(Some(pattern.clone().into_bytes())));
+                                for (k, v) in kvs {
+                                    items.push(Value::BulkString(Some(k.into_bytes())));
+                                    items.push(v);
+                                }
+                                ws_send!(&Value::Array(Some(items)).serialize());
+                            }
+                            Command::QUnsub(pattern) => {
+                                let targets: Vec<String> = match pattern {
+                                    Some(p) => {
+                                        if qsub_patterns.remove(&p) {
+                                            vec![p]
+                                        } else {
+                                            vec![]
+                                        }
+                                    }
+                                    None => qsub_patterns.drain().collect(),
+                                };
+                                if !targets.is_empty() {
+                                    let mut pats = watch_registry.patterns.lock().await;
+                                    for p in &targets {
+                                        if let Some(subs) = pats.get_mut(p) {
+                                            subs.retain(|(id, _)| *id != conn_id);
+                                            if subs.is_empty() {
+                                                pats.remove(p);
+                                            }
+                                        }
+                                    }
+                                    watch_registry.sync_patterns_len(&pats);
+                                }
+                                ws_send!(b"+OK\r\n");
+                            }
+
                             cmd => {
                                 if is_subscribed && !matches!(cmd, Command::Ping(_)) {
                                     ws_send!(b"-ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in subscribe mode\r\n");
@@ -3242,6 +3384,18 @@ async fn handle_ws<S>(
                     }
                 }
             }
+
+            // Live-query keychange: same frame as WATCH pushes, but never
+            // dirties transactions.
+            notif = q_rx.recv(), if !qsub_patterns.is_empty() => {
+                if let Some((key, value)) = notif {
+                    let bytes = encode_keychange(&key, &value);
+                    let text = String::from_utf8_lossy(&bytes).into_owned();
+                    if ws_sender.send(Message::Text(text.into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -3260,6 +3414,7 @@ async fn handle_ws<S>(
         }
         watch_registry.sync_len(&reg);
     }
+    unregister_all_qsubs(&watch_registry, conn_id, &mut qsub_patterns).await;
 }
 
 #[cfg(test)]
@@ -4296,6 +4451,40 @@ mod tests {
                 .flatten()
         }
 
+        /// Wait up to `ms` for the next `keychange` frame (WATCH / live-query
+        /// push), returning `(key, value)`. `None` when nothing arrives.
+        async fn recv_keychange(&mut self, ms: u64) -> Option<(String, Value)> {
+            let fut = async {
+                loop {
+                    match self.ws.next().await {
+                        Some(Ok(Message::Text(t))) => {
+                            let Ok((v, _)) = Value::parse(t.as_bytes()) else {
+                                continue;
+                            };
+                            if let Value::Array(Some(items)) = &v
+                                && items.len() == 3
+                                && matches!(items.first(), Some(Value::BulkString(Some(k))) if k == b"keychange")
+                            {
+                                let Value::BulkString(Some(key)) = &items[1] else {
+                                    continue;
+                                };
+                                return Some((
+                                    String::from_utf8_lossy(key).into_owned(),
+                                    items[2].clone(),
+                                ));
+                            }
+                        }
+                        Some(Ok(_)) => continue,
+                        _ => return None,
+                    }
+                }
+            };
+            tokio::time::timeout(tokio::time::Duration::from_millis(ms), fut)
+                .await
+                .ok()
+                .flatten()
+        }
+
         /// Read the next *command reply*, skipping server-initiated frames
         /// (RESP3 Push broadcasts and `keychange` observable-key pushes).
         async fn next_reply(&mut self) -> Value {
@@ -4590,5 +4779,80 @@ mod tests {
             client.recv_push(300).await.is_none(),
             "out-of-scope push leaked on strict connection"
         );
+    }
+
+    // ── Live queries (QSUB / QUNSUB) ──────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn integration_ws_qsub_initial_state_and_diffs() {
+        let srv = spawn_ws_server().await;
+        let mut writer = WsClient::connect(srv.tcp_addr).await;
+        let mut client = WsClient::connect(srv.tcp_addr).await;
+
+        // Pre-existing state the subscription must deliver up front.
+        assert_eq!(writer.cmd(&["SET", "cart:1", "apples"]).await, ok());
+        assert_eq!(writer.cmd(&["SET", "other:1", "zzz"]).await, ok());
+
+        let initial = client.cmd(&["QSUB", "cart:*"]).await;
+        match &initial {
+            Value::Array(Some(items)) => {
+                assert_eq!(
+                    items.len(),
+                    4,
+                    "expected tag + pattern + one pair: {items:?}"
+                );
+                assert_eq!(items[0], bulk("qstate"));
+                assert_eq!(items[1], bulk("cart:*"));
+                assert_eq!(items[2], bulk("cart:1"));
+                assert_eq!(items[3], bulk("apples"));
+            }
+            other => panic!("expected initial-state array, got {other:?}"),
+        }
+
+        // A matching write arrives as a keychange diff…
+        assert_eq!(writer.cmd(&["SET", "cart:2", "pears"]).await, ok());
+        let (key, value) = client.recv_keychange(1000).await.expect("cart:2 diff");
+        assert_eq!((key.as_str(), &value), ("cart:2", &bulk("pears")));
+
+        // …a non-matching write does not…
+        assert_eq!(writer.cmd(&["SET", "other:2", "yyy"]).await, ok());
+        assert!(client.recv_keychange(300).await.is_none());
+
+        // …a deletion arrives as a nil keychange…
+        assert_eq!(writer.cmd(&["DEL", "cart:2"]).await, int(1));
+        let (key, value) = client.recv_keychange(1000).await.expect("delete diff");
+        assert_eq!((key.as_str(), &value), ("cart:2", &nil()));
+
+        // …and QUNSUB stops the stream.
+        assert_eq!(client.cmd(&["QUNSUB", "cart:*"]).await, ok());
+        assert_eq!(writer.cmd(&["SET", "cart:3", "plums"]).await, ok());
+        assert!(client.recv_keychange(300).await.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn integration_ws_qsub_strict_scope() {
+        let secret = "qsub-secret";
+        let srv = spawn_ws_server_cfg(Some(secret.to_string())).await;
+        let mut client = WsClient::connect(srv.tcp_addr).await;
+
+        let tok = mint_sync_token(secret, "cart:*");
+        assert_eq!(client.cmd(&["SYNC", "TOKEN", &tok]).await, arr(&["cart:*"]));
+
+        // A narrower pattern under the grant is allowed (prefix-style cover).
+        assert_eq!(
+            client.cmd(&["QSUB", "cart:42:*"]).await,
+            arr(&["qstate", "cart:42:*"])
+        );
+        // A pattern outside the grant is refused.
+        let r = client.cmd(&["QSUB", "admin:*"]).await;
+        assert!(matches!(&r, Value::Error(e) if e.contains("NOSCOPE")));
+
+        // Diffs flow for the subscribed pattern.
+        let mut writer = WsClient::connect(srv.tcp_addr).await;
+        let wtok = mint_sync_token(secret, "cart:*");
+        writer.cmd(&["SYNC", "TOKEN", &wtok]).await;
+        assert_eq!(writer.cmd(&["SET", "cart:42:item", "x"]).await, ok());
+        let (key, _) = client.recv_keychange(1000).await.expect("scoped diff");
+        assert_eq!(key, "cart:42:item");
     }
 }

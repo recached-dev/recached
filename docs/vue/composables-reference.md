@@ -204,6 +204,38 @@ cache.setJSON<CartItem[]>('cart', updatedItems, 3600)    // expires in 1 hour
 
 ---
 
+## `useKeys(pattern)`
+
+```ts
+function useKeys(pattern: string): Ref<Array<[key: string, value: string | null]>>
+```
+
+Live query: reactively read **every key matching a glob pattern**. On setup, the server sends the current state of all matching keys (merged into the local WASM store), then streams every change to matching keys — including keys created after subscribing. The `Ref` updates on each change; reads never leave the browser.
+
+Pairs are sorted by key. Values are strings; keys holding collection types come back as `null`. The server subscription is ref-counted per pattern and ends when the last component using it unmounts.
+
+Under [strict sync scoping](/server/sync-scopes), the pattern must sit inside the connection's granted scopes.
+
+### Example
+
+```vue
+<script setup lang="ts">
+import { useKeys } from '@recached/vue'
+
+const items = useKeys('cart:42:item:*')
+</script>
+
+<template>
+  <ul>
+    <li v-for="[key, qty] in items" :key="key">
+      {{ key.split(':').pop() }}: {{ qty }}
+    </li>
+  </ul>
+</template>
+```
+
+---
+
 ## `usePubSub(channel, handler)`
 
 ```ts

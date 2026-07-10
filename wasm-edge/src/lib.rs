@@ -222,6 +222,63 @@ fn notify_mutation(on_mut: &Rc<RefCell<Option<js_sys::Function>>>) {
     }
 }
 
+/// Apply a server-initiated Array frame to the local store: `keychange`
+/// pushes (WATCH / live queries) and `qstate` initial-state replies (QSUB).
+/// Silently ignores anything else — ordinary command replies, acks, errors.
+fn apply_server_array(
+    store: &KeyValueStore,
+    on_mut: &Rc<RefCell<Option<js_sys::Function>>>,
+    items: Vec<Value>,
+) {
+    let tag = match items.first() {
+        Some(Value::BulkString(Some(t))) => t.clone(),
+        _ => return,
+    };
+    match tag.as_slice() {
+        b"keychange" if items.len() == 3 => {
+            let Value::BulkString(Some(key)) = &items[1] else {
+                return;
+            };
+            let key = String::from_utf8_lossy(key).into_owned();
+            match &items[2] {
+                Value::BulkString(Some(v)) => {
+                    store.execute(Command::Set(
+                        key,
+                        String::from_utf8_lossy(v).into_owned(),
+                        SetOptions::default(),
+                    ));
+                }
+                Value::BulkString(None) => {
+                    store.execute(Command::Del(vec![key]));
+                }
+                // Collection-type marker: the value is not carried in the
+                // keychange; the regular mutation push keeps collections in
+                // sync — this frame only needs to trigger a re-render.
+                _ => {}
+            }
+            notify_mutation(on_mut);
+        }
+        b"qstate" if items.len() >= 2 => {
+            for pair in items[2..].chunks_exact(2) {
+                let Value::BulkString(Some(k)) = &pair[0] else {
+                    continue;
+                };
+                // String values are applied; collection-typed keys arrive as
+                // type-name markers and are hydrated by mutation pushes.
+                if let Value::BulkString(Some(v)) = &pair[1] {
+                    store.execute(Command::Set(
+                        String::from_utf8_lossy(k).into_owned(),
+                        String::from_utf8_lossy(v).into_owned(),
+                        SetOptions::default(),
+                    ));
+                }
+            }
+            notify_mutation(on_mut);
+        }
+        _ => {}
+    }
+}
+
 // ── public API ────────────────────────────────────────────────────────────────
 
 #[wasm_bindgen]
@@ -432,6 +489,12 @@ impl RecachedCache {
         let onmessage = Closure::wrap(Box::new(move |e: MessageEvent| {
             if let Ok(text) = e.data().dyn_into::<js_sys::JsString>() {
                 let s = String::from(text);
+                // keychange pushes and qstate initial-state replies arrive as
+                // plain Arrays (not RESP3 Push) — apply them to the local store.
+                if let Ok((Value::Array(Some(items)), _)) = Value::parse(s.as_bytes()) {
+                    apply_server_array(&store_clone, &on_mut, items);
+                    return;
+                }
                 if let Ok((Value::Push(arr), _)) = Value::parse(s.as_bytes()) {
                     // Pub/sub message: >3 ["message", channel, payload]
                     if arr.len() == 3
@@ -524,6 +587,72 @@ impl RecachedCache {
         }
         self.ws_enqueue(&to_resp(&["AUTH", password]));
         "OK".to_string()
+    }
+
+    /// Present a signed sync-scope token (servers running with
+    /// `RECACHED_SYNC_SECRET`). Scopes what this connection may read, write,
+    /// and receive. The grant confirmation arrives asynchronously.
+    pub fn sync_token(&self, token: &str) {
+        self.ws_enqueue(&to_resp(&["SYNC", "TOKEN", token]));
+    }
+
+    /// Set sync scopes directly from comma-separated glob patterns. Only
+    /// honoured by servers without a sync secret — a bandwidth filter, not an
+    /// authorization boundary.
+    pub fn sync_scopes(&self, patterns_csv: &str) {
+        let pats: Vec<&str> = patterns_csv
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .collect();
+        if pats.is_empty() {
+            return;
+        }
+        let mut parts = vec!["SYNC"];
+        parts.extend(pats);
+        self.ws_enqueue(&to_resp(&parts));
+    }
+
+    /// Subscribe to a live query. The server replies with the current state
+    /// of every key matching the glob pattern — applied into the local store —
+    /// then streams every change to matching keys. The mutation callback
+    /// fires on the initial state and on each change; read the data with
+    /// `get_matching`.
+    pub fn live_query(&self, pattern: &str) {
+        self.ws_enqueue(&to_resp(&["QSUB", pattern]));
+    }
+
+    /// Drop one live query, or all of them when `pattern` is omitted.
+    pub fn live_unquery(&self, pattern: Option<String>) {
+        match pattern {
+            Some(p) => self.ws_enqueue(&to_resp(&["QUNSUB", &p])),
+            None => self.ws_enqueue(&to_resp(&["QUNSUB"])),
+        }
+    }
+
+    /// Snapshot of local keys matching a glob pattern, as an array of
+    /// `[key, value]` pairs sorted by key — deterministic order for UI
+    /// rendering and stable snapshot comparison. String values only; keys
+    /// holding collection types come back with `null` (read them with typed
+    /// accessors).
+    pub fn get_matching(&self, pattern: &str) -> js_sys::Array {
+        let mut kvs = self.store.matching_key_values(pattern, usize::MAX);
+        kvs.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let out = js_sys::Array::new();
+        for (k, v) in kvs {
+            let pair = js_sys::Array::new();
+            pair.push(&JsValue::from_str(&k));
+            match v {
+                Value::BulkString(Some(bytes)) => {
+                    pair.push(&JsValue::from_str(&String::from_utf8_lossy(&bytes)));
+                }
+                _ => {
+                    pair.push(&JsValue::NULL);
+                }
+            }
+            out.push(&pair);
+        }
+        out
     }
 
     /// Set a key-value pair locally, sync to the server, and fan out to other tabs if broadcast() was called.

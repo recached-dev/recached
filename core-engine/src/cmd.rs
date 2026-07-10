@@ -162,6 +162,14 @@ pub enum Command {
     /// Interpretation of the arguments (token verification, pattern grants)
     /// happens in the server layer; the store never sees this command.
     Sync(Vec<String>),
+    // ── Live queries (WebSocket only) ──────────────────────────────────────────
+    /// QSUB pattern — subscribe to a live query: the reply carries the current
+    /// state of every key matching the glob pattern, and subsequent mutations
+    /// to matching keys arrive as `keychange` pushes. Server-layer only.
+    QSub(String),
+    /// QUNSUB [pattern] — drop one live query, or all of them without an
+    /// argument. Server-layer only.
+    QUnsub(Option<String>),
     // ── Persistence ───────────────────────────────────────────────────────────
     Save,
     BgSave,
@@ -515,6 +523,24 @@ impl Command {
                             .map(|v| extract_string(v).unwrap_or_default())
                             .collect(),
                     )),
+
+                    // ── Live queries ───────────────────────────────────────────
+                    "QSUB" => {
+                        need!(2);
+                        let pattern = extract_string(&arr[1]).unwrap_or_default();
+                        if pattern.is_empty() {
+                            return Err("ERR QSUB requires a non-empty pattern".to_string());
+                        }
+                        Ok(Command::QSub(pattern))
+                    }
+                    "QUNSUB" => {
+                        let pattern = if arr.len() > 1 {
+                            Some(extract_string(&arr[1]).unwrap_or_default())
+                        } else {
+                            None
+                        };
+                        Ok(Command::QUnsub(pattern))
+                    }
 
                     // ── Rate limiting ──────────────────────────────────────────
                     "RLSET" => {

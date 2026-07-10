@@ -225,6 +225,31 @@ On the TCP port, `SYNC` returns an error — backend connections are trusted and
 
 ---
 
+## Live Queries (WebSocket only)
+
+A live query delivers the current state of every key matching a glob pattern, then streams every subsequent change to matching keys — initial state plus diffs, not fire-and-forget events. This is the primitive behind reactive UI bindings.
+
+| Command | Description |
+|---|---|
+| `QSUB pattern` | Subscribe. The reply is `["qstate", pattern, key, value, ...]` — the current state of every live key matching the pattern as flat pairs (strings in full; collection types as their type name, fetch them with a typed read). Afterwards, every mutation to a matching key — including keys created later — arrives as a `["keychange", key, value]` push; deletions arrive with a nil value. Initial state is capped at 10 000 keys. Up to 64 live queries per connection. |
+| `QUNSUB [pattern]` | Drop one live query, or all of them without an argument. |
+
+```bash
+QSUB cart:42:*
+# 1) "qstate"
+# 2) "cart:42:*"
+# 3) "cart:42:item:9"     initial state…
+# 4) "2"
+# …then, when the server (or any client) writes cart:42:item:12:
+# ["keychange", "cart:42:item:12", "1"]
+```
+
+Under strict sync scoping, `QSUB` patterns must sit inside the connection's granted scopes — a grant of `cart:42:*` covers `QSUB cart:42:*` and narrower prefix patterns. Live-query pushes never interfere with `WATCH` transactions (they travel on a separate internal channel).
+
+Two current limitations: `FLUSHDB` does not emit per-key diffs to live queries, and collection-type values arrive as type markers rather than full values — subscribe plus a typed re-read (`HGETALL`, `LRANGE`) on change.
+
+---
+
 ## Transactions
 
 Transactions queue commands and execute them atomically. No other client can interleave commands between `MULTI` and `EXEC`. After `EXEC`, the full result set is broadcast to WebSocket clients.

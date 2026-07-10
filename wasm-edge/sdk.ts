@@ -8,6 +8,19 @@ export interface ConnectOptions {
    * Sent immediately after the socket opens via `AUTH`.
    */
   password?: string;
+  /**
+   * Signed sync-scope token, minted by your application backend. Required when
+   * the server has `RECACHED_SYNC_SECRET` set (strict mode): without it the
+   * connection receives no pushes and may run no key commands.
+   * Sent after `AUTH` via `SYNC TOKEN`.
+   */
+  syncToken?: string;
+  /**
+   * Glob patterns to scope this connection's sync to, e.g. `['cart:*']`.
+   * Only honoured by servers *without* a sync secret — a bandwidth filter,
+   * not an authorization boundary. Use `syncToken` for security.
+   */
+  syncScopes?: string[];
 }
 
 export interface CacheOptions {
@@ -53,6 +66,11 @@ interface RawCache {
   publish(channel: string, message: string): void;
   subscribe(channel: string): void;
   unsubscribe(channel: string): void;
+  sync_token(token: string): void;
+  sync_scopes(patterns_csv: string): void;
+  live_query(pattern: string): void;
+  live_unquery(pattern?: string): void;
+  get_matching(pattern: string): Array<[string, string | null]>;
   set_mutation_callback(cb: () => void): void;
   set_message_callback(cb: (channel: string, message: string) => void): void;
   free(): void;
@@ -279,6 +297,76 @@ export class Cache {
     this.raw.publish(channel, message);
   }
 
+  // ── Sync scoping & live queries ───────────────────────────────────────────
+
+  /**
+   * Present a signed sync-scope token (strict servers — `RECACHED_SYNC_SECRET`).
+   * Mint it on your backend and hand it to the page; see the Sync Scopes docs.
+   */
+  syncToken(token: string): void {
+    this.raw.sync_token(token);
+  }
+
+  /**
+   * Scope this connection's sync to glob patterns (servers without a sync
+   * secret only). A bandwidth filter, not an authorization boundary.
+   */
+  syncScopes(patterns: string[]): void {
+    this.raw.sync_scopes(patterns.join(','));
+  }
+
+  /** @internal Ref-counts per live-query pattern so components sharing a
+   * pattern don't cancel each other's server subscription. */
+  private readonly _liveQueryRefs = new Map<string, number>();
+
+  /**
+   * Start a live query: the server sends the current state of every key
+   * matching `pattern` (merged into the local store), then streams every
+   * change to matching keys — including keys created later.
+   *
+   * Returns a stop function. Calls are ref-counted per pattern: the server
+   * subscription ends when the last caller stops.
+   *
+   * ```ts
+   * const stop = cache.liveQuery('cart:42:*');
+   * cache.onMutation(() => {
+   *   render(cache.getMatching('cart:42:*'));
+   * });
+   * // later:
+   * stop();
+   * ```
+   */
+  liveQuery(pattern: string): () => void {
+    const refs = this._liveQueryRefs.get(pattern) ?? 0;
+    this._liveQueryRefs.set(pattern, refs + 1);
+    if (refs === 0) {
+      this.raw.live_query(pattern);
+    }
+    let stopped = false;
+    return () => {
+      if (stopped) return;
+      stopped = true;
+      const now = (this._liveQueryRefs.get(pattern) ?? 1) - 1;
+      if (now <= 0) {
+        this._liveQueryRefs.delete(pattern);
+        this.raw.live_unquery(pattern);
+      } else {
+        this._liveQueryRefs.set(pattern, now);
+      }
+    };
+  }
+
+  /**
+   * Snapshot of local keys matching a glob pattern, as `[key, value]` pairs.
+   * Values are strings; keys holding collection types come back as `null`
+   * (read those with typed accessors).
+   *
+   * Served entirely from local WASM memory — zero network latency.
+   */
+  getMatching(pattern: string): Array<[string, string | null]> {
+    return this.raw.get_matching(pattern);
+  }
+
   // ── Persistence ───────────────────────────────────────────────────────────
 
   /**
@@ -353,6 +441,11 @@ export async function createCache(options: CacheOptions = {}): Promise<Cache> {
     raw.connect(options.connect.url);
     if (options.connect.password) {
       raw.auth(options.connect.password);
+    }
+    if (options.connect.syncToken) {
+      raw.sync_token(options.connect.syncToken);
+    } else if (options.connect.syncScopes?.length) {
+      raw.sync_scopes(options.connect.syncScopes.join(','));
     }
   }
 

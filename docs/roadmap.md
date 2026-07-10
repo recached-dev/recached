@@ -13,15 +13,15 @@ Ordered by priority.
 Every WebSocket connection can now be scoped to glob patterns via the `SYNC` command, and the mutation fan-out delivers only matching keys. With `RECACHED_SYNC_SECRET` set, scopes become a real authorization boundary: connections present an HMAC-signed token minted by your backend (`SYNC TOKEN <token>`), and every command — reads included — is checked against the granted patterns; admin/keyspace-wide commands are refused. See [Sync Scopes](/server/sync-scopes).
 
 
-## 3. Live queries — "Redis that renders"
+## 3. Live queries — "Redis that renders" ✅ shipped
 
-Extend the existing keychange push into pattern subscriptions with initial state. A React component does:
+`QSUB pattern` returns the current state of every matching key and then streams keychange diffs — initial state plus diffs, not fire-and-forget events — scope-checked under strict sync scoping. The client half makes it a one-liner in React and Vue:
 
 ```tsx
 const cart = useKeys('cart:item:*'); // current matching keys + live updates
 ```
 
-and gets the full loop with zero application glue: server write → patch over WebSocket → local WASM cache → component re-render. Reads stay local (0 ms); the subscription delivers initial state plus diffs, not fire-and-forget events.
+Server write → diff over WebSocket → local WASM cache → component re-render, with zero application glue. See [Commands → Live Queries](/server/commands#live-queries-websocket-only) and [`useKeys`](/react/hooks-reference#usekeys-pattern).
 
 
 ## 4. Native JSON type
