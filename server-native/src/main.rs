@@ -162,6 +162,8 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::Sync(_) => "sync",
         Command::QSub(_) => "qsub",
         Command::QUnsub(_) => "qunsub",
+        // Metrics count the wrapped command, not the envelope.
+        Command::Dedup(_, _, inner) => command_name(inner),
         Command::Unknown(_) => "unknown",
     }
 }
@@ -523,7 +525,17 @@ struct ServerState {
     replicas: ReplRegistry,
     /// true = currently acting as a read-only replica
     is_replica: std::sync::atomic::AtomicBool,
+    /// Exactly-once bookkeeping for DEDUP-wrapped writes: client id →
+    /// (highest id applied, last-seen ms). Clients send monotonically
+    /// increasing ids and replay in order, so a single high-water mark per
+    /// client suffices — no seen-set. In-memory only: a server restart
+    /// reopens the (already narrow) duplicate window, which is documented.
+    dedup: std::sync::Mutex<HashMap<String, (u64, u64)>>,
 }
+
+/// Sweep dedup client entries idle longer than this once the map is large.
+const DEDUP_IDLE_MS: u64 = 24 * 60 * 60 * 1000;
+const DEDUP_SWEEP_THRESHOLD: usize = 10_000;
 
 impl ServerState {
     fn is_replica(&self) -> bool {
@@ -539,6 +551,36 @@ impl ServerState {
     /// path even if no other consumer needs it.
     fn needs_write_log(&self) -> bool {
         self.aof.is_some() || !self.replicas.is_empty()
+    }
+
+    /// Record a DEDUP-wrapped write. Returns `true` when `id` was already
+    /// applied for this client (the write must be skipped). Marks the id
+    /// *before* execution so a crash between check and execute can never
+    /// double-apply.
+    fn dedup_seen(&self, client: &str, id: u64) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mut map = self.dedup.lock().expect("dedup mutex poisoned");
+        if map.len() > DEDUP_SWEEP_THRESHOLD {
+            map.retain(|_, (_, seen)| now.saturating_sub(*seen) < DEDUP_IDLE_MS);
+        }
+        match map.get_mut(client) {
+            Some((hwm, seen)) => {
+                *seen = now;
+                if id <= *hwm {
+                    true
+                } else {
+                    *hwm = id;
+                    false
+                }
+            }
+            None => {
+                map.insert(client.to_string(), (id, now));
+                false
+            }
+        }
     }
 
     /// Called after every successful write: appends to AOF and fans out to replicas.
@@ -575,6 +617,9 @@ impl ServerState {
 }
 
 fn is_write_command(cmd: &Command) -> bool {
+    if let Command::Dedup(_, _, inner) = cmd {
+        return is_write_command(inner);
+    }
     matches!(
         cmd,
         Command::Set(..)
@@ -1119,6 +1164,9 @@ fn command_scope(cmd: &Command) -> CommandScope {
             all.push(dst.clone());
             CommandScope::Keys(all)
         }
+
+        // Scope enforcement applies to the wrapped command.
+        Command::Dedup(_, _, inner) => command_scope(inner),
     }
 }
 
@@ -2243,6 +2291,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         aof,
         replicas: Arc::clone(&replicas),
         is_replica: std::sync::atomic::AtomicBool::new(is_replica_start),
+        dedup: std::sync::Mutex::new(HashMap::new()),
     });
 
     // ── autosave ──────────────────────────────────────────────────────────
@@ -3297,6 +3346,20 @@ async fn handle_ws<S>(
                             }
 
                             cmd => {
+                                // Exactly-once: unwrap the DEDUP envelope. An id at or
+                                // below this client's high-water mark was already applied
+                                // (its acknowledgment was lost) — skip it. +DUP still
+                                // acknowledges the write so the client retires it.
+                                let cmd = match cmd {
+                                    Command::Dedup(client, id, inner) => {
+                                        if state.dedup_seen(&client, id) {
+                                            ws_send!(b"+DUP\r\n");
+                                            continue 'outer;
+                                        }
+                                        *inner
+                                    }
+                                    other => other,
+                                };
                                 if is_subscribed && !matches!(cmd, Command::Ping(_)) {
                                     ws_send!(b"-ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in subscribe mode\r\n");
                                     continue 'outer;
@@ -3491,6 +3554,7 @@ mod tests {
             aof: None,
             replicas: ReplHub::new(),
             is_replica: AtomicBool::new(start_as_replica),
+            dedup: std::sync::Mutex::new(HashMap::new()),
         });
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3986,6 +4050,7 @@ mod tests {
             aof: Some(Arc::new(aof)),
             replicas: ReplHub::new(),
             is_replica: AtomicBool::new(false),
+            dedup: std::sync::Mutex::new(HashMap::new()),
         });
 
         // Simulate writes captured by AOF
@@ -4113,6 +4178,7 @@ mod tests {
                 aof: None,
                 replicas: Arc::clone(&repl_registry),
                 is_replica: AtomicBool::new(false),
+                dedup: std::sync::Mutex::new(HashMap::new()),
             });
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -4159,6 +4225,7 @@ mod tests {
             aof: None,
             replicas: ReplHub::new(),
             is_replica: AtomicBool::new(true),
+            dedup: std::sync::Mutex::new(HashMap::new()),
         });
         let rs = Arc::clone(&replica_store);
         let rst = Arc::clone(&replica_state);
@@ -4230,6 +4297,7 @@ mod tests {
             aof: None,
             replicas: ReplHub::new(),
             is_replica: AtomicBool::new(false),
+            dedup: std::sync::Mutex::new(HashMap::new()),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4346,6 +4414,7 @@ mod tests {
             aof: None,
             replicas: ReplHub::new(),
             is_replica: AtomicBool::new(true),
+            dedup: std::sync::Mutex::new(HashMap::new()),
         });
         let replica_store = Arc::new(KeyValueStore::new());
         let rs = Arc::clone(&replica_store);
@@ -4391,6 +4460,7 @@ mod tests {
             aof: None,
             replicas: ReplHub::new(),
             is_replica: AtomicBool::new(false),
+            dedup: std::sync::Mutex::new(HashMap::new()),
         });
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4801,6 +4871,61 @@ mod tests {
             client.recv_push(300).await.is_none(),
             "out-of-scope push leaked on strict connection"
         );
+    }
+
+    // ── Exactly-once delivery (DEDUP) ─────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn integration_dedup_skips_replayed_writes() {
+        let srv = spawn_ws_server().await;
+        let mut c = WsClient::connect(srv.tcp_addr).await;
+
+        // First delivery applies.
+        assert_eq!(
+            c.cmd(&["DEDUP", "client-a", "1", "INCRBY", "n", "2"]).await,
+            int(2)
+        );
+        // Exact replay (ack lost, client re-sent) is skipped.
+        assert_eq!(
+            c.cmd(&["DEDUP", "client-a", "1", "INCRBY", "n", "2"]).await,
+            Value::SimpleString("DUP".into())
+        );
+        // Higher id applies.
+        assert_eq!(
+            c.cmd(&["DEDUP", "client-a", "2", "INCRBY", "n", "3"]).await,
+            int(5)
+        );
+        // The high-water mark survives a reconnect — the whole point.
+        let mut c2 = WsClient::connect(srv.tcp_addr).await;
+        assert_eq!(
+            c2.cmd(&["DEDUP", "client-a", "2", "INCRBY", "n", "3"])
+                .await,
+            Value::SimpleString("DUP".into())
+        );
+        assert_eq!(srv.store.execute(Command::Get("n".into())), bulk("5"));
+        // A different client id has an independent mark.
+        assert_eq!(
+            c2.cmd(&["DEDUP", "client-b", "1", "INCRBY", "n", "1"])
+                .await,
+            int(6)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn integration_dedup_respects_sync_scopes() {
+        let secret = "dedup-secret";
+        let srv = spawn_ws_server_cfg(Some(secret.to_string())).await;
+        let mut c = WsClient::connect(srv.tcp_addr).await;
+        let tok = mint_sync_token(secret, "cart:*");
+        assert_eq!(c.cmd(&["SYNC", "TOKEN", &tok]).await, arr(&["cart:*"]));
+
+        // Scope enforcement applies to the wrapped command.
+        assert_eq!(
+            c.cmd(&["DEDUP", "c1", "1", "SET", "cart:1", "x"]).await,
+            ok()
+        );
+        let r = c.cmd(&["DEDUP", "c1", "2", "SET", "admin:1", "x"]).await;
+        assert!(matches!(&r, Value::Error(e) if e.contains("NOSCOPE")));
     }
 
     // ── JSON over the wire ────────────────────────────────────────────────────

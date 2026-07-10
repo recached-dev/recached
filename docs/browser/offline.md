@@ -19,7 +19,9 @@ Browsers go offline. Recached is built so that when they do, the app keeps worki
 3. Every active live query is re-subscribed — the fresh `qstate` re-hydrates local keys with whatever happened server-side while you were away
 4. The outbox replays FIFO
 
-A queued write is retired from the outbox only when the server's reply *acknowledges* it (replies arrive in command order, so acknowledgment is exact). A write that was sent but unacknowledged when the connection died is re-sent on reconnect — delivery is **at-least-once**: in the narrow window where the server processed a write but the acknowledgment was lost, a replayed `incr` can apply twice. Exactly-once delivery (deduplication ids) is future work.
+A queued write is retired from the outbox only when the server's reply *acknowledges* it (replies arrive in command order, so acknowledgment is exact). A write that was sent but unacknowledged when the connection died is re-sent on reconnect — and delivery is **exactly-once**: every store write carries a `DEDUP` envelope (a per-client id plus a monotonic write id), and the server skips any id it has already applied, replying `+DUP` so the outbox still retires the entry. A replayed `incr` whose acknowledgment was lost can never apply twice.
+
+The client identity behind this is persisted with the outbox (IndexedDB), and each session's ids start above the previous session's, so exactly-once holds across page reloads too. One caveat: the server's dedup marks are in-memory — a *server* restart in the exact window between applying a write and the client receiving the acknowledgment reopens a narrow duplicate possibility.
 
 Nothing to call, nothing to configure. Disable with `createCache({ connect: { reconnect: false } })` or stop a connection deliberately with `cache.disconnect()`.
 
@@ -47,7 +49,7 @@ cache.incr('cart:count')
 ## Limits to know about
 
 - **Durability requires persistence.** Without `persistence: true`, the outbox is in-memory: offline writes replay within the tab session but are lost on reload. With it, unacknowledged writes are restored from IndexedDB on startup and re-sent on the next connect.
-- **Delivery is at-least-once**, not exactly-once — see above. For counters this means a rare double-increment is possible when a connection dies at exactly the wrong moment.
+- **Exactly-once depends on server memory.** Dedup high-water marks live in server memory (swept after 24 h idle); a server restart at exactly the wrong moment can let one duplicate through — see above.
 - **LWW means arrival order, not wall-clock order.** A `set` replayed from a client that was offline for an hour overwrites the server's newer value for that key. Prefer operation forms for anything multiple parties write.
 - `clearPersistence()` (sign-out) discards unsent offline writes along with the local state.
 - Reconnection uses `window.setTimeout` — in non-browser environments without a `window`, auto-reconnect is inactive.

@@ -169,6 +169,11 @@ pub enum Command {
     /// Interpretation of the arguments (token verification, pattern grants)
     /// happens in the server layer; the store never sees this command.
     Sync(Vec<String>),
+    // ── Exactly-once delivery (WebSocket only) ─────────────────────────────────
+    /// DEDUP client_id id command args... — wraps a write with a per-client
+    /// monotonic id so an offline-replayed duplicate is skipped. Unwrapped in
+    /// the server layer; the store never sees this command.
+    Dedup(String, u64, Box<Command>),
     // ── Live queries (WebSocket only) ──────────────────────────────────────────
     /// QSUB pattern — subscribe to a live query: the reply carries the current
     /// state of every key matching the glob pattern, and subsequent mutations
@@ -530,6 +535,24 @@ impl Command {
                             .map(|v| extract_string(v).unwrap_or_default())
                             .collect(),
                     )),
+
+                    // ── Exactly-once delivery ──────────────────────────────────
+                    "DEDUP" => {
+                        need!(4);
+                        let client_id = extract_string(&arr[1]).unwrap_or_default();
+                        if client_id.is_empty() || client_id.len() > 64 {
+                            return Err("ERR DEDUP client id must be 1-64 characters".to_string());
+                        }
+                        let id = extract_int(&arr[2])?;
+                        if id < 0 {
+                            return Err("ERR DEDUP id must be non-negative".to_string());
+                        }
+                        let inner = Command::from_value(Value::Array(Some(arr[3..].to_vec())))?;
+                        if matches!(inner, Command::Dedup(_, _, _)) {
+                            return Err("ERR DEDUP cannot be nested".to_string());
+                        }
+                        Ok(Command::Dedup(client_id, id as u64, Box::new(inner)))
+                    }
 
                     // ── Live queries ───────────────────────────────────────────
                     "QSUB" => {
@@ -1879,6 +1902,35 @@ mod tests {
         assert_eq!(
             Command::from_value(array(&["ZCOUNT", "z", "-inf", "+inf"])).unwrap(),
             Command::ZCount("z".into(), "-inf".into(), "+inf".into())
+        );
+    }
+
+    // ── Exactly-once delivery ─────────────────────────────────────────────────
+
+    #[test]
+    fn dedup_parse_wraps_inner_command() {
+        assert_eq!(
+            Command::from_value(array(&["DEDUP", "client-a", "42", "INCRBY", "k", "2"])).unwrap(),
+            Command::Dedup(
+                "client-a".into(),
+                42,
+                Box::new(Command::IncrBy("k".into(), 2))
+            )
+        );
+    }
+
+    #[test]
+    fn dedup_parse_rejections() {
+        // Too few args, bad id, oversized client id, nesting.
+        assert!(Command::from_value(array(&["DEDUP", "c", "1"])).is_err());
+        assert!(Command::from_value(array(&["DEDUP", "c", "-1", "SET", "k", "v"])).is_err());
+        let long = "x".repeat(65);
+        assert!(Command::from_value(array(&["DEDUP", &long, "1", "SET", "k", "v"])).is_err());
+        assert!(
+            Command::from_value(array(&[
+                "DEDUP", "c", "1", "DEDUP", "c", "2", "SET", "k", "v"
+            ]))
+            .is_err()
         );
     }
 

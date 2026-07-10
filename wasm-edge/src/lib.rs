@@ -18,12 +18,14 @@ use web_sys::{BroadcastChannel, Event, MessageEvent, WebSocket};
 #[wasm_bindgen(inline_js = r#"
 export function openRecachedDb() {
     return new Promise((resolve, reject) => {
-        // v2 adds the 'outbox' store (writes awaiting server acknowledgment).
-        const req = indexedDB.open('recached', 2);
+        // v2 added 'outbox' (writes awaiting server acknowledgment);
+        // v3 adds 'meta' (client identity + session epoch for exactly-once).
+        const req = indexedDB.open('recached', 3);
         req.onupgradeneeded = (e) => {
             const db = e.target.result;
             if (!db.objectStoreNames.contains('wal')) db.createObjectStore('wal');
             if (!db.objectStoreNames.contains('outbox')) db.createObjectStore('outbox');
+            if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta');
         };
         req.onsuccess = (e) => resolve(e.target.result);
         req.onerror   = (e) => reject(e.target.error);
@@ -74,6 +76,22 @@ export function idbWalClear(db) {
         req.onerror   = (e) => reject(e.target.error);
     });
 }
+export function idbMetaGet(db, key) {
+    return new Promise((resolve, reject) => {
+        const tx  = db.transaction('meta', 'readonly');
+        const req = tx.objectStore('meta').get(key);
+        req.onsuccess = (e) => resolve(e.target.result);
+        req.onerror   = (e) => reject(e.target.error);
+    });
+}
+export function idbMetaPut(db, key, val) {
+    return new Promise((resolve, reject) => {
+        const tx  = db.transaction('meta', 'readwrite');
+        const req = tx.objectStore('meta').put(val, key);
+        req.onsuccess = () => resolve(undefined);
+        req.onerror   = (e) => reject(e.target.error);
+    });
+}
 export function idbClear(db) {
     return new Promise((resolve, reject) => {
         const tx  = db.transaction(['wal', 'outbox'], 'readwrite');
@@ -99,6 +117,10 @@ extern "C" {
     fn idb_outbox_delete_js(db: &JsValue, id: f64) -> Promise;
     #[wasm_bindgen(js_name = "idbWalClear")]
     fn idb_wal_clear_js(db: &JsValue) -> Promise;
+    #[wasm_bindgen(js_name = "idbMetaGet")]
+    fn idb_meta_get(db: &JsValue, key: &str) -> Promise;
+    #[wasm_bindgen(js_name = "idbMetaPut")]
+    fn idb_meta_put(db: &JsValue, key: &str, val: &JsValue) -> Promise;
     #[wasm_bindgen(js_name = "idbClear")]
     fn idb_clear_js(db: &JsValue) -> Promise;
 }
@@ -297,11 +319,68 @@ fn ack_reply(sh: &WsShared) {
     }
 }
 
+/// Unguessable client id: `crypto.randomUUID()` when available (unguessability
+/// is what stops another authenticated client from poisoning this client's
+/// dedup high-water mark), with a Math.random+timestamp fallback.
+fn random_client_id() -> String {
+    if let Some(w) = web_sys::window()
+        && let Ok(c) = js_sys::Reflect::get(&w, &JsValue::from_str("crypto"))
+        && !c.is_undefined()
+        && let Ok(f) = js_sys::Reflect::get(&c, &JsValue::from_str("randomUUID"))
+        && f.is_function()
+        && let Ok(v) = js_sys::Function::from(f).call0(&c)
+        && let Some(s) = v.as_string()
+    {
+        return s;
+    }
+    format!(
+        "{:08x}{:08x}{:08x}-{:x}",
+        (js_sys::Math::random() * u32::MAX as f64) as u32,
+        (js_sys::Math::random() * u32::MAX as f64) as u32,
+        (js_sys::Math::random() * u32::MAX as f64) as u32,
+        js_sys::Date::now() as u64,
+    )
+}
+
+/// Splice a `DEDUP <client> <wire-id>` envelope into an already-encoded RESP
+/// array: bump the element count and prepend three elements. Avoids threading
+/// parts through every write path.
+fn wrap_dedup(sh: &WsShared, plain: &str, outbox_id: u64) -> String {
+    let Some((head, rest)) = plain.split_once("\r\n") else {
+        return plain.to_string();
+    };
+    let n: usize = head.trim_start_matches('*').parse().unwrap_or(0);
+    if n == 0 {
+        return plain.to_string();
+    }
+    let client = sh.client_id.borrow();
+    let wire_id = ((sh.epoch.get() as u64) << 32) | (outbox_id & 0xFFFF_FFFF);
+    let id_s = wire_id.to_string();
+    format!(
+        "*{}\r\n$5\r\nDEDUP\r\n${}\r\n{}\r\n${}\r\n{}\r\n{}",
+        n + 3,
+        client.len(),
+        client,
+        id_s.len(),
+        id_s,
+        rest
+    )
+}
+
 /// Append a write to the durable outbox and send it if the socket is open.
 /// The entry is retired only when the server's reply acknowledges it.
-fn enqueue_write(sh: &WsShared, encoded: &str) {
+/// `dedup` wraps the write in an exactly-once envelope — used for store
+/// writes; connection-scoped commands (pub/sub) must not be deduplicated or
+/// a legitimate re-subscribe after reconnect would be skipped.
+fn enqueue_write(sh: &WsShared, encoded: &str, dedup: bool) {
     let id = sh.outbox_seq.get();
     sh.outbox_seq.set(id + 1);
+    let encoded: String = if dedup {
+        wrap_dedup(sh, encoded, id)
+    } else {
+        encoded.to_string()
+    };
+    let encoded = encoded.as_str();
     {
         let mut ob = sh.outbox.borrow_mut();
         if ob.len() >= MAX_PENDING_WRITES {
@@ -413,6 +492,14 @@ struct WsShared {
     inflight: Rc<RefCell<std::collections::VecDeque<Option<u64>>>>,
     /// Shared with `RecachedCache.idb` — the open IndexedDB handle, if any.
     idb: Rc<RefCell<Option<JsValue>>>,
+    /// Stable client identity for exactly-once writes (persisted in IDB meta
+    /// when persistence is on; random per instance otherwise, which is safe
+    /// because a memory-only outbox cannot survive into a new session).
+    client_id: Rc<RefCell<String>>,
+    /// Session epoch, upper 32 bits of every dedup wire id. Incremented and
+    /// persisted on each `enable_persistence`, so a new session's ids are
+    /// always above the previous session's server-side high-water mark.
+    epoch: Rc<Cell<u32>>,
     url: Rc<RefCell<Option<String>>>,
     /// Session state re-established on every (re)connect, in this order:
     /// AUTH → SYNC TOKEN / scopes → QSUBs → queued writes.
@@ -668,6 +755,8 @@ impl RecachedCache {
                 outbox_seq: Rc::new(Cell::new(0)),
                 inflight: Rc::new(RefCell::new(std::collections::VecDeque::new())),
                 idb: Rc::clone(&idb),
+                client_id: Rc::new(RefCell::new(random_client_id())),
+                epoch: Rc::new(Cell::new(0)),
                 url: Rc::new(RefCell::new(None)),
                 password: Rc::new(RefCell::new(None)),
                 sync_token: Rc::new(RefCell::new(None)),
@@ -693,6 +782,7 @@ impl RecachedCache {
     /// until `onopen` fires. Without this, anything sent during the CONNECTING
     /// window (notably the AUTH that `createCache` issues right after connect)
     /// would be silently dropped.
+    /// Queue a store write (dedup-wrapped for exactly-once delivery).
     fn ws_enqueue(&self, encoded: &str) {
         // Local-only mode (no connect() yet and no persistence): nothing to
         // sync to. With persistence enabled the write still goes into the
@@ -701,7 +791,17 @@ impl RecachedCache {
         if self.shared.url.borrow().is_none() && self.shared.idb.borrow().is_none() {
             return;
         }
-        enqueue_write(&self.shared, encoded);
+        enqueue_write(&self.shared, encoded, true);
+    }
+
+    /// Queue a connection-scoped command (pub/sub) — replayed on reconnect
+    /// but never dedup-wrapped: skipping a re-sent SUBSCRIBE would silently
+    /// drop the subscription.
+    fn ws_enqueue_nodedup(&self, encoded: &str) {
+        if self.shared.url.borrow().is_none() && self.shared.idb.borrow().is_none() {
+            return;
+        }
+        enqueue_write(&self.shared, encoded, false);
     }
 
     /// Register a JS callback invoked after every mutation from any source
@@ -733,9 +833,44 @@ impl RecachedCache {
         let seq_cell = Rc::clone(&self.seq);
         let outbox = Rc::clone(&self.shared.outbox);
         let outbox_seq = Rc::clone(&self.shared.outbox_seq);
+        let client_id = Rc::clone(&self.shared.client_id);
+        let epoch = Rc::clone(&self.shared.epoch);
 
         wasm_bindgen_futures::future_to_promise(async move {
             let db = JsFuture::from(open_recached_db()).await?;
+
+            // ── exactly-once identity ─────────────────────────────────────
+            // Adopt the stored client id (so dedup high-water marks span
+            // sessions) unless this session already sent writes under the
+            // random one — switching ids mid-stream would fragment the mark.
+            {
+                let stored = JsFuture::from(idb_meta_get(&db, "client_id")).await?;
+                let no_writes_yet = outbox_seq.get() == 0 && outbox.borrow().is_empty();
+                match stored.as_string() {
+                    Some(cid) if !cid.is_empty() && no_writes_yet => {
+                        *client_id.borrow_mut() = cid;
+                    }
+                    _ => {
+                        let current = client_id.borrow().clone();
+                        let _ = JsFuture::from(idb_meta_put(
+                            &db,
+                            "client_id",
+                            &JsValue::from_str(&current),
+                        ))
+                        .await;
+                    }
+                }
+                // Bump the session epoch so this session's dedup ids are
+                // strictly above every id the previous session ever sent.
+                let prev = JsFuture::from(idb_meta_get(&db, "epoch"))
+                    .await?
+                    .as_f64()
+                    .unwrap_or(0.0) as u32;
+                let next = prev.saturating_add(1);
+                epoch.set(next);
+                let _ = JsFuture::from(idb_meta_put(&db, "epoch", &JsValue::from_f64(next as f64)))
+                    .await;
+            }
 
             // Restore the durable outbox: writes from a previous session that
             // never got a server acknowledgment. They re-send on the next
@@ -1182,16 +1317,16 @@ impl RecachedCache {
 
     /// Publish a message to a channel on the server.
     pub fn publish(&self, channel: &str, message: &str) {
-        self.ws_enqueue(&to_resp(&["PUBLISH", channel, message]));
+        self.ws_enqueue_nodedup(&to_resp(&["PUBLISH", channel, message]));
     }
 
     /// Subscribe to a channel on the server. Push messages arrive via the `onmessage` callback.
     pub fn subscribe(&self, channel: &str) {
-        self.ws_enqueue(&to_resp(&["SUBSCRIBE", channel]));
+        self.ws_enqueue_nodedup(&to_resp(&["SUBSCRIBE", channel]));
     }
 
     /// Unsubscribe from a channel on the server.
     pub fn unsubscribe(&self, channel: &str) {
-        self.ws_enqueue(&to_resp(&["UNSUBSCRIBE", channel]));
+        self.ws_enqueue_nodedup(&to_resp(&["UNSUBSCRIBE", channel]));
     }
 }

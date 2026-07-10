@@ -33,7 +33,7 @@ Server write → diff over WebSocket → local WASM cache → component re-rende
 
 Browser clients queue writes as *operations* in a **durable outbox** while offline (IndexedDB-backed with persistence enabled, so they survive a full page reload), auto-reconnect with backoff, re-establish the session (auth, sync token, live queries — which re-hydrate local state), and replay the outbox. Writes are retired only on server acknowledgment (at-least-once delivery). Operation replay makes merges type-aware: `incr`/`decr` queue deltas that merge additively (PN-counter semantics), `jmerge` patches deep-merge, collection ops replay, and plain `set` is last-writer-wins by server arrival. See [Offline & Reconnection](/browser/offline).
 
-Follow-up (tracked, not yet built): exactly-once delivery via per-write deduplication ids — today a write whose acknowledgment is lost mid-disconnect can replay twice.
+Exactly-once delivery is included: every store write carries a `DEDUP` envelope (per-client id + monotonic write id, session epochs persisted so ids stay monotonic across reloads), and the server skips already-applied ids via a per-client high-water mark — a replayed write whose acknowledgment was lost never applies twice. Residual caveat: dedup marks are in server memory, so a *server* restart in the ack window can admit one duplicate.
 
 ## 6. Mobile SDKs — React Native, Flutter, Kotlin, Swift
 

@@ -2408,6 +2408,10 @@ impl KeyValueStore {
             Command::QSub(_) | Command::QUnsub(_) => Value::Error(
                 "ERR live queries are only available on the WebSocket port".to_string(),
             ),
+            // Deduplication is unwrapped in the server layer before execution.
+            Command::Dedup(_, _, _) => {
+                Value::Error("ERR DEDUP is only available on the WebSocket port".to_string())
+            }
             Command::Publish(_, _) => Value::Integer(0),
 
             Command::Unknown(name) => Value::Error(format!("ERR unknown command '{}'", name)),

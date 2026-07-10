@@ -251,6 +251,12 @@ Controls which keys a WebSocket connection receives pushes for and may operate o
 
 On the TCP port, `SYNC` returns an error — backend connections are trusted and unscoped.
 
+### Exactly-once envelope
+
+| Command | Description |
+|---|---|
+| `DEDUP client-id id command args...` | Wraps a write with a per-client monotonic id. If `id` is at or below the highest id already applied for `client-id`, the write is skipped and the reply is `+DUP` — used by the browser SDK's offline-replay so a write whose acknowledgment was lost never applies twice. Client ids are 1–64 characters and should be unguessable (the SDK uses `crypto.randomUUID()`). Scope checks, replica rejection, and metrics all apply to the wrapped command. Dedup marks are in-memory, per server, swept after 24 h idle. |
+
 ---
 
 ## Live Queries (WebSocket only)
