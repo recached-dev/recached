@@ -8,13 +8,9 @@ Ordered by priority.
 
 `RLSET key limit window` / `RLCHECK key [limit window]`. A built-in sliding-window rate limiter that replaces hand-rolled INCR+EXPIRE (racy) or Lua script approaches. `RLCHECK` returns `[allowed, remaining, retry_after_ms]` — a direct fit for `X-RateLimit-*` / `Retry-After` headers — and the inline config form auto-creates self-cleaning per-IP/per-user limiters in a single command. See [Commands → Rate Limiting](/server/commands#rate-limiting).
 
-## 2. Scoped sync and per-client auth
+## 2. Scoped sync and per-client auth ✅ shipped
 
-Today every mutation fans out to **every** connected WebSocket client. For a multi-user application that is a data-leak footgun: user A's session keys are pushed to user B's browser. Before the browser story can be used in serious production:
-
-- Clients subscribe to key prefixes or patterns (`sync: ['cart:{userId}:*', 'catalog:*']`) instead of receiving everything.
-- Scopes are authorized server-side (per-connection token → allowed patterns), so a client cannot subscribe to keys it shouldn't see.
-- Fan-out filters by scope, which also cuts broadcast cost — most mutations stop being everyone's problem.
+Every WebSocket connection can now be scoped to glob patterns via the `SYNC` command, and the mutation fan-out delivers only matching keys. With `RECACHED_SYNC_SECRET` set, scopes become a real authorization boundary: connections present an HMAC-signed token minted by your backend (`SYNC TOKEN <token>`), and every command — reads included — is checked against the granted patterns; admin/keyspace-wide commands are refused. See [Sync Scopes](/server/sync-scopes).
 
 
 ## 3. Live queries — "Redis that renders"

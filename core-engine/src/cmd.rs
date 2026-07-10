@@ -157,6 +157,11 @@ pub enum Command {
     // ── Observable keys ───────────────────────────────────────────────────────
     Watch(Vec<String>),
     Unwatch(Vec<String>),
+    // ── Sync scoping (WebSocket only) ──────────────────────────────────────────
+    /// SYNC [TOKEN token | pattern ...] — set this connection's sync scopes.
+    /// Interpretation of the arguments (token verification, pattern grants)
+    /// happens in the server layer; the store never sees this command.
+    Sync(Vec<String>),
     // ── Persistence ───────────────────────────────────────────────────────────
     Save,
     BgSave,
@@ -502,6 +507,14 @@ impl Command {
                         need!(2);
                         Ok(Command::Type(extract_string(&arr[1]).unwrap_or_default()))
                     }
+
+                    // ── Sync scoping ───────────────────────────────────────────
+                    "SYNC" => Ok(Command::Sync(
+                        arr[1..]
+                            .iter()
+                            .map(|v| extract_string(v).unwrap_or_default())
+                            .collect(),
+                    )),
 
                     // ── Rate limiting ──────────────────────────────────────────
                     "RLSET" => {

@@ -211,6 +211,20 @@ Replication note: `RLSET` config replicates to AOF and replicas; recorded attemp
 
 ---
 
+## Sync Scoping (WebSocket only)
+
+Controls which keys a WebSocket connection receives pushes for and may operate on. Full guide: [Sync Scopes](/server/sync-scopes).
+
+| Command | Description |
+|---|---|
+| `SYNC` | Returns this connection's current scope patterns. |
+| `SYNC TOKEN token` | Sets scopes from a token signed with `RECACHED_SYNC_SECRET` (HMAC-SHA256). Required before any key access when the secret is configured (strict mode). Returns the granted patterns. |
+| `SYNC pattern [pattern ...]` | Sets scopes directly from glob patterns. Only available when no sync secret is configured — a bandwidth filter, not a security boundary. |
+
+On the TCP port, `SYNC` returns an error — backend connections are trusted and unscoped.
+
+---
+
 ## Transactions
 
 Transactions queue commands and execute them atomically. No other client can interleave commands between `MULTI` and `EXEC`. After `EXEC`, the full result set is broadcast to WebSocket clients.

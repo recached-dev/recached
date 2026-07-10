@@ -2137,6 +2137,11 @@ impl KeyValueStore {
             | Command::Unsubscribe(_)
             | Command::PSubscribe(_)
             | Command::PUnsubscribe(_) => Value::Error("ERR only in pub/sub context".to_string()),
+            // Sync scoping is a WebSocket-connection concern, handled entirely
+            // in the server layer.
+            Command::Sync(_) => {
+                Value::Error("ERR SYNC is only available on the WebSocket port".to_string())
+            }
             Command::Publish(_, _) => Value::Integer(0),
 
             Command::Unknown(name) => Value::Error(format!("ERR unknown command '{}'", name)),
@@ -2214,7 +2219,10 @@ fn set_expiry(data: &DashMap<String, Entry>, key: String, ts_ms: u64) -> Value {
     }
 }
 
-fn glob_match(pattern: &str, s: &str) -> bool {
+/// Glob match with `*`, `?`, and `[abc]` classes — iterative DP, O(m × n),
+/// immune to backtracking blowup. Used by KEYS/SCAN and exported for the
+/// server layer's sync-scope filtering.
+pub fn glob_match(pattern: &str, s: &str) -> bool {
     let pat = pattern.as_bytes();
     let text = s.as_bytes();
     let (m, n) = (pat.len(), text.len());

@@ -156,6 +156,7 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::ReplicaOfNoOne => "replicaof",
         Command::RlSet(_, _, _) => "rlset",
         Command::RlCheck(_, _) => "rlcheck",
+        Command::Sync(_) => "sync",
         Command::Unknown(_) => "unknown",
     }
 }
@@ -212,7 +213,7 @@ fn execute_and_record(store: &KeyValueStore, cmd: Command) -> Value {
 /// the caller can move the command into `execute_and_record` without cloning
 /// and skip `apply_write_effects` entirely.
 fn write_effects_armed(
-    tx: &broadcast::Sender<(u64, String)>,
+    tx: &broadcast::Sender<SyncMsg>,
     state: &ServerState,
     watch_registry: &WatchRegistry,
 ) -> bool {
@@ -747,7 +748,7 @@ async fn run_repl_client(
     state: Arc<ServerState>,
     repl_password: Option<String>,
     failover_timeout_secs: Option<u64>,
-    tx: broadcast::Sender<(u64, String)>,
+    tx: broadcast::Sender<SyncMsg>,
 ) {
     let mut backoff_secs = 2u64;
     let mut unreachable_since: Option<std::time::Instant> = None;
@@ -805,7 +806,7 @@ async fn sync_from_primary(
     socket: &mut TcpStream,
     store: &KeyValueStore,
     repl_password: Option<&str>,
-    tx: &broadcast::Sender<(u64, String)>,
+    tx: &broadcast::Sender<SyncMsg>,
     state: &ServerState,
 ) -> std::io::Result<()> {
     // 0. Send auth password if configured
@@ -871,12 +872,17 @@ async fn sync_from_primary(
                     other => other,
                 };
                 if let Ok(cmd) = Command::from_value(normalised) {
+                    let keys = primary_keys(&cmd);
                     store.execute(cmd);
                     // Relay the applied write so this replica's own WebSocket
                     // clients see it, and any sub-replicas / AOF get it too
                     // (enables multi-tier replication and replica WS push).
                     let frame = String::from_utf8_lossy(&cmd_bytes).into_owned();
-                    let _ = tx.send((0, frame.clone()));
+                    let _ = tx.send(Arc::new(SyncPush {
+                        origin: 0,
+                        keys,
+                        resp: frame.clone(),
+                    }));
                     state.on_write(&frame).await;
                 }
             }
@@ -896,6 +902,264 @@ fn ct_eq_bytes(a: &[u8], b: &[u8]) -> bool {
         .zip(b.iter())
         .fold(0u8, |acc, (x, y)| acc | (x ^ y))
         == 0
+}
+
+// ── sync scoping ─────────────────────────────────────────────────────────────
+
+/// One mutation pushed towards WebSocket peers: the RESP push frame plus the
+/// keys it touches, so each connection can filter against its sync scopes
+/// without re-parsing the frame. Wrapped in `Arc` — the broadcast channel
+/// clones the payload once per receiver, so a clone is a refcount bump.
+struct SyncPush {
+    origin: u64,
+    keys: Vec<String>,
+    resp: String,
+}
+
+type SyncMsg = Arc<SyncPush>;
+
+/// True when a mutation touching `keys` is visible to a connection whose sync
+/// scopes are `scopes`. A mutation with no keys (FLUSHDB) affects every scope.
+fn scopes_match(scopes: &[String], keys: &[String]) -> bool {
+    keys.is_empty()
+        || keys
+            .iter()
+            .any(|k| scopes.iter().any(|p| core_engine::store::glob_match(p, k)))
+}
+
+/// Verify a signed sync-scope token and return the granted patterns.
+///
+/// Token format: `base64url(payload) "." base64url(hmac_sha256(secret, base64url(payload)))`
+/// where payload is comma-separated glob patterns with an optional
+/// `|<unix_expiry_secs>` suffix. The HMAC is computed over the *encoded*
+/// payload string, so minting in JS is one `createHmac` call on the base64url
+/// text — no byte-level canonicalisation questions.
+fn verify_sync_token(secret: &str, token: &str) -> Result<Vec<String>, &'static str> {
+    use base64::Engine as _;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let (payload_b64, sig_b64) = token.split_once('.').ok_or("malformed token")?;
+    let sig = engine.decode(sig_b64).map_err(|_| "malformed signature")?;
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(payload_b64.as_bytes());
+    if !ct_eq_bytes(&sig, &mac.finalize().into_bytes()) {
+        return Err("invalid signature");
+    }
+    let payload_bytes = engine
+        .decode(payload_b64)
+        .map_err(|_| "malformed payload")?;
+    let payload = String::from_utf8(payload_bytes).map_err(|_| "malformed payload")?;
+    let (patterns_str, expiry) = match payload.split_once('|') {
+        Some((p, e)) => (p, Some(e)),
+        None => (payload.as_str(), None),
+    };
+    if let Some(e) = expiry {
+        let exp: u64 = e.parse().map_err(|_| "malformed expiry")?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if now >= exp {
+            return Err("token expired");
+        }
+    }
+    let patterns: Vec<String> = patterns_str
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    if patterns.is_empty() {
+        return Err("token grants no patterns");
+    }
+    Ok(patterns)
+}
+
+/// What a command touches, for scope enforcement on token-scoped WebSocket
+/// connections.
+enum CommandScope {
+    /// No key access (PING, AUTH, MULTI, SYNC, pub/sub) — always allowed.
+    KeyLess,
+    /// Touches exactly these keys — every one must match a scope pattern.
+    Keys(Vec<String>),
+    /// Keyspace-wide or administrative — denied on scoped connections.
+    Admin,
+}
+
+fn command_scope(cmd: &Command) -> CommandScope {
+    match cmd {
+        Command::Ping(_)
+        | Command::Auth(_)
+        | Command::Multi
+        | Command::Exec
+        | Command::Discard
+        | Command::Subscribe(_)
+        | Command::Unsubscribe(_)
+        | Command::PSubscribe(_)
+        | Command::PUnsubscribe(_)
+        | Command::Publish(_, _)
+        | Command::Sync(_)
+        | Command::Unknown(_) => CommandScope::KeyLess,
+
+        Command::Keys(_)
+        | Command::Scan(_, _, _)
+        | Command::DbSize
+        | Command::FlushDb
+        | Command::Save
+        | Command::BgSave
+        | Command::LastSave
+        | Command::ReplicaOfNoOne => CommandScope::Admin,
+
+        Command::Set(k, _, _)
+        | Command::Get(k)
+        | Command::Append(k, _)
+        | Command::Strlen(k)
+        | Command::GetSet(k, _)
+        | Command::SetNx(k, _)
+        | Command::SetEx(k, _, _)
+        | Command::PSetEx(k, _, _)
+        | Command::Incr(k)
+        | Command::Decr(k)
+        | Command::IncrBy(k, _)
+        | Command::DecrBy(k, _)
+        | Command::Expire(k, _)
+        | Command::PExpire(k, _)
+        | Command::ExpireAt(k, _)
+        | Command::PExpireAt(k, _)
+        | Command::Ttl(k)
+        | Command::PTtl(k)
+        | Command::Persist(k)
+        | Command::Type(k)
+        | Command::HSet(k, _)
+        | Command::HGet(k, _)
+        | Command::HGetAll(k)
+        | Command::HDel(k, _)
+        | Command::HKeys(k)
+        | Command::HVals(k)
+        | Command::HLen(k)
+        | Command::HIncrBy(k, _, _)
+        | Command::HIncrByFloat(k, _, _)
+        | Command::HExists(k, _)
+        | Command::HSetNx(k, _, _)
+        | Command::HMGet(k, _)
+        | Command::LPush(k, _)
+        | Command::RPush(k, _)
+        | Command::LPushX(k, _)
+        | Command::RPushX(k, _)
+        | Command::LPop(k, _)
+        | Command::RPop(k, _)
+        | Command::LRange(k, _, _)
+        | Command::LLen(k)
+        | Command::LIndex(k, _)
+        | Command::LSet(k, _, _)
+        | Command::LRem(k, _, _)
+        | Command::LTrim(k, _, _)
+        | Command::SAdd(k, _)
+        | Command::SMembers(k)
+        | Command::SRem(k, _)
+        | Command::SCard(k)
+        | Command::SIsMember(k, _)
+        | Command::SMIsMember(k, _)
+        | Command::SPop(k, _)
+        | Command::SRandMember(k, _)
+        | Command::ZAdd(k, _, _)
+        | Command::ZRange(k, _, _, _)
+        | Command::ZRevRange(k, _, _, _)
+        | Command::ZRangeByScore(k, _, _, _, _)
+        | Command::ZRevRangeByScore(k, _, _, _, _)
+        | Command::ZScore(k, _)
+        | Command::ZMScore(k, _)
+        | Command::ZRank(k, _)
+        | Command::ZRevRank(k, _)
+        | Command::ZRem(k, _)
+        | Command::ZCard(k)
+        | Command::ZIncrBy(k, _, _)
+        | Command::ZCount(k, _, _)
+        | Command::RlSet(k, _, _)
+        | Command::RlCheck(k, _) => CommandScope::Keys(vec![k.clone()]),
+
+        Command::Del(keys)
+        | Command::Unlink(keys)
+        | Command::MGet(keys)
+        | Command::Exists(keys)
+        | Command::SInter(keys)
+        | Command::SUnion(keys)
+        | Command::SDiff(keys)
+        | Command::Watch(keys)
+        | Command::Unwatch(keys) => CommandScope::Keys(keys.clone()),
+
+        Command::MSet(pairs) => CommandScope::Keys(pairs.iter().map(|(k, _)| k.clone()).collect()),
+        Command::Rename(src, dst) | Command::SMove(src, dst, _) => {
+            CommandScope::Keys(vec![src.clone(), dst.clone()])
+        }
+        Command::SInterStore(dst, keys)
+        | Command::SUnionStore(dst, keys)
+        | Command::SDiffStore(dst, keys) => {
+            let mut all = keys.clone();
+            all.push(dst.clone());
+            CommandScope::Keys(all)
+        }
+    }
+}
+
+/// Handle the SYNC command for one WebSocket connection, returning the RESP
+/// reply. Forms:
+///   `SYNC`                 — list this connection's current scopes
+///   `SYNC TOKEN <token>`   — set scopes from a signed token (requires
+///                            `RECACHED_SYNC_SECRET` on the server)
+///   `SYNC <pattern> [...]` — set scopes directly (only allowed when no
+///                            secret is configured — a bandwidth filter, not
+///                            an authorization boundary)
+fn handle_sync_command(
+    args: &[String],
+    secret: Option<&str>,
+    scopes: &mut Option<Vec<String>>,
+    conn_id: u64,
+) -> Vec<u8> {
+    fn patterns_reply(patterns: &[String]) -> Vec<u8> {
+        Value::Array(Some(
+            patterns
+                .iter()
+                .map(|p| Value::BulkString(Some(p.clone().into_bytes())))
+                .collect(),
+        ))
+        .serialize()
+    }
+    match args {
+        [] => patterns_reply(scopes.as_deref().unwrap_or(&[])),
+        [kw, token] if kw.eq_ignore_ascii_case("token") => {
+            let Some(secret) = secret else {
+                return b"-ERR SYNC TOKEN requires RECACHED_SYNC_SECRET to be configured on the server\r\n"
+                    .to_vec();
+            };
+            match verify_sync_token(secret, token) {
+                Ok(patterns) => {
+                    info!("WS conn {} scoped via token: {:?}", conn_id, patterns);
+                    let reply = patterns_reply(&patterns);
+                    *scopes = Some(patterns);
+                    reply
+                }
+                Err(e) => Value::Error(format!("ERR invalid sync token: {}", e)).serialize(),
+            }
+        }
+        patterns => {
+            if secret.is_some() {
+                return b"-ERR this server requires signed scopes: use SYNC TOKEN <token>\r\n"
+                    .to_vec();
+            }
+            let pats: Vec<String> = patterns.iter().filter(|p| !p.is_empty()).cloned().collect();
+            if pats.is_empty() {
+                return b"-ERR SYNC requires at least one pattern\r\n".to_vec();
+            }
+            info!("WS conn {} sync scopes set: {:?}", conn_id, pats);
+            let reply = patterns_reply(&pats);
+            *scopes = Some(pats);
+            reply
+        }
+    }
 }
 
 // ── connection identity ──────────────────────────────────────────────────────
@@ -1149,7 +1413,7 @@ async fn notify_watchers(registry: &WatchRegistry, cmd: &Command, store: &KeyVal
 async fn apply_write_effects(
     cmd: &Command,
     response: &Value,
-    tx: &broadcast::Sender<(u64, String)>,
+    tx: &broadcast::Sender<SyncMsg>,
     origin: u64,
     state: &ServerState,
     watch_registry: &WatchRegistry,
@@ -1171,7 +1435,11 @@ async fn apply_write_effects(
         notify_watchers(watch_registry, cmd, store).await;
     }
     if has_ws {
-        let _ = tx.send((origin, msg));
+        let _ = tx.send(Arc::new(SyncPush {
+            origin,
+            keys: primary_keys(cmd),
+            resp: msg,
+        }));
     }
 }
 
@@ -1702,6 +1970,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!("Authentication DISABLED. Set RECACHED_PASSWORD to enable.");
     }
 
+    // ── sync scoping ──────────────────────────────────────────────────────
+    let sync_secret: Arc<Option<String>> = Arc::new(
+        std::env::var("RECACHED_SYNC_SECRET")
+            .ok()
+            .filter(|s| !s.is_empty()),
+    );
+    if sync_secret.is_some() {
+        info!(
+            "Sync scoping ENABLED (strict): WebSocket clients receive no pushes and no key access until they present 'SYNC TOKEN <token>'."
+        );
+    } else {
+        warn!(
+            "Sync scoping DISABLED: every WebSocket client receives every mutation. Set RECACHED_SYNC_SECRET before exposing port 6380 to untrusted clients."
+        );
+    }
+
     // ── IP allowlist ──────────────────────────────────────────────────────
     let allowed_ips: Option<Arc<Vec<IpAddr>>> = std::env::var("RECACHED_ALLOW_IPS").ok().map(|s| {
         let ips: Vec<IpAddr> = s
@@ -1909,7 +2193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Carries (sender_conn_id, resp_encoded_mutation). WS receivers skip their
     // own messages. Created before replication so a replica can push the writes
     // it receives from the primary to its own local WebSocket clients.
-    let (tx, _rx) = broadcast::channel::<(u64, String)>(BROADCAST_CHANNEL_CAPACITY);
+    let (tx, _rx) = broadcast::channel::<SyncMsg>(BROADCAST_CHANNEL_CAPACITY);
 
     // ── start replication ─────────────────────────────────────────────────
     // The replication server runs on every node — including replicas — so a
@@ -2106,16 +2390,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let wr = Arc::clone(&watch_registry);
                         let tls = Arc::clone(&tls_acceptor);
                         let sc = Arc::clone(&state);
+                        let ss = Arc::clone(&sync_secret);
                         let id = next_conn_id();
                         tokio::spawn(async move {
                             let _permit = permit;
                             if let Some(acc) = tls.as_ref() {
                                 match acc.accept(socket).await {
-                                    Ok(tls_stream) => handle_ws(tls_stream, s, t, p, id, ps, wr, sc).await,
+                                    Ok(tls_stream) => handle_ws(tls_stream, s, t, p, id, ps, wr, sc, ss).await,
                                     Err(e) => warn!("WS TLS handshake failed from {}: {}", addr, e),
                                 }
                             } else {
-                                handle_ws(socket, s, t, p, id, ps, wr, sc).await;
+                                handle_ws(socket, s, t, p, id, ps, wr, sc, ss).await;
                             }
                         });
                     }
@@ -2140,7 +2425,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn handle_tcp<S>(
     socket: S,
     store: Arc<KeyValueStore>,
-    tx: broadcast::Sender<(u64, String)>,
+    tx: broadcast::Sender<SyncMsg>,
     password: Arc<Option<String>>,
     pubsub: SharedPubSub,
     watch_registry: WatchRegistry,
@@ -2523,12 +2808,13 @@ async fn handle_tcp<S>(
 async fn handle_ws<S>(
     socket: S,
     store: Arc<KeyValueStore>,
-    tx: broadcast::Sender<(u64, String)>,
+    tx: broadcast::Sender<SyncMsg>,
     password: Arc<Option<String>>,
     conn_id: u64,
     pubsub: SharedPubSub,
     watch_registry: WatchRegistry,
     state: Arc<ServerState>,
+    sync_secret: Arc<Option<String>>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -2553,6 +2839,12 @@ async fn handle_ws<S>(
     // Set when any watched key changes; EXEC aborts (returns nil) if true.
     let mut watch_dirty = false;
     let (watch_tx, mut watch_rx) = mpsc::unbounded_channel::<WatchNotif>();
+    // Sync scopes for this connection. `strict` (RECACHED_SYNC_SECRET set)
+    // means: no pushes and no key commands until a signed token is presented.
+    // Without a secret, scopes are an opt-in bandwidth filter (legacy fan-out
+    // of everything when None).
+    let strict = sync_secret.is_some();
+    let mut sync_scopes: Option<Vec<String>> = None;
 
     // NOTE: the WebSocket transport uses *text* frames, so values must be valid
     // UTF-8. Non-UTF-8 bytes are replaced (lossy) on the way out. This is safe
@@ -2606,6 +2898,43 @@ async fn handle_ws<S>(
                             let resp = Value::Error("NOAUTH Authentication required.".to_string()).serialize();
                             ws_send!(&resp);
                             continue;
+                        }
+
+                        // ── Sync scoping ──────────────────────────────────────
+                        if let Command::Sync(ref args) = cmd {
+                            let resp = handle_sync_command(args, (*sync_secret).as_deref(), &mut sync_scopes, conn_id);
+                            ws_send!(&resp);
+                            continue;
+                        }
+                        // Token-scoped mode: check every command against this
+                        // connection's granted scopes before it runs (including
+                        // commands about to be queued inside MULTI).
+                        if strict {
+                            match command_scope(&cmd) {
+                                CommandScope::KeyLess => {}
+                                CommandScope::Admin => {
+                                    ws_send!(b"-NOSCOPE keyspace-wide and administrative commands are not available on scoped WebSocket connections\r\n");
+                                    continue;
+                                }
+                                CommandScope::Keys(keys) => {
+                                    let Some(ref scopes) = sync_scopes else {
+                                        ws_send!(b"-NOSCOPE send SYNC TOKEN <token> before issuing commands\r\n");
+                                        continue;
+                                    };
+                                    if let Some(denied) = keys
+                                        .iter()
+                                        .find(|k| !scopes_match(scopes, std::slice::from_ref(k)))
+                                    {
+                                        let err = Value::Error(format!(
+                                            "NOSCOPE key '{}' is outside this connection's sync scopes",
+                                            denied
+                                        ))
+                                        .serialize();
+                                        ws_send!(&err);
+                                        continue;
+                                    }
+                                }
+                            }
                         }
 
                         // ── Transactions ──────────────────────────────────────
@@ -2863,8 +3192,18 @@ async fn handle_ws<S>(
 
             result = rx.recv() => {
                 match result {
-                    Ok((sender_id, msg)) if sender_id != conn_id => {
-                        if ws_sender.send(Message::Text(msg.into())).await.is_err() {
+                    Ok(push) if push.origin != conn_id => {
+                        // Scope filter: with scopes set, only matching keys are
+                        // forwarded. Without scopes, legacy mode forwards
+                        // everything; strict mode forwards nothing until a
+                        // token has been presented.
+                        let visible = match &sync_scopes {
+                            Some(scopes) => scopes_match(scopes, &push.keys),
+                            None => !strict,
+                        };
+                        if visible
+                            && ws_sender.send(Message::Text(push.resp.clone().into())).await.is_err()
+                        {
                             break;
                         }
                     }
@@ -2962,7 +3301,7 @@ mod tests {
         start_as_replica: bool,
     ) -> TestServer {
         let store = Arc::new(KeyValueStore::new());
-        let (tx, _rx) = broadcast::channel::<(u64, String)>(256);
+        let (tx, _rx) = broadcast::channel::<SyncMsg>(256);
         let pubsub: SharedPubSub = Arc::new(tokio::sync::Mutex::new(PubSubHub::new()));
         let watch_registry: WatchRegistry = WatchHub::new();
         let semaphore = Arc::new(Semaphore::new(64));
@@ -3075,6 +3414,9 @@ mod tests {
     }
     fn int(n: i64) -> Value {
         Value::Integer(n)
+    }
+    fn arr(items: &[&str]) -> Value {
+        Value::Array(Some(items.iter().map(|s| bulk(s)).collect()))
     }
 
     // ── is_write_command ──────────────────────────────────────────────────────
@@ -3584,7 +3926,7 @@ mod tests {
         // Use a fresh primary state that shares our registry.
         let primary2 = {
             let store = Arc::clone(&primary.store);
-            let (tx, _rx) = broadcast::channel::<(u64, String)>(256);
+            let (tx, _rx) = broadcast::channel::<SyncMsg>(256);
             let pubsub: SharedPubSub = Arc::new(tokio::sync::Mutex::new(PubSubHub::new()));
             let wr: WatchRegistry = WatchHub::new();
             let sem = Arc::new(Semaphore::new(64));
@@ -3644,7 +3986,7 @@ mod tests {
         let rs = Arc::clone(&replica_store);
         let rst = Arc::clone(&replica_state);
         let repl_addr = format!("127.0.0.1:{repl_port}");
-        let rtx = broadcast::channel::<(u64, String)>(16).0;
+        let rtx = broadcast::channel::<SyncMsg>(16).0;
         tokio::spawn(async move {
             run_repl_client(repl_addr, rs, rst, None, None, rtx).await;
         });
@@ -3699,7 +4041,7 @@ mod tests {
     async fn integration_connection_limit() {
         // Small semaphore: only 3 concurrent connections
         let store = Arc::new(KeyValueStore::new());
-        let (tx, _rx) = broadcast::channel::<(u64, String)>(16);
+        let (tx, _rx) = broadcast::channel::<SyncMsg>(16);
         let pubsub: SharedPubSub = Arc::new(tokio::sync::Mutex::new(PubSubHub::new()));
         let watch_registry: WatchRegistry = WatchHub::new();
         let semaphore = Arc::new(Semaphore::new(3));
@@ -3835,7 +4177,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
         drop(listener);
-        let rtx = broadcast::channel::<(u64, String)>(16).0;
+        let rtx = broadcast::channel::<SyncMsg>(16).0;
         tokio::spawn(async move {
             run_repl_client(dead_addr, rs, rst, None, Some(1), rtx).await;
         });
@@ -3854,8 +4196,13 @@ mod tests {
     /// Spawn a WebSocket server sharing one store + watch registry across all
     /// connections, so WATCH notifications fan out between clients.
     async fn spawn_ws_server() -> TestServer {
+        spawn_ws_server_cfg(None).await
+    }
+
+    /// Like `spawn_ws_server`, with an optional sync-scope secret (strict mode).
+    async fn spawn_ws_server_cfg(sync_secret: Option<String>) -> TestServer {
         let store = Arc::new(KeyValueStore::new());
-        let (tx, _rx) = broadcast::channel::<(u64, String)>(256);
+        let (tx, _rx) = broadcast::channel::<SyncMsg>(256);
         let pubsub: SharedPubSub = Arc::new(tokio::sync::Mutex::new(PubSubHub::new()));
         let watch_registry: WatchRegistry = WatchHub::new();
         let snap_cfg = Arc::new(SnapshotConfig {
@@ -3873,22 +4220,24 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let store2 = Arc::clone(&store);
         let state2 = Arc::clone(&state);
+        let secret = Arc::new(sync_secret);
 
         let task = tokio::spawn(async move {
             loop {
                 let Ok((socket, _)) = listener.accept().await else {
                     return;
                 };
-                let (s, t, ps, wr, st) = (
+                let (s, t, ps, wr, st, ss) = (
                     Arc::clone(&store2),
                     tx.clone(),
                     Arc::clone(&pubsub),
                     Arc::clone(&watch_registry),
                     Arc::clone(&state2),
+                    Arc::clone(&secret),
                 );
                 let id = next_conn_id();
                 tokio::spawn(async move {
-                    handle_ws(socket, s, t, Arc::new(None), id, ps, wr, st).await;
+                    handle_ws(socket, s, t, Arc::new(None), id, ps, wr, st, ss).await;
                 });
             }
         });
@@ -3920,6 +4269,31 @@ mod tests {
             }
             self.ws.send(Message::Text(req.into())).await.unwrap();
             self.next_reply().await
+        }
+
+        /// Wait up to `ms` for the next RESP3 Push broadcast frame, returning
+        /// its raw text. `None` when nothing arrives in time.
+        async fn recv_push(&mut self, ms: u64) -> Option<String> {
+            let fut = async {
+                loop {
+                    match self.ws.next().await {
+                        Some(Ok(Message::Text(t))) => {
+                            let Ok((v, _)) = Value::parse(t.as_bytes()) else {
+                                continue;
+                            };
+                            if matches!(v, Value::Push(_)) {
+                                return Some(t.to_string());
+                            }
+                        }
+                        Some(Ok(_)) => continue,
+                        _ => return None,
+                    }
+                }
+            };
+            tokio::time::timeout(tokio::time::Duration::from_millis(ms), fut)
+                .await
+                .ok()
+                .flatten()
         }
 
         /// Read the next *command reply*, skipping server-initiated frames
@@ -4041,5 +4415,180 @@ mod tests {
         assert_eq!(c.cmd(&["MULTI"]).await, ok());
         // WATCH is not allowed once a transaction has started.
         assert!(matches!(c.cmd(&["WATCH", "k"]).await, Value::Error(_)));
+    }
+
+    // ── Sync scoping ──────────────────────────────────────────────────────────
+
+    /// Mint a sync-scope token the way an application backend would:
+    /// HMAC-SHA256 over the base64url payload text.
+    fn mint_sync_token(secret: &str, payload: &str) -> String {
+        use base64::Engine as _;
+        use hmac::{Hmac, Mac};
+        let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let payload_b64 = engine.encode(payload);
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(payload_b64.as_bytes());
+        let sig = engine.encode(mac.finalize().into_bytes());
+        format!("{payload_b64}.{sig}")
+    }
+
+    #[test]
+    fn sync_token_roundtrip_and_rejections() {
+        let tok = mint_sync_token("s3cret", "cart:42:*,profile:42");
+        assert_eq!(
+            verify_sync_token("s3cret", &tok).unwrap(),
+            vec!["cart:42:*".to_string(), "profile:42".to_string()]
+        );
+        // Wrong secret → invalid signature.
+        assert_eq!(
+            verify_sync_token("other", &tok).unwrap_err(),
+            "invalid signature"
+        );
+        // Tampered payload → invalid signature.
+        let (_, sig) = tok.split_once('.').unwrap();
+        use base64::Engine as _;
+        let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let forged = format!("{}.{}", engine.encode("admin:*"), sig);
+        assert_eq!(
+            verify_sync_token("s3cret", &forged).unwrap_err(),
+            "invalid signature"
+        );
+        // Expired token.
+        let expired = mint_sync_token("s3cret", "cart:*|1");
+        assert_eq!(
+            verify_sync_token("s3cret", &expired).unwrap_err(),
+            "token expired"
+        );
+        // Future expiry still valid.
+        let live = mint_sync_token("s3cret", "cart:*|99999999999");
+        assert!(verify_sync_token("s3cret", &live).is_ok());
+        // Empty patterns / malformed.
+        let empty = mint_sync_token("s3cret", "");
+        assert_eq!(
+            verify_sync_token("s3cret", &empty).unwrap_err(),
+            "token grants no patterns"
+        );
+        assert!(verify_sync_token("s3cret", "no-dot-here").is_err());
+    }
+
+    #[test]
+    fn scopes_match_globs_and_flushdb() {
+        let scopes = vec!["cart:42:*".to_string(), "catalog:*".to_string()];
+        assert!(scopes_match(&scopes, &["cart:42:item:1".to_string()]));
+        assert!(scopes_match(&scopes, &["catalog:books".to_string()]));
+        assert!(!scopes_match(&scopes, &["cart:7:item:1".to_string()]));
+        assert!(!scopes_match(&scopes, &["session:42".to_string()]));
+        // Multi-key: any matching key makes the push visible.
+        assert!(scopes_match(
+            &scopes,
+            &["session:42".to_string(), "catalog:books".to_string()]
+        ));
+        // No keys = FLUSHDB — visible to every scope.
+        assert!(scopes_match(&scopes, &[]));
+    }
+
+    #[test]
+    fn command_scope_classification() {
+        assert!(matches!(
+            command_scope(&Command::Ping(None)),
+            CommandScope::KeyLess
+        ));
+        assert!(matches!(
+            command_scope(&Command::Keys("*".into())),
+            CommandScope::Admin
+        ));
+        assert!(matches!(
+            command_scope(&Command::FlushDb),
+            CommandScope::Admin
+        ));
+        match command_scope(&Command::Get("a".into())) {
+            CommandScope::Keys(k) => assert_eq!(k, vec!["a".to_string()]),
+            _ => panic!("GET should be key-scoped"),
+        }
+        match command_scope(&Command::SInterStore(
+            "dst".into(),
+            vec!["a".into(), "b".into()],
+        )) {
+            CommandScope::Keys(k) => {
+                assert!(k.contains(&"dst".to_string()) && k.contains(&"a".to_string()))
+            }
+            _ => panic!("SINTERSTORE should be key-scoped"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn integration_ws_sync_scope_filters_fanout() {
+        let srv = spawn_ws_server().await;
+        let mut scoped = WsClient::connect(srv.tcp_addr).await;
+        let mut unscoped = WsClient::connect(srv.tcp_addr).await;
+        let mut writer = WsClient::connect(srv.tcp_addr).await;
+
+        // Open mode: SYNC with literal patterns.
+        assert_eq!(scoped.cmd(&["SYNC", "cart:*"]).await, arr(&["cart:*"]));
+
+        assert_eq!(writer.cmd(&["SET", "cart:1", "x"]).await, ok());
+        assert_eq!(writer.cmd(&["SET", "other:1", "y"]).await, ok());
+
+        // Scoped client sees the cart write and nothing else.
+        let push = scoped.recv_push(1000).await.expect("expected cart:1 push");
+        assert!(push.contains("cart:1"), "unexpected push: {push}");
+        assert!(
+            scoped.recv_push(300).await.is_none(),
+            "out-of-scope push leaked to scoped client"
+        );
+
+        // Unscoped client (legacy mode) sees both.
+        let p1 = unscoped.recv_push(1000).await.expect("push 1");
+        let p2 = unscoped.recv_push(1000).await.expect("push 2");
+        assert!(p1.contains("cart:1") && p2.contains("other:1"));
+
+        // Bare SYNC reports current scopes.
+        assert_eq!(scoped.cmd(&["SYNC"]).await, arr(&["cart:*"]));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn integration_ws_sync_strict_mode_gates_and_filters() {
+        let secret = "integration-secret";
+        let srv = spawn_ws_server_cfg(Some(secret.to_string())).await;
+        let mut client = WsClient::connect(srv.tcp_addr).await;
+
+        // No token yet: key commands and pushes are refused.
+        let r = client.cmd(&["GET", "cart:1"]).await;
+        assert!(matches!(&r, Value::Error(e) if e.contains("NOSCOPE")));
+        // Literal patterns are rejected in strict mode.
+        let r = client.cmd(&["SYNC", "cart:*"]).await;
+        assert!(matches!(&r, Value::Error(e) if e.contains("signed scopes")));
+        // Garbage token.
+        let r = client.cmd(&["SYNC", "TOKEN", "not-a-token"]).await;
+        assert!(matches!(&r, Value::Error(e) if e.contains("invalid sync token")));
+
+        // Valid token: scoped to cart:* only.
+        let tok = mint_sync_token(secret, "cart:*");
+        assert_eq!(client.cmd(&["SYNC", "TOKEN", &tok]).await, arr(&["cart:*"]));
+
+        // In-scope commands work; out-of-scope and admin are refused.
+        assert_eq!(client.cmd(&["SET", "cart:1", "x"]).await, ok());
+        assert_eq!(client.cmd(&["GET", "cart:1"]).await, bulk("x"));
+        let r = client.cmd(&["GET", "secret-key"]).await;
+        assert!(matches!(&r, Value::Error(e) if e.contains("NOSCOPE")));
+        let r = client.cmd(&["KEYS", "*"]).await;
+        assert!(matches!(&r, Value::Error(e) if e.contains("NOSCOPE")));
+
+        // Fan-out: a second scoped client writes in and out of the first's scope.
+        let mut writer = WsClient::connect(srv.tcp_addr).await;
+        let wtok = mint_sync_token(secret, "cart:*,other:*");
+        assert_eq!(
+            writer.cmd(&["SYNC", "TOKEN", &wtok]).await,
+            arr(&["cart:*", "other:*"])
+        );
+        assert_eq!(writer.cmd(&["SET", "cart:2", "a"]).await, ok());
+        assert_eq!(writer.cmd(&["SET", "other:2", "b"]).await, ok());
+
+        let push = client.recv_push(1000).await.expect("expected cart:2 push");
+        assert!(push.contains("cart:2"), "unexpected push: {push}");
+        assert!(
+            client.recv_push(300).await.is_none(),
+            "out-of-scope push leaked on strict connection"
+        );
     }
 }

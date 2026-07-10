@@ -41,6 +41,11 @@ rustls-pemfile               = "2"
 serde      = { version = "1", features = ["derive"] }
 rmp-serde  = "1"
 
+# sync-scope tokens
+hmac   = "0.12"
+sha2   = "0.10"
+base64 = "0.22"
+
 # wasm
 wasm-bindgen = "0.2.92"
 js-sys       = "0.3.69"
