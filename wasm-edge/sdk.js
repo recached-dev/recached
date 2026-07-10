@@ -181,6 +181,28 @@ export class Cache {
         const existed = this.raw.del(key) === 1;
         return existed;
     }
+    /**
+     * Increment an integer counter. Returns the new local value.
+     *
+     * Offline increments queue as *deltas* and merge additively with concurrent
+     * increments from other clients when the connection returns — nobody's
+     * counts are lost (PN-counter semantics). Throws if the key holds a
+     * non-integer value.
+     */
+    incr(key, by = 1) {
+        return this.raw.incr_by(key, by);
+    }
+    /** Decrement an integer counter. See {@link incr}. */
+    decr(key, by = 1) {
+        return this.raw.incr_by(key, -by);
+    }
+    /**
+     * Close the server connection and stop reconnecting. Local reads and writes
+     * keep working; writes queue and replay on the next connect.
+     */
+    disconnect() {
+        this.raw.disconnect();
+    }
     // ── JSON documents ────────────────────────────────────────────────────────
     /**
      * Set part of a JSON document. `path` addresses one location: `"$"` is the
@@ -392,6 +414,9 @@ export async function createCache(options = {}) {
         }
         else if (options.connect.syncScopes?.length) {
             raw.sync_scopes(options.connect.syncScopes.join(','));
+        }
+        if (options.connect.reconnect === false) {
+            raw.set_auto_reconnect(false);
         }
     }
     return new Cache(raw);

@@ -19,6 +19,15 @@ export interface ConnectOptions {
      * not an authorization boundary. Use `syncToken` for security.
      */
     syncScopes?: string[];
+    /**
+     * Automatically reconnect with exponential backoff (500 ms doubling to a
+     * 30 s cap) when the connection drops. On reconnect the session is
+     * re-established (AUTH, sync token, live queries) and writes queued while
+     * offline are replayed in order.
+     *
+     * @default true
+     */
+    reconnect?: boolean;
 }
 export interface CacheOptions {
     /**
@@ -54,6 +63,9 @@ interface RawCache {
     set_ex(key: string, value: string, seconds: number): string;
     get(key: string): string | undefined;
     del(key: string): number;
+    incr_by(key: string, delta: number): number;
+    disconnect(): void;
+    set_auto_reconnect(enabled: boolean): void;
     ttl(key: string): number;
     exists(key: string): boolean;
     publish(channel: string, message: string): void;
@@ -173,6 +185,22 @@ export declare class Cache {
      * Syncs to the server and other tabs when connected.
      */
     del(key: string): boolean;
+    /**
+     * Increment an integer counter. Returns the new local value.
+     *
+     * Offline increments queue as *deltas* and merge additively with concurrent
+     * increments from other clients when the connection returns — nobody's
+     * counts are lost (PN-counter semantics). Throws if the key holds a
+     * non-integer value.
+     */
+    incr(key: string, by?: number): number;
+    /** Decrement an integer counter. See {@link incr}. */
+    decr(key: string, by?: number): number;
+    /**
+     * Close the server connection and stop reconnecting. Local reads and writes
+     * keep working; writes queue and replay on the next connect.
+     */
+    disconnect(): void;
     /**
      * Set part of a JSON document. `path` addresses one location: `"$"` is the
      * whole document, `"$.user.name"` a nested field, `"$.items[2].qty"` an

@@ -29,12 +29,11 @@ Server write → diff over WebSocket → local WASM cache → component re-rende
 `JSET key path value`, `JGET key [path]`, `JMERGE key patch` — nested JSON stored as a native type, without RedisJSON. Path reads and partial updates never re-serialize the whole document, and only the change travels over the wire. `JMERGE` follows RFC 7386 (deep merge, `null` removes fields). The browser SDK mirrors all three (`jset`/`jget`/`jmerge`), so a merge from any client updates every connected browser's local document. See [Commands → JSON](/server/commands#json).
 
 
-## 5. Offline-first writes with merge semantics
+## 5. Offline-first writes with merge semantics ✅ shipped
 
-Browser clients already persist through IndexedDB and read locally. The missing piece is writing while offline: queue mutations locally, reconcile on reconnect.
+Browser clients queue writes as *operations* in a **durable outbox** while offline (IndexedDB-backed with persistence enabled, so they survive a full page reload), auto-reconnect with backoff, re-establish the session (auth, sync token, live queries — which re-hydrate local state), and replay the outbox. Writes are retired only on server acknowledgment (at-least-once delivery). Operation replay makes merges type-aware: `incr`/`decr` queue deltas that merge additively (PN-counter semantics), `jmerge` patches deep-merge, collection ops replay, and plain `set` is last-writer-wins by server arrival. See [Offline & Reconnection](/browser/offline).
 
-- Default policy: last-write-wins with server timestamps.
-- CRDT semantics where the data type makes them natural: `INCR`/`DECR` as a PN-counter (offline increments merge additively instead of clobbering), `SADD`/`SREM` as an observed-remove set.
+Follow-up (tracked, not yet built): exactly-once delivery via per-write deduplication ids — today a write whose acknowledgment is lost mid-disconnect can replay twice.
 
 ## 6. Mobile SDKs — React Native, Flutter, Kotlin, Swift
 

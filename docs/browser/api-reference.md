@@ -221,6 +221,27 @@ The callback receives no arguments — it signals that _something_ changed. Read
 
 ---
 
+### Counters & connection
+
+#### `incr(key, by?)` / `decr(key, by?)`
+
+Increment or decrement an integer counter. Returns the new local value; throws if the key holds a non-integer. Offline increments queue as **deltas** and merge additively with everyone else's on reconnect — see [Offline & Reconnection](/browser/offline).
+
+```typescript
+incr(key: string, by?: number): number
+decr(key: string, by?: number): number
+```
+
+#### `disconnect()`
+
+Close the server connection and stop auto-reconnecting. Local reads and writes keep working; writes queue and replay on the next `connect`. Reconnection behavior itself is automatic and configured via `createCache({ connect: { reconnect } })`.
+
+```typescript
+disconnect(): void
+```
+
+---
+
 ### JSON documents {#json-documents}
 
 Native JSON documents shared between server and browser. A `jset`/`jmerge` from any client — or `JSET`/`JMERGE` from the backend over TCP — updates every connected browser's local copy automatically.

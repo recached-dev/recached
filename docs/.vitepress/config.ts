@@ -66,6 +66,7 @@ export default defineConfig({
             { text: 'Getting Started', link: '/browser/getting-started' },
             { text: 'API Reference', link: '/browser/api-reference' },
             { text: 'Persistence', link: '/browser/persistence' },
+            { text: 'Offline & Reconnection', link: '/browser/offline' },
           ],
         },
       ],
