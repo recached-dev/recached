@@ -8,6 +8,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 core-engine.workspace    = true
+sync-client.workspace    = true
 wasm-bindgen.workspace   = true
 wasm-bindgen-futures     = "0.4"
 js-sys.workspace         = true

@@ -45,6 +45,6 @@
     "type": "git",
     "url": "https://github.com/thinkgrid-labs/recached"
   },
-  "homepage": "https://github.com/thinkgrid-labs/recached/tree/main/recached-react",
+  "homepage": "https://github.com/thinkgrid-labs/recached/tree/main/sdks/recached-react",
   "bugs": "https://github.com/thinkgrid-labs/recached/issues"
 }

@@ -86,13 +86,13 @@ jobs:
           npx tsc
 
       - name: Install @recached/react dependencies
-        run: cd recached-react && npm install --legacy-peer-deps
+        run: cd sdks/recached-react && npm install --legacy-peer-deps
 
       - name: Typecheck @recached/react
-        run: cd recached-react && npm run typecheck
+        run: cd sdks/recached-react && npm run typecheck
 
       - name: Install @recached/vue dependencies
-        run: cd recached-vue && npm install --legacy-peer-deps
+        run: cd sdks/recached-vue && npm install --legacy-peer-deps
 
       - name: Typecheck @recached/vue
-        run: cd recached-vue && npm run typecheck
+        run: cd sdks/recached-vue && npm run typecheck

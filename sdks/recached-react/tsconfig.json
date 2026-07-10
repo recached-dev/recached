@@ -13,7 +13,7 @@
     "skipLibCheck": true,
     "baseUrl": ".",
     "paths": {
-      "recached-edge": ["../wasm-edge/sdk.d.ts"]
+      "recached-edge": ["../../wasm-edge/sdk.d.ts"]
     }
   },
   "include": ["src"]

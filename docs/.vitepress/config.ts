@@ -56,6 +56,7 @@ export default defineConfig({
             { text: 'Configuration', link: '/server/configuration' },
             { text: 'Commands', link: '/server/commands' },
             { text: 'Sync Scopes', link: '/server/sync-scopes' },
+            { text: 'Wire Protocol', link: '/server/protocol' },
           ],
         },
       ],
