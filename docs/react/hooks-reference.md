@@ -190,6 +190,37 @@ cache.setJSON<CartItem[]>('cart', updatedItems, 3600)    // expires in 1 hour
 
 ---
 
+## `useKeys(pattern)`
+
+```ts
+function useKeys(pattern: string): Array<[key: string, value: string | null]>
+```
+
+Live query: reactively read **every key matching a glob pattern**. On mount, the server sends the current state of all matching keys (merged into the local WASM store), then streams every change to matching keys — including keys created after subscribing. The component re-renders on each change; reads never leave the browser.
+
+Pairs are sorted by key. Values are strings; keys holding collection types come back as `null` (read those with typed accessors). The server subscription is ref-counted per pattern and ends when the last component using it unmounts.
+
+Under [strict sync scoping](/server/sync-scopes), the pattern must sit inside the connection's granted scopes.
+
+### Example
+
+```tsx
+function CartList() {
+  const items = useKeys('cart:42:item:*')
+  return (
+    <ul>
+      {items.map(([key, qty]) => (
+        <li key={key}>
+          {key.split(':').pop()}: {qty}
+        </li>
+      ))}
+    </ul>
+  )
+}
+```
+
+Any write to a matching key — from this tab, another tab, the backend over TCP, or another user's browser — re-renders `CartList` with the new data. No fetching, no invalidation, no glue.
+
 ## Reactivity model
 
 Every mutation — regardless of source — fires the internal notification bus, which triggers all `useKey` and `useKeyJSON` subscribers to re-read their key and schedule a re-render if the value changed.

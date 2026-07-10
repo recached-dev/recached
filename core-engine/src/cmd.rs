@@ -136,6 +136,21 @@ pub enum Command {
     ZCard(String),
     ZIncrBy(String, f64, String),
     ZCount(String, String, String),
+    // ── JSON ──────────────────────────────────────────────────────────────────
+    /// JSET key path value — set JSON at a path (`$` = whole document).
+    JSet(String, String, String),
+    /// JGET key [path] — read JSON at a path, serialized. Defaults to `$`.
+    JGet(String, Option<String>),
+    /// JMERGE key patch — RFC 7386 JSON Merge Patch against the whole document.
+    JMerge(String, String),
+    // ── Rate limiting ─────────────────────────────────────────────────────────
+    /// RLSET key limit window_secs — configure a sliding-window rate limiter.
+    RlSet(String, u64, u64),
+    /// RLCHECK key [limit window_secs] — record an attempt and report
+    /// [allowed, remaining, retry_after_ms]. The optional limit/window pair
+    /// configures the limiter on first use (upsert), for per-IP/per-user keys
+    /// where a separate RLSET round-trip per key is impractical.
+    RlCheck(String, Option<(u64, u64)>),
     // ── Transactions ─────────────────────────────────────────────────────────
     Multi,
     Exec,
@@ -149,6 +164,19 @@ pub enum Command {
     // ── Observable keys ───────────────────────────────────────────────────────
     Watch(Vec<String>),
     Unwatch(Vec<String>),
+    // ── Sync scoping (WebSocket only) ──────────────────────────────────────────
+    /// SYNC [TOKEN token | pattern ...] — set this connection's sync scopes.
+    /// Interpretation of the arguments (token verification, pattern grants)
+    /// happens in the server layer; the store never sees this command.
+    Sync(Vec<String>),
+    // ── Live queries (WebSocket only) ──────────────────────────────────────────
+    /// QSUB pattern — subscribe to a live query: the reply carries the current
+    /// state of every key matching the glob pattern, and subsequent mutations
+    /// to matching keys arrive as `keychange` pushes. Server-layer only.
+    QSub(String),
+    /// QUNSUB [pattern] — drop one live query, or all of them without an
+    /// argument. Server-layer only.
+    QUnsub(Option<String>),
     // ── Persistence ───────────────────────────────────────────────────────────
     Save,
     BgSave,
@@ -493,6 +521,79 @@ impl Command {
                     "TYPE" => {
                         need!(2);
                         Ok(Command::Type(extract_string(&arr[1]).unwrap_or_default()))
+                    }
+
+                    // ── Sync scoping ───────────────────────────────────────────
+                    "SYNC" => Ok(Command::Sync(
+                        arr[1..]
+                            .iter()
+                            .map(|v| extract_string(v).unwrap_or_default())
+                            .collect(),
+                    )),
+
+                    // ── Live queries ───────────────────────────────────────────
+                    "QSUB" => {
+                        need!(2);
+                        let pattern = extract_string(&arr[1]).unwrap_or_default();
+                        if pattern.is_empty() {
+                            return Err("ERR QSUB requires a non-empty pattern".to_string());
+                        }
+                        Ok(Command::QSub(pattern))
+                    }
+                    "QUNSUB" => {
+                        let pattern = if arr.len() > 1 {
+                            Some(extract_string(&arr[1]).unwrap_or_default())
+                        } else {
+                            None
+                        };
+                        Ok(Command::QUnsub(pattern))
+                    }
+
+                    // ── JSON ───────────────────────────────────────────────────
+                    "JSET" => {
+                        need!(4);
+                        Ok(Command::JSet(
+                            extract_key(&arr[1])?,
+                            extract_string(&arr[2]).unwrap_or_default(),
+                            extract_string(&arr[3]).unwrap_or_default(),
+                        ))
+                    }
+                    "JGET" => {
+                        need!(2);
+                        let path = if arr.len() > 2 {
+                            Some(extract_string(&arr[2]).unwrap_or_default())
+                        } else {
+                            None
+                        };
+                        Ok(Command::JGet(extract_key(&arr[1])?, path))
+                    }
+                    "JMERGE" => {
+                        need!(3);
+                        Ok(Command::JMerge(
+                            extract_key(&arr[1])?,
+                            extract_string(&arr[2]).unwrap_or_default(),
+                        ))
+                    }
+
+                    // ── Rate limiting ──────────────────────────────────────────
+                    "RLSET" => {
+                        need!(4);
+                        let key = extract_key(&arr[1])?;
+                        let (limit, window) = parse_rl_config(&arr[2], &arr[3], "rlset")?;
+                        Ok(Command::RlSet(key, limit, window))
+                    }
+                    "RLCHECK" => {
+                        need!(2);
+                        let key = extract_key(&arr[1])?;
+                        let config = match arr.len() {
+                            2 => None,
+                            4 => Some(parse_rl_config(&arr[2], &arr[3], "rlcheck")?),
+                            _ => {
+                                return Err("ERR wrong number of arguments for 'rlcheck' command"
+                                    .to_string());
+                            }
+                        };
+                        Ok(Command::RlCheck(key, config))
                     }
 
                     // ── Hash ───────────────────────────────────────────────────
@@ -1026,6 +1127,19 @@ fn validate_key(key: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Parse and validate the `limit window_secs` pair shared by RLSET and RLCHECK.
+fn parse_rl_config(limit: &Value, window: &Value, cmd: &str) -> Result<(u64, u64), String> {
+    let limit = extract_int(limit)?;
+    let window = extract_int(window)?;
+    if limit <= 0 {
+        return Err(format!("ERR limit must be >= 1 in '{}' command", cmd));
+    }
+    if window <= 0 {
+        return Err(format!("ERR window must be >= 1 in '{}' command", cmd));
+    }
+    Ok((limit as u64, window as u64))
 }
 
 fn extract_key(val: &Value) -> Result<String, String> {
@@ -1766,6 +1880,45 @@ mod tests {
             Command::from_value(array(&["ZCOUNT", "z", "-inf", "+inf"])).unwrap(),
             Command::ZCount("z".into(), "-inf".into(), "+inf".into())
         );
+    }
+
+    // ── Rate limiting ───────────────────────────────────────────────────────
+
+    #[test]
+    fn rlset_parse() {
+        assert_eq!(
+            Command::from_value(array(&["RLSET", "api", "100", "60"])).unwrap(),
+            Command::RlSet("api".into(), 100, 60)
+        );
+    }
+
+    #[test]
+    fn rlset_rejects_non_positive_config() {
+        assert!(Command::from_value(array(&["RLSET", "api", "0", "60"])).is_err());
+        assert!(Command::from_value(array(&["RLSET", "api", "10", "0"])).is_err());
+        assert!(Command::from_value(array(&["RLSET", "api", "-1", "60"])).is_err());
+    }
+
+    #[test]
+    fn rlcheck_bare_parse() {
+        assert_eq!(
+            Command::from_value(array(&["RLCHECK", "api"])).unwrap(),
+            Command::RlCheck("api".into(), None)
+        );
+    }
+
+    #[test]
+    fn rlcheck_inline_config_parse() {
+        assert_eq!(
+            Command::from_value(array(&["RLCHECK", "ip:1.2.3.4", "5", "60"])).unwrap(),
+            Command::RlCheck("ip:1.2.3.4".into(), Some((5, 60)))
+        );
+    }
+
+    #[test]
+    fn rlcheck_partial_config_errors() {
+        assert!(Command::from_value(array(&["RLCHECK", "api", "5"])).is_err());
+        assert!(Command::from_value(array(&["RLCHECK"])).is_err());
     }
 
     // ── Persistence ───────────────────────────────────────────────────────────

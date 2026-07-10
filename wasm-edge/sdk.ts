@@ -8,6 +8,28 @@ export interface ConnectOptions {
    * Sent immediately after the socket opens via `AUTH`.
    */
   password?: string;
+  /**
+   * Signed sync-scope token, minted by your application backend. Required when
+   * the server has `RECACHED_SYNC_SECRET` set (strict mode): without it the
+   * connection receives no pushes and may run no key commands.
+   * Sent after `AUTH` via `SYNC TOKEN`.
+   */
+  syncToken?: string;
+  /**
+   * Glob patterns to scope this connection's sync to, e.g. `['cart:*']`.
+   * Only honoured by servers *without* a sync secret — a bandwidth filter,
+   * not an authorization boundary. Use `syncToken` for security.
+   */
+  syncScopes?: string[];
+  /**
+   * Automatically reconnect with exponential backoff (500 ms doubling to a
+   * 30 s cap) when the connection drops. On reconnect the session is
+   * re-established (AUTH, sync token, live queries) and writes queued while
+   * offline are replayed in order.
+   *
+   * @default true
+   */
+  reconnect?: boolean;
 }
 
 export interface CacheOptions {
@@ -48,11 +70,22 @@ interface RawCache {
   set_ex(key: string, value: string, seconds: number): string;
   get(key: string): string | undefined;
   del(key: string): number;
+  incr_by(key: string, delta: number): number;
+  disconnect(): void;
+  set_auto_reconnect(enabled: boolean): void;
   ttl(key: string): number;
   exists(key: string): boolean;
   publish(channel: string, message: string): void;
   subscribe(channel: string): void;
   unsubscribe(channel: string): void;
+  jset(key: string, path: string, value: string): string;
+  jget(key: string, path?: string): string | undefined;
+  jmerge(key: string, patch: string): string;
+  sync_token(token: string): void;
+  sync_scopes(patterns_csv: string): void;
+  live_query(pattern: string): void;
+  live_unquery(pattern?: string): void;
+  get_matching(pattern: string): Array<[string, string | null]>;
   set_mutation_callback(cb: () => void): void;
   set_message_callback(cb: (channel: string, message: string) => void): void;
   free(): void;
@@ -256,6 +289,85 @@ export class Cache {
     return existed;
   }
 
+  /**
+   * Increment an integer counter. Returns the new local value.
+   *
+   * Offline increments queue as *deltas* and merge additively with concurrent
+   * increments from other clients when the connection returns — nobody's
+   * counts are lost (PN-counter semantics). Throws if the key holds a
+   * non-integer value.
+   */
+  incr(key: string, by = 1): number {
+    return this.raw.incr_by(key, by);
+  }
+
+  /** Decrement an integer counter. See {@link incr}. */
+  decr(key: string, by = 1): number {
+    return this.raw.incr_by(key, -by);
+  }
+
+  /**
+   * Close the server connection and stop reconnecting. Local reads and writes
+   * keep working; writes queue and replay on the next connect.
+   */
+  disconnect(): void {
+    this.raw.disconnect();
+  }
+
+  // ── JSON documents ────────────────────────────────────────────────────────
+
+  /**
+   * Set part of a JSON document. `path` addresses one location: `"$"` is the
+   * whole document, `"$.user.name"` a nested field, `"$.items[2].qty"` an
+   * array element. Intermediate objects are created automatically.
+   *
+   * The value is serialized with `JSON.stringify`. Syncs to the server and
+   * other tabs when connected.
+   *
+   * ```ts
+   * cache.jset('doc:42', '$', { title: 'Hello', tags: ['a'] })
+   * cache.jset('doc:42', '$.title', 'Hello world')
+   * ```
+   */
+  jset<T>(key: string, path: string, value: T): void {
+    const err = this.raw.jset(key, path, JSON.stringify(value));
+    if (err !== 'OK') throw new Error(err);
+  }
+
+  /**
+   * Read part of a JSON document from local memory. Returns the parsed value
+   * at `path` (default: the whole document), or `null` when the key or path
+   * does not exist.
+   *
+   * ```ts
+   * const title = cache.jget<string>('doc:42', '$.title')
+   * const doc = cache.jget<Doc>('doc:42')
+   * ```
+   */
+  jget<T>(key: string, path?: string): T | null {
+    const raw = this.raw.jget(key, path);
+    if (raw === undefined) return null;
+    try {
+      return JSON.parse(raw) as T;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Apply an RFC 7386 JSON Merge Patch to a document: objects merge
+   * recursively, `null` fields are removed, arrays and scalars are replaced.
+   * Only the patch travels over the wire — not the whole document.
+   *
+   * ```ts
+   * cache.jmerge('doc:42', { title: 'New title', draft: null })
+   * ```
+   */
+  jmerge<T>(key: string, patch: T): void {
+    const err = this.raw.jmerge(key, JSON.stringify(patch));
+    if (err !== 'OK') throw new Error(err);
+  }
+
   // ── Pub/sub ───────────────────────────────────────────────────────────────
 
   /**
@@ -277,6 +389,76 @@ export class Cache {
    */
   publish(channel: string, message: string): void {
     this.raw.publish(channel, message);
+  }
+
+  // ── Sync scoping & live queries ───────────────────────────────────────────
+
+  /**
+   * Present a signed sync-scope token (strict servers — `RECACHED_SYNC_SECRET`).
+   * Mint it on your backend and hand it to the page; see the Sync Scopes docs.
+   */
+  syncToken(token: string): void {
+    this.raw.sync_token(token);
+  }
+
+  /**
+   * Scope this connection's sync to glob patterns (servers without a sync
+   * secret only). A bandwidth filter, not an authorization boundary.
+   */
+  syncScopes(patterns: string[]): void {
+    this.raw.sync_scopes(patterns.join(','));
+  }
+
+  /** @internal Ref-counts per live-query pattern so components sharing a
+   * pattern don't cancel each other's server subscription. */
+  private readonly _liveQueryRefs = new Map<string, number>();
+
+  /**
+   * Start a live query: the server sends the current state of every key
+   * matching `pattern` (merged into the local store), then streams every
+   * change to matching keys — including keys created later.
+   *
+   * Returns a stop function. Calls are ref-counted per pattern: the server
+   * subscription ends when the last caller stops.
+   *
+   * ```ts
+   * const stop = cache.liveQuery('cart:42:*');
+   * cache.onMutation(() => {
+   *   render(cache.getMatching('cart:42:*'));
+   * });
+   * // later:
+   * stop();
+   * ```
+   */
+  liveQuery(pattern: string): () => void {
+    const refs = this._liveQueryRefs.get(pattern) ?? 0;
+    this._liveQueryRefs.set(pattern, refs + 1);
+    if (refs === 0) {
+      this.raw.live_query(pattern);
+    }
+    let stopped = false;
+    return () => {
+      if (stopped) return;
+      stopped = true;
+      const now = (this._liveQueryRefs.get(pattern) ?? 1) - 1;
+      if (now <= 0) {
+        this._liveQueryRefs.delete(pattern);
+        this.raw.live_unquery(pattern);
+      } else {
+        this._liveQueryRefs.set(pattern, now);
+      }
+    };
+  }
+
+  /**
+   * Snapshot of local keys matching a glob pattern, as `[key, value]` pairs.
+   * Values are strings; keys holding collection types come back as `null`
+   * (read those with typed accessors).
+   *
+   * Served entirely from local WASM memory — zero network latency.
+   */
+  getMatching(pattern: string): Array<[string, string | null]> {
+    return this.raw.get_matching(pattern);
   }
 
   // ── Persistence ───────────────────────────────────────────────────────────
@@ -353,6 +535,14 @@ export async function createCache(options: CacheOptions = {}): Promise<Cache> {
     raw.connect(options.connect.url);
     if (options.connect.password) {
       raw.auth(options.connect.password);
+    }
+    if (options.connect.syncToken) {
+      raw.sync_token(options.connect.syncToken);
+    } else if (options.connect.syncScopes?.length) {
+      raw.sync_scopes(options.connect.syncScopes.join(','));
+    }
+    if (options.connect.reconnect === false) {
+      raw.set_auto_reconnect(false);
     }
   }
 

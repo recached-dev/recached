@@ -44,6 +44,9 @@ export class Cache {
                     cb(message);
             }
         };
+        /** @internal Ref-counts per live-query pattern so components sharing a
+         * pattern don't cancel each other's server subscription. */
+        this._liveQueryRefs = new Map();
         this.raw = raw;
         raw.set_mutation_callback(this._notifyMutation);
         raw.set_message_callback(this._notifyMessage);
@@ -140,8 +143,9 @@ export class Cache {
      * Store a string value. Syncs to the server and other tabs when connected.
      */
     set(key, value) {
+        // raw.set fires the mutation callback registered in the constructor, so
+        // listeners are already notified — no second _notifyMutation() here.
         this.raw.set(key, value);
-        this._notifyMutation();
     }
     /**
      * Store a string value with a TTL (seconds). The key is deleted automatically
@@ -149,7 +153,6 @@ export class Cache {
      */
     setEx(key, value, seconds) {
         this.raw.set_ex(key, value, seconds);
-        this._notifyMutation();
     }
     /**
      * Serialize `value` as JSON and store it under `key`.
@@ -167,7 +170,6 @@ export class Cache {
         else {
             this.raw.set(key, serialized);
         }
-        this._notifyMutation();
     }
     /**
      * Delete `key`.
@@ -177,8 +179,83 @@ export class Cache {
      */
     del(key) {
         const existed = this.raw.del(key) === 1;
-        this._notifyMutation();
         return existed;
+    }
+    /**
+     * Increment an integer counter. Returns the new local value.
+     *
+     * Offline increments queue as *deltas* and merge additively with concurrent
+     * increments from other clients when the connection returns — nobody's
+     * counts are lost (PN-counter semantics). Throws if the key holds a
+     * non-integer value.
+     */
+    incr(key, by = 1) {
+        return this.raw.incr_by(key, by);
+    }
+    /** Decrement an integer counter. See {@link incr}. */
+    decr(key, by = 1) {
+        return this.raw.incr_by(key, -by);
+    }
+    /**
+     * Close the server connection and stop reconnecting. Local reads and writes
+     * keep working; writes queue and replay on the next connect.
+     */
+    disconnect() {
+        this.raw.disconnect();
+    }
+    // ── JSON documents ────────────────────────────────────────────────────────
+    /**
+     * Set part of a JSON document. `path` addresses one location: `"$"` is the
+     * whole document, `"$.user.name"` a nested field, `"$.items[2].qty"` an
+     * array element. Intermediate objects are created automatically.
+     *
+     * The value is serialized with `JSON.stringify`. Syncs to the server and
+     * other tabs when connected.
+     *
+     * ```ts
+     * cache.jset('doc:42', '$', { title: 'Hello', tags: ['a'] })
+     * cache.jset('doc:42', '$.title', 'Hello world')
+     * ```
+     */
+    jset(key, path, value) {
+        const err = this.raw.jset(key, path, JSON.stringify(value));
+        if (err !== 'OK')
+            throw new Error(err);
+    }
+    /**
+     * Read part of a JSON document from local memory. Returns the parsed value
+     * at `path` (default: the whole document), or `null` when the key or path
+     * does not exist.
+     *
+     * ```ts
+     * const title = cache.jget<string>('doc:42', '$.title')
+     * const doc = cache.jget<Doc>('doc:42')
+     * ```
+     */
+    jget(key, path) {
+        const raw = this.raw.jget(key, path);
+        if (raw === undefined)
+            return null;
+        try {
+            return JSON.parse(raw);
+        }
+        catch {
+            return null;
+        }
+    }
+    /**
+     * Apply an RFC 7386 JSON Merge Patch to a document: objects merge
+     * recursively, `null` fields are removed, arrays and scalars are replaced.
+     * Only the patch travels over the wire — not the whole document.
+     *
+     * ```ts
+     * cache.jmerge('doc:42', { title: 'New title', draft: null })
+     * ```
+     */
+    jmerge(key, patch) {
+        const err = this.raw.jmerge(key, JSON.stringify(patch));
+        if (err !== 'OK')
+            throw new Error(err);
     }
     // ── Pub/sub ───────────────────────────────────────────────────────────────
     /**
@@ -198,6 +275,69 @@ export class Cache {
      */
     publish(channel, message) {
         this.raw.publish(channel, message);
+    }
+    // ── Sync scoping & live queries ───────────────────────────────────────────
+    /**
+     * Present a signed sync-scope token (strict servers — `RECACHED_SYNC_SECRET`).
+     * Mint it on your backend and hand it to the page; see the Sync Scopes docs.
+     */
+    syncToken(token) {
+        this.raw.sync_token(token);
+    }
+    /**
+     * Scope this connection's sync to glob patterns (servers without a sync
+     * secret only). A bandwidth filter, not an authorization boundary.
+     */
+    syncScopes(patterns) {
+        this.raw.sync_scopes(patterns.join(','));
+    }
+    /**
+     * Start a live query: the server sends the current state of every key
+     * matching `pattern` (merged into the local store), then streams every
+     * change to matching keys — including keys created later.
+     *
+     * Returns a stop function. Calls are ref-counted per pattern: the server
+     * subscription ends when the last caller stops.
+     *
+     * ```ts
+     * const stop = cache.liveQuery('cart:42:*');
+     * cache.onMutation(() => {
+     *   render(cache.getMatching('cart:42:*'));
+     * });
+     * // later:
+     * stop();
+     * ```
+     */
+    liveQuery(pattern) {
+        const refs = this._liveQueryRefs.get(pattern) ?? 0;
+        this._liveQueryRefs.set(pattern, refs + 1);
+        if (refs === 0) {
+            this.raw.live_query(pattern);
+        }
+        let stopped = false;
+        return () => {
+            if (stopped)
+                return;
+            stopped = true;
+            const now = (this._liveQueryRefs.get(pattern) ?? 1) - 1;
+            if (now <= 0) {
+                this._liveQueryRefs.delete(pattern);
+                this.raw.live_unquery(pattern);
+            }
+            else {
+                this._liveQueryRefs.set(pattern, now);
+            }
+        };
+    }
+    /**
+     * Snapshot of local keys matching a glob pattern, as `[key, value]` pairs.
+     * Values are strings; keys holding collection types come back as `null`
+     * (read those with typed accessors).
+     *
+     * Served entirely from local WASM memory — zero network latency.
+     */
+    getMatching(pattern) {
+        return this.raw.get_matching(pattern);
     }
     // ── Persistence ───────────────────────────────────────────────────────────
     /**
@@ -268,6 +408,15 @@ export async function createCache(options = {}) {
         raw.connect(options.connect.url);
         if (options.connect.password) {
             raw.auth(options.connect.password);
+        }
+        if (options.connect.syncToken) {
+            raw.sync_token(options.connect.syncToken);
+        }
+        else if (options.connect.syncScopes?.length) {
+            raw.sync_scopes(options.connect.syncScopes.join(','));
+        }
+        if (options.connect.reconnect === false) {
+            raw.set_auto_reconnect(false);
         }
     }
     return new Cache(raw);

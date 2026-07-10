@@ -9,7 +9,7 @@ resolver = "2"
 # ── Single source of truth for all crate versions ────────────────────────────
 # Members inherit with:  version.workspace = true  /  edition.workspace = true
 [workspace.package]
-version = "0.1.8"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 authors = ["ThinkGrid Labs"]
@@ -39,7 +39,13 @@ rustls-pemfile               = "2"
 
 # serialization
 serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
 rmp-serde  = "1"
+
+# sync-scope tokens
+hmac   = "0.12"
+sha2   = "0.10"
+base64 = "0.22"
 
 # wasm
 wasm-bindgen = "0.2.92"

@@ -101,6 +101,8 @@ enum EntryValue {
     // random member by index, which a hash table cannot provide.
     Set(IndexSet<String>),
     ZSet(ZSetInner),
+    RateLimiter(RateLimiterInner),
+    Json(serde_json::Value),
 }
 
 impl EntryValue {
@@ -111,6 +113,186 @@ impl EntryValue {
             EntryValue::List(_) => "list",
             EntryValue::Set(_) => "set",
             EntryValue::ZSet(_) => "zset",
+            EntryValue::RateLimiter(_) => "ratelimit",
+            EntryValue::Json(_) => "json",
+        }
+    }
+}
+
+// ── JSON paths & merge (JSET / JGET / JMERGE) ─────────────────────────────────
+
+enum JsonPathSeg {
+    Field(String),
+    Index(usize),
+}
+
+const MAX_JSON_PATH_DEPTH: usize = 128;
+
+/// Parse a deterministic JSON path: `$` (whole document), `$.user.name`,
+/// `$.items[2].qty`. The leading `$` is optional. Wildcards, slices, and
+/// filters are not supported — every path addresses exactly one location.
+fn parse_json_path(path: &str) -> Result<Vec<JsonPathSeg>, String> {
+    let mut rest = path.strip_prefix('$').unwrap_or(path);
+    let mut segs = Vec::new();
+    while !rest.is_empty() {
+        if segs.len() >= MAX_JSON_PATH_DEPTH {
+            return Err("ERR JSON path too deep".to_string());
+        }
+        if let Some(r) = rest.strip_prefix('.') {
+            let end = r.find(['.', '[']).unwrap_or(r.len());
+            let field = &r[..end];
+            if field.is_empty() {
+                return Err("ERR invalid JSON path: empty field".to_string());
+            }
+            segs.push(JsonPathSeg::Field(field.to_string()));
+            rest = &r[end..];
+        } else if let Some(r) = rest.strip_prefix('[') {
+            let end = r
+                .find(']')
+                .ok_or_else(|| "ERR invalid JSON path: unterminated index".to_string())?;
+            let idx: usize = r[..end]
+                .parse()
+                .map_err(|_| "ERR invalid JSON path: bad index".to_string())?;
+            segs.push(JsonPathSeg::Index(idx));
+            rest = &r[end + 1..];
+        } else {
+            // Bare leading field, e.g. `user.name` without `$.`.
+            let end = rest.find(['.', '[']).unwrap_or(rest.len());
+            segs.push(JsonPathSeg::Field(rest[..end].to_string()));
+            rest = &rest[end..];
+        }
+    }
+    Ok(segs)
+}
+
+/// Set `value` at the path. Intermediate objects are auto-created when a
+/// field segment hits `null`; array indices must already exist.
+fn json_set_at(
+    cur: &mut serde_json::Value,
+    segs: &[JsonPathSeg],
+    value: serde_json::Value,
+) -> Result<(), String> {
+    let Some((seg, rest)) = segs.split_first() else {
+        *cur = value;
+        return Ok(());
+    };
+    match seg {
+        JsonPathSeg::Field(f) => {
+            if cur.is_null() {
+                *cur = serde_json::Value::Object(serde_json::Map::new());
+            }
+            let obj = cur
+                .as_object_mut()
+                .ok_or_else(|| format!("ERR path segment '.{}' is not an object", f))?;
+            let slot = obj.entry(f.clone()).or_insert(serde_json::Value::Null);
+            json_set_at(slot, rest, value)
+        }
+        JsonPathSeg::Index(i) => {
+            let arr = cur
+                .as_array_mut()
+                .ok_or_else(|| format!("ERR path segment '[{}]' is not an array", i))?;
+            let len = arr.len();
+            let slot = arr
+                .get_mut(*i)
+                .ok_or_else(|| format!("ERR index {} out of bounds (len {})", i, len))?;
+            json_set_at(slot, rest, value)
+        }
+    }
+}
+
+fn json_get_at<'a>(
+    cur: &'a serde_json::Value,
+    segs: &[JsonPathSeg],
+) -> Option<&'a serde_json::Value> {
+    let mut c = cur;
+    for seg in segs {
+        c = match seg {
+            JsonPathSeg::Field(f) => c.get(f.as_str())?,
+            JsonPathSeg::Index(i) => c.get(*i)?,
+        };
+    }
+    Some(c)
+}
+
+/// RFC 7386 JSON Merge Patch: objects merge recursively, `null` removes the
+/// field, and any non-object patch replaces the target wholesale.
+fn json_merge_patch(target: &mut serde_json::Value, patch: serde_json::Value) {
+    match patch {
+        serde_json::Value::Object(pobj) => {
+            if !target.is_object() {
+                *target = serde_json::Value::Object(serde_json::Map::new());
+            }
+            let tobj = target.as_object_mut().expect("just ensured object");
+            for (k, v) in pobj {
+                if v.is_null() {
+                    tobj.remove(&k);
+                } else {
+                    let slot = tobj.entry(k).or_insert(serde_json::Value::Null);
+                    json_merge_patch(slot, v);
+                }
+            }
+        }
+        other => *target = other,
+    }
+}
+
+fn json_approx_size(v: &serde_json::Value) -> usize {
+    use serde_json::Value as J;
+    match v {
+        J::Null | J::Bool(_) => 8,
+        J::Number(_) => 16,
+        J::String(s) => s.len() + 8,
+        J::Array(a) => 8 + a.iter().map(json_approx_size).sum::<usize>(),
+        J::Object(o) => {
+            8 + o
+                .iter()
+                .map(|(k, val)| k.len() + json_approx_size(val))
+                .sum::<usize>()
+        }
+    }
+}
+
+// ── Sliding-window rate limiter (RLSET / RLCHECK) ─────────────────────────────
+
+#[derive(Clone)]
+struct RateLimiterInner {
+    limit: u64,
+    window_ms: u64,
+    /// Timestamps (ms) of recorded attempts, oldest first. Attempts arrive in
+    /// monotonically non-decreasing time, so the deque stays sorted and window
+    /// pruning is O(pruned) pops from the front — no sorted-set machinery
+    /// needed. Length is bounded by `limit` (denied attempts are not recorded).
+    events: VecDeque<u64>,
+}
+
+impl RateLimiterInner {
+    fn new(limit: u64, window_ms: u64) -> Self {
+        Self {
+            limit,
+            window_ms,
+            events: VecDeque::new(),
+        }
+    }
+
+    /// Record an attempt at `now`, returning `(allowed, remaining, retry_after_ms)`.
+    /// Denied attempts are not recorded — a client hammering a full limiter
+    /// does not push its own recovery further away.
+    fn check(&mut self, now: u64) -> (i64, u64, u64) {
+        let cutoff = now.saturating_sub(self.window_ms);
+        while self.events.front().is_some_and(|&t| t <= cutoff) {
+            self.events.pop_front();
+        }
+        if (self.events.len() as u64) < self.limit {
+            self.events.push_back(now);
+            let remaining = self.limit - self.events.len() as u64;
+            (1, remaining, 0)
+        } else {
+            let retry_after = self
+                .events
+                .front()
+                .map(|&t| (t + self.window_ms).saturating_sub(now))
+                .unwrap_or(0);
+            (0, 0, retry_after)
         }
     }
 }
@@ -290,6 +472,15 @@ pub enum SnapshotValue {
     List(Vec<String>),
     Set(Vec<String>),
     ZSet(Vec<(String, f64)>),
+    // Appended after the original variants: rmp-serde encodes variants by
+    // index, so new variants must go last to keep old snapshots readable.
+    RateLimiter {
+        limit: u64,
+        window_ms: u64,
+        events: Vec<u64>,
+    },
+    /// JSON document, stored serialized.
+    Json(String),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -421,8 +612,35 @@ impl KeyValueStore {
                 EntryValue::List(_) => Value::SimpleString("list".to_string()),
                 EntryValue::Set(_) => Value::SimpleString("set".to_string()),
                 EntryValue::ZSet(_) => Value::SimpleString("zset".to_string()),
+                EntryValue::RateLimiter(_) => Value::SimpleString("ratelimit".to_string()),
+                EntryValue::Json(_) => Value::SimpleString("json".to_string()),
             },
         }
+    }
+
+    /// Current state of every live key matching the glob pattern, in
+    /// `get_current` form (strings in full; collection types as type-name
+    /// markers), capped at `limit` entries. Backs live-query (QSUB) initial
+    /// state.
+    pub fn matching_key_values(&self, pattern: &str, limit: usize) -> Vec<(String, Value)> {
+        let now = now_ms();
+        self.data
+            .iter()
+            .filter(|e| !e.is_expired(now) && glob_match(pattern, e.key()))
+            .take(limit)
+            .map(|e| {
+                let value = match &e.value {
+                    EntryValue::Str(s) => Value::BulkString(Some(s.clone().into_bytes())),
+                    EntryValue::Hash(_) => Value::SimpleString("hash".to_string()),
+                    EntryValue::List(_) => Value::SimpleString("list".to_string()),
+                    EntryValue::Set(_) => Value::SimpleString("set".to_string()),
+                    EntryValue::ZSet(_) => Value::SimpleString("zset".to_string()),
+                    EntryValue::RateLimiter(_) => Value::SimpleString("ratelimit".to_string()),
+                    EntryValue::Json(_) => Value::SimpleString("json".to_string()),
+                };
+                (e.key().clone(), value)
+            })
+            .collect()
     }
 
     pub fn sweep_expired(&self) {
@@ -510,6 +728,14 @@ impl KeyValueStore {
                     EntryValue::ZSet(z) => {
                         SnapshotValue::ZSet(z.scores.iter().map(|(k, &v)| (k.clone(), v)).collect())
                     }
+                    EntryValue::RateLimiter(rl) => SnapshotValue::RateLimiter {
+                        limit: rl.limit,
+                        window_ms: rl.window_ms,
+                        events: rl.events.iter().copied().collect(),
+                    },
+                    EntryValue::Json(doc) => {
+                        SnapshotValue::Json(serde_json::to_string(doc).unwrap_or_default())
+                    }
                 };
                 SnapshotEntry {
                     key: e.key().clone(),
@@ -536,6 +762,18 @@ impl KeyValueStore {
                 SnapshotValue::ZSet(pairs) => EntryValue::ZSet(ZSetInner {
                     scores: pairs.into_iter().collect(),
                 }),
+                SnapshotValue::RateLimiter {
+                    limit,
+                    window_ms,
+                    events,
+                } => EntryValue::RateLimiter(RateLimiterInner {
+                    limit,
+                    window_ms,
+                    events: events.into(),
+                }),
+                SnapshotValue::Json(s) => {
+                    EntryValue::Json(serde_json::from_str(&s).unwrap_or(serde_json::Value::Null))
+                }
             };
             self.data.insert(
                 e.key,
@@ -1973,6 +2211,181 @@ impl KeyValueStore {
                 Ok(Value::Integer(count as i64))
             }),
 
+            // ── JSON ──────────────────────────────────────────────────────────
+            Command::JSet(key, path, value) => {
+                let now = now_ms();
+                let was_expired = type_guard!(self.data, &key, EntryValue::Json(_), now);
+                let segs = match parse_json_path(&path) {
+                    Ok(s) => s,
+                    Err(e) => return Value::Error(e),
+                };
+                let val: serde_json::Value = match serde_json::from_str(&value) {
+                    Ok(v) => v,
+                    Err(e) => return Value::Error(format!("ERR invalid JSON value: {}", e)),
+                };
+                // A fresh document starts as null; a leading index segment can
+                // never apply to it — reject before creating the key.
+                let is_fresh = was_expired || !self.data.contains_key(&key);
+                if is_fresh && matches!(segs.first(), Some(JsonPathSeg::Index(_))) {
+                    return Value::Error(
+                        "ERR path segment '[..]' is not an array (key does not exist)".to_string(),
+                    );
+                }
+                let mut entry = self.data.entry(key).or_insert_with(|| Entry {
+                    value: EntryValue::Json(serde_json::Value::Null),
+                    expires_at_ms: None,
+                    last_access_ms: AtomicU64::new(now_ms()),
+                });
+                if was_expired {
+                    entry.value = EntryValue::Json(serde_json::Value::Null);
+                    entry.expires_at_ms = None;
+                }
+                let doc = match &mut entry.value {
+                    EntryValue::Json(d) => d,
+                    _ => unreachable!(),
+                };
+                match json_set_at(doc, &segs, val) {
+                    Ok(()) => Value::SimpleString("OK".to_string()),
+                    Err(e) => Value::Error(e),
+                }
+            }
+
+            Command::JGet(key, path) => {
+                let now = now_ms();
+                match self.data.get(&key) {
+                    None => Value::BulkString(None),
+                    Some(e) if e.is_expired(now) => Value::BulkString(None),
+                    Some(e) => match &e.value {
+                        EntryValue::Json(doc) => {
+                            e.touch(now);
+                            let segs = match parse_json_path(path.as_deref().unwrap_or("$")) {
+                                Ok(s) => s,
+                                Err(err) => return Value::Error(err),
+                            };
+                            match json_get_at(doc, &segs) {
+                                Some(v) => Value::BulkString(Some(
+                                    serde_json::to_string(v).unwrap_or_default().into_bytes(),
+                                )),
+                                None => Value::BulkString(None),
+                            }
+                        }
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::JMerge(key, patch) => {
+                let now = now_ms();
+                let was_expired = type_guard!(self.data, &key, EntryValue::Json(_), now);
+                let patch: serde_json::Value = match serde_json::from_str(&patch) {
+                    Ok(v) => v,
+                    Err(e) => return Value::Error(format!("ERR invalid JSON patch: {}", e)),
+                };
+                if patch.is_null() {
+                    // RFC 7386: a null patch replaces the target — the key is
+                    // deleted rather than left holding a bare null.
+                    self.data.remove(&key);
+                    return Value::SimpleString("OK".to_string());
+                }
+                let mut entry = self.data.entry(key).or_insert_with(|| Entry {
+                    value: EntryValue::Json(serde_json::Value::Null),
+                    expires_at_ms: None,
+                    last_access_ms: AtomicU64::new(now_ms()),
+                });
+                if was_expired {
+                    entry.value = EntryValue::Json(serde_json::Value::Null);
+                    entry.expires_at_ms = None;
+                }
+                let doc = match &mut entry.value {
+                    EntryValue::Json(d) => d,
+                    _ => unreachable!(),
+                };
+                json_merge_patch(doc, patch);
+                Value::SimpleString("OK".to_string())
+            }
+
+            // ── Rate limiting ─────────────────────────────────────────────────
+            Command::RlSet(key, limit, window_secs) => {
+                let now = now_ms();
+                let was_expired = type_guard!(self.data, &key, EntryValue::RateLimiter(_), now);
+                let window_ms = window_secs.saturating_mul(1000);
+                let mut entry = self.data.entry(key).or_insert_with(|| Entry {
+                    value: EntryValue::RateLimiter(RateLimiterInner::new(limit, window_ms)),
+                    expires_at_ms: None,
+                    last_access_ms: AtomicU64::new(now_ms()),
+                });
+                if was_expired {
+                    entry.value = EntryValue::RateLimiter(RateLimiterInner::new(limit, window_ms));
+                }
+                match &mut entry.value {
+                    EntryValue::RateLimiter(rl) => {
+                        // Reconfigure in place; recorded attempts are kept so a
+                        // live limiter is not reset by a config change.
+                        rl.limit = limit;
+                        rl.window_ms = window_ms;
+                    }
+                    _ => unreachable!(),
+                }
+                // Explicitly configured limiters persist until DEL/EXPIRE, unlike
+                // limiters auto-created by inline RLCHECK config.
+                entry.expires_at_ms = None;
+                Value::SimpleString("OK".to_string())
+            }
+
+            Command::RlCheck(key, config) => {
+                let now = now_ms();
+                let was_expired = type_guard!(self.data, &key, EntryValue::RateLimiter(_), now);
+                let missing = was_expired
+                    || match self.data.get(&key) {
+                        None => true,
+                        Some(e) => e.is_expired(now),
+                    };
+                if missing {
+                    let Some((limit, window_secs)) = config else {
+                        return Value::Error(format!(
+                            "ERR no rate limit configured for '{}'; call RLSET first or use RLCHECK key limit window",
+                            key
+                        ));
+                    };
+                    let window_ms = window_secs.saturating_mul(1000);
+                    // Auto-created limiters self-clean: they expire one window
+                    // after the last attempt, so per-IP / per-user keys don't
+                    // accumulate forever.
+                    self.data.insert(
+                        key.clone(),
+                        Entry {
+                            value: EntryValue::RateLimiter(RateLimiterInner::new(limit, window_ms)),
+                            expires_at_ms: Some(now.saturating_add(window_ms)),
+                            last_access_ms: AtomicU64::new(now),
+                        },
+                    );
+                }
+                match self.data.get_mut(&key) {
+                    Some(mut e) => match &mut e.value {
+                        EntryValue::RateLimiter(rl) => {
+                            if let Some((limit, window_secs)) = config {
+                                // Inline config wins: middleware config changes
+                                // propagate without a separate RLSET.
+                                rl.limit = limit;
+                                rl.window_ms = window_secs.saturating_mul(1000);
+                            }
+                            let (allowed, remaining, retry_after_ms) = rl.check(now);
+                            let window_ms = rl.window_ms;
+                            if e.expires_at_ms.is_some() {
+                                e.expires_at_ms = Some(now.saturating_add(window_ms));
+                            }
+                            Value::Array(Some(vec![
+                                Value::Integer(allowed),
+                                Value::Integer(remaining as i64),
+                                Value::Integer(retry_after_ms as i64),
+                            ]))
+                        }
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                    None => Value::Error("ERR rate limiter vanished mid-check".to_string()),
+                }
+            }
+
             // ── Transactions ─────────────────────────────────────────────────
             // These are handled at the server layer before reaching the store.
             // The arms below are fallback-only (e.g. store used in tests).
@@ -1986,6 +2399,15 @@ impl KeyValueStore {
             | Command::Unsubscribe(_)
             | Command::PSubscribe(_)
             | Command::PUnsubscribe(_) => Value::Error("ERR only in pub/sub context".to_string()),
+            // Sync scoping is a WebSocket-connection concern, handled entirely
+            // in the server layer.
+            Command::Sync(_) => {
+                Value::Error("ERR SYNC is only available on the WebSocket port".to_string())
+            }
+            // Live queries are likewise per-WebSocket-connection state.
+            Command::QSub(_) | Command::QUnsub(_) => Value::Error(
+                "ERR live queries are only available on the WebSocket port".to_string(),
+            ),
             Command::Publish(_, _) => Value::Integer(0),
 
             Command::Unknown(name) => Value::Error(format!("ERR unknown command '{}'", name)),
@@ -2014,6 +2436,8 @@ fn entry_size(key: &str, e: &Entry) -> usize {
         EntryValue::List(l) => l.iter().map(|s| s.len()).sum(),
         EntryValue::Set(s) => s.iter().map(|m| m.len()).sum::<usize>(),
         EntryValue::ZSet(z) => z.scores.keys().map(|m| m.len() + 8).sum(),
+        EntryValue::RateLimiter(rl) => rl.events.len() * 8 + 16,
+        EntryValue::Json(doc) => json_approx_size(doc),
     };
     key.len() + val_size + 64
 }
@@ -2062,7 +2486,10 @@ fn set_expiry(data: &DashMap<String, Entry>, key: String, ts_ms: u64) -> Value {
     }
 }
 
-fn glob_match(pattern: &str, s: &str) -> bool {
+/// Glob match with `*`, `?`, and `[abc]` classes — iterative DP, O(m × n),
+/// immune to backtracking blowup. Used by KEYS/SCAN and exported for the
+/// server layer's sync-scope filtering.
+pub fn glob_match(pattern: &str, s: &str) -> bool {
     let pat = pattern.as_bytes();
     let text = s.as_bytes();
     let (m, n) = (pat.len(), text.len());
@@ -3614,5 +4041,302 @@ mod tests {
 
         let ttl = s2.execute(Command::Ttl("k".into()));
         assert!(matches!(ttl, Value::Integer(n) if n > 0 && n <= 60));
+    }
+
+    // ── Rate limiting (RLSET / RLCHECK) ───────────────────────────────────────
+
+    /// Unpack an RLCHECK reply into (allowed, remaining, retry_after_ms).
+    fn rl(v: Value) -> (i64, i64, i64) {
+        match v {
+            Value::Array(Some(items)) => match items.as_slice() {
+                [Value::Integer(a), Value::Integer(r), Value::Integer(t)] => (*a, *r, *t),
+                other => panic!("unexpected RLCHECK reply shape: {:?}", other),
+            },
+            other => panic!("unexpected RLCHECK reply: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rlset_and_check_enforce_limit() {
+        let s = store();
+        assert_eq!(s.execute(Command::RlSet("api".into(), 3, 60)), ok());
+        for expected_remaining in [2, 1, 0] {
+            let (allowed, remaining, retry) = rl(s.execute(Command::RlCheck("api".into(), None)));
+            assert_eq!(allowed, 1);
+            assert_eq!(remaining, expected_remaining);
+            assert_eq!(retry, 0);
+        }
+        let (allowed, remaining, retry) = rl(s.execute(Command::RlCheck("api".into(), None)));
+        assert_eq!(allowed, 0);
+        assert_eq!(remaining, 0);
+        assert!(retry > 0 && retry <= 60_000, "retry_after_ms = {}", retry);
+    }
+
+    #[test]
+    fn rlcheck_inline_config_creates_limiter() {
+        let s = store();
+        let key = "ip:10.0.0.1".to_string();
+        let (allowed, _, _) = rl(s.execute(Command::RlCheck(key.clone(), Some((2, 60)))));
+        assert_eq!(allowed, 1);
+        let (allowed, _, _) = rl(s.execute(Command::RlCheck(key.clone(), Some((2, 60)))));
+        assert_eq!(allowed, 1);
+        let (allowed, _, _) = rl(s.execute(Command::RlCheck(key, Some((2, 60)))));
+        assert_eq!(allowed, 0);
+    }
+
+    #[test]
+    fn rlcheck_unconfigured_errors() {
+        let s = store();
+        let r = s.execute(Command::RlCheck("nope".into(), None));
+        assert!(matches!(&r, Value::Error(e) if e.contains("no rate limit configured")));
+    }
+
+    #[test]
+    fn rl_wrongtype_interactions() {
+        let s = store();
+        s.execute(Command::Set(
+            "str".into(),
+            "v".into(),
+            SetOptions::default(),
+        ));
+        let r = s.execute(Command::RlCheck("str".into(), Some((5, 60))));
+        assert!(matches!(&r, Value::Error(e) if e.contains("WRONGTYPE")));
+        let r = s.execute(Command::RlSet("str".into(), 5, 60));
+        assert!(matches!(&r, Value::Error(e) if e.contains("WRONGTYPE")));
+
+        s.execute(Command::RlSet("rl".into(), 5, 60));
+        let r = s.execute(Command::Get("rl".into()));
+        assert!(matches!(&r, Value::Error(e) if e.contains("WRONGTYPE")));
+        assert_eq!(
+            s.execute(Command::Type("rl".into())),
+            Value::SimpleString("ratelimit".into())
+        );
+    }
+
+    #[test]
+    fn rlset_reconfig_keeps_recorded_attempts() {
+        let s = store();
+        s.execute(Command::RlSet("api".into(), 2, 60));
+        rl(s.execute(Command::RlCheck("api".into(), None)));
+        // Raise the limit: the one recorded attempt still counts against it.
+        s.execute(Command::RlSet("api".into(), 3, 60));
+        let (allowed, remaining, _) = rl(s.execute(Command::RlCheck("api".into(), None)));
+        assert_eq!((allowed, remaining), (1, 1));
+        let (allowed, _, _) = rl(s.execute(Command::RlCheck("api".into(), None)));
+        assert_eq!(allowed, 1);
+        let (allowed, _, _) = rl(s.execute(Command::RlCheck("api".into(), None)));
+        assert_eq!(allowed, 0);
+    }
+
+    #[test]
+    fn rl_snapshot_roundtrip_preserves_state() {
+        let s = store();
+        s.execute(Command::RlSet("api".into(), 2, 60));
+        rl(s.execute(Command::RlCheck("api".into(), None)));
+        rl(s.execute(Command::RlCheck("api".into(), None)));
+
+        let s2 = store();
+        s2.restore(s.snapshot());
+        let (allowed, remaining, retry) = rl(s2.execute(Command::RlCheck("api".into(), None)));
+        assert_eq!((allowed, remaining), (0, 0));
+        assert!(retry > 0);
+    }
+
+    // ── JSON (JSET / JGET / JMERGE) ───────────────────────────────────────────
+
+    fn jset(s: &KeyValueStore, key: &str, path: &str, value: &str) -> Value {
+        s.execute(Command::JSet(key.into(), path.into(), value.into()))
+    }
+    fn jget(s: &KeyValueStore, key: &str, path: Option<&str>) -> Value {
+        s.execute(Command::JGet(key.into(), path.map(String::from)))
+    }
+
+    #[test]
+    fn jset_jget_root_and_paths() {
+        let s = store();
+        assert_eq!(
+            jset(&s, "doc", "$", r#"{"user":{"name":"amy"},"items":[1,2,3]}"#),
+            ok()
+        );
+        // serde_json serializes object keys in sorted order — deterministic
+        // output regardless of insertion order.
+        assert_eq!(
+            jget(&s, "doc", None),
+            bulk(r#"{"items":[1,2,3],"user":{"name":"amy"}}"#)
+        );
+        assert_eq!(jget(&s, "doc", Some("$.user.name")), bulk(r#""amy""#));
+        assert_eq!(jget(&s, "doc", Some("$.items[1]")), bulk("2"));
+        // Set a nested field and an array element in place.
+        assert_eq!(jset(&s, "doc", "$.user.age", "30"), ok());
+        assert_eq!(jget(&s, "doc", Some("$.user.age")), bulk("30"));
+        assert_eq!(jset(&s, "doc", "$.items[0]", "9"), ok());
+        assert_eq!(jget(&s, "doc", Some("$.items")), bulk("[9,2,3]"));
+        // Missing path → nil; missing key → nil.
+        assert_eq!(jget(&s, "doc", Some("$.nope.deep")), nil());
+        assert_eq!(jget(&s, "ghost", None), nil());
+        // TYPE reports json.
+        assert_eq!(
+            s.execute(Command::Type("doc".into())),
+            Value::SimpleString("json".into())
+        );
+    }
+
+    #[test]
+    fn jset_autocreates_intermediate_objects() {
+        let s = store();
+        // Fresh key, deep field path: intermediate objects are created.
+        assert_eq!(jset(&s, "doc", "$.a.b.c", "1"), ok());
+        assert_eq!(jget(&s, "doc", None), bulk(r#"{"a":{"b":{"c":1}}}"#));
+        // Fresh key with a leading index cannot apply — and must not create
+        // the key as a side effect.
+        let r = jset(&s, "fresh", "$[0]", "1");
+        assert!(matches!(&r, Value::Error(_)));
+        assert_eq!(s.execute(Command::Exists(vec!["fresh".into()])), int(0));
+        // Index out of bounds errors.
+        let r = jset(&s, "doc", "$.a.b.c[5]", "1");
+        assert!(matches!(&r, Value::Error(e) if e.contains("not an array")));
+    }
+
+    #[test]
+    fn jmerge_rfc7386_semantics() {
+        let s = store();
+        jset(
+            &s,
+            "doc",
+            "$",
+            r#"{"title":"old","meta":{"draft":true,"v":1}}"#,
+        );
+        // Deep merge + null removal.
+        assert_eq!(
+            s.execute(Command::JMerge(
+                "doc".into(),
+                r#"{"title":"new","meta":{"draft":null}}"#.into()
+            )),
+            ok()
+        );
+        assert_eq!(
+            jget(&s, "doc", None),
+            bulk(r#"{"meta":{"v":1},"title":"new"}"#)
+        );
+        // Merge into a missing key creates the document.
+        assert_eq!(
+            s.execute(Command::JMerge("fresh".into(), r#"{"a":1}"#.into())),
+            ok()
+        );
+        assert_eq!(jget(&s, "fresh", None), bulk(r#"{"a":1}"#));
+        // A null patch deletes the key.
+        assert_eq!(
+            s.execute(Command::JMerge("fresh".into(), "null".into())),
+            ok()
+        );
+        assert_eq!(jget(&s, "fresh", None), nil());
+    }
+
+    #[test]
+    fn json_wrongtype_and_invalid_input() {
+        let s = store();
+        s.execute(Command::Set(
+            "str".into(),
+            "v".into(),
+            SetOptions::default(),
+        ));
+        assert!(matches!(&jset(&s, "str", "$", "1"), Value::Error(e) if e.contains("WRONGTYPE")));
+        assert!(matches!(&jget(&s, "str", None), Value::Error(e) if e.contains("WRONGTYPE")));
+        jset(&s, "doc", "$", "{}");
+        let r = s.execute(Command::Get("doc".into()));
+        assert!(matches!(&r, Value::Error(e) if e.contains("WRONGTYPE")));
+        // Invalid JSON / invalid path.
+        assert!(
+            matches!(&jset(&s, "doc", "$", "{oops"), Value::Error(e) if e.contains("invalid JSON"))
+        );
+        assert!(
+            matches!(&jset(&s, "doc", "$.a[x]", "1"), Value::Error(e) if e.contains("bad index"))
+        );
+    }
+
+    #[test]
+    fn json_snapshot_roundtrip() {
+        let s = store();
+        jset(&s, "doc", "$", r#"{"n":42,"arr":[true,null,"x"]}"#);
+        let s2 = store();
+        s2.restore(s.snapshot());
+        assert_eq!(
+            s2.execute(Command::JGet("doc".into(), None)),
+            bulk(r#"{"arr":[true,null,"x"],"n":42}"#)
+        );
+        assert_eq!(
+            s2.execute(Command::Type("doc".into())),
+            Value::SimpleString("json".into())
+        );
+    }
+
+    // ── Live-query initial state ──────────────────────────────────────────────
+
+    #[test]
+    fn matching_key_values_globs_caps_and_skips_expired() {
+        use std::time::Duration;
+        let s = store();
+        s.execute(Command::Set(
+            "cart:1".into(),
+            "a".into(),
+            SetOptions::default(),
+        ));
+        s.execute(Command::Set(
+            "cart:2".into(),
+            "b".into(),
+            SetOptions::default(),
+        ));
+        s.execute(Command::Set(
+            "other:1".into(),
+            "c".into(),
+            SetOptions::default(),
+        ));
+        s.execute(Command::LPush("cart:list".into(), vec!["x".into()]));
+        s.execute(Command::PSetEx("cart:dead".into(), 1, "d".into()));
+        std::thread::sleep(Duration::from_millis(10));
+
+        let mut kvs = s.matching_key_values("cart:*", 100);
+        kvs.sort_by(|(a, _), (b, _)| a.cmp(b));
+        assert_eq!(kvs.len(), 3, "expired key must be skipped: {kvs:?}");
+        assert_eq!(kvs[0], ("cart:1".to_string(), bulk("a")));
+        assert_eq!(kvs[1], ("cart:2".to_string(), bulk("b")));
+        // Collection types come back as type-name markers, like get_current.
+        assert_eq!(
+            kvs[2],
+            (
+                "cart:list".to_string(),
+                Value::SimpleString("list".to_string())
+            )
+        );
+        // Cap respected.
+        assert_eq!(s.matching_key_values("cart:*", 2).len(), 2);
+        // Non-matching pattern.
+        assert!(s.matching_key_values("nope:*", 100).is_empty());
+    }
+
+    #[test]
+    fn rl_window_slides_and_inline_limiter_expires() {
+        use std::time::Duration;
+        let s = store();
+        // Persistent limiter: 1 attempt per 1-second window.
+        s.execute(Command::RlSet("persist".into(), 1, 1));
+        let (allowed, _, _) = rl(s.execute(Command::RlCheck("persist".into(), None)));
+        assert_eq!(allowed, 1);
+        let (allowed, _, retry) = rl(s.execute(Command::RlCheck("persist".into(), None)));
+        assert_eq!(allowed, 0);
+        assert!(retry > 0 && retry <= 1_000);
+        // Auto-created limiter with a 1-second window.
+        let (allowed, _, _) = rl(s.execute(Command::RlCheck("perip".into(), Some((1, 1)))));
+        assert_eq!(allowed, 1);
+
+        std::thread::sleep(Duration::from_millis(1_050));
+
+        // The window slid past the recorded attempt: allowed again.
+        let (allowed, _, _) = rl(s.execute(Command::RlCheck("persist".into(), None)));
+        assert_eq!(allowed, 1);
+        // The auto-created limiter expired with its window — bare RLCHECK
+        // finds no config.
+        let r = s.execute(Command::RlCheck("perip".into(), None));
+        assert!(matches!(&r, Value::Error(e) if e.contains("no rate limit configured")));
     }
 }

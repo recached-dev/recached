@@ -20,6 +20,8 @@ features = [
     "MessageEvent",
     "ErrorEvent",
     "console",
+    # Window.setTimeout, for reconnect backoff.
+    "Window",
 ]
 
 # getrandom v0.3 requires explicit opt-in for wasm32-unknown-unknown to use

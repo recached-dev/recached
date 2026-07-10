@@ -4,41 +4,36 @@ Recached competes on **where the data can live** — the same engine on the serv
 
 Ordered by priority.
 
-## 1. Rate-limiting commands
+## 1. Rate-limiting commands ✅ shipped
 
-`RLSET key limit window` / `RLCHECK key`. A built-in sliding-window rate limiter that replaces hand-rolled INCR+EXPIRE (racy) or Lua script approaches. The window is stored as a sorted set internally; the API is a single command.
+`RLSET key limit window` / `RLCHECK key [limit window]`. A built-in sliding-window rate limiter that replaces hand-rolled INCR+EXPIRE (racy) or Lua script approaches. `RLCHECK` returns `[allowed, remaining, retry_after_ms]` — a direct fit for `X-RateLimit-*` / `Retry-After` headers — and the inline config form auto-creates self-cleaning per-IP/per-user limiters in a single command. See [Commands → Rate Limiting](/server/commands#rate-limiting).
 
-## 2. Scoped sync and per-client auth
+## 2. Scoped sync and per-client auth ✅ shipped
 
-Today every mutation fans out to **every** connected WebSocket client. For a multi-user application that is a data-leak footgun: user A's session keys are pushed to user B's browser. Before the browser story can be used in serious production:
-
-- Clients subscribe to key prefixes or patterns (`sync: ['cart:{userId}:*', 'catalog:*']`) instead of receiving everything.
-- Scopes are authorized server-side (per-connection token → allowed patterns), so a client cannot subscribe to keys it shouldn't see.
-- Fan-out filters by scope, which also cuts broadcast cost — most mutations stop being everyone's problem.
+Every WebSocket connection can now be scoped to glob patterns via the `SYNC` command, and the mutation fan-out delivers only matching keys. With `RECACHED_SYNC_SECRET` set, scopes become a real authorization boundary: connections present an HMAC-signed token minted by your backend (`SYNC TOKEN <token>`), and every command — reads included — is checked against the granted patterns; admin/keyspace-wide commands are refused. See [Sync Scopes](/server/sync-scopes).
 
 
-## 3. Live queries — "Redis that renders"
+## 3. Live queries — "Redis that renders" ✅ shipped
 
-Extend the existing keychange push into pattern subscriptions with initial state. A React component does:
+`QSUB pattern` returns the current state of every matching key and then streams keychange diffs — initial state plus diffs, not fire-and-forget events — scope-checked under strict sync scoping. The client half makes it a one-liner in React and Vue:
 
 ```tsx
 const cart = useKeys('cart:item:*'); // current matching keys + live updates
 ```
 
-and gets the full loop with zero application glue: server write → patch over WebSocket → local WASM cache → component re-render. Reads stay local (0 ms); the subscription delivers initial state plus diffs, not fire-and-forget events.
+Server write → diff over WebSocket → local WASM cache → component re-render, with zero application glue. See [Commands → Live Queries](/server/commands#live-queries-websocket-only) and [`useKeys`](/react/hooks-reference#usekeys-pattern).
 
 
-## 4. Native JSON type
+## 4. Native JSON type ✅ shipped
 
-`JSET key path value`, `JGET key path`, `JMERGE key patch`. JSONPath-based access to nested JSON structures stored as a native type, without RedisJSON. Avoids the serialize-deserialize round-trip for complex objects where only part of the document changes.
+`JSET key path value`, `JGET key [path]`, `JMERGE key patch` — nested JSON stored as a native type, without RedisJSON. Path reads and partial updates never re-serialize the whole document, and only the change travels over the wire. `JMERGE` follows RFC 7386 (deep merge, `null` removes fields). The browser SDK mirrors all three (`jset`/`jget`/`jmerge`), so a merge from any client updates every connected browser's local document. See [Commands → JSON](/server/commands#json).
 
 
-## 5. Offline-first writes with merge semantics
+## 5. Offline-first writes with merge semantics ✅ shipped
 
-Browser clients already persist through IndexedDB and read locally. The missing piece is writing while offline: queue mutations locally, reconcile on reconnect.
+Browser clients queue writes as *operations* in a **durable outbox** while offline (IndexedDB-backed with persistence enabled, so they survive a full page reload), auto-reconnect with backoff, re-establish the session (auth, sync token, live queries — which re-hydrate local state), and replay the outbox. Writes are retired only on server acknowledgment (at-least-once delivery). Operation replay makes merges type-aware: `incr`/`decr` queue deltas that merge additively (PN-counter semantics), `jmerge` patches deep-merge, collection ops replay, and plain `set` is last-writer-wins by server arrival. See [Offline & Reconnection](/browser/offline).
 
-- Default policy: last-write-wins with server timestamps.
-- CRDT semantics where the data type makes them natural: `INCR`/`DECR` as a PN-counter (offline increments merge additively instead of clobbering), `SADD`/`SREM` as an observed-remove set.
+Follow-up (tracked, not yet built): exactly-once delivery via per-write deduplication ids — today a write whose acknowledgment is lost mid-disconnect can replay twice.
 
 ## 6. Mobile SDKs — React Native, Flutter, Kotlin, Swift
 

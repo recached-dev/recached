@@ -55,7 +55,7 @@ The most common data type. Values are always stored as byte strings; numeric ope
 | `DEL key [key ...]` | Deletes one or more keys. Returns the number of keys that were deleted. Keys that do not exist are ignored. |
 | `UNLINK key [key ...]` | Non-blocking delete. Semantically equivalent to `DEL` (Recached does not implement async deletion, but `UNLINK` is accepted for client compatibility). |
 | `EXISTS key [key ...]` | Returns the number of keys that exist among the provided arguments. A key listed multiple times counts multiple times. |
-| `TYPE key` | Returns the type of the value stored at key: `string`, `hash`, `list`, `set`, `zset`, or `none` if the key does not exist. |
+| `TYPE key` | Returns the type of the value stored at key: `string`, `hash`, `list`, `set`, `zset`, `ratelimit`, or `none` if the key does not exist. |
 | `RENAME key newkey` | Renames a key. Returns an error if the source key does not exist. Overwrites `newkey` if it already exists. |
 | `KEYS pattern` | Returns all keys matching the glob pattern. `*` matches any sequence of characters, `?` matches a single character, `[abc]` matches a character class. Warning: `KEYS *` on a large store is slow — prefer `SCAN`. |
 | `SCAN cursor [MATCH pattern] [COUNT count]` | Iterates keys incrementally, returning at most `COUNT` keys per call (default 10) plus the next cursor. Start with cursor `0` and continue until the returned cursor is `0`. `MATCH` filters results by glob pattern. As in Redis, keys inserted or deleted mid-iteration may be missed or returned twice. |
@@ -170,6 +170,111 @@ ZREVRANGE leaderboard 0 2 WITHSCORES
 ZINCRBY leaderboard 300 carol
 ZREVRANK leaderboard carol    # 2 → 1 (moved up)
 ```
+
+---
+
+## JSON
+
+A native JSON document type — no RedisJSON module needed. Documents are stored parsed, so path reads and partial updates never re-serialize the whole value, and only the change travels to replicas, the AOF, and connected browsers.
+
+| Command | Description |
+|---|---|
+| `JSET key path value` | Set JSON at a path. `$` is the whole document, `$.user.name` a nested field, `$.items[2].qty` an array element. Intermediate objects are auto-created; array indices must exist. `value` must be valid JSON text. |
+| `JGET key [path]` | Read the JSON at a path (default `$`), serialized. Returns nil when the key or path does not exist. Object keys serialize in sorted order — deterministic output. |
+| `JMERGE key patch` | RFC 7386 JSON Merge Patch against the whole document: objects merge recursively, `null` fields are removed, arrays and scalars are replaced. A `null` patch deletes the key. Creates the document if missing. |
+
+Paths address exactly one location — wildcards, slices, and filters are not supported. `TYPE` reports `json`.
+
+### Example: partial updates
+
+```bash
+JSET doc:42 $ '{"title":"Draft","meta":{"views":0,"draft":true}}'
+JGET doc:42 $.meta.views          # "0"
+JSET doc:42 $.meta.views 17       # only this field changes
+JMERGE doc:42 '{"title":"Final","meta":{"draft":null}}'
+JGET doc:42                       # {"meta":{"views":17},"title":"Final"}
+```
+
+The browser SDK exposes the same commands as [`jset` / `jget` / `jmerge`](/browser/api-reference#json-documents) with `JSON.stringify`/`parse` handled for you — a `JMERGE` from any client updates every connected browser's local document.
+
+In live queries (`QSUB` / `useKeys`), JSON keys appear with a `json` type marker rather than the document — subscribe for change signals and read the document with `JGET`/`jget`.
+
+---
+
+## Rate Limiting
+
+A built-in sliding-window rate limiter — no INCR+EXPIRE races, no Lua scripts. Internally a limiter key stores its config plus the timestamps of allowed attempts inside the window (type name: `ratelimit`). Denied attempts are not recorded, so a client hammering a full limiter does not push its own recovery further away.
+
+| Command | Description |
+|---|---|
+| `RLSET key limit window` | Configure a limiter: at most `limit` attempts per `window` seconds. Reconfiguring in place keeps already-recorded attempts. Limiters created with `RLSET` persist until `DEL`/`EXPIRE`. |
+| `RLCHECK key [limit window]` | Record an attempt. Returns a 3-element array: `[allowed (1\|0), remaining, retry_after_ms]`. With the optional `limit window` pair, the limiter is created on first use — ideal for per-IP or per-user keys where a separate `RLSET` round-trip per key is impractical. Auto-created limiters self-clean: they expire one window after the last attempt. Bare `RLCHECK` on an unconfigured key returns an error. |
+
+The reply maps directly onto standard HTTP rate-limit headers: `remaining` → `X-RateLimit-Remaining`, `retry_after_ms` → `Retry-After`.
+
+### Example: per-IP request limiting
+
+```bash
+# 100 requests per minute per client IP — one command per request,
+# limiter auto-created on the first attempt and self-cleans when idle.
+RLCHECK ip:203.0.113.7 100 60
+# 1) (integer) 1        allowed
+# 2) (integer) 99       remaining in window
+# 3) (integer) 0        retry_after_ms
+
+# ...101st request within the minute:
+# 1) (integer) 0
+# 2) (integer) 0
+# 3) (integer) 58211    → Retry-After: 59
+```
+
+### Example: named app-level limiter
+
+```bash
+RLSET login:alice 5 300      # 5 login attempts per 5 minutes
+RLCHECK login:alice          # check + record one attempt
+```
+
+Replication note: `RLSET` config replicates to AOF and replicas; recorded attempts are transient and deliberately do not (streaming every check would flood the write log for state that expires within one window).
+
+---
+
+## Sync Scoping (WebSocket only)
+
+Controls which keys a WebSocket connection receives pushes for and may operate on. Full guide: [Sync Scopes](/server/sync-scopes).
+
+| Command | Description |
+|---|---|
+| `SYNC` | Returns this connection's current scope patterns. |
+| `SYNC TOKEN token` | Sets scopes from a token signed with `RECACHED_SYNC_SECRET` (HMAC-SHA256). Required before any key access when the secret is configured (strict mode). Returns the granted patterns. |
+| `SYNC pattern [pattern ...]` | Sets scopes directly from glob patterns. Only available when no sync secret is configured — a bandwidth filter, not a security boundary. |
+
+On the TCP port, `SYNC` returns an error — backend connections are trusted and unscoped.
+
+---
+
+## Live Queries (WebSocket only)
+
+A live query delivers the current state of every key matching a glob pattern, then streams every subsequent change to matching keys — initial state plus diffs, not fire-and-forget events. This is the primitive behind reactive UI bindings.
+
+| Command | Description |
+|---|---|
+| `QSUB pattern` | Subscribe. The reply is `["qstate", pattern, key, value, ...]` — the current state of every live key matching the pattern as flat pairs (strings in full; collection types as their type name, fetch them with a typed read). Afterwards, every mutation to a matching key — including keys created later — arrives as a `["keychange", key, value]` push; deletions arrive with a nil value. Initial state is capped at 10 000 keys. Up to 64 live queries per connection. |
+| `QUNSUB [pattern]` | Drop one live query, or all of them without an argument. |
+
+```bash
+QSUB cart:42:*
+# 1) "qstate"
+# 2) "cart:42:*"
+# 3) "cart:42:item:9"     initial state…
+# 4) "2"
+# …then, when the server (or any client) writes cart:42:item:12:
+# ["keychange", "cart:42:item:12", "1"]
+```
+
+Under strict sync scoping, `QSUB` patterns must sit inside the connection's granted scopes — a grant of `cart:42:*` covers `QSUB cart:42:*` and narrower prefix patterns. Live-query pushes never interfere with `WATCH` transactions (they travel on a separate internal channel).
+
+Two current limitations: `FLUSHDB` does not emit per-key diffs to live queries, and collection-type values arrive as type markers rather than full values — subscribe plus a typed re-read (`HGETALL`, `LRANGE`) on change.
 
 ---
 

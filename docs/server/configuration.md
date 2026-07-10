@@ -9,6 +9,7 @@ Recached is configured entirely through environment variables. There is no confi
 | `RECACHED_BIND` | `0.0.0.0` | Network interface all listeners (TCP, WebSocket, replication, metrics) bind to. Defaults to `0.0.0.0` (all interfaces). Set to `127.0.0.1` to restrict the server to localhost — strongly recommended unless the server is deliberately public. |
 | `RECACHED_PASSWORD` | _(none)_ | Require clients to authenticate with `AUTH <password>`. If unset, the server accepts connections without authentication. After 5 consecutive failed `AUTH` attempts, the connection is closed. The password is compared in constant time. |
 | `RECACHED_ALLOW_IPS` | _(allow all)_ | Comma-separated list of IP addresses allowed to connect. Any connection from an IP not in the list is immediately closed. Invalid entries are logged and skipped. |
+| `RECACHED_SYNC_SECRET` | _(none)_ | Enables **strict sync scoping** on the WebSocket port: clients receive no mutation pushes and may run no key commands until they present a signed scope token (`SYNC TOKEN <token>`), and are then restricted to the keys their token grants. Without it, every WebSocket client receives every mutation. See [Sync Scopes](/server/sync-scopes). |
 | `RECACHED_MAX_KEYS` | _(unlimited)_ | Maximum number of keys in the store. When this limit is reached, behavior depends on `RECACHED_EVICTION`. If set to `noeviction` (the default), write commands that would exceed the cap return an error. |
 | `RECACHED_EVICTION` | `noeviction` | Eviction policy when `RECACHED_MAX_KEYS` is reached. See eviction policies below. |
 | `RECACHED_METRICS_PORT` | `9091` | Port for the Prometheus metrics HTTP server. Metrics are available at `/metrics`. Set to `0` to disable. |
@@ -43,6 +44,28 @@ Eviction runs when `RECACHED_MAX_KEYS` is reached and a write command would add 
 | `volatile-ttl` | Evicts the key with the shortest remaining TTL. Prioritizes keys that are closest to expiring. Falls back to `noeviction` if no keys have a TTL. |
 
 For most applications, `lru` is the right default when a key cap is configured.
+
+---
+
+## Durability: what survives a server crash? {#durability}
+
+Recached persists data on the server with the same two mechanisms Redis uses — periodic snapshots (≈ RDB) and an optional append-only file (≈ AOF). What you lose when the process dies depends entirely on which are enabled:
+
+| Configuration | Writes lost on crash |
+|---|---|
+| Defaults (snapshot every 15 min) | Everything since the last snapshot — up to 15 minutes |
+| `RECACHED_SAVE="900:1,300:10,60:10000"` | Bounded by the tightest matching condition — busy servers snapshot every minute |
+| Snapshot + AOF `everysec` | At most ~1 second |
+| Snapshot + AOF `always` | Essentially nothing — fsync on every write |
+| Replica configured (`RECACHED_REPLICAOF`) | Nothing that reached the replica — promote it with `REPLICAOF NO ONE` |
+| `RECACHED_SAVE_INTERVAL=0`, no AOF | Everything — pure in-memory cache |
+
+**Recovery order on restart:** the snapshot is loaded first, then AOF commands written after that snapshot are replayed on top — same order as Redis. Snapshot writes are atomic (write to `.tmp`, rename into place), so a crash mid-save can never corrupt the previous snapshot, and a clean shutdown (SIGTERM / Ctrl-C) always saves a final snapshot.
+
+Two recached-specific durability properties worth knowing:
+
+- **Browser clients survive server loss independently.** Clients created with `persistence: true` keep their own IndexedDB-backed copy. If the server dies, browsers continue serving local reads from the last-synced state and re-sync automatically when it returns — a server crash doesn't blank your users' UIs.
+- **Rate-limiter attempt state is deliberately transient.** `RLSET` config survives restarts (snapshot, AOF, and replication); in-window attempt counts restart clean by design.
 
 ---
 

@@ -221,6 +221,113 @@ The callback receives no arguments — it signals that _something_ changed. Read
 
 ---
 
+### Counters & connection
+
+#### `incr(key, by?)` / `decr(key, by?)`
+
+Increment or decrement an integer counter. Returns the new local value; throws if the key holds a non-integer. Offline increments queue as **deltas** and merge additively with everyone else's on reconnect — see [Offline & Reconnection](/browser/offline).
+
+```typescript
+incr(key: string, by?: number): number
+decr(key: string, by?: number): number
+```
+
+#### `disconnect()`
+
+Close the server connection and stop auto-reconnecting. Local reads and writes keep working; writes queue and replay on the next `connect`. Reconnection behavior itself is automatic and configured via `createCache({ connect: { reconnect } })`.
+
+```typescript
+disconnect(): void
+```
+
+---
+
+### JSON documents {#json-documents}
+
+Native JSON documents shared between server and browser. A `jset`/`jmerge` from any client — or `JSET`/`JMERGE` from the backend over TCP — updates every connected browser's local copy automatically.
+
+#### `jset(key, path, value)`
+
+Set part of a document. `"$"` is the whole document, `"$.user.name"` a nested field, `"$.items[2]"` an array element. Intermediate objects are auto-created. The value is `JSON.stringify`-ed for you. Throws on invalid paths.
+
+```typescript
+jset<T>(key: string, path: string, value: T): void
+```
+
+```typescript
+cache.jset('doc:42', '$', { title: 'Hello', meta: { views: 0 } })
+cache.jset('doc:42', '$.meta.views', 17)
+```
+
+#### `jget(key, path?)`
+
+Read part of a document from local WASM memory, parsed. Returns `null` when the key or path does not exist.
+
+```typescript
+jget<T>(key: string, path?: string): T | null
+```
+
+```typescript
+const views = cache.jget<number>('doc:42', '$.meta.views') // 17
+const doc = cache.jget<Doc>('doc:42')
+```
+
+#### `jmerge(key, patch)`
+
+RFC 7386 JSON Merge Patch: objects merge recursively, `null` fields are removed, arrays and scalars are replaced. Only the patch travels over the wire.
+
+```typescript
+jmerge<T>(key: string, patch: T): void
+```
+
+```typescript
+cache.jmerge('doc:42', { title: 'Final', draft: null })
+```
+
+---
+
+### Live queries & sync scoping
+
+#### `liveQuery(pattern)`
+
+Start a live query: the server sends the current state of every key matching the glob pattern (merged into the local store), then streams every change to matching keys — including keys created after subscribing. The mutation callback fires on each change.
+
+Returns a stop function. Calls are ref-counted per pattern: the server subscription ends when the last caller stops.
+
+```typescript
+liveQuery(pattern: string): () => void
+```
+
+```typescript
+const stop = cache.liveQuery('cart:42:*')
+const unsub = cache.onMutation(() => {
+  render(cache.getMatching('cart:42:*'))
+})
+// later:
+unsub(); stop()
+```
+
+Using React or Vue? [`useKeys(pattern)`](/react/hooks-reference#usekeys-pattern) wraps this in one line.
+
+#### `getMatching(pattern)`
+
+Snapshot of local keys matching a glob pattern, as `[key, value]` pairs sorted by key. Values are strings; keys holding collection types come back as `null`. Served entirely from local WASM memory.
+
+```typescript
+getMatching(pattern: string): Array<[string, string | null]>
+```
+
+#### `syncToken(token)` / `syncScopes(patterns)`
+
+Scope this connection's sync. `syncToken` presents a signed scope token — required on servers running with `RECACHED_SYNC_SECRET`; `syncScopes` sets plain glob patterns as a bandwidth filter on servers without one. Usually you pass these via `createCache({ connect: { syncToken } })` instead. See [Sync Scopes](/server/sync-scopes).
+
+```typescript
+syncToken(token: string): void
+syncScopes(patterns: string[]): void
+```
+
+---
+
 ### Pub/Sub
 
 Pub/Sub requires a server connection. Messages are delivered via the WebSocket and routed to subscribers on the receiving end.
