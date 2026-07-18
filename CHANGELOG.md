@@ -4,6 +4,27 @@ All notable changes to Recached are documented here.
 
 ---
 
+## [0.2.1] — 2026-07-18
+
+### Changed — License
+
+- **Recached is now licensed under the Apache License 2.0** (previously MIT). Both are permissive and
+  neither restricts commercial or closed-source use; Apache 2.0 adds an **explicit patent grant** from
+  contributors to users — which MIT is silent on — plus a defensive patent-retaliation clause and an
+  explicit statement that trademark rights are not granted. Every crate and npm package now declares
+  the SPDX identifier `Apache-2.0`, and a `NOTICE` file has been added and is shipped with each
+  published package.
+- Releases up to and including **`v0.2.0` remain MIT-licensed** — that grant is irrevocable for those
+  versions and for anyone who already received them.
+
+### Fixed
+
+- The workspace declared a `license` but no member crate inherited it, so `core-engine`,
+  `server-native`, `sync-client`, and `wasm-edge` all published with no license metadata at all. Each
+  now carries `license.workspace = true`.
+
+---
+
 ## [0.2.0] — 2026-07-11
 
 ### Changed

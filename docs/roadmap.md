@@ -4,35 +4,7 @@ Recached competes on **where the data can live** — the same engine on the serv
 
 Ordered by priority.
 
-## 1. Rate-limiting commands ✅ shipped
-
-`RLSET key limit window` / `RLCHECK key [limit window]`. A built-in sliding-window rate limiter that replaces hand-rolled INCR+EXPIRE (racy) or Lua script approaches. `RLCHECK` returns `[allowed, remaining, retry_after_ms]` — a direct fit for `X-RateLimit-*` / `Retry-After` headers — and the inline config form auto-creates self-cleaning per-IP/per-user limiters in a single command. See [Commands → Rate Limiting](/server/commands#rate-limiting).
-
-## 2. Scoped sync and per-client auth ✅ shipped
-
-Every WebSocket connection can now be scoped to glob patterns via the `SYNC` command, and the mutation fan-out delivers only matching keys. With `RECACHED_SYNC_SECRET` set, scopes become a real authorization boundary: connections present an HMAC-signed token minted by your backend (`SYNC TOKEN <token>`), and every command — reads included — is checked against the granted patterns; admin/keyspace-wide commands are refused. See [Sync Scopes](/server/sync-scopes).
-
-
-## 3. Live queries — "Redis that renders" ✅ shipped
-
-`QSUB pattern` returns the current state of every matching key and then streams keychange diffs — initial state plus diffs, not fire-and-forget events — scope-checked under strict sync scoping. The client half makes it a one-liner in React and Vue:
-
-```tsx
-const cart = useKeys('cart:item:*'); // current matching keys + live updates
-```
-
-Server write → diff over WebSocket → local WASM cache → component re-render, with zero application glue. See [Commands → Live Queries](/server/commands#live-queries-websocket-only) and [`useKeys`](/react/hooks-reference#usekeys-pattern).
-
-
-## 4. Native JSON type ✅ shipped
-
-`JSET key path value`, `JGET key [path]`, `JMERGE key patch` — nested JSON stored as a native type, without RedisJSON. Path reads and partial updates never re-serialize the whole document, and only the change travels over the wire. `JMERGE` follows RFC 7386 (deep merge, `null` removes fields). The browser SDK mirrors all three (`jset`/`jget`/`jmerge`), so a merge from any client updates every connected browser's local document. See [Commands → JSON](/server/commands#json).
-
-
-## 5. Offline-first writes with merge semantics ✅ shipped
-
-Browser clients queue writes as *operations* in a **durable outbox** while offline (IndexedDB-backed with persistence enabled, so they survive a full page reload), auto-reconnect with backoff, re-establish the session (auth, sync token, live queries — which re-hydrate local state), and replay the outbox. Writes are retired only on server acknowledgment (at-least-once delivery). Operation replay makes merges type-aware: `incr`/`decr` queue deltas that merge additively (PN-counter semantics), `jmerge` patches deep-merge, collection ops replay, and plain `set` is last-writer-wins by server arrival. See [Offline & Reconnection](/browser/offline).
-
+Items 1–5 have shipped: rate-limiting commands, scoped sync with per-client auth, live queries, the native JSON type, and offline-first writes with merge semantics. Their numbering is retained below so existing references stay valid — see the [changelog](https://github.com/thinkgrid-labs/recached/blob/main/CHANGELOG.md) for what landed in each.
 
 ## 6. Mobile SDKs — React Native, Flutter, Kotlin, Swift
 
@@ -80,11 +52,8 @@ SEMGET prompts <embedding> 0.92          # → cached response or nil
 
 An agent streams tokens into a key with `APPEND`; every subscribed browser renders it live. Live queries already deliver the subscription — the missing piece is an append *delta* frame (keychange currently re-sends the whole value) plus catch-up-then-follow on reconnect. `useKey('agent:run:42:output')` becomes a live-typing agent visible to any number of viewers. Redis Streams end at the backend; this reaches the UI.
 
-### 12. Vector search in the browser
 
-Server-side vector search is table stakes now (Redis 8 has it). What only Recached's architecture allows: the same vector index compiled to WASM and synced via scoped sync — **on-device semantic search over the user's own data, offline, zero-latency**. Personal RAG memory that works on a plane. A server-only tool structurally cannot copy this.
-
-### 13. Computed keys — the reactive cache
+### 12. Computed keys — the reactive cache
 
 Declare a key as a function of other keys; the server recomputes on change and the diff flows through live queries — cache becomes spreadsheet. `cart:42:total` recomputes when any `cart:42:item:*` changes, and every subscribed UI updates. Uses WASM scripting (#7) as the function runtime. Biggest lift, biggest ceiling.
 

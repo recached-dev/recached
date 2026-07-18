@@ -81,7 +81,7 @@ The road to 1.0 is hardening, not features: fuzzing the parser surfaces, automat
 | Lua scripting | No (WASM scripting on roadmap) | Yes |
 | Cluster mode | No | Yes |
 | Command coverage | ~80 commands | 250+ |
-| License | MIT | BSD-3 |
+| License | Apache 2.0 | BSD-3 |
 
 ## Recached vs SWR / React Query
 
@@ -96,3 +96,17 @@ They can coexist: Recached for your server-synced live state, SWR for your HTTP 
 Zustand and Redux are UI state managers. They are excellent for component state, UI interactions, form state, and modal visibility. They have no concept of expiry or server sync.
 
 Recached replaces the manual caching layer developers build on top of Zustand or Redux: the `fetchedAt` timestamp tracking, the staleness checks, the manual invalidation on mutation. It does not replace UI state management — it replaces the cache you bolted onto it.
+
+## Recached vs TalaDB
+
+[TalaDB](https://taladb.dev) is our sibling project at ThinkGrid Labs, and the two are deliberately complementary, not competing:
+
+| | Recached | TalaDB |
+|---|---|---|
+| What it is | Cache + **sync fabric** between backend and clients | Embedded **database** inside the app |
+| Data model | Keys — strings, collections, JSON | Documents with MongoDB-like queries, indexes, ACID transactions |
+| Server | The server is the product (Redis-compatible) | None — runs entirely on-device |
+| Superpower | Multi-client sync: scoped auth, live fan-out, offline outbox, exactly-once delivery | On-device vector + hybrid search, rich queries |
+| Truth model | **Shared truth** across users and devices | **Device-local truth** |
+
+The one-line rule: **TalaDB is where one device's data lives; Recached is how many devices agree.** A notes app with on-device semantic search wants TalaDB. A shared cart, live dashboard, presence, or agent-output streaming wants Recached. An app that needs both — locally queryable data that also syncs across users — is exactly where the two are designed to meet: TalaDB's planned `SyncAdapter` interface can use Recached as its sync backbone.

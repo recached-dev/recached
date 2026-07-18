@@ -39,8 +39,8 @@ jobs:
       - name: Build Wasm package
         run: wasm-pack build wasm-edge --target web --release --out-name recached-edge
 
-      - name: Copy LICENSE into package
-        run: cp LICENSE.md wasm-edge/pkg/LICENSE.md
+      - name: Copy LICENSE + NOTICE into package
+        run: cp LICENSE.md NOTICE wasm-edge/pkg/
 
       - name: Set package name and version
         # wasm-pack derives the npm name and version from the crate — patch both so the
@@ -87,8 +87,8 @@ jobs:
       - name: Build
         run: cd sdks/recached-react && npm run build
 
-      - name: Copy LICENSE into package
-        run: cp LICENSE.md sdks/recached-react/LICENSE.md
+      - name: Copy LICENSE + NOTICE into package
+        run: cp LICENSE.md NOTICE sdks/recached-react/
 
       - name: Publish to NPM
         env:
@@ -119,8 +119,8 @@ jobs:
       - name: Build
         run: cd sdks/recached-vue && npm run build
 
-      - name: Copy LICENSE into package
-        run: cp LICENSE.md sdks/recached-vue/LICENSE.md
+      - name: Copy LICENSE + NOTICE into package
+        run: cp LICENSE.md NOTICE sdks/recached-vue/
 
       - name: Publish to NPM
         env:

@@ -7,7 +7,7 @@
   <a href="https://www.npmjs.com/package/recached-edge"><img src="https://img.shields.io/npm/v/recached-edge?label=npm" alt="npm"></a>
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Language-Rust-orange.svg?logo=rust" alt="Rust"></a>
   <a href="https://webassembly.org"><img src="https://img.shields.io/badge/Ecosystem-WebAssembly-yellow.svg" alt="Wasm"></a>
-  <a href="LICENSE.md"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="MIT"></a>
+  <a href="LICENSE.md"><img src="https://img.shields.io/badge/License-Apache_2.0-green.svg" alt="Apache 2.0"></a>
 </div>
 
 ---
@@ -146,4 +146,4 @@ Recached is free and open-source, maintained by one person. If it saves you infr
 
 ## License
 
-MIT — © 2026 ThinkGrid Labs
+Apache License 2.0 — © 2026 ThinkGrid Labs

@@ -1,7 +1,7 @@
 {
   "name": "recached-edge",
   "description": "Browser and edge WebAssembly client for Recached \u2014 zero-latency local cache with automatic server sync",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "main": "sdk.js",
   "module": "sdk.js",
@@ -52,6 +52,6 @@
     "browser-cache",
     "zero-latency"
   ],
-  "license": "MIT",
+  "license": "Apache-2.0",
   "licenseFile": "../LICENSE.md"
 }
