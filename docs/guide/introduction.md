@@ -8,7 +8,7 @@ That is where the similarity with Redis ends.
 
 The distinguishing feature is the `core-engine` crate: a pure Rust state machine with no network dependencies, no file I/O, and no OS-specific code. It compiles to native x86-64/ARM64 for the server **and** to `wasm32-unknown-unknown` for the browser. Both targets run the same cache logic from the same source. The WebSocket sync layer (port 6380) keeps the two sides consistent in real time.
 
-The result: your backend caches data over RESP as it always has, and every connected browser instance holds a local copy of the cache in WASM memory. Frontend reads are 0 ms — no network hop. Frontend writes propagate to the server and fan out to all other connected clients.
+The result: your backend caches data over RESP as it always has, and every connected browser instance holds a local copy of the cache in WASM memory. Frontend reads never leave the process — no network hop, no serialization, sub-microsecond in practice. Frontend writes propagate to the server and fan out to all other connected clients.
 
 ## The core insight
 
@@ -21,25 +21,16 @@ Recached removes the choice. The `core-engine` is the cache. It runs in both pla
 
 ## Architecture
 
-```
-┌─────────────────┐        RESP (port 6379)        ┌──────────────────┐
-│   Your backend  │ ──────────────────────────────► │  Recached Server │
-└─────────────────┘                                 │  (server-native) │
-                                                    └────────┬─────────┘
-                                                             │ WebSocket
-                                                             │ sync (6380)
-                                                    ┌────────▼─────────┐
-                                                    │  Browser / Edge  │
-                                                    │  (wasm-edge)     │
-                                                    │  local reads: 0ms│
-                                                    └──────────────────┘
-```
+<figure>
+  <img class="light-only" src="/architecture-light.svg" alt="Your backend writes to the Recached server over RESP on port 6379. The server syncs over a WebSocket on port 6380 to the browser or edge runtime, where reads are served from local WebAssembly memory. Writes flow back the same way.">
+  <img class="dark-only" src="/architecture-dark.svg" alt="Your backend writes to the Recached server over RESP on port 6379. The server syncs over a WebSocket on port 6380 to the browser or edge runtime, where reads are served from local WebAssembly memory. Writes flow back the same way.">
+</figure>
 
 Three crates with hard dependency boundaries:
 
 | Crate | Role |
 |---|---|
-| `core-engine` | Pure state machine — no networking, no I/O. RESP parser, typed command dispatch, `Arc<RwLock<HashMap>>` store, TTL engine, optional key cap. Compiles to both native and `wasm32`. |
+| `core-engine` | Pure state machine — no networking, no I/O. RESP parser, typed command dispatch, sharded lock-free store (`DashMap`), TTL engine, optional key cap. Compiles to both native and `wasm32`. |
 | `server-native` | Tokio TCP server (port 6379) + WebSocket server (port 6380). Persistent read buffers handle fragmented RESP. Per-connection pub/sub via `mpsc` channels. Connection semaphore, auth rate-limiting, sender-ID broadcast filter. |
 | `wasm-edge` | `wasm-bindgen` JS bindings. Local zero-latency reads, RESP-over-WebSocket sync. Closure lifecycle managed to avoid memory leaks on reconnect. |
 
@@ -80,8 +71,8 @@ The road to 1.0 is hardening, not features: fuzzing the parser surfaces, automat
 | Replication | Primary/replica + auto-failover | Yes (+ Sentinel/Cluster) |
 | Lua scripting | No (WASM scripting on roadmap) | Yes |
 | Cluster mode | No | Yes |
-| Command coverage | ~80 commands | 250+ |
-| License | Apache 2.0 | BSD-3 |
+| Command coverage | ~106 commands | 250+ |
+| License | Apache 2.0 | AGPLv3 / RSALv2 + SSPLv1 (BSD-3 up to 7.2; Valkey stayed BSD-3) |
 
 ## Recached vs SWR / React Query
 

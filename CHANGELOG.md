@@ -4,7 +4,7 @@ All notable changes to Recached are documented here.
 
 ---
 
-## [0.2.1] — 2026-07-18
+## [0.2.1] — Unreleased
 
 ### Changed — License
 
@@ -14,14 +14,84 @@ All notable changes to Recached are documented here.
   explicit statement that trademark rights are not granted. Every crate and npm package now declares
   the SPDX identifier `Apache-2.0`, and a `NOTICE` file has been added and is shipped with each
   published package.
-- Releases up to and including **`v0.2.0` remain MIT-licensed** — that grant is irrevocable for those
-  versions and for anyone who already received them.
 
-### Fixed
+### Added — Documentation
+
+- **[Use Cases](docs/guide/use-cases.md)** — where Recached fits against Redis and Memcached, and
+  where it does not. Opens with a disqualifying question (if no client needs to read what your
+  backend writes, use Redis), covers the scenarios where the difference is real, and names Redis for
+  raw single-node throughput and Memcached for large uniform blob caching. Includes a three-way
+  comparison table, a "run it alongside Redis" section, and a migration checklist.
+- **[Security & Production Checklist](docs/server/security.md)** — a tickable pre-exposure list, the
+  authentication/TLS/allowlist details, the sync-port threat model and token-minting flow, and a
+  plainly-stated list of what Recached does **not** defend against (no per-command ACLs, no audit
+  log, no encryption at rest, no rate limiting on the RESP port, no third-party security review).
+- **[Operations](docs/server/operations.md)** — the six exported Prometheus metrics with their types
+  and labels, PromQL queries, an alert table, health-check probes, the compiled-in capacity limits,
+  and backup/restore. States the observability gaps explicitly: no memory, key-count, eviction,
+  replication, or sync-layer metrics exist yet, so process RSS is the only capacity signal.
+- **[Troubleshooting](docs/server/troubleshooting.md)** — symptoms ordered by likelihood, derived
+  from the actual error strings and limits in the code.
+- **Animated architecture diagram** replacing the ASCII art in the README and `How It Works`, shipped
+  as light and dark SVG variants (`<picture>` on GitHub, class-swapped in VitePress).
+
+### Fixed — Packaging
 
 - The workspace declared a `license` but no member crate inherited it, so `core-engine`,
   `server-native`, `sync-client`, and `wasm-edge` all published with no license metadata at all. Each
   now carries `license.workspace = true`.
+
+### Fixed — Documentation accuracy
+
+- **The store was described as `Arc<RwLock<HashMap>>`.** It is `Arc<DashMap<String, Entry>>` — a
+  sharded concurrent map with no global lock. The old wording described a scalability bottleneck the
+  code does not have, and contradicted the pipelined benchmark results on the same page.
+- **Command coverage was undercounted as "~80 commands."** The real figure is **106**.
+- **Two benchmark claims were contradicted by the table directly beneath them.** "Everything stays
+  under 0.75 ms at p50" and "sub-millisecond p50 on every common command" both ignored the `LRANGE`
+  rows at 1.96–3.58 ms. Both now scope the claim to single-key commands and name `LRANGE` as the
+  exception with its real figures. The "74–96% of Redis" range was likewise corrected to 73–96% for
+  single-key operations, with `LRANGE` broken out separately at 63–85%.
+- **The benchmark page is now marked as measured on v0.1.8**, which predates the v0.2.0 `DEDUP`
+  envelope, rather than reading as a current measurement.
+- **Redis's license was listed as BSD-3.** Redis relicensed in 2024 (RSALv2/SSPLv1) and added AGPLv3
+  in Redis 8; BSD-3 describes Redis ≤ 7.2 and Valkey. The comparison table now says so.
+- **Pub/Sub was undocumented at the receiving end.** `subscribe`, `unsubscribe`, and `publish` were
+  documented but `onMessage` — the only way to actually receive a message — appeared nowhere, making
+  the API unusable from the docs alone. Now documented with an example.
+- **`REPLICAOF` was missing from the command reference**, including the fact that only
+  `REPLICAOF NO ONE` is accepted at runtime and re-pointing a live server requires a restart.
+- **`RECACHED_ALLOW_IPS` was documented as "CIDR support depends on the version."** It accepts exact
+  IP addresses only; invalid entries are logged and dropped, and an all-invalid list rejects every
+  connection.
+- The `isEnabled()`-style caption in the architecture diagram overflowed its viewBox and was clipped.
+
+### Changed — Test coverage
+
+- **`core-engine` line coverage raised from 84.19% to 93.67%** (regions 86.16% → 93.59%, functions
+  86.11% → 95.49%), with tests going from 175 to **273**. Per file: `cmd.rs` 82.05% → 96.65%,
+  `resp.rs` 90.71% → 97.91%, `store.rs` 84.48% → 91.89%.
+- **CI now gates `core-engine` coverage at 90%** via `cargo llvm-cov --fail-under-lines 90`. The
+  crate is the shared state machine — the same code evaluates commands on the server and in the
+  browser through WASM — so a regression there reaches every platform at once.
+- New coverage targets the paths that carry the most risk rather than chasing the number:
+  - **`glob_match` gained its first direct tests.** It is not only the `KEYS`/`SCAN` matcher: it is
+    the sync-scope authorization primitive (`scopes.iter().any(|p| glob_match(p, k))`), so a false
+    positive is a cross-tenant read. Now covered for sibling-tenant isolation (`cart:42:*` must not
+    match `cart:99:*`), `:` boundary handling, byte-wise multi-byte behaviour, and a wall-clock
+    assertion that the pathological `*a*a*a…*b` shape cannot reintroduce the exponential
+    backtracking the current implementation was written to remove. All passed on the first run — the
+    boundary was already correct and is now pinned.
+  - **Eviction and capacity**: all five eviction policies, `try_evict_for_memory`, `max_keys` with
+    and without a policy, per-key eviction during `MSET`, and memory accounting for every value type.
+  - **RESP parser hardening**: every prefix of a valid frame must report `Incomplete`, plus nesting
+    depth limits, element caps, oversized headers, and malformed integers.
+  - **Correctness edges**: expired keys invisible across all five read paths, `INCR` at `i64::MAX`
+    erroring without corrupting the stored value, `WRONGTYPE` preserving the original value, `ZADD`
+    `GT`/`LT` directionality, TTL overflow guards, `KEEPTTL` versus plain `SET`, and snapshot
+    round-trip for every value type including TTL preservation.
+  - **Per-command arity and error paths** across ~80 commands, table-driven so a single off-by-one
+    guard is caught per command rather than in aggregate.
 
 ---
 

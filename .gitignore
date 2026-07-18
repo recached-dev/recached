@@ -34,3 +34,9 @@ PLAN.md
 NOTES.md
 
 scripts/
+
+# Cache snapshots / AOF written by a server started in the repo root
+# (e.g. while running scripts/benchmark.sh). Never artifacts to commit.
+*.rdb
+*.aof
+*.msgpack

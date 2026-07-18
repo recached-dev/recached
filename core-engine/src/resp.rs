@@ -372,3 +372,156 @@ mod tests {
         assert_eq!(empty, b"*0\r\n");
     }
 }
+
+#[cfg(test)]
+mod parser_edge_tests {
+    use super::*;
+
+    /// Every prefix of a valid frame must report `Incomplete` rather than
+    /// parsing garbage — this is the property that makes streaming reads safe
+    /// when TCP hands us a partial frame.
+    fn every_prefix_is_incomplete(frame: &[u8]) {
+        for cut in 1..frame.len() {
+            let err = Value::parse(&frame[..cut]).expect_err(&format!(
+                "prefix of {cut} bytes should not parse: {frame:?}"
+            ));
+            assert!(
+                err.contains("Incomplete") || err.contains("too large") || err.contains("Invalid"),
+                "prefix {cut}: unexpected error {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_error_frames() {
+        let (v, n) = Value::parse(b"-ERR something broke\r\n").unwrap();
+        assert_eq!(v, Value::Error("ERR something broke".to_string()));
+        assert_eq!(n, 22);
+    }
+
+    #[test]
+    fn parses_integer_frames_including_negatives() {
+        assert_eq!(Value::parse(b":42\r\n").unwrap().0, Value::Integer(42));
+        assert_eq!(Value::parse(b":-7\r\n").unwrap().0, Value::Integer(-7));
+        assert_eq!(Value::parse(b":0\r\n").unwrap().0, Value::Integer(0));
+    }
+
+    #[test]
+    fn rejects_malformed_integer() {
+        let err = Value::parse(b":notanumber\r\n").unwrap_err();
+        assert!(err.contains("Invalid integer"), "got {err}");
+    }
+
+    #[test]
+    fn partial_frames_report_incomplete() {
+        every_prefix_is_incomplete(b"-ERR broke\r\n");
+        every_prefix_is_incomplete(b":123\r\n");
+        every_prefix_is_incomplete(b"$5\r\nhello\r\n");
+        every_prefix_is_incomplete(b"*2\r\n$1\r\na\r\n$1\r\nb\r\n");
+    }
+
+    #[test]
+    fn parses_push_frames() {
+        let frame = b">2\r\n$7\r\nmessage\r\n$2\r\nhi\r\n";
+        let (v, n) = Value::parse(frame).unwrap();
+        assert_eq!(
+            v,
+            Value::Push(vec![
+                Value::BulkString(Some(b"message".to_vec())),
+                Value::BulkString(Some(b"hi".to_vec())),
+            ])
+        );
+        assert_eq!(n, frame.len());
+    }
+
+    #[test]
+    fn push_frame_round_trips() {
+        let v = Value::Push(vec![
+            Value::SimpleString("keychange".into()),
+            Value::Integer(1),
+        ]);
+        let bytes = v.serialize();
+        assert_eq!(Value::parse(&bytes).unwrap().0, v);
+    }
+
+    #[test]
+    fn rejects_malformed_push_length() {
+        let err = Value::parse(b">abc\r\n").unwrap_err();
+        assert!(err.contains("Invalid push frame length"), "got {err}");
+    }
+
+    #[test]
+    fn rejects_push_frame_with_too_many_elements() {
+        // Declared count over the element cap must be refused on the header
+        // alone, before any allocation proportional to it.
+        let frame = format!(">{}\r\n", MAX_ARRAY_ELEMENTS + 1);
+        let err = Value::parse(frame.as_bytes()).unwrap_err();
+        assert!(err.contains("push frame too large"), "got {err}");
+    }
+
+    #[test]
+    fn rejects_array_frame_with_too_many_elements() {
+        let frame = format!("*{}\r\n", MAX_ARRAY_ELEMENTS + 1);
+        let err = Value::parse(frame.as_bytes()).unwrap_err();
+        assert!(err.contains("too large"), "got {err}");
+    }
+
+    #[test]
+    fn rejects_nesting_beyond_the_depth_limit() {
+        // A hostile client can otherwise drive unbounded recursion with a few
+        // bytes per level.
+        let mut frame = Vec::new();
+        for _ in 0..(MAX_ARRAY_DEPTH + 2) {
+            frame.extend_from_slice(b"*1\r\n");
+        }
+        frame.extend_from_slice(b"$1\r\na\r\n");
+        let err = Value::parse(&frame).unwrap_err();
+        assert!(err.contains("nesting depth"), "got {err}");
+    }
+
+    #[test]
+    fn nesting_within_the_limit_still_parses() {
+        let mut frame = Vec::new();
+        for _ in 0..(MAX_ARRAY_DEPTH - 2) {
+            frame.extend_from_slice(b"*1\r\n");
+        }
+        frame.extend_from_slice(b"$1\r\na\r\n");
+        assert!(Value::parse(&frame).is_ok());
+    }
+
+    #[test]
+    fn rejects_oversized_bulk_string_header() {
+        let frame = format!("${}\r\n", MAX_BULK_STRING_BYTES + 1);
+        let err = Value::parse(frame.as_bytes()).unwrap_err();
+        assert!(err.contains("too large"), "got {err}");
+    }
+
+    #[test]
+    fn rejects_unknown_type_byte() {
+        let err = Value::parse(b"%1\r\n").unwrap_err();
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn empty_buffer_is_incomplete() {
+        assert!(Value::parse(b"").is_err());
+    }
+
+    #[test]
+    fn null_array_and_null_bulk_round_trip() {
+        assert_eq!(Value::parse(b"*-1\r\n").unwrap().0, Value::Array(None));
+        assert_eq!(Value::parse(b"$-1\r\n").unwrap().0, Value::BulkString(None));
+    }
+
+    #[test]
+    fn parse_reports_bytes_consumed_so_pipelines_advance() {
+        // Two frames back to back: the parser must consume exactly the first.
+        let buf = b":1\r\n:2\r\n";
+        let (v1, n1) = Value::parse(buf).unwrap();
+        assert_eq!(v1, Value::Integer(1));
+        assert_eq!(n1, 4);
+        let (v2, n2) = Value::parse(&buf[n1..]).unwrap();
+        assert_eq!(v2, Value::Integer(2));
+        assert_eq!(n2, 4);
+    }
+}

@@ -1991,3 +1991,605 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod parse_coverage_tests {
+    use super::*;
+
+    fn bulk(s: &str) -> Value {
+        Value::BulkString(Some(s.as_bytes().to_vec()))
+    }
+
+    fn array(parts: &[&str]) -> Value {
+        Value::Array(Some(parts.iter().map(|s| bulk(s)).collect()))
+    }
+
+    fn parse(parts: &[&str]) -> Result<Command, String> {
+        Command::from_value(array(parts))
+    }
+
+    // ── SET expiry options ────────────────────────────────────────────────────
+    // Four near-identical parse blocks (EX/PX/EXAT/PXAT). Copy-paste bugs hide
+    // in exactly this shape, so each variant is pinned to its own unit.
+
+    #[test]
+    fn set_parses_each_expiry_unit() {
+        for (kw, expected) in [
+            ("EX", SetExpiry::Ex(10)),
+            ("PX", SetExpiry::Px(10)),
+            ("EXAT", SetExpiry::Exat(10)),
+            ("PXAT", SetExpiry::Pxat(10)),
+        ] {
+            let cmd = parse(&["SET", "k", "v", kw, "10"]).unwrap();
+            match cmd {
+                Command::Set(_, _, opts) => assert_eq!(
+                    opts.expiry,
+                    Some(expected),
+                    "{kw} mapped to the wrong expiry unit"
+                ),
+                other => panic!("{kw}: expected Set, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn set_expiry_options_are_case_insensitive() {
+        let cmd = parse(&["SET", "k", "v", "ex", "10"]).unwrap();
+        assert!(matches!(cmd, Command::Set(_, _, o) if o.expiry == Some(SetExpiry::Ex(10))));
+    }
+
+    #[test]
+    fn set_rejects_non_positive_expiry_for_every_unit() {
+        for kw in ["EX", "PX", "EXAT", "PXAT"] {
+            for bad in ["0", "-1"] {
+                let err = parse(&["SET", "k", "v", kw, bad]).unwrap_err();
+                assert!(
+                    err.contains("invalid expire time"),
+                    "{kw} {bad} should be rejected, got: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn set_rejects_expiry_keyword_with_no_value() {
+        for kw in ["EX", "PX", "EXAT", "PXAT"] {
+            let err = parse(&["SET", "k", "v", kw]).unwrap_err();
+            assert!(err.contains("syntax error"), "{kw}: got {err}");
+        }
+    }
+
+    #[test]
+    fn set_parses_keepttl_nx_xx_and_get() {
+        assert!(matches!(
+            parse(&["SET", "k", "v", "KEEPTTL"]).unwrap(),
+            Command::Set(_, _, o) if o.expiry == Some(SetExpiry::KeepTtl)
+        ));
+        assert!(matches!(
+            parse(&["SET", "k", "v", "NX"]).unwrap(),
+            Command::Set(_, _, o) if o.condition == Some(SetCondition::Nx)
+        ));
+        assert!(matches!(
+            parse(&["SET", "k", "v", "XX"]).unwrap(),
+            Command::Set(_, _, o) if o.condition == Some(SetCondition::Xx)
+        ));
+        assert!(matches!(
+            parse(&["SET", "k", "v", "GET"]).unwrap(),
+            Command::Set(_, _, o) if o.get
+        ));
+    }
+
+    #[test]
+    fn set_rejects_unknown_options() {
+        assert!(parse(&["SET", "k", "v", "BOGUS"]).is_err());
+    }
+
+    // ── Optional-argument commands ────────────────────────────────────────────
+
+    #[test]
+    fn lpop_and_rpop_take_an_optional_count() {
+        assert_eq!(
+            parse(&["LPOP", "l"]).unwrap(),
+            Command::LPop("l".into(), None)
+        );
+        assert_eq!(
+            parse(&["LPOP", "l", "3"]).unwrap(),
+            Command::LPop("l".into(), Some(3))
+        );
+        assert_eq!(
+            parse(&["RPOP", "l"]).unwrap(),
+            Command::RPop("l".into(), None)
+        );
+        assert_eq!(
+            parse(&["RPOP", "l", "2"]).unwrap(),
+            Command::RPop("l".into(), Some(2))
+        );
+    }
+
+    #[test]
+    fn jget_path_is_optional() {
+        assert_eq!(
+            parse(&["JGET", "doc"]).unwrap(),
+            Command::JGet("doc".into(), None)
+        );
+        assert_eq!(
+            parse(&["JGET", "doc", "$.a"]).unwrap(),
+            Command::JGet("doc".into(), Some("$.a".into()))
+        );
+    }
+
+    #[test]
+    fn jmerge_requires_a_patch() {
+        assert!(parse(&["JMERGE", "doc"]).is_err());
+        assert_eq!(
+            parse(&["JMERGE", "doc", "{\"a\":1}"]).unwrap(),
+            Command::JMerge("doc".into(), "{\"a\":1}".into())
+        );
+    }
+
+    // ── Live queries ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn qsub_requires_a_non_empty_pattern() {
+        assert_eq!(
+            parse(&["QSUB", "cart:*"]).unwrap(),
+            Command::QSub("cart:*".into())
+        );
+        let err = parse(&["QSUB", ""]).unwrap_err();
+        assert!(err.contains("non-empty pattern"), "got {err}");
+        assert!(parse(&["QSUB"]).is_err(), "QSUB with no pattern");
+    }
+
+    #[test]
+    fn qunsub_pattern_is_optional() {
+        // Bare QUNSUB drops every subscription; with a pattern it drops one.
+        assert_eq!(parse(&["QUNSUB"]).unwrap(), Command::QUnsub(None));
+        assert_eq!(
+            parse(&["QUNSUB", "cart:*"]).unwrap(),
+            Command::QUnsub(Some("cart:*".into()))
+        );
+    }
+
+    // ── Set commands ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn set_family_parses_and_enforces_arity() {
+        assert_eq!(
+            parse(&["SREM", "s", "a", "b"]).unwrap(),
+            Command::SRem("s".into(), vec!["a".into(), "b".into()])
+        );
+        assert_eq!(parse(&["SCARD", "s"]).unwrap(), Command::SCard("s".into()));
+        assert_eq!(
+            parse(&["SISMEMBER", "s", "a"]).unwrap(),
+            Command::SIsMember("s".into(), "a".into())
+        );
+
+        for short in [vec!["SREM", "s"], vec!["SCARD"], vec!["SISMEMBER", "s"]] {
+            assert!(parse(&short).is_err(), "{short:?} should fail arity check");
+        }
+    }
+
+    // ── Float coercion ────────────────────────────────────────────────────────
+    // Used by ZADD/ZINCRBY scores, where infinities are meaningful sentinels
+    // rather than errors.
+
+    #[test]
+    fn float_extraction_accepts_infinities() {
+        assert_eq!(extract_float(&bulk("inf")).unwrap(), f64::INFINITY);
+        assert_eq!(extract_float(&bulk("+inf")).unwrap(), f64::INFINITY);
+        assert_eq!(extract_float(&bulk("-inf")).unwrap(), f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn float_extraction_accepts_other_value_shapes() {
+        assert_eq!(
+            extract_float(&Value::SimpleString("1.5".into())).unwrap(),
+            1.5
+        );
+        assert_eq!(extract_float(&Value::Integer(7)).unwrap(), 7.0);
+    }
+
+    #[test]
+    fn float_extraction_rejects_non_numeric() {
+        for bad in [
+            bulk("abc"),
+            Value::SimpleString("nope".into()),
+            Value::Array(None),
+        ] {
+            let err = extract_float(&bad).unwrap_err();
+            assert!(err.contains("not a valid float"), "got {err}");
+        }
+    }
+
+    // ── Unknown commands ──────────────────────────────────────────────────────
+
+    #[test]
+    fn unknown_command_is_reported_not_rejected() {
+        // Parsing succeeds so the server can answer with a proper error reply
+        // naming the command, rather than dropping the connection.
+        assert_eq!(
+            parse(&["NOSUCHCOMMAND", "a"]).unwrap(),
+            Command::Unknown("NOSUCHCOMMAND".into())
+        );
+    }
+}
+
+#[cfg(test)]
+mod arity_and_error_tests {
+    use super::*;
+
+    fn bulk(s: &str) -> Value {
+        Value::BulkString(Some(s.as_bytes().to_vec()))
+    }
+
+    fn array(parts: &[&str]) -> Value {
+        Value::Array(Some(parts.iter().map(|s| bulk(s)).collect()))
+    }
+
+    fn parse(parts: &[&str]) -> Result<Command, String> {
+        Command::from_value(array(parts))
+    }
+
+    /// Every command below must reject a call with too few arguments. Table
+    /// driven because the arity guard is copy-pasted per command — the failure
+    /// mode is one arm being off by one, which only a per-command case catches.
+    #[test]
+    fn commands_reject_too_few_arguments() {
+        let too_short: &[&[&str]] = &[
+            &["GET"],
+            &["SET", "k"],
+            &["SETEX", "k", "10"],
+            &["PSETEX", "k", "10"],
+            &["SETNX", "k"],
+            &["GETSET", "k"],
+            &["APPEND", "k"],
+            &["STRLEN"],
+            &["INCR"],
+            &["DECR"],
+            &["INCRBY", "k"],
+            &["DECRBY", "k"],
+            &["MGET"],
+            &["MSET", "k"],
+            &["EXPIRE", "k"],
+            &["EXPIREAT", "k"],
+            &["PEXPIRE", "k"],
+            &["TTL"],
+            &["PTTL"],
+            &["PERSIST"],
+            &["DEL"],
+            &["EXISTS"],
+            &["TYPE"],
+            &["RENAME", "k"],
+            &["KEYS"],
+            &["HSET", "h", "f"],
+            &["HGET", "h"],
+            &["HDEL", "h"],
+            &["HEXISTS", "h"],
+            &["HLEN"],
+            &["HGETALL"],
+            &["HKEYS"],
+            &["HVALS"],
+            &["HMGET", "h"],
+            &["HINCRBY", "h", "f"],
+            &["HINCRBYFLOAT", "h", "f"],
+            &["HSETNX", "h", "f"],
+            &["LPUSH", "l"],
+            &["RPUSH", "l"],
+            &["LPOP"],
+            &["RPOP"],
+            &["LLEN"],
+            &["LRANGE", "l", "0"],
+            &["LINDEX", "l"],
+            &["LSET", "l", "0"],
+            &["LREM", "l", "0"],
+            &["LTRIM", "l", "0"],
+            &["SADD", "s"],
+            &["SREM", "s"],
+            &["SMEMBERS"],
+            &["SCARD"],
+            &["SISMEMBER", "s"],
+            &["SINTER"],
+            &["SUNION"],
+            &["SDIFF"],
+            &["SMOVE", "a", "b"],
+            &["SPOP"],
+            &["SRANDMEMBER"],
+            &["ZADD", "z", "1"],
+            &["ZSCORE", "z"],
+            &["ZREM", "z"],
+            &["ZCARD"],
+            &["ZRANK", "z"],
+            &["ZINCRBY", "z", "1"],
+            &["ZRANGE", "z", "0"],
+            &["ZREVRANGE", "z", "0"],
+            &["ZCOUNT", "z", "0"],
+            &["JSET", "j", "$"],
+            &["JGET"],
+            &["JMERGE", "j"],
+            &["RLSET", "k", "10"],
+            &["RLCHECK"],
+            &["SUBSCRIBE"],
+            &["PUBLISH", "ch"],
+            &["QSUB"],
+            &["AUTH"],
+            &["REPLICAOF", "NO"],
+            &["DEDUP", "client", "1"],
+        ];
+
+        for parts in too_short {
+            assert!(
+                parse(parts).is_err(),
+                "{parts:?} should fail its arity check but parsed"
+            );
+        }
+    }
+
+    /// The matching positive case for the same commands: a minimal valid call
+    /// must parse. Without this, an arity guard that rejects *everything* would
+    /// still pass the test above.
+    #[test]
+    fn minimal_valid_calls_parse() {
+        let valid: &[&[&str]] = &[
+            &["GET", "k"],
+            &["SET", "k", "v"],
+            &["SETEX", "k", "10", "v"],
+            &["PSETEX", "k", "10", "v"],
+            &["SETNX", "k", "v"],
+            &["GETSET", "k", "v"],
+            &["APPEND", "k", "v"],
+            &["STRLEN", "k"],
+            &["INCR", "k"],
+            &["DECR", "k"],
+            &["INCRBY", "k", "2"],
+            &["DECRBY", "k", "2"],
+            &["MGET", "a"],
+            &["MSET", "k", "v"],
+            &["EXPIRE", "k", "10"],
+            &["TTL", "k"],
+            &["PERSIST", "k"],
+            &["DEL", "k"],
+            &["EXISTS", "k"],
+            &["TYPE", "k"],
+            &["RENAME", "a", "b"],
+            &["KEYS", "*"],
+            &["HSET", "h", "f", "v"],
+            &["HGET", "h", "f"],
+            &["HDEL", "h", "f"],
+            &["HEXISTS", "h", "f"],
+            &["HLEN", "h"],
+            &["HGETALL", "h"],
+            &["HKEYS", "h"],
+            &["HVALS", "h"],
+            &["HMGET", "h", "f"],
+            &["HINCRBY", "h", "f", "1"],
+            &["HINCRBYFLOAT", "h", "f", "1.5"],
+            &["HSETNX", "h", "f", "v"],
+            &["LPUSH", "l", "v"],
+            &["RPUSH", "l", "v"],
+            &["LLEN", "l"],
+            &["LRANGE", "l", "0", "-1"],
+            &["LINDEX", "l", "0"],
+            &["LSET", "l", "0", "v"],
+            &["LREM", "l", "0", "v"],
+            &["LTRIM", "l", "0", "-1"],
+            &["SADD", "s", "m"],
+            &["SREM", "s", "m"],
+            &["SMEMBERS", "s"],
+            &["SCARD", "s"],
+            &["SISMEMBER", "s", "m"],
+            &["SINTER", "a"],
+            &["SUNION", "a"],
+            &["SDIFF", "a"],
+            &["SMOVE", "a", "b", "m"],
+            &["SPOP", "s"],
+            &["SRANDMEMBER", "s"],
+            &["ZADD", "z", "1", "m"],
+            &["ZSCORE", "z", "m"],
+            &["ZREM", "z", "m"],
+            &["ZCARD", "z"],
+            &["ZRANK", "z", "m"],
+            &["ZINCRBY", "z", "1", "m"],
+            &["ZRANGE", "z", "0", "-1"],
+            &["ZREVRANGE", "z", "0", "-1"],
+            &["ZCOUNT", "z", "0", "10"],
+            &["JSET", "j", "$", "1"],
+            &["JGET", "j"],
+            &["JMERGE", "j", "{}"],
+            &["RLSET", "k", "10", "60"],
+            &["RLCHECK", "k"],
+            &["SUBSCRIBE", "ch"],
+            &["UNSUBSCRIBE", "ch"],
+            &["PUBLISH", "ch", "msg"],
+            &["QSUB", "p:*"],
+            &["AUTH", "pw"],
+            &["PING"],
+            &["DBSIZE"],
+            &["FLUSHDB"],
+        ];
+
+        for parts in valid {
+            assert!(parse(parts).is_ok(), "{parts:?} should parse but errored");
+        }
+    }
+
+    #[test]
+    fn unsubscribe_with_no_arguments_means_all_channels() {
+        // Documented behaviour: a bare UNSUBSCRIBE drops every subscription, so
+        // it must parse rather than fail an arity check.
+        assert_eq!(
+            parse(&["UNSUBSCRIBE"]).unwrap(),
+            Command::Unsubscribe(vec![])
+        );
+        assert_eq!(
+            parse(&["UNSUBSCRIBE", "ch"]).unwrap(),
+            Command::Unsubscribe(vec!["ch".into()])
+        );
+        // SUBSCRIBE, by contrast, needs at least one channel.
+        assert!(parse(&["SUBSCRIBE"]).is_err());
+    }
+
+    #[test]
+    fn unsupported_commands_fall_through_to_unknown() {
+        // INCRBYFLOAT (the string variant) is deliberately not implemented —
+        // only HINCRBYFLOAT is. Unsupported verbs parse as `Unknown` so the
+        // server can answer with a proper error naming the command rather than
+        // dropping the connection.
+        assert_eq!(
+            parse(&["INCRBYFLOAT", "k", "1.5"]).unwrap(),
+            Command::Unknown("INCRBYFLOAT".into())
+        );
+        assert!(matches!(
+            parse(&["HINCRBYFLOAT", "h", "f", "1.5"]).unwrap(),
+            Command::HIncrByFloat(..)
+        ));
+    }
+
+    // ── REPLICAOF ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn replicaof_accepts_only_no_one() {
+        assert_eq!(
+            parse(&["REPLICAOF", "NO", "ONE"]).unwrap(),
+            Command::ReplicaOfNoOne
+        );
+        // Case-insensitive, like every other keyword.
+        assert_eq!(
+            parse(&["REPLICAOF", "no", "one"]).unwrap(),
+            Command::ReplicaOfNoOne
+        );
+    }
+
+    #[test]
+    fn replicaof_rejects_repointing_at_runtime() {
+        // Re-pointing a live server is deliberately unsupported — it requires a
+        // restart with a new RECACHED_REPLICAOF. The error must say so.
+        let err = parse(&["REPLICAOF", "127.0.0.1", "6379"]).unwrap_err();
+        assert!(err.contains("REPLICAOF NO ONE"), "got {err}");
+    }
+
+    // ── DEDUP ─────────────────────────────────────────────────────────────────
+    // The exactly-once envelope. A malformed client id or id must be refused
+    // rather than silently treated as a fresh write.
+
+    #[test]
+    fn dedup_validates_the_client_id() {
+        assert!(
+            parse(&["DEDUP", "", "1", "GET"]).is_err(),
+            "empty client id"
+        );
+        let long = "x".repeat(65);
+        assert!(
+            parse(&["DEDUP", &long, "1", "GET"]).is_err(),
+            "client id over 64 chars"
+        );
+        assert!(parse(&["DEDUP", "client", "1", "PING"]).is_ok());
+    }
+
+    #[test]
+    fn dedup_rejects_a_non_numeric_id() {
+        assert!(parse(&["DEDUP", "client", "notanumber", "PING"]).is_err());
+    }
+
+    // ── SYNC ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sync_accepts_zero_or_more_patterns() {
+        // Bare SYNC clears scopes; with patterns it sets them.
+        assert_eq!(parse(&["SYNC"]).unwrap(), Command::Sync(vec![]));
+        assert_eq!(
+            parse(&["SYNC", "cart:*", "user:1:*"]).unwrap(),
+            Command::Sync(vec!["cart:*".into(), "user:1:*".into()])
+        );
+    }
+
+    // ── Numeric argument validation ───────────────────────────────────────────
+
+    #[test]
+    fn integer_arguments_reject_non_numeric_input() {
+        for parts in [
+            vec!["INCRBY", "k", "abc"],
+            vec!["DECRBY", "k", "abc"],
+            vec!["EXPIRE", "k", "abc"],
+            vec!["LRANGE", "l", "0", "abc"],
+            vec!["LINDEX", "l", "abc"],
+            vec!["SETEX", "k", "abc", "v"],
+        ] {
+            assert!(
+                parse(&parts).is_err(),
+                "{parts:?} should reject a non-numeric argument"
+            );
+        }
+    }
+
+    #[test]
+    fn setex_and_psetex_reject_non_positive_ttls() {
+        for cmd in ["SETEX", "PSETEX"] {
+            for ttl in ["0", "-5"] {
+                let err = parse(&[cmd, "k", ttl, "v"]).unwrap_err();
+                assert!(
+                    err.contains("invalid expire time"),
+                    "{cmd} {ttl}: got {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rate_limiter_config_rejects_zero_limit_or_window() {
+        let err = parse(&["RLSET", "k", "0", "60"]).unwrap_err();
+        assert!(err.contains("limit must be >= 1"), "got {err}");
+        let err = parse(&["RLSET", "k", "10", "0"]).unwrap_err();
+        assert!(err.contains("window must be >= 1"), "got {err}");
+    }
+
+    // ── Frame-level validation ────────────────────────────────────────────────
+
+    #[test]
+    fn non_array_frames_are_rejected() {
+        // Commands arrive as RESP arrays; anything else is a protocol error.
+        for v in [
+            Value::SimpleString("PING".into()),
+            Value::Integer(1),
+            Value::BulkString(Some(b"PING".to_vec())),
+        ] {
+            assert!(Command::from_value(v).is_err());
+        }
+    }
+
+    #[test]
+    fn empty_command_array_is_rejected() {
+        let err = Command::from_value(Value::Array(Some(vec![]))).unwrap_err();
+        assert!(err.contains("Empty command"), "got {err}");
+    }
+
+    #[test]
+    fn command_name_may_arrive_as_a_simple_string() {
+        // Some clients send the verb as a simple string rather than a bulk one.
+        let v = Value::Array(Some(vec![Value::SimpleString("PING".into())]));
+        assert_eq!(Command::from_value(v).unwrap(), Command::Ping(None));
+    }
+
+    #[test]
+    fn non_string_command_name_is_rejected() {
+        let v = Value::Array(Some(vec![Value::Integer(42)]));
+        assert!(Command::from_value(v).is_err());
+    }
+
+    #[test]
+    fn command_names_are_case_insensitive() {
+        for name in ["get", "Get", "GET", "gEt"] {
+            assert!(
+                matches!(parse(&[name, "k"]).unwrap(), Command::Get(_)),
+                "{name} should parse as GET"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_keys_are_rejected() {
+        // An empty key is never valid — it would be indistinguishable from a
+        // missing argument once stored.
+        let err = parse(&["GET", ""]).unwrap_err();
+        assert!(err.contains("key cannot be empty"), "got {err}");
+    }
+}

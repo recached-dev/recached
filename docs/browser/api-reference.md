@@ -334,10 +334,34 @@ Pub/Sub requires a server connection. Messages are delivered via the WebSocket a
 
 #### `subscribe(channel)`
 
-Subscribe to a pub/sub channel. Incoming messages from the server are applied to the local store.
+Subscribe to a pub/sub channel, so the server starts delivering that channel's messages to this
+client. Subscribing alone does not surface anything — register a handler with
+[`onMessage`](#onmessage-channel-callback) to actually receive them.
 
 ```typescript
 subscribe(channel: string): void
+```
+
+#### `onMessage(channel, callback)` {#onmessage-channel-callback}
+
+Register a handler for messages on a channel. Returns an unsubscribe function that removes **this
+handler only** — it does not leave the channel; call `unsubscribe(channel)` for that. Multiple
+handlers can be registered on the same channel.
+
+```typescript
+onMessage(channel: string, cb: (msg: string) => void): () => void
+```
+
+```typescript
+cache.subscribe('notifications');
+
+const stop = cache.onMessage('notifications', (msg) => {
+  console.log('got', msg);
+});
+
+// Later — remove the handler, then leave the channel.
+stop();
+cache.unsubscribe('notifications');
 ```
 
 #### `unsubscribe(channel)`

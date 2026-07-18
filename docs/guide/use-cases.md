@@ -1,0 +1,147 @@
+# Use Cases
+
+Where Recached earns its place next to — or instead of — Redis and Memcached, and where it does not.
+
+This page is written for the evaluation, not the pitch. If your problem is on the "reach for
+something else" list, that is the honest answer.
+
+## The one-sentence test
+
+> **Does a browser, mobile app, or edge worker need to read the same data your backend writes?**
+
+If **no** — you are caching database rows for your own API, computing fragment caches, storing
+sessions read only by the server — Redis or Memcached is the right tool and Recached offers you
+nothing they do not already do better, with a decade more hardening.
+
+If **yes**, you are currently paying for that in one of three ways: polling, a bespoke WebSocket
+layer, or a second client-side cache you invalidate by hand. Removing that cost is the entire
+reason Recached exists.
+
+## Where the difference actually shows up
+
+### Live dashboards and counters
+
+**The usual shape.** Backend writes a metric to Redis. Frontend polls `GET /api/metrics` every few
+seconds. You tune the interval as a tradeoff between staleness and load, and it is wrong in both
+directions — stale for users, wasteful for the server.
+
+**With Recached.** The backend does the same `INCR` it always did. Every subscribed browser gets the
+new value pushed over the sync WebSocket and re-renders. No polling loop, no `/api/metrics` endpoint,
+no interval to tune.
+
+```typescript
+const online = useKey('metrics:users:online'); // re-renders on every server-side change
+```
+
+The comparison is not "Redis is slow." Redis is fast. The comparison is that with Redis you still
+have to *build the delivery mechanism*, and with Recached the cache is the delivery mechanism.
+
+### Shared carts, collaborative state, presence
+
+Multiple clients read and write the same keys and each needs to see the others' changes. Classically
+this is Redis plus a pub/sub channel plus a WebSocket server plus reconnection and replay logic —
+several hundred lines that are easy to get subtly wrong under packet loss.
+
+Recached ships that path: writes replay from a durable outbox after reconnect, `incr`/`decr` merge
+additively rather than clobbering, `jmerge` deep-merges documents, and delivery is exactly-once via a
+`DEDUP` envelope. See [Offline & Reconnection](/browser/offline).
+
+### Feature flags and config that must flip instantly
+
+Flags read on every render are the pathological case for a network cache: either you round-trip
+constantly or you cache locally and accept staleness. Recached holds the flag in WASM memory (read
+cost: a local map lookup) while a server-side flip propagates in milliseconds. You get local-read
+speed *and* immediate invalidation, which is normally a tradeoff.
+
+### Offline-capable and flaky-network UIs
+
+Reads are served from local memory whether or not the network is up. Writes queue in an
+IndexedDB-backed outbox and replay on reconnect. Redis and Memcached have nothing to say here — they
+are unreachable when the network is down, by definition.
+
+### Cross-tab consistency
+
+Multiple tabs of the same app share mutations through BroadcastChannel without any server round-trip.
+With Redis this is either polling per tab or a `storage` event protocol you write yourself.
+
+## Where you should reach for something else
+
+Being specific here is more useful than a feature grid.
+
+**Pure server-side caching → Redis or Memcached.** Query result caches, rendered fragments,
+rate-limit counters read only by your API. Recached will do this correctly, but you would be adopting
+a young project to solve a problem two extremely mature ones already solve.
+
+**Raw single-node throughput above all → Redis.** Unpipelined, Recached runs at 46–96% of Redis
+depending on the command ([benchmarks](/guide/benchmarks)). It leads when pipelined, because it is
+multi-threaded, but if your bottleneck is a single node's ceiling on unpipelined `HSET`, Redis wins
+today.
+
+**Pure memory-efficient blob caching at scale → Memcached.** Memcached's slab allocator and
+multi-threaded simplicity are excellent for large, uniform, ephemeral values. Recached is not
+optimized for that shape, and the sync machinery is dead weight if nothing subscribes.
+
+**System of record → a database.** Recached is an in-memory cache with snapshot and AOF persistence.
+It is not durable storage. See the persistence caveats in
+[when Recached is not the right fit](/guide/introduction#when-recached-is-not-the-right-fit).
+
+**Working set larger than RAM → a database, or Redis with eviction tuned.** There is no disk-backed
+tier.
+
+**You need Lua scripting, cluster mode, RESP3, or `INFO`/`SLOWLOG` introspection → Redis.** These are
+explicitly out of scope; see [Commands](/server/commands).
+
+## Compared directly
+
+| | Recached | Redis | Memcached |
+|---|---|---|---|
+| Server-side cache | Yes | Yes | Yes |
+| Client reads without a network hop | **Yes** — WASM, in-process | No | No |
+| Push to browsers on change | **Built in** | Pub/Sub + your own WS server | No |
+| Offline writes + replay | **Built in** | No | No |
+| Cross-tab sync | **Built in** | No | No |
+| Data structures | Strings, hashes, lists, sets, sorted sets, JSON | All of those + streams, bitmaps, HLL, geo | Strings only |
+| Persistence | Snapshot + AOF | RDB + AOF | None |
+| Replication | Primary/replica + single-replica auto-failover | Primary/replica + Sentinel + Cluster | None |
+| Scripting | No (WASM scripting on roadmap) | Lua | No |
+| Cluster / sharding | No | Yes | Client-side sharding |
+| Threading | Multi-threaded | Single-threaded command execution | Multi-threaded |
+| Command coverage | ~106 | 250+ | ~15 |
+| Maturity | Young — server production-ready for cache workloads, sync layer beta | 15+ years | 20+ years |
+| License | Apache 2.0 | AGPLv3 / RSALv2 + SSPLv1 (BSD-3 up to 7.2) | BSD-3 |
+
+Read the [maturity statement](/guide/introduction#maturity) before putting the sync layer in front of
+users. The server half and the sync half are at different levels of hardening, and the docs do not
+pretend otherwise.
+
+## Using Recached alongside Redis
+
+These are not mutually exclusive, and for most teams the honest first step is not a migration.
+
+A common split: keep Redis for everything server-only — session storage, job queues, rate limiting,
+query caches — and add Recached for the specific slice of state the UI needs live. That slice is
+usually small (a dozen keys: presence, counters, flags, cart) and it is exactly the slice that costs
+the most to build by hand.
+
+This also bounds your risk. If the sync layer disappoints, you have replaced a polling loop, not your
+cache tier.
+
+## Migrating from Redis
+
+Recached speaks RESP, so existing clients connect unchanged:
+
+```javascript
+const cache = new Redis('redis://127.0.0.1:6379'); // now pointing at Recached
+```
+
+Before switching a workload over, check:
+
+1. **Command coverage.** Diff your actual command usage against [Commands](/server/commands).
+   `MONITOR` on your existing Redis for a representative window is the fastest way to get that list.
+   Lua scripts, cluster commands, streams, and `INFO`-based tooling will not carry over.
+2. **Persistence expectations.** Confirm snapshot + AOF semantics match what you assume today.
+3. **Replication topology.** Single-replica auto-failover only; no Sentinel or quorum election.
+4. **Eviction.** Review the key cap and TTL behaviour in
+   [Configuration](/server/configuration) against your memory budget.
+
+There is no data migration path from an RDB file — treat it as a cold cache and let it fill.

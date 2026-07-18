@@ -1,5 +1,15 @@
 # How It Works
 
+<figure>
+  <img class="light-only" src="/architecture-light.svg" alt="Your backend writes to the Recached server over RESP on port 6379. The server syncs over a WebSocket on port 6380 to the browser or edge runtime, where reads are served from local WebAssembly memory. Writes flow back the same way.">
+  <img class="dark-only" src="/architecture-dark.svg" alt="Your backend writes to the Recached server over RESP on port 6379. The server syncs over a WebSocket on port 6380 to the browser or edge runtime, where reads are served from local WebAssembly memory. Writes flow back the same way.">
+  <figcaption>
+    A write on either side reaches the other automatically — server mutations fan out to every
+    connected browser, and browser writes sync back and fan out to other clients. Reads never leave
+    the process.
+  </figcaption>
+</figure>
+
 ## The three-crate architecture
 
 Recached is split into three crates with hard dependency boundaries. The key constraint is that `core-engine` has zero dependencies on anything that does not compile to `wasm32`.
