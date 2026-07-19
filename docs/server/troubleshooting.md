@@ -151,9 +151,11 @@ See [Offline & Reconnection](/browser/offline).
 A live query's initial state is capped at **10,000 keys**. Beyond that the snapshot is truncated.
 Narrow the pattern.
 
-Also note two documented limits of live queries: `FLUSHDB` does not emit per-key diffs, and
-collection values arrive as type markers rather than full values — subscribe, then re-read with
-`HGETALL` / `LRANGE` on change.
+Also note a remaining limit: `FLUSHDB` does not emit per-key diffs.
+
+If collection values arrive as a bare type name (`"hash"`) rather than their contents, the server and
+SDK are on different versions — collection values ship complete from 0.2.2 onward, and the two are
+released in lockstep.
 
 ### Too many live queries
 

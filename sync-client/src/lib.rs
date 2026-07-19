@@ -29,6 +29,16 @@ pub const MAX_PENDING_WRITES: usize = 10_000;
 pub const BACKOFF_BASE_MS: u32 = 500;
 pub const BACKOFF_CAP_MS: u32 = 30_000;
 
+/// FNV-1a over the client id — a stable, non-zero seed per client.
+fn seed_from(client_id: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in client_id.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h | 1
+}
+
 /// What an incoming frame turned out to be, and what the adapter must do.
 #[derive(Debug, PartialEq)]
 pub enum Incoming {
@@ -83,10 +93,16 @@ pub struct SyncClient {
     sync_scopes_csv: Option<String>,
     live_queries: Vec<String>,
     attempts: u32,
+    /// Jitter source for reconnect backoff. Seeded from `client_id` rather than
+    /// a system RNG so this crate stays dependency-free and I/O-free — and so
+    /// the sequence is reproducible in tests. Different clients get different
+    /// sequences, which is the only property that matters here.
+    jitter: u64,
 }
 
 impl SyncClient {
     pub fn new(store: Arc<KeyValueStore>, client_id: String) -> Self {
+        let jitter = seed_from(&client_id);
         Self {
             store,
             outbox: VecDeque::new(),
@@ -99,6 +115,7 @@ impl SyncClient {
             sync_scopes_csv: None,
             live_queries: Vec::new(),
             attempts: 0,
+            jitter,
         }
     }
 
@@ -228,12 +245,35 @@ impl SyncClient {
 
     /// The socket closed: returns the delay before the next reconnect
     /// attempt (exponential backoff, capped).
+    /// Delay before the next reconnect attempt, in milliseconds.
+    ///
+    /// Exponential with a cap, then **jittered into `[delay/2, delay]`**. Without
+    /// jitter every client disconnected by the same event computes an identical
+    /// schedule and reconnects in lockstep — a thundering herd that can keep a
+    /// recovering server down. Halving the floor keeps the growth shape intact
+    /// while spreading arrivals across the window.
     pub fn on_close(&mut self) -> u32 {
         let delay = BACKOFF_BASE_MS
             .saturating_mul(1u32 << self.attempts.min(6))
             .min(BACKOFF_CAP_MS);
         self.attempts = self.attempts.saturating_add(1);
-        delay
+
+        let half = delay / 2;
+        if half == 0 {
+            return delay;
+        }
+        half + (self.next_jitter() % (half as u64 + 1)) as u32
+    }
+
+    /// xorshift64* — small, dependency-free, and good enough for spreading
+    /// reconnects. Not for anything security-sensitive.
+    fn next_jitter(&mut self) -> u64 {
+        let mut x = self.jitter;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.jitter = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
 
     // ── writes ────────────────────────────────────────────────────────────
@@ -402,8 +442,71 @@ impl SyncClient {
             Value::BulkString(None) => {
                 self.store.execute(Command::Del(vec![key]));
             }
-            // Collection/JSON type marker: the value is not carried; regular
-            // mutation pushes keep those in sync — nothing to apply here.
+            // Type-tagged collection: ["hash"|"list"|"set"|"zset"|"json", ...].
+            Value::Array(Some(items)) => self.apply_tagged(key, items),
+            // Anything else (e.g. the "ratelimit" marker) carries no client-
+            // usable value.
+            _ => {}
+        }
+    }
+
+    /// Apply a type-tagged collection value from a keychange or qstate frame.
+    ///
+    /// The key is replaced wholesale rather than merged: the frame carries the
+    /// complete current value, so rebuilding is both simpler and correct when a
+    /// member was removed. Anything unrecognised is ignored rather than guessed
+    /// at, so a newer server cannot corrupt an older client's local copy.
+    fn apply_tagged(&self, key: String, items: &[Value]) {
+        fn text(v: &Value) -> Option<String> {
+            match v {
+                Value::BulkString(Some(b)) => Some(String::from_utf8_lossy(b).into_owned()),
+                Value::SimpleString(s) => Some(s.clone()),
+                _ => None,
+            }
+        }
+        let Some(tag) = items.first().and_then(text) else {
+            return;
+        };
+        let rest: Vec<String> = items[1..].iter().filter_map(text).collect();
+
+        // Clear first so removed members do not linger.
+        self.store.execute(Command::Del(vec![key.clone()]));
+        match tag.as_str() {
+            "hash" => {
+                let pairs: Vec<(String, String)> = rest
+                    .chunks_exact(2)
+                    .map(|c| (c[0].clone(), c[1].clone()))
+                    .collect();
+                if !pairs.is_empty() {
+                    self.store.execute(Command::HSet(key, pairs));
+                }
+            }
+            "list" => {
+                if !rest.is_empty() {
+                    self.store.execute(Command::RPush(key, rest));
+                }
+            }
+            "set" => {
+                if !rest.is_empty() {
+                    self.store.execute(Command::SAdd(key, rest));
+                }
+            }
+            "zset" => {
+                let members: Vec<(f64, String)> = rest
+                    .chunks_exact(2)
+                    .filter_map(|c| c[1].parse::<f64>().ok().map(|sc| (sc, c[0].clone())))
+                    .collect();
+                if !members.is_empty() {
+                    self.store
+                        .execute(Command::ZAdd(key, Default::default(), members));
+                }
+            }
+            "json" => {
+                if let Some(doc) = rest.first() {
+                    self.store
+                        .execute(Command::JSet(key, "$".to_string(), doc.clone()));
+                }
+            }
             _ => {}
         }
     }
@@ -413,12 +516,19 @@ impl SyncClient {
             let Value::BulkString(Some(k)) = &pair[0] else {
                 continue;
             };
-            if let Value::BulkString(Some(v)) = &pair[1] {
-                self.store.execute(Command::Set(
-                    String::from_utf8_lossy(k).into_owned(),
-                    String::from_utf8_lossy(v).into_owned(),
-                    Default::default(),
-                ));
+            let key = String::from_utf8_lossy(k).into_owned();
+            match &pair[1] {
+                Value::BulkString(Some(v)) => {
+                    self.store.execute(Command::Set(
+                        key,
+                        String::from_utf8_lossy(v).into_owned(),
+                        Default::default(),
+                    ));
+                }
+                // Collections arrive type-tagged, so the initial state of a
+                // live query is complete — no follow-up typed read needed.
+                Value::Array(Some(inner)) => self.apply_tagged(key, inner),
+                _ => {}
             }
         }
     }

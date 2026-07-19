@@ -94,17 +94,74 @@ fn session_commands_sent_while_open_occupy_reply_slots() {
 
 #[test]
 fn backoff_doubles_and_caps() {
+    // Jitter puts each delay in [nominal/2, nominal]; assert the band rather
+    // than an exact value.
+    fn band(delay: u32, nominal: u32) {
+        assert!(
+            delay >= nominal / 2 && delay <= nominal,
+            "delay {delay} outside [{}, {nominal}]",
+            nominal / 2
+        );
+    }
+
     let mut c = client();
-    assert_eq!(c.on_close(), 500);
-    assert_eq!(c.on_close(), 1000);
-    assert_eq!(c.on_close(), 2000);
+    band(c.on_close(), 500);
+    band(c.on_close(), 1000);
+    band(c.on_close(), 2000);
     for _ in 0..10 {
         c.on_close();
     }
-    assert_eq!(c.on_close(), 30_000);
+    band(c.on_close(), 30_000);
     // A successful open resets the schedule.
     c.on_open();
-    assert_eq!(c.on_close(), 500);
+    band(c.on_close(), 500);
+}
+
+#[test]
+fn backoff_is_jittered_across_clients() {
+    // The point of jitter: two clients disconnected by the same event must not
+    // compute the same schedule, or they reconnect in lockstep.
+    let mut a = SyncClient::new(Arc::new(KeyValueStore::new()), "client-a".to_string());
+    let mut b = SyncClient::new(Arc::new(KeyValueStore::new()), "client-b".to_string());
+
+    let seq_a: Vec<u32> = (0..6).map(|_| a.on_close()).collect();
+    let seq_b: Vec<u32> = (0..6).map(|_| b.on_close()).collect();
+    assert_ne!(seq_a, seq_b, "distinct clients must not share a schedule");
+}
+
+#[test]
+fn backoff_never_returns_zero_or_exceeds_the_cap() {
+    // A zero delay would busy-loop reconnects; exceeding the cap would strand
+    // a client for longer than intended.
+    let mut c = client();
+    for _ in 0..40 {
+        let d = c.on_close();
+        assert!(d > 0, "backoff must never be zero");
+        assert!(d <= BACKOFF_CAP_MS, "backoff {d} exceeded the cap");
+    }
+}
+
+#[test]
+fn jitter_spreads_reconnects_over_the_window() {
+    // With many clients the delays should occupy a range, not cluster on one
+    // value — that is the property that prevents the herd.
+    let delays: Vec<u32> = (0..50)
+        .map(|i| {
+            let mut c = SyncClient::new(Arc::new(KeyValueStore::new()), format!("client-{i}"));
+            for _ in 0..3 {
+                c.on_close();
+            }
+            c.on_close() // nominal 4000ms
+        })
+        .collect();
+
+    let unique: std::collections::HashSet<u32> = delays.iter().copied().collect();
+    assert!(
+        unique.len() > 20,
+        "expected a spread of delays, got {} distinct values",
+        unique.len()
+    );
+    assert!(delays.iter().all(|d| *d >= 2000 && *d <= 4000));
 }
 
 // ── acknowledgment & retirement ───────────────────────────────────────────────
@@ -397,8 +454,9 @@ fn on_open_resets_attempt_count_and_inflight() {
     c.enqueue_write(&to_resp(&["SET", "k", "v"]), true, true);
 
     c.on_open();
-    // Backoff restarts from the floor after a successful open.
-    assert_eq!(c.on_close(), 500);
+    // Backoff restarts from the floor after a successful open (jittered).
+    let d = c.on_close();
+    assert!((250..=500).contains(&d), "expected a reset floor, got {d}");
 }
 
 #[test]
@@ -448,4 +506,192 @@ fn epoch_is_readable_and_settable() {
     assert_eq!(c.epoch(), 0);
     c.set_epoch(7);
     assert_eq!(c.epoch(), 7);
+}
+
+// ── Type-tagged collection values ─────────────────────────────────────────────
+// A live query used to deliver only a type name for collections, forcing the
+// subscriber into a follow-up HGETALL/LRANGE — a network round-trip in a system
+// built on local reads. Values now arrive tagged and complete.
+
+/// Build the keychange frame a server sends for `key`, using the real
+/// `get_current` encoding rather than a hand-written fixture.
+fn keychange_frame(source: &KeyValueStore, key: &str) -> Vec<Value> {
+    vec![
+        Value::BulkString(Some(b"keychange".to_vec())),
+        Value::BulkString(Some(key.as_bytes().to_vec())),
+        source.get_current(key),
+    ]
+}
+
+/// keychange/qstate frames are plain RESP arrays, matching the wire format
+/// the existing tests use.
+fn push(items: Vec<Value>) -> String {
+    String::from_utf8_lossy(&Value::Array(Some(items)).serialize()).into_owned()
+}
+
+#[test]
+fn keychange_rebuilds_a_hash_without_a_re_read() {
+    let source = KeyValueStore::new();
+    source.execute(Command::HSet(
+        "cart:42".into(),
+        vec![("item".into(), "book".into()), ("qty".into(), "2".into())],
+    ));
+
+    let mut c = client();
+    c.handle_frame(&push(keychange_frame(&source, "cart:42")));
+
+    assert_eq!(
+        c.store()
+            .execute(Command::HGet("cart:42".into(), "item".into())),
+        bulk("book")
+    );
+    assert_eq!(
+        c.store()
+            .execute(Command::HGet("cart:42".into(), "qty".into())),
+        bulk("2")
+    );
+}
+
+#[test]
+fn keychange_rebuilds_lists_in_order() {
+    let source = KeyValueStore::new();
+    source.execute(Command::RPush(
+        "queue".into(),
+        vec!["first".into(), "second".into(), "third".into()],
+    ));
+
+    let mut c = client();
+    c.handle_frame(&push(keychange_frame(&source, "queue")));
+
+    assert_eq!(
+        c.store().execute(Command::LRange("queue".into(), 0, -1)),
+        Value::Array(Some(vec![bulk("first"), bulk("second"), bulk("third")])),
+        "list order must survive the round trip"
+    );
+}
+
+#[test]
+fn keychange_rebuilds_sets_and_zsets() {
+    let source = KeyValueStore::new();
+    source.execute(Command::SAdd(
+        "tags".into(),
+        vec!["red".into(), "blue".into()],
+    ));
+    source.execute(Command::ZAdd(
+        "board".into(),
+        Default::default(),
+        vec![(10.0, "alice".into()), (5.0, "bob".into())],
+    ));
+
+    let mut c = client();
+    c.handle_frame(&push(keychange_frame(&source, "tags")));
+    c.handle_frame(&push(keychange_frame(&source, "board")));
+
+    assert_eq!(
+        c.store().execute(Command::SCard("tags".into())),
+        Value::Integer(2)
+    );
+    assert_eq!(
+        c.store()
+            .execute(Command::ZScore("board".into(), "alice".into())),
+        bulk("10")
+    );
+}
+
+#[test]
+fn keychange_rebuilds_json_documents() {
+    let source = KeyValueStore::new();
+    source.execute(Command::JSet(
+        "doc".into(),
+        "$".into(),
+        "{\"a\":1}".to_string(),
+    ));
+
+    let mut c = client();
+    c.handle_frame(&push(keychange_frame(&source, "doc")));
+
+    assert_eq!(
+        c.store().execute(Command::JGet("doc".into(), None)),
+        bulk("{\"a\":1}")
+    );
+}
+
+#[test]
+fn a_removed_member_disappears_from_the_local_copy() {
+    // The frame carries the complete value, so the key is rebuilt rather than
+    // merged — otherwise a removal would never propagate.
+    let source = KeyValueStore::new();
+    source.execute(Command::SAdd(
+        "tags".into(),
+        vec!["red".into(), "blue".into()],
+    ));
+
+    let mut c = client();
+    c.handle_frame(&push(keychange_frame(&source, "tags")));
+    assert_eq!(
+        c.store().execute(Command::SCard("tags".into())),
+        Value::Integer(2)
+    );
+
+    source.execute(Command::SRem("tags".into(), vec!["red".into()]));
+    c.handle_frame(&push(keychange_frame(&source, "tags")));
+
+    assert_eq!(
+        c.store()
+            .execute(Command::SIsMember("tags".into(), "red".into())),
+        Value::Integer(0),
+        "a member removed on the server must not linger locally"
+    );
+    assert_eq!(
+        c.store().execute(Command::SCard("tags".into())),
+        Value::Integer(1)
+    );
+}
+
+#[test]
+fn qstate_delivers_complete_collections_on_subscribe() {
+    // The initial state of a live query is now usable immediately.
+    let source = KeyValueStore::new();
+    source.execute(Command::HSet(
+        "cart:1".into(),
+        vec![("item".into(), "pen".into())],
+    ));
+    source.execute(Command::RPush("cart:2".into(), vec!["a".into()]));
+
+    let mut c = client();
+    let frame = push(vec![
+        Value::BulkString(Some(b"qstate".to_vec())),
+        Value::BulkString(Some(b"cart:*".to_vec())),
+        Value::BulkString(Some(b"cart:1".to_vec())),
+        source.get_current("cart:1"),
+        Value::BulkString(Some(b"cart:2".to_vec())),
+        source.get_current("cart:2"),
+    ]);
+    c.handle_frame(&frame);
+
+    assert_eq!(
+        c.store()
+            .execute(Command::HGet("cart:1".into(), "item".into())),
+        bulk("pen")
+    );
+    assert_eq!(
+        c.store().execute(Command::LLen("cart:2".into())),
+        Value::Integer(1)
+    );
+}
+
+#[test]
+fn an_unknown_type_tag_is_ignored_rather_than_guessed() {
+    // Forward compatibility: a newer server sending a type this client does not
+    // know must not corrupt the local copy.
+    let mut c = client();
+    c.handle_frame(&push(vec![
+        Value::BulkString(Some(b"keychange".to_vec())),
+        Value::BulkString(Some(b"k".to_vec())),
+        Value::Array(Some(vec![
+            Value::BulkString(Some(b"futuretype".to_vec())),
+            Value::BulkString(Some(b"payload".to_vec())),
+        ])),
+    ]));
+    assert_eq!(get(&c, "k"), Value::BulkString(None));
 }

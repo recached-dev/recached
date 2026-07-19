@@ -614,19 +614,70 @@ impl KeyValueStore {
     /// Strings are returned as bulk strings. Complex types return nil — the
     /// watcher must use a type-specific command (HGETALL, LRANGE, etc.) to
     /// fetch the full value. Deleted or expired keys also return nil.
+    /// The current value of `key`, as delivered to live-query subscribers.
+    ///
+    /// Strings come back as a bulk string and a missing or expired key as nil.
+    /// Collections come back **type-tagged**: an array whose first element names
+    /// the type, followed by its contents.
+    ///
+    /// ```text
+    /// hash  →  ["hash", field, value, ...]     (HGETALL order)
+    /// list  →  ["list", element, ...]          (head to tail)
+    /// set   →  ["set", member, ...]
+    /// zset  →  ["zset", member, score, ...]    (ascending score)
+    /// json  →  ["json", serialized-document]
+    /// ```
+    ///
+    /// The tag is what makes the payload unambiguous — a four-element array is
+    /// otherwise indistinguishable between a list of four items and a hash of
+    /// two pairs. Earlier versions sent only the type name, which forced every
+    /// subscriber into a follow-up `HGETALL`/`LRANGE` round-trip: exactly the
+    /// network hop local reads exist to avoid.
     pub fn get_current(&self, key: &str) -> Value {
+        fn tagged(tag: &str, mut items: Vec<Value>) -> Value {
+            let mut out = Vec::with_capacity(items.len() + 1);
+            out.push(Value::BulkString(Some(tag.as_bytes().to_vec())));
+            out.append(&mut items);
+            Value::Array(Some(out))
+        }
+        fn bulk(s: &str) -> Value {
+            Value::BulkString(Some(s.as_bytes().to_vec()))
+        }
+
         let now = now_ms();
         match self.data.get(key) {
             None => Value::BulkString(None),
             Some(e) if e.is_expired(now) => Value::BulkString(None),
             Some(e) => match &e.value {
                 EntryValue::Str(s) => Value::BulkString(Some(s.clone().into_bytes())),
-                EntryValue::Hash(_) => Value::SimpleString("hash".to_string()),
-                EntryValue::List(_) => Value::SimpleString("list".to_string()),
-                EntryValue::Set(_) => Value::SimpleString("set".to_string()),
-                EntryValue::ZSet(_) => Value::SimpleString("zset".to_string()),
+                EntryValue::Hash(m) => {
+                    let mut fields: Vec<(&String, &String)> = m.iter().collect();
+                    fields.sort_by(|a, b| a.0.cmp(b.0));
+                    let items = fields
+                        .into_iter()
+                        .flat_map(|(f, v)| [bulk(f), bulk(v)])
+                        .collect();
+                    tagged("hash", items)
+                }
+                EntryValue::List(l) => tagged("list", l.iter().map(|v| bulk(v)).collect()),
+                EntryValue::Set(st) => tagged("set", st.iter().map(|m| bulk(m)).collect()),
+                EntryValue::ZSet(z) => {
+                    let mut pairs: Vec<(&String, &f64)> = z.scores.iter().collect();
+                    pairs.sort_by(|a, b| {
+                        a.1.partial_cmp(b.1)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| a.0.cmp(b.0))
+                    });
+                    let items = pairs
+                        .into_iter()
+                        .flat_map(|(m, sc)| [bulk(m), bulk(&format_score(*sc))])
+                        .collect();
+                    tagged("zset", items)
+                }
+                // Attempt state is transient and server-side; clients have no
+                // use for it and it must not leak into a browser replica.
                 EntryValue::RateLimiter(_) => Value::SimpleString("ratelimit".to_string()),
-                EntryValue::Json(_) => Value::SimpleString("json".to_string()),
+                EntryValue::Json(doc) => tagged("json", vec![bulk(&doc.to_string())]),
             },
         }
     }
@@ -801,6 +852,13 @@ impl KeyValueStore {
 
     pub fn execute(&self, cmd: Command) -> Value {
         match cmd {
+            // Ephemeral keys are ordinary strings to the engine — their lifetime
+            // is enforced by the server, which is the layer that knows about
+            // connections. Keeping the engine unaware keeps it I/O-free.
+            Command::ESet(key, value) => {
+                self.execute(Command::Set(key, value, crate::cmd::SetOptions::default()))
+            }
+
             // ── Core ─────────────────────────────────────────────────────────
             Command::Ping(msg) => match msg {
                 Some(m) => Value::BulkString(Some(m.into_bytes())),
@@ -4432,23 +4490,72 @@ mod capacity_tests {
     }
 
     #[test]
-    fn get_current_returns_type_markers_for_collections() {
+    fn get_current_returns_type_tagged_collection_values() {
+        // Live-query subscribers get the actual contents, tagged with the type
+        // so the payload is unambiguous. Previously only the type name was sent,
+        // which forced a follow-up HGETALL/LRANGE — a network round-trip in a
+        // system whose whole premise is local reads.
         let s = KeyValueStore::new();
         s.execute(Command::HSet("h".into(), vec![("f".into(), "v".into())]));
-        s.execute(Command::LPush("l".into(), vec!["a".into()]));
-        s.execute(Command::SAdd("st".into(), vec!["a".into()]));
+        s.execute(Command::RPush("l".into(), vec!["a".into(), "b".into()]));
+        s.execute(Command::SAdd("st".into(), vec!["m".into()]));
         s.execute(Command::ZAdd(
             "z".into(),
             Default::default(),
-            vec![(1.0, "a".into())],
+            vec![(1.5, "alice".into())],
         ));
         s.execute(Command::JSet("j".into(), "$".into(), "{\"a\":1}".into()));
 
-        assert_eq!(s.get_current("h"), Value::SimpleString("hash".into()));
-        assert_eq!(s.get_current("l"), Value::SimpleString("list".into()));
-        assert_eq!(s.get_current("st"), Value::SimpleString("set".into()));
-        assert_eq!(s.get_current("z"), Value::SimpleString("zset".into()));
-        assert_eq!(s.get_current("j"), Value::SimpleString("json".into()));
+        fn parts(v: Value) -> Vec<String> {
+            match v {
+                Value::Array(Some(items)) => items
+                    .iter()
+                    .map(|i| match i {
+                        Value::BulkString(Some(b)) => String::from_utf8_lossy(b).into_owned(),
+                        other => format!("{other:?}"),
+                    })
+                    .collect(),
+                other => panic!("expected a tagged array, got {other:?}"),
+            }
+        }
+
+        assert_eq!(parts(s.get_current("h")), vec!["hash", "f", "v"]);
+        assert_eq!(parts(s.get_current("l")), vec!["list", "a", "b"]);
+        assert_eq!(parts(s.get_current("st")), vec!["set", "m"]);
+        assert_eq!(parts(s.get_current("z")), vec!["zset", "alice", "1.5"]);
+        assert_eq!(parts(s.get_current("j")), vec!["json", "{\"a\":1}"]);
+    }
+
+    #[test]
+    fn get_current_orders_collections_deterministically() {
+        // Two clients receiving the same key must build identical local state,
+        // so ordering cannot depend on hash iteration order.
+        let s = KeyValueStore::new();
+        s.execute(Command::HSet(
+            "h".into(),
+            vec![("b".into(), "2".into()), ("a".into(), "1".into())],
+        ));
+        s.execute(Command::ZAdd(
+            "z".into(),
+            Default::default(),
+            vec![(9.0, "high".into()), (1.0, "low".into())],
+        ));
+        for _ in 0..5 {
+            match s.get_current("h") {
+                Value::Array(Some(items)) => {
+                    // Fields sorted: a before b.
+                    assert_eq!(items[1], Value::BulkString(Some(b"a".to_vec())));
+                }
+                other => panic!("{other:?}"),
+            }
+            match s.get_current("z") {
+                Value::Array(Some(items)) => {
+                    // Ascending score: low before high.
+                    assert_eq!(items[1], Value::BulkString(Some(b"low".to_vec())));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
     }
 
     // ── sweep_expired ─────────────────────────────────────────────────────────
@@ -5212,5 +5319,51 @@ mod critical_path_tests {
             matches!(restored.execute(Command::Ttl("k".into())), Value::Integer(n) if n > 0),
             "a restored key must keep its expiry, not become permanent"
         );
+    }
+}
+
+#[cfg(test)]
+mod ephemeral_tests {
+    use super::*;
+    use crate::cmd::Command;
+
+    #[test]
+    fn eset_stores_a_value_like_set() {
+        // To the engine an ephemeral key is an ordinary string — lifetime is
+        // enforced by the server, which is the layer that knows about
+        // connections. Keeping the engine unaware is what keeps it I/O-free
+        // and identical between native and wasm builds.
+        let s = KeyValueStore::new();
+        assert_eq!(
+            s.execute(Command::ESet("presence:1".into(), "online".into())),
+            Value::SimpleString("OK".into())
+        );
+        assert_eq!(
+            s.execute(Command::Get("presence:1".into())),
+            Value::BulkString(Some(b"online".to_vec()))
+        );
+        assert_eq!(
+            s.execute(Command::Type("presence:1".into())),
+            Value::SimpleString("string".into())
+        );
+        // No TTL — the engine must not invent one.
+        assert_eq!(
+            s.execute(Command::Ttl("presence:1".into())),
+            Value::Integer(-1)
+        );
+    }
+
+    #[test]
+    fn eset_overwrites_and_is_visible_to_reads_and_live_queries() {
+        let s = KeyValueStore::new();
+        s.execute(Command::ESet("presence:1".into(), "first".into()));
+        s.execute(Command::ESet("presence:1".into(), "second".into()));
+        assert_eq!(
+            s.get_current("presence:1"),
+            Value::BulkString(Some(b"second".to_vec()))
+        );
+        // Pattern matching picks it up like any other key.
+        let matched = s.matching_key_values("presence:*", 10);
+        assert_eq!(matched.len(), 1);
     }
 }

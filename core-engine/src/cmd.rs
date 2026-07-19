@@ -50,6 +50,10 @@ pub enum Command {
     // ── Strings ──────────────────────────────────────────────────────────────
     Set(String, String, SetOptions),
     Get(String),
+    /// ESET — a SET whose key is owned by the connection that wrote it.
+    /// The engine stores it like any string; the *server* deletes it when that
+    /// connection closes. Presence, cursors, "who is online".
+    ESet(String, String),
     Del(Vec<String>),
     Unlink(Vec<String>),
     Append(String, String),
@@ -307,6 +311,13 @@ impl Command {
                     "GET" => {
                         need!(2);
                         Ok(Command::Get(extract_key(&arr[1])?))
+                    }
+                    "ESET" => {
+                        need!(3);
+                        Ok(Command::ESet(
+                            extract_key(&arr[1])?,
+                            extract_string(&arr[2]).unwrap_or_default(),
+                        ))
                     }
                     "DEL" => {
                         need!(2);

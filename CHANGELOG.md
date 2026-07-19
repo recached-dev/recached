@@ -4,6 +4,63 @@ All notable changes to Recached are documented here.
 
 ---
 
+## [0.2.2] — Unreleased
+
+### Added
+
+- **`ESET` — connection-scoped keys for presence.** A key written with `ESET` lives exactly as long
+  as the connection that wrote it; when that connection closes the server deletes it and pushes the
+  deletion to live queries. Presence, cursors and "who is online" previously had to be hand-rolled
+  with `SETEX` plus a heartbeat, which leaves ghost entries for the length of the TTL whenever a tab
+  closes.
+
+  Ownership transfers on each write, which is what makes multiple tabs behave: two tabs both setting
+  `presence:user:42` leave the **later** one as owner, so closing the first does not mark the user
+  offline. Replicas receive the write as a plain `SET` — they have no connection to scope a lifetime
+  to, and the owning server broadcasts the deletion.
+
+### Changed
+
+- **Live queries now carry collection values.** `qstate` and `keychange` previously delivered only a
+  *type name* for hashes, lists, sets, sorted sets and JSON, so every subscriber had to follow up with
+  `HGETALL`/`LRANGE`/`JGET` — a network round-trip in a system whose premise is that reads are local.
+  Collections now arrive **type-tagged and complete**:
+
+  ```text
+  hash  →  ["hash", field, value, ...]     fields sorted
+  list  →  ["list", element, ...]          head to tail
+  set   →  ["set", member, ...]
+  zset  →  ["zset", member, score, ...]    ascending score
+  json  →  ["json", document]
+  ```
+
+  The tag is required for the payload to be unambiguous — a four-element array would otherwise be
+  indistinguishable between a list of four items and a hash of two pairs. Ordering is deterministic
+  so two clients build identical local state, and each notification carries the complete value, which
+  is what allows a removed member to propagate.
+
+  ::: warning Wire-format change
+  A client older than 0.2.2 does not understand the tagged shape and will ignore collection values
+  from live queries. Server and SDKs are released in lockstep at the same version — run matching
+  versions.
+  :::
+
+- **Reconnect backoff is jittered.** Delays now land in `[nominal/2, nominal]` instead of an exact
+  `500ms × 2^attempts`. Without jitter every client disconnected by the same event computes an
+  identical schedule and reconnects in lockstep — a thundering herd that can keep a recovering server
+  down. The jitter source is seeded from the client id rather than a system RNG, so `sync-client`
+  stays dependency-free and I/O-free and the sequence remains reproducible in tests.
+
+### Fixed
+
+- **`ESET` would not have replicated.** `is_write_command` is a `matches!` list, which — unlike a
+  `match` — has no exhaustiveness check, so a newly added command silently defaults to "not a write"
+  and never reaches replicas, the AOF, or live queries. Caught while wiring `ESET`; a cross-check test
+  now asserts that every command reporting written keys is also classified as a write, so the next
+  addition cannot repeat it.
+
+---
+
 ## [0.2.1] — 2026-07-19
 
 ### Fixed — Browser SDK (critical)

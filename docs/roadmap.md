@@ -5,19 +5,21 @@ Recached competes on **where the data can live** — the same engine on the serv
 Numbered items are stable identifiers, not an ordering — code and changelog entries reference them
 (e.g. "roadmap #6"), so they are never renumbered. **Near-term priorities** are called out below.
 
-Items 1–5 have shipped: rate-limiting commands, scoped sync with per-client auth, live queries, the native JSON type, and offline-first writes with merge semantics. Their numbering is retained below so existing references stay valid — see the [changelog](https://github.com/thinkgrid-labs/recached/blob/main/CHANGELOG.md) for what landed in each.
+Items 1–5 and 13 have shipped: rate-limiting commands, scoped sync with per-client auth, live queries, the native JSON type, and offline-first writes with merge semantics. Their numbering is retained below so existing references stay valid — see the [changelog](https://github.com/thinkgrid-labs/recached/blob/main/CHANGELOG.md) for what landed in each.
 
 ## Near-term
 
-The next three things worth doing, in order:
+The three items previously listed here shipped in **0.2.2**: reconnect backoff jitter, presence via
+connection-scoped keys (`ESET`), and live queries carrying complete collection values. See the
+[changelog](https://github.com/thinkgrid-labs/recached/blob/main/CHANGELOG.md).
 
-1. **[Reconnect backoff jitter](#reliability)** — a few lines; prevents a thundering
-   herd every time the server restarts.
-2. **[Presence — connection-scoped keys](#_13-presence-—-connection-scoped-keys)** — the docs already
-   sell presence as a use case; the primitive does not exist yet.
-3. **[Live queries carry collection values](#live-queries)** — removes a
-   round-trip that currently contradicts the local-read premise.
+Next up, in order:
 
+1. **[Exactly-once across a server restart](#reliability)** — the last documented caveat on the
+   delivery guarantee.
+2. **[Atomic WAL compaction](#reliability)** — removes a browser-side data-loss window.
+3. **[Capacity and sync metrics](#operability)** — operators currently cannot see memory, key count,
+   eviction rate, or replication lag.
 ---
 
 ## 6. Mobile SDKs — React Native, Flutter, Kotlin, Swift
@@ -38,25 +40,6 @@ A `wasm32-wasip1` build of `wasm-edge` for Cloudflare Workers and Deno Deploy, r
 
 `core-engine` is already `wasm32`-compatible; the work is adapting the WebSocket and persistence layers to WASI. Last on the list because the platform fights the model — Workers cannot hold persistent WebSockets outside Durable Objects — and edge platforms ship native KV stores.
 
-## 13. Presence — connection-scoped keys
-
-Keys whose lifetime is tied to the connection that set them. The server drops them when the socket
-closes, and the deletion fans out through live queries like any other change.
-
-```bash
-ESET presence:room:7:user:42 "typing"   # lives exactly as long as this connection
-```
-
-Today presence has to be hand-rolled with `SETEX` plus a heartbeat, which leaves ghost entries for
-the length of the TTL whenever a tab closes — the classic "still shows as online" bug. Every piece
-needed already exists: the WebSocket handler knows when a connection ends, and `QSUB` already
-broadcasts deletions.
-
-Worth doing early because presence, live dashboards, and collaborative cursors are the use cases the
-architecture is uniquely suited to, and they are already named in the
-[use cases](/guide/use-cases) page.
-
----
 
 ## AI-era features
 
@@ -100,12 +83,6 @@ independent — pick them off in any order.
 
 ### Reliability
 
-**Reconnect backoff jitter.** `on_close()` computes `500ms × 2^attempts` with no randomisation, so
-every client disconnected by a server restart reconnects on an identical schedule. At scale that is a
-thundering herd that can keep knocking the server over as it comes back up. Full or decorrelated
-jitter is a few lines, and the existing backoff test only needs to assert a range instead of an exact
-value.
-
 **Exactly-once across a server restart.** `DEDUP` high-water marks live in server memory and are
 swept after 24 h idle, so a restart inside the acknowledgement window can admit one duplicate — a
 caveat currently documented rather than fixed. Persisting the marks alongside the snapshot would make
@@ -120,11 +97,6 @@ past that. An `onOutboxFull` callback, or a `pendingWrites()` accessor, lets an 
 deliberately instead of losing writes without a signal.
 
 ### Live queries
-
-**Live queries carry collection values.** Collection types currently arrive as *type markers*, so a
-subscriber must follow every change with a typed re-read (`HGETALL`, `LRANGE`). That round-trip is
-precisely what the local-read model exists to remove, so the promise only fully holds for strings
-today. Sending the value — or a delta — inline closes the gap.
 
 **`FLUSHDB` should emit per-key diffs.** Subscribers currently miss a mass deletion entirely.
 

@@ -59,6 +59,7 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::Ping(_) => "ping",
         Command::Auth(_) => "auth",
         Command::Get(_) => "get",
+        Command::ESet(_, _) => "eset",
         Command::Set(_, _, _) => "set",
         Command::Del(_) => "del",
         Command::Unlink(_) => "unlink",
@@ -605,6 +606,40 @@ struct ServerState {
     /// client suffices — no seen-set. In-memory only: a server restart
     /// reopens the (already narrow) duplicate window, which is documented.
     dedup: std::sync::Mutex<HashMap<String, (u64, u64)>>,
+    /// Ephemeral (`ESET`) keys → the connection that currently owns them.
+    ///
+    /// Ownership transfers on each `ESET`, which is what makes multiple tabs
+    /// work: two tabs both setting `presence:user:42` leave the *later* one as
+    /// owner, so the first tab closing does not mark the user offline. Only the
+    /// owning connection's close deletes the key.
+    ephemeral: std::sync::Mutex<HashMap<String, u64>>,
+}
+
+impl ServerState {
+    /// Record `conn_id` as the owner of an ephemeral key, replacing any
+    /// previous owner.
+    fn claim_ephemeral(&self, key: &str, conn_id: u64) {
+        if let Ok(mut map) = self.ephemeral.lock() {
+            map.insert(key.to_string(), conn_id);
+        }
+    }
+
+    /// Keys still owned by `conn_id`, removed from the registry. Called once
+    /// when a connection closes.
+    fn take_ephemeral_for(&self, conn_id: u64) -> Vec<String> {
+        let Ok(mut map) = self.ephemeral.lock() else {
+            return Vec::new();
+        };
+        let owned: Vec<String> = map
+            .iter()
+            .filter(|(_, id)| **id == conn_id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in &owned {
+            map.remove(k);
+        }
+        owned
+    }
 }
 
 /// Sweep dedup client entries idle longer than this once the map is large.
@@ -697,6 +732,7 @@ fn is_write_command(cmd: &Command) -> bool {
     matches!(
         cmd,
         Command::Set(..)
+            | Command::ESet(..)
             | Command::Del(..)
             | Command::Unlink(..)
             | Command::Append(..)
@@ -1147,7 +1183,8 @@ fn command_scope(cmd: &Command) -> CommandScope {
         | Command::LastSave
         | Command::ReplicaOfNoOne => CommandScope::Admin,
 
-        Command::Set(k, _, _)
+        Command::ESet(k, _)
+        | Command::Set(k, _, _)
         | Command::Get(k)
         | Command::Append(k, _)
         | Command::Strlen(k)
@@ -1474,7 +1511,8 @@ type WatchRegistry = Arc<WatchHub>;
 /// already confirmed a mutation occurred.
 fn primary_keys(cmd: &Command) -> Vec<String> {
     match cmd {
-        Command::Set(k, _, _)
+        Command::ESet(k, _)
+        | Command::Set(k, _, _)
         | Command::Append(k, _)
         | Command::GetSet(k, _)
         | Command::SetNx(k, _)
@@ -1710,6 +1748,9 @@ fn resp_push(parts: &[&str]) -> String {
 /// if the command mutated nothing (read-only or conditional-and-failed).
 fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
     match cmd {
+        // Replays as SET: a replica has no connection to scope the lifetime to,
+        // and the owning server broadcasts the DEL when the connection closes.
+        Command::ESet(k, v) => Some(resp_push(&["SET", k, v])),
         Command::Set(k, v, opts) => {
             // Without GET: nil response means NX/XX condition failed — don't broadcast.
             // With GET: nil means key didn't exist before, but SET still happened.
@@ -2343,6 +2384,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         replicas: Arc::clone(&replicas),
         is_replica: std::sync::atomic::AtomicBool::new(is_replica_start),
         dedup: std::sync::Mutex::new(HashMap::new()),
+        ephemeral: std::sync::Mutex::new(HashMap::new()),
     });
 
     // ── autosave ──────────────────────────────────────────────────────────
@@ -3446,6 +3488,15 @@ async fn handle_ws<S>(
                                     }
                                     _ => {}
                                 }
+                                // Ephemeral keys are owned by the connection that wrote
+                                // them until another claims them; the close handler deletes
+                                // whatever is still ours. Claimed outside the write-effects
+                                // branch below, which only runs when a peer, replica, AOF or
+                                // watcher is present — ownership must be recorded even on a
+                                // standalone server with no listeners.
+                                if let Command::ESet(ref k, _) = cmd {
+                                    state.claim_ephemeral(k, conn_id);
+                                }
                                 let response = if is_write_command(&cmd)
                                     && write_effects_armed(&tx, &state, &watch_registry)
                                 {
@@ -3551,6 +3602,25 @@ async fn handle_ws<S>(
         watch_registry.sync_len(&reg);
     }
     unregister_all_qsubs(&watch_registry, conn_id, &mut qsub_patterns).await;
+
+    // Delete ephemeral keys this connection still owns and fan the deletions
+    // out, so every subscriber sees the peer go away immediately rather than
+    // waiting for a heartbeat TTL to lapse.
+    let expired = state.take_ephemeral_for(conn_id);
+    if !expired.is_empty() {
+        let del = Command::Del(expired);
+        let response = store.execute(del.clone());
+        apply_write_effects(
+            &del,
+            &response,
+            &tx,
+            conn_id,
+            &state,
+            &watch_registry,
+            &store,
+        )
+        .await;
+    }
 }
 
 #[cfg(test)]
@@ -3606,6 +3676,7 @@ mod tests {
             replicas: ReplHub::new(),
             is_replica: AtomicBool::new(start_as_replica),
             dedup: std::sync::Mutex::new(HashMap::new()),
+            ephemeral: std::sync::Mutex::new(HashMap::new()),
         });
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4102,6 +4173,7 @@ mod tests {
             replicas: ReplHub::new(),
             is_replica: AtomicBool::new(false),
             dedup: std::sync::Mutex::new(HashMap::new()),
+            ephemeral: std::sync::Mutex::new(HashMap::new()),
         });
 
         // Simulate writes captured by AOF
@@ -4176,6 +4248,108 @@ mod tests {
         assert!(!srv.state.is_replica());
     }
 
+    // ── Presence: connection-scoped keys ──────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eset_key_is_deleted_when_its_connection_closes() {
+        let srv = spawn_ws_server().await;
+        let mut watcher = WsClient::connect(srv.tcp_addr).await;
+        watcher.cmd(&["QSUB", "presence:*"]).await;
+
+        {
+            let mut presence = WsClient::connect(srv.tcp_addr).await;
+            assert_eq!(
+                presence.cmd(&["ESET", "presence:user:42", "online"]).await,
+                Value::SimpleString("OK".into())
+            );
+            // Visible to everyone while the connection is open.
+            assert_eq!(
+                srv.store.execute(Command::Get("presence:user:42".into())),
+                Value::BulkString(Some(b"online".to_vec()))
+            );
+        } // connection dropped here
+
+        // The key goes away on its own — no heartbeat, no TTL to wait out.
+        for _ in 0..40 {
+            if srv.store.execute(Command::Get("presence:user:42".into())) == Value::BulkString(None)
+            {
+                return;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+        panic!("ephemeral key outlived its connection");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eset_deletion_is_broadcast_to_live_queries() {
+        // Presence is only useful if peers are *told*; polling for the absence
+        // of a key is the thing this replaces.
+        let srv = spawn_ws_server().await;
+        let mut watcher = WsClient::connect(srv.tcp_addr).await;
+        watcher.cmd(&["QSUB", "presence:*"]).await;
+
+        {
+            let mut presence = WsClient::connect(srv.tcp_addr).await;
+            presence.cmd(&["ESET", "presence:user:7", "online"]).await;
+            // Drain the set notification.
+            let _ = watcher.recv_push(1000).await;
+        }
+
+        let push = watcher
+            .recv_push(3000)
+            .await
+            .expect("expected a keychange for the departing peer");
+        assert!(push.contains("presence:user:7"), "unexpected push: {push}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_tab_keeps_presence_alive_when_the_first_closes() {
+        // The multi-tab case. Ownership transfers to the most recent writer, so
+        // closing an older tab must not mark the user offline.
+        let srv = spawn_ws_server().await;
+
+        let mut tab_b = WsClient::connect(srv.tcp_addr).await;
+        {
+            let mut tab_a = WsClient::connect(srv.tcp_addr).await;
+            tab_a.cmd(&["ESET", "presence:user:9", "online"]).await;
+            // Tab B claims the same key — it is now the owner.
+            tab_b.cmd(&["ESET", "presence:user:9", "online"]).await;
+        } // tab A closes
+
+        // Give the close handler time to run, then confirm the key survived.
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            srv.store.execute(Command::Get("presence:user:9".into())),
+            Value::BulkString(Some(b"online".to_vec())),
+            "closing an older tab must not clear presence held by a newer one"
+        );
+
+        drop(tab_b);
+        for _ in 0..40 {
+            if srv.store.execute(Command::Get("presence:user:9".into())) == Value::BulkString(None)
+            {
+                return;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+        panic!("key outlived its last owner");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plain_set_is_not_ephemeral() {
+        // Only ESET opts into connection-scoped lifetime; SET must be unaffected.
+        let srv = spawn_ws_server().await;
+        {
+            let mut c = WsClient::connect(srv.tcp_addr).await;
+            c.cmd(&["SET", "durable:key", "value"]).await;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            srv.store.execute(Command::Get("durable:key".into())),
+            Value::BulkString(Some(b"value".to_vec()))
+        );
+    }
+
     #[tokio::test]
     async fn integration_replica_receives_write() {
         // Spawn primary with a separate replication listener on a random port
@@ -4230,6 +4404,7 @@ mod tests {
                 replicas: Arc::clone(&repl_registry),
                 is_replica: AtomicBool::new(false),
                 dedup: std::sync::Mutex::new(HashMap::new()),
+                ephemeral: std::sync::Mutex::new(HashMap::new()),
             });
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -4277,6 +4452,7 @@ mod tests {
             replicas: ReplHub::new(),
             is_replica: AtomicBool::new(true),
             dedup: std::sync::Mutex::new(HashMap::new()),
+            ephemeral: std::sync::Mutex::new(HashMap::new()),
         });
         let rs = Arc::clone(&replica_store);
         let rst = Arc::clone(&replica_state);
@@ -4349,6 +4525,7 @@ mod tests {
             replicas: ReplHub::new(),
             is_replica: AtomicBool::new(false),
             dedup: std::sync::Mutex::new(HashMap::new()),
+            ephemeral: std::sync::Mutex::new(HashMap::new()),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4466,6 +4643,7 @@ mod tests {
             replicas: ReplHub::new(),
             is_replica: AtomicBool::new(true),
             dedup: std::sync::Mutex::new(HashMap::new()),
+            ephemeral: std::sync::Mutex::new(HashMap::new()),
         });
         let replica_store = Arc::new(KeyValueStore::new());
         let rs = Arc::clone(&replica_store);
@@ -4512,6 +4690,7 @@ mod tests {
             replicas: ReplHub::new(),
             is_replica: AtomicBool::new(false),
             dedup: std::sync::Mutex::new(HashMap::new()),
+            ephemeral: std::sync::Mutex::new(HashMap::new()),
         });
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5043,6 +5222,7 @@ mod tests {
                 Expect::Keys(&["k"]),
             ),
             (Command::Get("k".into()), Expect::Keys(&["k"])),
+            (Command::ESet("k".into(), "v".into()), Expect::Keys(&["k"])),
             (Command::Del(vec!["k".into()]), Expect::Keys(&["k"])),
             (Command::Unlink(vec!["k".into()]), Expect::Keys(&["k"])),
             (
@@ -5286,6 +5466,53 @@ mod tests {
                 (got, _) => panic!("{cmd:?} classified as {got:?}, which is not what it touches"),
             }
         }
+    }
+
+    #[test]
+    fn every_key_writing_command_is_classified_as_a_write() {
+        // `is_write_command` is a `matches!` list, which — unlike a `match` —
+        // has no exhaustiveness check: a new variant silently defaults to "not
+        // a write" and is then never replicated, logged to AOF, or broadcast.
+        // `primary_keys` reports the keys a command *writes*, so anything it
+        // names must also be classified as a write. This cross-check is what
+        // makes the missing entry impossible to ship.
+        for (cmd, _) in all_commands() {
+            if !primary_keys(&cmd).is_empty() {
+                assert!(
+                    is_write_command(&cmd),
+                    "{cmd:?} writes keys but is_write_command() says otherwise — \
+                     it would never reach replicas, the AOF, or live queries"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn eset_is_a_write_and_reports_its_key() {
+        let cmd = Command::ESet("presence:1".into(), "on".into());
+        assert!(is_write_command(&cmd));
+        assert_eq!(primary_keys(&cmd), vec!["presence:1".to_string()]);
+        assert_eq!(command_name(&cmd), "eset");
+        // Scoped connections must not be able to write presence keys outside
+        // their grant.
+        assert!(matches!(command_scope(&cmd), CommandScope::Keys(_)));
+    }
+
+    #[test]
+    fn eset_replays_to_replicas_as_a_plain_set() {
+        // A replica has no connection to scope the lifetime to, so it stores an
+        // ordinary key; the owning server broadcasts the DEL on disconnect.
+        let frame = broadcast_for(
+            &Command::ESet("presence:1".into(), "on".into()),
+            &Value::SimpleString("OK".into()),
+        )
+        .expect("ESET must broadcast");
+        assert!(frame.contains("SET"), "{frame}");
+        assert!(frame.contains("presence:1"));
+        assert!(
+            !frame.contains("ESET"),
+            "replica should receive SET, not ESET"
+        );
     }
 
     #[test]
