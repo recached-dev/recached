@@ -4,10 +4,8 @@
 
 Recached is an in-memory cache server written in Rust. It speaks RESP (the Redis Serialization Protocol) on port 6379, so any Redis client — `ioredis`, `node-redis`, `redis-py`, `Jedis` — works against it today with no code changes.
 
-One caveat worth knowing before you start: **values are text, not arbitrary bytes.** A value that is
-not valid UTF-8 is rejected with an error rather than stored, so binary payloads — compressed blobs,
-protobuf, pickled objects, images — must be base64-encoded first. See
-[Binary values](#binary-values) below.
+Values are binary-safe, as they are in Redis: a value is stored and returned as the exact bytes you
+sent. *Keys* and other identifiers must be text — see [Binary values](#binary-values).
 
 That is where the similarity with Redis ends.
 
@@ -47,7 +45,7 @@ Recached is a good fit when:
 - **You want live UI without polling.** The WebSocket sync replaces a polling loop without requiring you to build a separate SSE or WebSocket server.
 - **You want a frontend-only cache with TTL.** The WASM module works entirely without a server. Call `createCache()` without `connect()` and you get a local in-memory cache with built-in TTL — no Recached server, no Redis, no backend changes required.
 - **You need cross-tab sync.** BroadcastChannel support means all open tabs in the same browser share mutations automatically.
-- **You want a drop-in Redis replacement** for the subset of commands most applications actually use (strings, expiry, counters, collections, transactions, pub/sub) — and your values are text or JSON rather than binary blobs.
+- **You want a drop-in Redis replacement** for the subset of commands most applications actually use (strings, expiry, counters, collections, transactions, pub/sub).
 
 ## When Recached is not the right fit
 
@@ -55,35 +53,40 @@ Recached is a good fit when:
 - **You need multi-replica consensus failover.** Recached supports leader–follower replication with automatic single-replica failover (`RECACHED_FAILOVER_TIMEOUT`). If the primary is unreachable for the configured duration, the designated replica promotes itself. What it does not include is multi-replica quorum election: in a setup with several replicas, split-brain prevention requires you to designate one replica for auto-failover and keep the others as passive standbys.
 - **You depend on uncommon Redis commands.** Recached implements the commands most applications use, not all 250+. Server introspection (`INFO`, `SLOWLOG`, `COMMAND`), Lua scripting, and cluster mode are out of scope. RESP3 is supported for protocol negotiation and pub/sub delivery (`HELLO 3`), not for the full RESP3 type surface.
 - **You need very large datasets.** Recached is an in-memory cache — it is not a database. If your working set does not fit in RAM, Redis with RDB persistence or a proper database is the right tool.
-- **You cache binary payloads.** Values are text. See below.
 
 ## Binary values
 
-**Values must be valid UTF-8.** A command carrying a value that is not — a gzip blob, protobuf,
-a pickled Python object, an image — is rejected with an error:
+**Values are binary-safe.** A value is stored and returned as the exact bytes you sent — compressed
+payloads, protobuf, images, serialized objects — with no encoding step and no size penalty.
+
+**Identifiers must be text.** Keys, hash fields, set and sorted-set members, glob patterns and
+pub/sub channel names must be valid UTF-8, and a command carrying a binary one is rejected:
 
 ```
-ERR argument 2 is not valid UTF-8. Recached stores values as text;
-    base64-encode binary payloads before caching them
+ERR argument 1 is not valid UTF-8. Keys, fields, members and patterns must be text;
+    only values may be binary
 ```
 
-Nothing is stored when this happens, and the connection stays usable. Keys are checked the same way.
+Nothing is stored when this happens and the connection stays usable. This is narrower than Redis,
+where keys are binary-safe too — but keys are looked up, glob-matched and checked against sync scopes
+as text, and a binary key would be unreachable through those paths. Keys are identifiers in practice,
+so this is rarely felt.
 
-This is a real difference from Redis, where values are binary-safe. It matters most if you are
-migrating a cache that stores compressed responses or serialized objects, since many client
-libraries compress transparently — check your client's configuration before assuming your values are
-text.
+Commands that interpret a value still require the right shape: `INCR` on a binary value returns
+`ERR value is not an integer`, and JSON documents must be UTF-8 because JSON is defined that way.
+Those are type errors, not encoding losses — the stored bytes are unchanged either way.
 
-The workaround is base64, at roughly 33% extra memory and a small CPU cost on both ends. JSON,
-strings, numbers, and counters are unaffected, which covers most of what Recached is used for.
-
-::: tip Why an error rather than best-effort storage
-The engine stores values as UTF-8 strings, so a binary value cannot be kept faithfully. Before 0.2.2
-it was silently converted — invalid bytes became U+FFFD, `SET` still returned `OK`, and `GET`
-returned data that differed from what was written, with no signal anywhere that anything had
-happened. Failing loudly is worse ergonomics and much better behaviour. Byte-transparent values are
-on the [roadmap](/roadmap#byte-transparent-values) as a breaking change.
+::: warning Browser SDK: binary is read-only
+The browser cache stores and syncs binary values faithfully, and `cache.getBytes(key)` returns them
+as a `Uint8Array`. But `cache.set()` takes a string, so binary values can only *originate* from a
+backend writing over the RESP port. `cache.get()` throws on a binary value rather than returning
+mangled text.
 :::
+
+Before 0.2.2 values were stored as UTF-8 strings and binary was silently replaced with U+FFFD: `SET`
+returned `OK` and `GET` returned different bytes than were written, on every transport. If you are
+upgrading from an earlier version, data already corrupted that way cannot be recovered — the bytes
+were destroyed on the way in.
 
 ## Maturity
 

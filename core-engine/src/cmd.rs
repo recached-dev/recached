@@ -51,22 +51,22 @@ pub enum Command {
     /// the store never sees it, because the answer depends on the connection.
     Hello(Option<String>),
     // ── Strings ──────────────────────────────────────────────────────────────
-    Set(String, String, SetOptions),
+    Set(String, Vec<u8>, SetOptions),
     Get(String),
     /// ESET — a SET whose key is owned by the connection that wrote it.
     /// The engine stores it like any string; the *server* deletes it when that
     /// connection closes. Presence, cursors, "who is online".
-    ESet(String, String),
+    ESet(String, Vec<u8>),
     Del(Vec<String>),
     Unlink(Vec<String>),
-    Append(String, String),
+    Append(String, Vec<u8>),
     Strlen(String),
-    GetSet(String, String),
+    GetSet(String, Vec<u8>),
     MGet(Vec<String>),
-    MSet(Vec<(String, String)>),
-    SetNx(String, String),
-    SetEx(String, u64, String),
-    PSetEx(String, u64, String),
+    MSet(Vec<(String, Vec<u8>)>),
+    SetNx(String, Vec<u8>),
+    SetEx(String, u64, Vec<u8>),
+    PSetEx(String, u64, Vec<u8>),
     Incr(String),
     Decr(String),
     IncrBy(String, i64),
@@ -88,7 +88,7 @@ pub enum Command {
     Rename(String, String),
     Type(String),
     // ── Hash ─────────────────────────────────────────────────────────────────
-    HSet(String, Vec<(String, String)>),
+    HSet(String, Vec<(String, Vec<u8>)>),
     HGet(String, String),
     HGetAll(String),
     HDel(String, Vec<String>),
@@ -98,20 +98,20 @@ pub enum Command {
     HIncrBy(String, String, i64),
     HIncrByFloat(String, String, f64),
     HExists(String, String),
-    HSetNx(String, String, String),
+    HSetNx(String, String, Vec<u8>),
     HMGet(String, Vec<String>),
     // ── List ─────────────────────────────────────────────────────────────────
-    LPush(String, Vec<String>),
-    RPush(String, Vec<String>),
-    LPushX(String, Vec<String>),
-    RPushX(String, Vec<String>),
+    LPush(String, Vec<Vec<u8>>),
+    RPush(String, Vec<Vec<u8>>),
+    LPushX(String, Vec<Vec<u8>>),
+    RPushX(String, Vec<Vec<u8>>),
     LPop(String, Option<u64>),
     RPop(String, Option<u64>),
     LRange(String, i64, i64),
     LLen(String),
     LIndex(String, i64),
-    LSet(String, i64, String),
-    LRem(String, i64, String),
+    LSet(String, i64, Vec<u8>),
+    LRem(String, i64, Vec<u8>),
     LTrim(String, i64, i64),
     // ── Set ──────────────────────────────────────────────────────────────────
     SAdd(String, Vec<String>),
@@ -167,7 +167,7 @@ pub enum Command {
     Unsubscribe(Vec<String>),
     PSubscribe(Vec<String>),
     PUnsubscribe(Vec<String>),
-    Publish(String, String),
+    Publish(String, Vec<u8>),
     // ── Observable keys ───────────────────────────────────────────────────────
     Watch(Vec<String>),
     Unwatch(Vec<String>),
@@ -205,27 +205,31 @@ impl Command {
                 if arr.is_empty() {
                     return Err("Empty command".to_string());
                 }
-                // Reject the whole command if any argument is not valid UTF-8.
-                //
-                // Values are stored as `String`, so a non-UTF-8 byte would
-                // otherwise be silently replaced with U+FFFD: SET returns OK,
-                // GET returns different bytes than were written, and nothing
-                // anywhere reports a problem. Failing loudly here — before
-                // anything is stored — is the only honest option until values
-                // are byte-transparent. See docs/roadmap.md.
-                if let Some(pos) = arr.iter().position(
-                    |v| matches!(v, Value::BulkString(Some(b)) if std::str::from_utf8(b).is_err()),
-                ) {
-                    return Err(format!(
-                        "ERR argument {pos} is not valid UTF-8. Recached stores values as text; \
-                         base64-encode binary payloads before caching them"
-                    ));
-                }
                 let cmd_name = match &arr[0] {
                     Value::BulkString(Some(data)) => String::from_utf8_lossy(data).to_uppercase(),
                     Value::SimpleString(s) => s.to_uppercase(),
                     _ => return Err("Invalid command name type".to_string()),
                 };
+
+                // Payload arguments may be arbitrary bytes; identifier
+                // arguments may not.
+                //
+                // Keys, hash fields, set and sorted-set members, glob patterns
+                // and channel names are looked up, matched and routed as text,
+                // so a non-UTF-8 one cannot be handled faithfully. Rather than
+                // lossily converting it — which returns OK and stores something
+                // different from what was sent — the command is refused here,
+                // before anything is written. Values are exempt: they are
+                // stored verbatim. See `is_payload_index`.
+                if let Some(pos) = (1..arr.len()).find(|&i| {
+                    !is_payload_index(&cmd_name, i)
+                        && matches!(&arr[i], Value::BulkString(Some(b)) if std::str::from_utf8(b).is_err())
+                }) {
+                    return Err(format!(
+                        "ERR argument {pos} is not valid UTF-8. Keys, fields, members and \
+                         patterns must be text; only values may be binary"
+                    ));
+                }
 
                 macro_rules! need {
                     ($n:expr) => {
@@ -265,7 +269,7 @@ impl Command {
                     "SET" => {
                         need!(3);
                         let key = take_key(&mut arr[1])?;
-                        let val = take_string(&mut arr[2]).unwrap_or_default();
+                        let val = take_bytes(&mut arr[2]).unwrap_or_default();
                         let mut opts = SetOptions::default();
                         let mut i = 3usize;
                         while i < arr.len() {
@@ -343,7 +347,7 @@ impl Command {
                         need!(3);
                         Ok(Command::ESet(
                             extract_key(&arr[1])?,
-                            extract_string(&arr[2]).unwrap_or_default(),
+                            extract_bytes(&arr[2]).unwrap_or_default(),
                         ))
                     }
                     "DEL" => {
@@ -357,7 +361,7 @@ impl Command {
                     "APPEND" => {
                         need!(3);
                         let key = take_key(&mut arr[1])?;
-                        let val = take_string(&mut arr[2]).unwrap_or_default();
+                        let val = take_bytes(&mut arr[2]).unwrap_or_default();
                         Ok(Command::Append(key, val))
                     }
                     "STRLEN" => {
@@ -367,7 +371,7 @@ impl Command {
                     "GETSET" => {
                         need!(3);
                         let key = take_key(&mut arr[1])?;
-                        let val = take_string(&mut arr[2]).unwrap_or_default();
+                        let val = take_bytes(&mut arr[2]).unwrap_or_default();
                         Ok(Command::GetSet(key, val))
                     }
                     "MGET" => {
@@ -386,7 +390,7 @@ impl Command {
                                 let (k, v) = c.split_at_mut(1);
                                 Ok((
                                     take_key(&mut k[0])?,
-                                    take_string(&mut v[0]).unwrap_or_default(),
+                                    take_bytes(&mut v[0]).unwrap_or_default(),
                                 ))
                             })
                             .collect::<Result<Vec<_>, String>>()?;
@@ -395,7 +399,7 @@ impl Command {
                     "SETNX" => {
                         need!(3);
                         let key = take_key(&mut arr[1])?;
-                        let val = take_string(&mut arr[2]).unwrap_or_default();
+                        let val = take_bytes(&mut arr[2]).unwrap_or_default();
                         Ok(Command::SetNx(key, val))
                     }
                     "SETEX" => {
@@ -407,7 +411,7 @@ impl Command {
                         Ok(Command::SetEx(
                             extract_key(&arr[1])?,
                             secs as u64,
-                            extract_string(&arr[3]).unwrap_or_default(),
+                            extract_bytes(&arr[3]).unwrap_or_default(),
                         ))
                     }
                     "PSETEX" => {
@@ -419,7 +423,7 @@ impl Command {
                         Ok(Command::PSetEx(
                             extract_key(&arr[1])?,
                             ms as u64,
-                            extract_string(&arr[3]).unwrap_or_default(),
+                            extract_bytes(&arr[3]).unwrap_or_default(),
                         ))
                     }
                     "INCR" => {
@@ -668,7 +672,7 @@ impl Command {
                                 let (f, v) = c.split_at_mut(1);
                                 (
                                     take_string(&mut f[0]).unwrap_or_default(),
-                                    take_string(&mut v[0]).unwrap_or_default(),
+                                    take_bytes(&mut v[0]).unwrap_or_default(),
                                 )
                             })
                             .collect();
@@ -734,7 +738,7 @@ impl Command {
                         Ok(Command::HSetNx(
                             extract_string(&arr[1]).unwrap_or_default(),
                             extract_string(&arr[2]).unwrap_or_default(),
-                            extract_string(&arr[3]).unwrap_or_default(),
+                            extract_bytes(&arr[3]).unwrap_or_default(),
                         ))
                     }
                     "HMGET" => {
@@ -748,25 +752,25 @@ impl Command {
                     "LPUSH" => {
                         need!(3);
                         let key = extract_key(&arr[1])?;
-                        let vals = arr[2..].iter_mut().filter_map(take_string).collect();
+                        let vals = arr[2..].iter_mut().filter_map(take_bytes).collect();
                         Ok(Command::LPush(key, vals))
                     }
                     "RPUSH" => {
                         need!(3);
                         let key = extract_key(&arr[1])?;
-                        let vals = arr[2..].iter_mut().filter_map(take_string).collect();
+                        let vals = arr[2..].iter_mut().filter_map(take_bytes).collect();
                         Ok(Command::RPush(key, vals))
                     }
                     "LPUSHX" => {
                         need!(3);
                         let key = extract_key(&arr[1])?;
-                        let vals = arr[2..].iter_mut().filter_map(take_string).collect();
+                        let vals = arr[2..].iter_mut().filter_map(take_bytes).collect();
                         Ok(Command::LPushX(key, vals))
                     }
                     "RPUSHX" => {
                         need!(3);
                         let key = extract_key(&arr[1])?;
-                        let vals = arr[2..].iter_mut().filter_map(take_string).collect();
+                        let vals = arr[2..].iter_mut().filter_map(take_bytes).collect();
                         Ok(Command::RPushX(key, vals))
                     }
                     "LPOP" => {
@@ -813,7 +817,7 @@ impl Command {
                         Ok(Command::LSet(
                             extract_string(&arr[1]).unwrap_or_default(),
                             extract_int(&arr[2])?,
-                            extract_string(&arr[3]).unwrap_or_default(),
+                            extract_bytes(&arr[3]).unwrap_or_default(),
                         ))
                     }
                     "LREM" => {
@@ -821,7 +825,7 @@ impl Command {
                         Ok(Command::LRem(
                             extract_string(&arr[1]).unwrap_or_default(),
                             extract_int(&arr[2])?,
-                            extract_string(&arr[3]).unwrap_or_default(),
+                            extract_bytes(&arr[3]).unwrap_or_default(),
                         ))
                     }
                     "LTRIM" => {
@@ -1128,7 +1132,7 @@ impl Command {
                         need!(3);
                         Ok(Command::Publish(
                             extract_string(&arr[1]).unwrap_or_default(),
-                            extract_string(&arr[2]).unwrap_or_default(),
+                            extract_bytes(&arr[2]).unwrap_or_default(),
                         ))
                     }
 
@@ -1219,6 +1223,43 @@ fn extract_keys(vals: &[Value]) -> Result<Vec<String>, String> {
 ///
 /// The slot is left as a nil array, so an arm must not read the same index
 /// twice — call this last, once per argument.
+/// Is argument `i` of `cmd_name` a value payload rather than an identifier?
+///
+/// Payloads are stored verbatim and may be any bytes. Everything else is used
+/// as a lookup key, a glob pattern or a routing name, and must be text. Index 0
+/// is the command name and is never a payload.
+fn is_payload_index(cmd_name: &str, i: usize) -> bool {
+    match cmd_name {
+        // key value
+        "SET" | "ESET" | "APPEND" | "GETSET" | "SETNX" => i == 2,
+        // key ttl value
+        "SETEX" | "PSETEX" => i == 3,
+        // key field value
+        "HSETNX" => i == 3,
+        // key index value / key count value
+        "LSET" | "LREM" => i == 3,
+        // channel message
+        "PUBLISH" => i == 2,
+        // key v1 v2 …
+        "LPUSH" | "RPUSH" | "LPUSHX" | "RPUSHX" => i >= 2,
+        // key f1 v1 f2 v2 … — values are the odd positions from 3
+        "HSET" | "HMSET" => i >= 3 && !i.is_multiple_of(2),
+        // k1 v1 k2 v2 … — values are the even positions from 2
+        "MSET" => i >= 2 && i.is_multiple_of(2),
+        _ => false,
+    }
+}
+
+/// Moving counterpart of `take_string` for payload arguments: takes the bytes
+/// as they arrived, with no UTF-8 conversion of any kind.
+fn take_bytes(val: &mut Value) -> Option<Vec<u8>> {
+    match std::mem::replace(val, Value::Array(None)) {
+        Value::BulkString(Some(data)) => Some(data),
+        Value::SimpleString(s) => Some(s.into_bytes()),
+        _ => None,
+    }
+}
+
 fn take_string(val: &mut Value) -> Option<String> {
     match std::mem::replace(val, Value::Array(None)) {
         // `from_utf8` reuses the buffer, so this is a move rather than a copy.
@@ -1239,6 +1280,16 @@ fn take_key(val: &mut Value) -> Result<String, String> {
     let key = take_string(val).unwrap_or_default();
     validate_key(&key)?;
     Ok(key)
+}
+
+/// Borrowing counterpart of `take_bytes`, for payload arguments read without
+/// consuming the frame.
+fn extract_bytes(val: &Value) -> Option<Vec<u8>> {
+    match val {
+        Value::BulkString(Some(data)) => Some(data.clone()),
+        Value::SimpleString(s) => Some(s.as_bytes().to_vec()),
+        _ => None,
+    }
 }
 
 fn extract_string(val: &Value) -> Option<String> {
@@ -2684,7 +2735,7 @@ mod zero_copy_parse_tests {
         match parse(&["SET", "k", "v", "EX", "60", "NX"]).unwrap() {
             Command::Set(key, val, opts) => {
                 assert_eq!(key, "k");
-                assert_eq!(val, "v");
+                assert_eq!(val, b"v");
                 assert_eq!(opts.expiry, Some(SetExpiry::Ex(60)));
                 assert_eq!(opts.condition, Some(SetCondition::Nx));
             }
@@ -2699,24 +2750,46 @@ mod zero_copy_parse_tests {
         match parse(&["SET", "k", &big]).unwrap() {
             Command::Set(_, val, _) => {
                 assert_eq!(val.len(), big.len());
-                assert_eq!(val, big, "payload must be byte-identical after the move");
+                assert_eq!(
+                    val,
+                    big.as_bytes(),
+                    "payload must be byte-identical after the move"
+                );
             }
             other => panic!("{other:?}"),
         }
     }
 
     #[test]
-    fn invalid_utf8_fails_the_command_instead_of_being_re_encoded() {
-        // The move-based parse must not resurrect the lossy fallback: a value
-        // that cannot be stored faithfully has to fail loudly, not arrive
-        // half-corrupted behind a successful reply.
+    fn a_binary_value_reaches_the_command_untouched() {
+        // The move-based parse must not reintroduce a UTF-8 conversion on the
+        // value path: the bytes have to arrive exactly as they were sent.
+        let raw = vec![0xff, 0xfe, b'o', b'k'];
         let frame = Value::Array(Some(vec![
             bulk("SET"),
             bulk("k"),
-            Value::BulkString(Some(vec![0xff, 0xfe, b'o', b'k'])),
+            Value::BulkString(Some(raw.clone())),
         ]));
-        let err = Command::from_value(frame).expect_err("must be refused");
-        assert!(err.contains("not valid UTF-8"), "got {err:?}");
+        match Command::from_value(frame).expect("a binary value is valid") {
+            Command::Set(key, val, _) => {
+                assert_eq!(key, "k");
+                assert_eq!(val, raw);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_binary_key_is_still_refused() {
+        // Keys are matched and routed as text, so this position stays strict
+        // even though the value beside it does not.
+        let frame = Value::Array(Some(vec![
+            bulk("SET"),
+            Value::BulkString(Some(vec![0xff, 0xfe])),
+            bulk("v"),
+        ]));
+        let err = Command::from_value(frame).expect_err("binary key must be refused");
+        assert!(err.contains("must be text"), "got {err:?}");
     }
 
     #[test]
@@ -2726,7 +2799,7 @@ mod zero_copy_parse_tests {
         match parse(&["SET", "ключ", "日本語 ✓"]).unwrap() {
             Command::Set(key, val, _) => {
                 assert_eq!(key, "ключ");
-                assert_eq!(val, "日本語 ✓");
+                assert_eq!(val, "日本語 ✓".as_bytes());
             }
             other => panic!("{other:?}"),
         }
@@ -2740,8 +2813,8 @@ mod zero_copy_parse_tests {
             Command::MSet(pairs) => assert_eq!(
                 pairs,
                 vec![
-                    ("a".to_string(), "1".to_string()),
-                    ("b".to_string(), "2".to_string())
+                    ("a".to_string(), b"1".to_vec()),
+                    ("b".to_string(), b"2".to_vec())
                 ]
             ),
             other => panic!("{other:?}"),
@@ -2752,8 +2825,8 @@ mod zero_copy_parse_tests {
                 assert_eq!(
                     pairs,
                     vec![
-                        ("f1".to_string(), "v1".to_string()),
-                        ("f2".to_string(), "v2".to_string())
+                        ("f1".to_string(), b"v1".to_vec()),
+                        ("f2".to_string(), b"v2".to_vec())
                     ]
                 );
             }
@@ -2766,7 +2839,7 @@ mod zero_copy_parse_tests {
         match parse(&["RPUSH", "l", "a", "b", "c"]).unwrap() {
             Command::RPush(key, vals) => {
                 assert_eq!(key, "l");
-                assert_eq!(vals, vec!["a", "b", "c"]);
+                assert_eq!(vals, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
             }
             other => panic!("{other:?}"),
         }

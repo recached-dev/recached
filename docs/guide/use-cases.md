@@ -92,10 +92,6 @@ tier.
 explicitly out of scope; see [Commands](/server/commands). RESP3 exists only for protocol
 negotiation and pub/sub framing (`HELLO 3`), not the full type surface.
 
-**You cache binary payloads → Redis.** Redis values are binary-safe; Recached values must be valid
-UTF-8 and a binary value is rejected outright. Compressed responses, protobuf, and serialized
-objects need base64 first — see [Binary values](/guide/introduction#binary-values).
-
 ## Compared directly
 
 | | Recached | Redis | Memcached |
@@ -144,11 +140,9 @@ Before switching a workload over, check:
 1. **Command coverage.** Diff your actual command usage against [Commands](/server/commands).
    `MONITOR` on your existing Redis for a representative window is the fastest way to get that list.
    Lua scripts, cluster commands, streams, and `INFO`-based tooling will not carry over.
-2. **Value encoding.** Recached values must be valid UTF-8 — binary is rejected, not stored. Check
-   whether your client compresses transparently (many do), and whether anything caches serialized
-   objects rather than JSON. This is the migration surprise most likely to bite, because the client
-   works perfectly right up until the value is not text. See
-   [Binary values](/guide/introduction#binary-values).
+2. **Key encoding.** Values are binary-safe, but keys, hash fields, set members and glob patterns
+   must be valid UTF-8 — Redis allows binary there. Applications that use binary keys are rare; if
+   yours does, that is a blocker. See [Binary values](/guide/introduction#binary-values).
 3. **Persistence expectations.** Confirm snapshot + AOF semantics match what you assume today.
 4. **Replication topology.** Single-replica auto-failover only; no Sentinel or quorum election.
 5. **Eviction.** Review the key cap and TTL behaviour in

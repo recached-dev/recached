@@ -130,6 +130,7 @@ dependencies = [
  "indexmap",
  "js-sys",
  "rand",
+ "rmp-serde",
  "serde",
  "serde_json",
 ]

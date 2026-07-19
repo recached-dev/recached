@@ -69,6 +69,7 @@ interface RawCache {
   set(key: string, value: string): string;
   set_ex(key: string, value: string, seconds: number): string;
   get(key: string): string | undefined;
+  getBytes(key: string): Uint8Array | undefined;
   del(key: string): number;
   incr_by(key: string, delta: number): number;
   disconnect(): void;
@@ -246,9 +247,33 @@ export class Cache {
    * Return the value for `key`, or `null` if the key does not exist or has expired.
    *
    * Always served from local WASM memory — zero network latency.
+   *
+   * @throws if the stored value is not valid UTF-8. Values are byte-transparent,
+   * so a backend can write binary that syncs into this cache; returning it as a
+   * mangled string would be worse than failing. Use {@link getBytes} for those.
    */
   get(key: string): string | null {
     return this.raw.get(key) ?? null;
+  }
+
+  /**
+   * Return the value for `key` as raw bytes, or `null` if it does not exist.
+   *
+   * Use this for values a backend wrote as binary — compressed payloads,
+   * protobuf, images — which cannot be represented as a JS string. Text values
+   * work here too, as their UTF-8 bytes.
+   *
+   * ```ts
+   * const bytes = cache.getBytes('thumb:42');
+   * if (bytes) img.src = URL.createObjectURL(new Blob([bytes]));
+   * ```
+   *
+   * Note: the browser SDK can *read* binary values but cannot yet *write* them
+   * — `set()` takes a string. Binary values originate from a backend writing
+   * over the RESP port.
+   */
+  getBytes(key: string): Uint8Array | null {
+    return this.raw.getBytes(key) ?? null;
   }
 
   /**
@@ -261,7 +286,14 @@ export class Cache {
    * ```
    */
   getJSON<T>(key: string): T | null {
-    const raw = this.get(key);
+    let raw: string | null;
+    try {
+      raw = this.get(key);
+    } catch {
+      // Binary value: not JSON by definition, so this is a miss rather than an
+      // error — getJSON is documented to return null for anything unparseable.
+      return null;
+    }
     if (raw === null) return null;
     try {
       return JSON.parse(raw) as T;

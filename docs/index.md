@@ -33,7 +33,7 @@ features:
     details: Any mutation on the server is pushed to all connected browser instances instantly. Any write from the browser is pushed to the server and fanned out to other tabs.
   - icon: 🦀
     title: Redis-compatible server
-    details: Speaks RESP on port 6379. Drop it in front of any Redis client — ioredis, node-redis, redis-py — with no code changes. Values are text; base64-encode binary payloads.
+    details: Speaks RESP on port 6379. Drop it in front of any Redis client — ioredis, node-redis, redis-py — with no code changes.
   - icon: 🌐
     title: Offline-first browser cache
     details: IndexedDB persistence means the cache survives page refreshes. Users see their data immediately, before any network request completes.
@@ -49,7 +49,7 @@ features:
 
 Every caching solution forces a choice: server-side caches like Redis mean every frontend read is a network round-trip; client-side state like Zustand or SWR means two caches — one on the server and one in every client, with manual staleness code gluing them together. **Recached removes the choice.**
 
-The same Rust cache engine runs natively on your server (RESP on port 6379 — any Redis client works today, zero code changes; values are text, so binary payloads need base64) and as WebAssembly inside the browser. Reads always come from local WASM memory. The WebSocket is only a sync path, not a read path.
+The same Rust cache engine runs natively on your server (RESP on port 6379 — any Redis client works today, zero code changes) and as WebAssembly inside the browser. Reads always come from local WASM memory. The WebSocket is only a sync path, not a read path.
 
 ```typescript
 import { createCache } from 'recached-edge'

@@ -522,9 +522,9 @@ impl AofWriter {
         })
     }
 
-    async fn append(&self, resp: &str) {
+    async fn append(&self, resp: &[u8]) {
         let mut f = self.file.lock().await;
-        if f.write_all(resp.as_bytes()).await.is_err() {
+        if f.write_all(resp).await.is_err() {
             warn!("AOF write failed");
             return;
         }
@@ -798,14 +798,14 @@ impl ServerState {
     }
 
     /// Called after every successful write: appends to AOF and fans out to replicas.
-    async fn on_write(&self, resp: &str) {
+    async fn on_write(&self, resp: &[u8]) {
         if let Some(aof) = &self.aof {
             aof.append(resp).await;
         }
         if self.replicas.is_empty() {
             return;
         }
-        self.replicas.fan_out(resp.as_bytes().to_vec()).await;
+        self.replicas.fan_out(resp.to_vec()).await;
     }
 
     /// Path of the dedup sidecar, alongside the snapshot.
@@ -1231,13 +1231,12 @@ async fn sync_from_primary(
                     // Relay the applied write so this replica's own WebSocket
                     // clients see it, and any sub-replicas / AOF get it too
                     // (enables multi-tier replication and replica WS push).
-                    let frame = String::from_utf8_lossy(&cmd_bytes).into_owned();
                     let _ = tx.send(Arc::new(SyncPush {
                         origin: 0,
                         keys,
-                        resp: frame.clone(),
+                        resp: cmd_bytes.clone(),
                     }));
-                    state.on_write(&frame).await;
+                    state.on_write(&cmd_bytes).await;
                 }
             }
             Err(e) => warn!("Replica: bad command from primary: {}", e),
@@ -1274,7 +1273,7 @@ fn ct_eq_bytes(a: &[u8], b: &[u8]) -> bool {
 struct SyncPush {
     origin: u64,
     keys: Vec<String>,
-    resp: String,
+    resp: Vec<u8>,
 }
 
 type SyncMsg = Arc<SyncPush>;
@@ -1549,12 +1548,12 @@ fn next_conn_id() -> u64 {
 enum PubSubMsg {
     Message {
         channel: String,
-        message: String,
+        message: Vec<u8>,
     },
     PMessage {
         pattern: String,
         channel: String,
-        message: String,
+        message: Vec<u8>,
     },
 }
 
@@ -1607,7 +1606,7 @@ impl PubSubHub {
     }
 
     /// Deliver to all matching subscribers; returns the count delivered.
-    fn publish(&mut self, channel: &str, message: &str) -> i64 {
+    fn publish(&mut self, channel: &str, message: &[u8]) -> i64 {
         let mut count = 0i64;
 
         if let std::collections::hash_map::Entry::Occupied(mut e) =
@@ -1618,7 +1617,7 @@ impl PubSubHub {
                 let ok = tx
                     .send(PubSubMsg::Message {
                         channel: channel.to_string(),
-                        message: message.to_string(),
+                        message: message.to_vec(),
                     })
                     .is_ok();
                 if ok {
@@ -1642,7 +1641,7 @@ impl PubSubHub {
                 .send(PubSubMsg::PMessage {
                     pattern,
                     channel: channel.to_string(),
-                    message: message.to_string(),
+                    message: message.to_vec(),
                 })
                 .is_ok()
             {
@@ -2030,7 +2029,7 @@ fn encode_pubsub_msg(msg: PubSubMsg, protover: u8) -> Vec<u8> {
         PubSubMsg::Message { channel, message } => frame(vec![
             Value::BulkString(Some(b"message".to_vec())),
             Value::BulkString(Some(channel.into_bytes())),
-            Value::BulkString(Some(message.into_bytes())),
+            Value::BulkString(Some(message)),
         ])
         .serialize(),
         PubSubMsg::PMessage {
@@ -2041,7 +2040,7 @@ fn encode_pubsub_msg(msg: PubSubMsg, protover: u8) -> Vec<u8> {
             Value::BulkString(Some(b"pmessage".to_vec())),
             Value::BulkString(Some(pattern.into_bytes())),
             Value::BulkString(Some(channel.into_bytes())),
-            Value::BulkString(Some(message.into_bytes())),
+            Value::BulkString(Some(message)),
         ])
         .serialize(),
     }
@@ -2058,21 +2057,29 @@ fn resp_subscribe_ack(kind: &str, channel: &str, count: usize) -> Vec<u8> {
 
 /// Encodes a list of string parts as a RESP3 Push frame for WebSocket fan-out.
 /// Uses `>` prefix so clients can distinguish server-initiated pushes from command responses.
-fn resp_push(parts: &[&str]) -> String {
-    let mut s = format!(">{}\r\n", parts.len());
+/// Build a RESP3 Push frame from raw byte arguments.
+///
+/// Bytes rather than `&str` because these frames carry stored values, which may
+/// be arbitrary binary. Building them as a `String` would have required a lossy
+/// conversion — silently corrupting the replicated, AOF-logged and
+/// browser-synced copy of a value the store itself holds faithfully.
+fn resp_push(parts: &[&[u8]]) -> Vec<u8> {
+    let mut out = format!(">{}\r\n", parts.len()).into_bytes();
     for part in parts {
-        s.push_str(&format!("${}\r\n{}\r\n", part.len(), part));
+        out.extend_from_slice(format!("${}\r\n", part.len()).as_bytes());
+        out.extend_from_slice(part);
+        out.extend_from_slice(b"\r\n");
     }
-    s
+    out
 }
 
 /// Returns the RESP-encoded mutation to broadcast to WebSocket peers, or `None`
 /// if the command mutated nothing (read-only or conditional-and-failed).
-fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
+fn broadcast_for(cmd: &Command, response: &Value) -> Option<Vec<u8>> {
     match cmd {
         // Replays as SET: a replica has no connection to scope the lifetime to,
         // and the owning server broadcasts the DEL when the connection closes.
-        Command::ESet(k, v) => Some(resp_push(&["SET", k, v])),
+        Command::ESet(k, v) => Some(resp_push(&[b"SET", k.as_bytes(), v.as_slice()])),
         Command::Set(k, v, opts) => {
             // Without GET: nil response means NX/XX condition failed — don't broadcast.
             // With GET: nil means key didn't exist before, but SET still happened.
@@ -2081,125 +2088,163 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
                 return None;
             }
             match &opts.expiry {
-                None => Some(resp_push(&["SET", k, v])),
+                None => Some(resp_push(&[b"SET", k.as_bytes(), v.as_slice()])),
                 Some(SetExpiry::Ex(s)) => {
                     let px = s.saturating_mul(1000).to_string();
-                    Some(resp_push(&["SET", k, v, "PX", &px]))
+                    Some(resp_push(&[
+                        b"SET",
+                        k.as_bytes(),
+                        v.as_slice(),
+                        b"PX",
+                        px.as_bytes(),
+                    ]))
                 }
                 Some(SetExpiry::Px(ms)) => {
                     let ms_s = ms.to_string();
-                    Some(resp_push(&["SET", k, v, "PX", &ms_s]))
+                    Some(resp_push(&[
+                        b"SET",
+                        k.as_bytes(),
+                        v.as_slice(),
+                        b"PX",
+                        ms_s.as_bytes(),
+                    ]))
                 }
                 Some(SetExpiry::Exat(ts)) => {
                     let pxat = ts.saturating_mul(1000).to_string();
-                    Some(resp_push(&["SET", k, v, "PXAT", &pxat]))
+                    Some(resp_push(&[
+                        b"SET",
+                        k.as_bytes(),
+                        v.as_slice(),
+                        b"PXAT",
+                        pxat.as_bytes(),
+                    ]))
                 }
                 Some(SetExpiry::Pxat(ts)) => {
                     let ts_s = ts.to_string();
-                    Some(resp_push(&["SET", k, v, "PXAT", &ts_s]))
+                    Some(resp_push(&[
+                        b"SET",
+                        k.as_bytes(),
+                        v.as_slice(),
+                        b"PXAT",
+                        ts_s.as_bytes(),
+                    ]))
                 }
-                Some(SetExpiry::KeepTtl) => Some(resp_push(&["SET", k, v, "KEEPTTL"])),
+                Some(SetExpiry::KeepTtl) => {
+                    Some(resp_push(&[b"SET", k.as_bytes(), v.as_slice(), b"KEEPTTL"]))
+                }
             }
         }
         Command::Del(keys) | Command::Unlink(keys) => {
-            let mut parts: Vec<&str> = vec!["DEL"];
-            let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+            let mut parts: Vec<&[u8]> = vec![b"DEL"];
+            let key_refs: Vec<&[u8]> = keys.iter().map(|s| s.as_bytes()).collect();
             parts.extend_from_slice(&key_refs);
             Some(resp_push(&parts))
         }
         Command::MSet(pairs) => {
-            let mut parts: Vec<&str> = vec!["MSET"];
-            let flat: Vec<String> = pairs
+            let mut parts: Vec<&[u8]> = vec![b"MSET"];
+            let flat: Vec<Vec<u8>> = pairs
                 .iter()
-                .flat_map(|(k, v)| [k.clone(), v.clone()])
+                .flat_map(|(k, v)| [k.as_bytes().to_vec(), v.clone()])
                 .collect();
-            let flat_refs: Vec<&str> = flat.iter().map(|s| s.as_str()).collect();
+            let flat_refs: Vec<&[u8]> = flat.iter().map(|s| s.as_slice()).collect();
             parts.extend_from_slice(&flat_refs);
             Some(resp_push(&parts))
         }
         Command::SetNx(k, v) => match response {
-            Value::Integer(1) => Some(resp_push(&["SET", k, v])),
+            Value::Integer(1) => Some(resp_push(&[b"SET", k.as_bytes(), v.as_slice()])),
             _ => None,
         },
         Command::SetEx(k, secs, v) => {
             let px = secs.saturating_mul(1000).to_string();
-            Some(resp_push(&["SET", k, v, "PX", &px]))
+            Some(resp_push(&[
+                b"SET",
+                k.as_bytes(),
+                v.as_slice(),
+                b"PX",
+                px.as_bytes(),
+            ]))
         }
         Command::PSetEx(k, ms, v) => {
             let ms_s = ms.to_string();
-            Some(resp_push(&["SET", k, v, "PX", &ms_s]))
+            Some(resp_push(&[
+                b"SET",
+                k.as_bytes(),
+                v.as_slice(),
+                b"PX",
+                ms_s.as_bytes(),
+            ]))
         }
         Command::Append(k, v) => match response {
-            Value::Integer(_) => Some(resp_push(&["APPEND", k, v])),
+            Value::Integer(_) => Some(resp_push(&[b"APPEND", k.as_bytes(), v.as_slice()])),
             _ => None,
         },
-        Command::GetSet(k, v) => Some(resp_push(&["SET", k, v])),
+        Command::GetSet(k, v) => Some(resp_push(&[b"SET", k.as_bytes(), v.as_slice()])),
         Command::Incr(k) | Command::Decr(k) => match response {
             Value::Integer(n) => {
                 let s = n.to_string();
-                Some(resp_push(&["SET", k, &s]))
+                Some(resp_push(&[b"SET", k.as_bytes(), s.as_bytes()]))
             }
             _ => None,
         },
         Command::IncrBy(k, _) | Command::DecrBy(k, _) => match response {
             Value::Integer(n) => {
                 let s = n.to_string();
-                Some(resp_push(&["SET", k, &s]))
+                Some(resp_push(&[b"SET", k.as_bytes(), s.as_bytes()]))
             }
             _ => None,
         },
         Command::Expire(k, secs) => match response {
             Value::Integer(1) => {
                 let ms = secs.saturating_mul(1000).to_string();
-                Some(resp_push(&["PEXPIRE", k, &ms]))
+                Some(resp_push(&[b"PEXPIRE", k.as_bytes(), ms.as_bytes()]))
             }
             _ => None,
         },
         Command::PExpire(k, ms) => match response {
             Value::Integer(1) => {
                 let ms_s = ms.to_string();
-                Some(resp_push(&["PEXPIRE", k, &ms_s]))
+                Some(resp_push(&[b"PEXPIRE", k.as_bytes(), ms_s.as_bytes()]))
             }
             _ => None,
         },
         Command::ExpireAt(k, ts) => match response {
             Value::Integer(1) => {
                 let ts_ms = ts.saturating_mul(1000).to_string();
-                Some(resp_push(&["PEXPIREAT", k, &ts_ms]))
+                Some(resp_push(&[b"PEXPIREAT", k.as_bytes(), ts_ms.as_bytes()]))
             }
             _ => None,
         },
         Command::PExpireAt(k, ts) => match response {
             Value::Integer(1) => {
                 let ts_s = ts.to_string();
-                Some(resp_push(&["PEXPIREAT", k, &ts_s]))
+                Some(resp_push(&[b"PEXPIREAT", k.as_bytes(), ts_s.as_bytes()]))
             }
             _ => None,
         },
         Command::Persist(k) => match response {
-            Value::Integer(1) => Some(resp_push(&["PERSIST", k])),
+            Value::Integer(1) => Some(resp_push(&[b"PERSIST", k.as_bytes()])),
             _ => None,
         },
-        Command::FlushDb => Some(resp_push(&["FLUSHDB"])),
+        Command::FlushDb => Some(resp_push(&[b"FLUSHDB"])),
         Command::Rename(src, dst) => match response {
             Value::Error(_) => None,
-            _ => Some(resp_push(&["RENAME", src, dst])),
+            _ => Some(resp_push(&[b"RENAME", src.as_bytes(), dst.as_bytes()])),
         },
 
         // ── Hash ─────────────────────────────────────────────────────────────
         Command::HSet(k, pairs) => {
-            let mut parts: Vec<String> = vec!["HSET".into(), k.clone()];
+            let mut parts: Vec<Vec<u8>> = vec![b"HSET".to_vec(), k.as_bytes().to_vec()];
             for (f, v) in pairs {
-                parts.push(f.clone());
+                parts.push(f.as_bytes().to_vec());
                 parts.push(v.clone());
             }
-            let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
+            let refs: Vec<&[u8]> = parts.iter().map(|s| s.as_slice()).collect();
             Some(resp_push(&refs))
         }
         Command::HDel(k, fields) => match response {
             Value::Integer(n) if *n > 0 => {
-                let mut parts: Vec<&str> = vec!["HDEL", k];
-                let field_refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
+                let mut parts: Vec<&[u8]> = vec![b"HDEL", k.as_bytes()];
+                let field_refs: Vec<&[u8]> = fields.iter().map(|s| s.as_bytes()).collect();
                 parts.extend_from_slice(&field_refs);
                 Some(resp_push(&parts))
             }
@@ -2208,19 +2253,34 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
         Command::HIncrBy(k, f, _) => match response {
             Value::Integer(n) => {
                 let s = n.to_string();
-                Some(resp_push(&["HSET", k, f, &s]))
+                Some(resp_push(&[
+                    b"HSET",
+                    k.as_bytes(),
+                    f.as_bytes(),
+                    s.as_bytes(),
+                ]))
             }
             _ => None,
         },
         Command::HIncrByFloat(k, f, _) => match response {
             Value::BulkString(Some(data)) => {
                 let s = String::from_utf8_lossy(data);
-                Some(resp_push(&["HSET", k, f, &s]))
+                Some(resp_push(&[
+                    b"HSET",
+                    k.as_bytes(),
+                    f.as_bytes(),
+                    s.as_bytes(),
+                ]))
             }
             _ => None,
         },
         Command::HSetNx(k, f, v) => match response {
-            Value::Integer(1) => Some(resp_push(&["HSET", k, f, v])),
+            Value::Integer(1) => Some(resp_push(&[
+                b"HSET",
+                k.as_bytes(),
+                f.as_bytes(),
+                v.as_slice(),
+            ])),
             _ => None,
         },
 
@@ -2231,8 +2291,8 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
             } else {
                 "RPUSH"
             };
-            let mut parts: Vec<&str> = vec![cmd_name, k];
-            let val_refs: Vec<&str> = vals.iter().map(|s| s.as_str()).collect();
+            let mut parts: Vec<&[u8]> = vec![cmd_name.as_bytes(), k.as_bytes()];
+            let val_refs: Vec<&[u8]> = vals.iter().map(|v| v.as_slice()).collect();
             parts.extend_from_slice(&val_refs);
             Some(resp_push(&parts))
         }
@@ -2243,8 +2303,8 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
                 } else {
                     "RPUSH"
                 };
-                let mut parts: Vec<&str> = vec![cmd_name, k];
-                let val_refs: Vec<&str> = vals.iter().map(|s| s.as_str()).collect();
+                let mut parts: Vec<&[u8]> = vec![cmd_name.as_bytes(), k.as_bytes()];
+                let val_refs: Vec<&[u8]> = vals.iter().map(|v| v.as_slice()).collect();
                 parts.extend_from_slice(&val_refs);
                 Some(resp_push(&parts))
             }
@@ -2256,8 +2316,8 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
             _ => {
                 let n = count.map(|c| c.to_string());
                 match &n {
-                    Some(ns) => Some(resp_push(&["LPOP", k, ns])),
-                    None => Some(resp_push(&["LPOP", k])),
+                    Some(ns) => Some(resp_push(&[b"LPOP", k.as_bytes(), ns.as_bytes()])),
+                    None => Some(resp_push(&[b"LPOP", k.as_bytes()])),
                 }
             }
         },
@@ -2267,36 +2327,51 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
             _ => {
                 let n = count.map(|c| c.to_string());
                 match &n {
-                    Some(ns) => Some(resp_push(&["RPOP", k, ns])),
-                    None => Some(resp_push(&["RPOP", k])),
+                    Some(ns) => Some(resp_push(&[b"RPOP", k.as_bytes(), ns.as_bytes()])),
+                    None => Some(resp_push(&[b"RPOP", k.as_bytes()])),
                 }
             }
         },
         Command::LSet(k, idx, v) => match response {
             Value::SimpleString(_) => {
                 let idx_s = idx.to_string();
-                Some(resp_push(&["LSET", k, &idx_s, v]))
+                Some(resp_push(&[
+                    b"LSET",
+                    k.as_bytes(),
+                    idx_s.as_bytes(),
+                    v.as_slice(),
+                ]))
             }
             _ => None,
         },
         Command::LRem(k, count, elem) => match response {
             Value::Integer(n) if *n > 0 => {
                 let count_s = count.to_string();
-                Some(resp_push(&["LREM", k, &count_s, elem]))
+                Some(resp_push(&[
+                    b"LREM",
+                    k.as_bytes(),
+                    count_s.as_bytes(),
+                    elem.as_slice(),
+                ]))
             }
             _ => None,
         },
         Command::LTrim(k, start, stop) => {
             let start_s = start.to_string();
             let stop_s = stop.to_string();
-            Some(resp_push(&["LTRIM", k, &start_s, &stop_s]))
+            Some(resp_push(&[
+                b"LTRIM",
+                k.as_bytes(),
+                start_s.as_bytes(),
+                stop_s.as_bytes(),
+            ]))
         }
 
         // ── Set ───────────────────────────────────────────────────────────────
         Command::SAdd(k, members) => match response {
             Value::Integer(n) if *n > 0 => {
-                let mut parts: Vec<&str> = vec!["SADD", k];
-                let m_refs: Vec<&str> = members.iter().map(|s| s.as_str()).collect();
+                let mut parts: Vec<&[u8]> = vec![b"SADD", k.as_bytes()];
+                let m_refs: Vec<&[u8]> = members.iter().map(|s| s.as_bytes()).collect();
                 parts.extend_from_slice(&m_refs);
                 Some(resp_push(&parts))
             }
@@ -2304,8 +2379,8 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
         },
         Command::SRem(k, members) => match response {
             Value::Integer(n) if *n > 0 => {
-                let mut parts: Vec<&str> = vec!["SREM", k];
-                let m_refs: Vec<&str> = members.iter().map(|s| s.as_str()).collect();
+                let mut parts: Vec<&[u8]> = vec![b"SREM", k.as_bytes()];
+                let m_refs: Vec<&[u8]> = members.iter().map(|s| s.as_bytes()).collect();
                 parts.extend_from_slice(&m_refs);
                 Some(resp_push(&parts))
             }
@@ -2332,31 +2407,36 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
                 let _ = count;
                 None
             } else {
-                let mut parts: Vec<&str> = vec!["SREM", k];
-                let m_refs: Vec<&str> = popped.iter().map(|s| s.as_str()).collect();
+                let mut parts: Vec<&[u8]> = vec![b"SREM", k.as_bytes()];
+                let m_refs: Vec<&[u8]> = popped.iter().map(|s| s.as_bytes()).collect();
                 parts.extend_from_slice(&m_refs);
                 Some(resp_push(&parts))
             }
         }
         Command::SMove(src, dst, member) => match response {
-            Value::Integer(1) => Some(resp_push(&["SMOVE", src, dst, member])),
+            Value::Integer(1) => Some(resp_push(&[
+                b"SMOVE",
+                src.as_bytes(),
+                dst.as_bytes(),
+                member.as_bytes(),
+            ])),
             _ => None,
         },
         Command::SInterStore(dst, keys) => {
-            let mut parts: Vec<&str> = vec!["SINTERSTORE", dst];
-            let k_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+            let mut parts: Vec<&[u8]> = vec![b"SINTERSTORE", dst.as_bytes()];
+            let k_refs: Vec<&[u8]> = keys.iter().map(|s| s.as_bytes()).collect();
             parts.extend_from_slice(&k_refs);
             Some(resp_push(&parts))
         }
         Command::SUnionStore(dst, keys) => {
-            let mut parts: Vec<&str> = vec!["SUNIONSTORE", dst];
-            let k_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+            let mut parts: Vec<&[u8]> = vec![b"SUNIONSTORE", dst.as_bytes()];
+            let k_refs: Vec<&[u8]> = keys.iter().map(|s| s.as_bytes()).collect();
             parts.extend_from_slice(&k_refs);
             Some(resp_push(&parts))
         }
         Command::SDiffStore(dst, keys) => {
-            let mut parts: Vec<&str> = vec!["SDIFFSTORE", dst];
-            let k_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+            let mut parts: Vec<&[u8]> = vec![b"SDIFFSTORE", dst.as_bytes()];
+            let k_refs: Vec<&[u8]> = keys.iter().map(|s| s.as_bytes()).collect();
             parts.extend_from_slice(&k_refs);
             Some(resp_push(&parts))
         }
@@ -2380,13 +2460,13 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
                 parts.push(format_f64_score(*score));
                 parts.push(member.clone());
             }
-            let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
+            let refs: Vec<&[u8]> = parts.iter().map(|s| s.as_bytes()).collect();
             Some(resp_push(&refs))
         }
         Command::ZRem(k, members) => match response {
             Value::Integer(n) if *n > 0 => {
-                let mut parts: Vec<&str> = vec!["ZREM", k];
-                let m_refs: Vec<&str> = members.iter().map(|s| s.as_str()).collect();
+                let mut parts: Vec<&[u8]> = vec![b"ZREM", k.as_bytes()];
+                let m_refs: Vec<&[u8]> = members.iter().map(|s| s.as_bytes()).collect();
                 parts.extend_from_slice(&m_refs);
                 Some(resp_push(&parts))
             }
@@ -2394,18 +2474,28 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
         },
         Command::ZIncrBy(k, delta, member) => {
             let delta_s = format_f64_score(*delta);
-            Some(resp_push(&["ZINCRBY", k, &delta_s, member]))
+            Some(resp_push(&[
+                b"ZINCRBY",
+                k.as_bytes(),
+                delta_s.as_bytes(),
+                member.as_bytes(),
+            ]))
         }
 
         // ── JSON ─────────────────────────────────────────────────────────────
         // Replayable as-is on replicas, AOF, and browser stores. Only
         // successful writes replicate (errors reply -ERR, not +OK).
         Command::JSet(k, path, value) => match response {
-            Value::SimpleString(_) => Some(resp_push(&["JSET", k, path, value])),
+            Value::SimpleString(_) => Some(resp_push(&[
+                b"JSET",
+                k.as_bytes(),
+                path.as_bytes(),
+                value.as_bytes(),
+            ])),
             _ => None,
         },
         Command::JMerge(k, patch) => match response {
-            Value::SimpleString(_) => Some(resp_push(&["JMERGE", k, patch])),
+            Value::SimpleString(_) => Some(resp_push(&[b"JMERGE", k.as_bytes(), patch.as_bytes()])),
             _ => None,
         },
 
@@ -2417,7 +2507,12 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
         Command::RlSet(k, limit, window_secs) => {
             let limit_s = limit.to_string();
             let window_s = window_secs.to_string();
-            Some(resp_push(&["RLSET", k, &limit_s, &window_s]))
+            Some(resp_push(&[
+                b"RLSET",
+                k.as_bytes(),
+                limit_s.as_bytes(),
+                window_s.as_bytes(),
+            ]))
         }
 
         // Pub/Sub and transactions carry no store state — no broadcast needed.
@@ -3965,10 +4060,8 @@ async fn handle_ws<S>(
                             Some(scopes) => scopes_match(scopes, &push.keys),
                             None => !strict,
                         };
-                        if visible
-                            && ws_sender.send(Message::Text(push.resp.clone().into())).await.is_err()
-                        {
-                            break;
+                        if visible {
+                            ws_send!(&push.resp);
                         }
                     }
                     Ok(_) => {}
@@ -4328,7 +4421,7 @@ mod tests {
     async fn aof_writer_append_and_truncate() {
         let path = tmp_path("aof_writer.aof");
         let aof = AofWriter::open(path.clone(), AofSync::No).await.unwrap();
-        aof.append("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
+        aof.append(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
             .await;
         aof.flush().await;
         let len_before = tokio::fs::metadata(&path).await.unwrap().len();
@@ -4355,25 +4448,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn integration_binary_value_is_refused_over_resp() {
-        // The drop-in claim runs through this port, so the refusal has to be a
-        // clean RESP error that leaves the connection usable — not a
-        // disconnect, and emphatically not a silent lossy store.
+    async fn integration_binary_value_round_trips_over_resp() {
+        // The drop-in claim runs through this port: a value that is not valid
+        // UTF-8 must come back byte-for-byte, exactly as Redis would.
         let srv = spawn_server().await;
         let mut c = RespClient::connect(srv.tcp_addr).await;
 
-        let raw = b"*3\r\n$3\r\nSET\r\n$3\r\nbin\r\n$3\r\n\xff\xfe\x41\r\n";
-        c.stream.write_all(raw).await.unwrap();
+        let binary: &[u8] = &[0xff, 0xfe, 0x00, 0x41, 0x80];
+        let mut req = b"*3\r\n$3\r\nSET\r\n$3\r\nbin\r\n".to_vec();
+        req.extend_from_slice(format!("${}\r\n", binary.len()).as_bytes());
+        req.extend_from_slice(binary);
+        req.extend_from_slice(b"\r\n");
+        c.stream.write_all(&req).await.unwrap();
+        assert_eq!(c.cmd(&[]).await, ok());
+
+        assert_eq!(
+            c.cmd(&["GET", "bin"]).await,
+            Value::BulkString(Some(binary.to_vec())),
+            "binary value must survive the round trip"
+        );
+        assert_eq!(
+            c.cmd(&["STRLEN", "bin"]).await,
+            int(binary.len() as i64),
+            "length is counted in bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_binary_key_is_refused_over_resp() {
+        // Keys stay text: they are glob-matched and scope-checked, so a
+        // corrupted one would be silently unreachable. The refusal must be a
+        // clean RESP error that leaves the connection usable.
+        let srv = spawn_server().await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        c.stream
+            .write_all(b"*3\r\n$3\r\nSET\r\n$2\r\n\xff\xfe\r\n$1\r\nv\r\n")
+            .await
+            .unwrap();
         let reply = c.cmd(&[]).await;
         let Value::Error(e) = &reply else {
-            panic!("binary value must be refused, got {reply:?}")
+            panic!("binary key must be refused, got {reply:?}")
         };
-        assert!(e.contains("base64"), "error must be actionable: {e:?}");
+        assert!(e.contains("must be text"), "error must explain: {e:?}");
 
-        // Nothing was stored, and the connection still works.
-        assert_eq!(c.cmd(&["EXISTS", "bin"]).await, int(0));
-        assert_eq!(c.cmd(&["SET", "bin", "ok"]).await, ok());
-        assert_eq!(c.cmd(&["GET", "bin"]).await, bulk("ok"));
+        assert_eq!(c.cmd(&["DBSIZE"]).await, int(0), "nothing may be stored");
+        assert_eq!(c.cmd(&["SET", "ok", "v"]).await, ok());
     }
 
     #[tokio::test]
@@ -4698,10 +4818,10 @@ mod tests {
 
         // Simulate writes captured by AOF
         state
-            .on_write("*3\r\n$3\r\nSET\r\n$5\r\nhello\r\n$5\r\nworld\r\n")
+            .on_write(b"*3\r\n$3\r\nSET\r\n$5\r\nhello\r\n$5\r\nworld\r\n")
             .await;
         state
-            .on_write("*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n")
+            .on_write(b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n")
             .await;
         if let Some(ref a) = state.aof {
             a.flush().await;
@@ -5190,18 +5310,20 @@ mod tests {
         assert_eq!(c.cmd_binary(raw).await, ok());
         assert_eq!(c.cmd(&["GET", "bin"]).await, bulk("hello"));
 
-        // A binary *value* is refused rather than silently corrupted, and
-        // nothing is stored — the transport accepted the frame, the engine
-        // declined the payload.
-        let raw = b"*3\r\n$3\r\nSET\r\n$3\r\nraw\r\n$3\r\n\xff\xfe\x41\r\n".to_vec();
-        let reply = c.cmd_binary(raw).await;
-        let Value::Error(e) = &reply else {
-            panic!("binary value must be refused, got {reply:?}")
-        };
-        assert!(e.contains("base64"), "error must be actionable: {e:?}");
-        assert_eq!(c.cmd(&["EXISTS", "raw"]).await, int(0));
+        // A binary value round-trips byte-for-byte, and the reply comes back in
+        // a binary frame because it is not valid UTF-8.
+        let binary: &[u8] = &[0xff, 0xfe, 0x00, 0x41];
+        let mut req = b"*3\r\n$3\r\nSET\r\n$3\r\nraw\r\n".to_vec();
+        req.extend_from_slice(format!("${}\r\n", binary.len()).as_bytes());
+        req.extend_from_slice(binary);
+        req.extend_from_slice(b"\r\n");
+        assert_eq!(c.cmd_binary(req).await, ok());
+        assert_eq!(
+            c.cmd(&["GET", "raw"]).await,
+            Value::BulkString(Some(binary.to_vec()))
+        );
 
-        // The connection stays usable after a rejection.
+        // The connection stays usable.
         assert_eq!(c.cmd(&["PING"]).await, Value::SimpleString("PONG".into()));
     }
 
@@ -6369,6 +6491,7 @@ mod tests {
             &Value::SimpleString("OK".into()),
         )
         .expect("ESET must broadcast");
+        let frame = String::from_utf8_lossy(&frame).into_owned();
         assert!(frame.contains("SET"), "{frame}");
         assert!(frame.contains("presence:1"));
         assert!(

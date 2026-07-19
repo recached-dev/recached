@@ -139,31 +139,44 @@ All notable changes to Recached are documented here.
 
 ### Fixed
 
-- **Non-UTF-8 values were silently corrupted; they are now rejected.** Values are stored as `String`,
-  so a value containing invalid UTF-8 was converted to U+FFFD replacement characters on the way in.
-  `SET` returned `OK`, `GET` returned bytes that differed from what was written, and nothing anywhere
-  reported a problem — the original bytes were destroyed at parse time, before storage, so there was
-  nothing to recover.
+- **Values were silently corrupted unless they were valid UTF-8; they are now byte-transparent.**
+  Values were stored as `String`, so a value containing invalid UTF-8 was converted to U+FFFD
+  replacement characters on the way in. `SET` returned `OK`, `GET` returned bytes that differed from
+  what was written, and nothing anywhere reported a problem — the original bytes were destroyed at
+  parse time, before storage, so there was nothing to recover.
 
   This affected **every transport, TCP included** — not only WebSocket, as the roadmap previously
   recorded. `SET k <0xFF 0xFE 0x41>` over plain RESP came back as `EF BF BD EF BF BD 41`.
 
-  Such a command is now refused before anything is stored:
+  Values are now stored and returned as the exact bytes sent, matching Redis. The change runs the
+  full depth of the stack: the store's string, list and hash types; command parsing; the RESP
+  encoder used for replication, AOF and browser sync; pub/sub payloads; and the browser's IndexedDB
+  write-ahead log.
+
+  **Identifiers stay text.** Keys, hash fields, set and sorted-set members, glob patterns and channel
+  names must be valid UTF-8, and a command carrying a binary one is refused before anything is
+  written:
 
   ```
-  ERR argument 2 is not valid UTF-8. Recached stores values as text;
-      base64-encode binary payloads before caching them
+  ERR argument 1 is not valid UTF-8. Keys, fields, members and patterns must be text;
+      only values may be binary
   ```
 
-  Keys are checked the same way, and the connection stays usable after a rejection. Nothing that
-  worked before can break: the affected values were already being destroyed, so no application can
-  have depended on the old behaviour.
+  Redis permits binary there too, but those positions are looked up, glob-matched and checked against
+  sync scopes as text, so a binary identifier would be unreachable through its own access paths. It
+  is recorded on the [roadmap](docs/roadmap.md) rather than scheduled.
 
-  **Action required if you cache binary payloads** — compressed responses, protobuf, pickled objects,
-  images — base64-encode them, or keep them elsewhere. Check whether your client compresses
-  transparently; several do by default. Byte-transparent values are on the
-  [roadmap](docs/roadmap.md) as a breaking change; this release makes the limitation visible rather
-  than silent.
+  **Snapshots remain compatible.** A snapshot written by 0.2.1 or earlier still loads: values were
+  msgpack strings then and are msgpack binary now, and the decoder accepts either. Binary values
+  encode as msgpack `bin` rather than an array of integers, so snapshot size is unchanged for text
+  and roughly halved versus the naive encoding for binary.
+
+  **Browser SDK: binary is read-only.** The browser cache stores and syncs binary faithfully and
+  `cache.getBytes(key)` returns a `Uint8Array`, but `cache.set()` still takes a string — binary
+  values originate from a backend writing over the RESP port. `cache.get()` now **throws** on a
+  binary value instead of returning mangled text, and `getJSON()` treats one as a miss.
+
+  Data corrupted by an earlier version cannot be recovered and must be re-populated.
 
 - **Pub/sub deliveries never reached a TCP subscriber that only listened.** Deliveries were written
   into a 32 KB buffered writer and flushed only at the end of a client-command batch, so a
@@ -182,7 +195,8 @@ All notable changes to Recached are documented here.
   text frames to be well-formed UTF-8, which left no way to send bytes at all. Replies are sent as
   text when the RESP bytes are valid UTF-8 and binary otherwise, so existing clients see no change.
 
-  This makes the *transport* byte-clean. Values are a separate matter — see below.
+  This makes the transport byte-clean; the values travelling over it became byte-transparent in the
+  same release — see below.
 
 - **Exactly-once delivery now survives a server restart.** Dedup high-water marks were held only in
   memory, so a restart inside the acknowledgement window let a client's replayed write apply twice —

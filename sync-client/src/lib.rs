@@ -449,11 +449,8 @@ impl SyncClient {
         let key = String::from_utf8_lossy(key).into_owned();
         match &items[2] {
             Value::BulkString(Some(v)) => {
-                self.store.execute(Command::Set(
-                    key,
-                    String::from_utf8_lossy(v).into_owned(),
-                    Default::default(),
-                ));
+                self.store
+                    .execute(Command::Set(key, v.clone(), Default::default()));
             }
             Value::BulkString(None) => {
                 // A nil value whose "key" is one of our registered live-query
@@ -497,37 +494,54 @@ impl SyncClient {
                 _ => None,
             }
         }
+        fn bytes(v: &Value) -> Option<Vec<u8>> {
+            match v {
+                Value::BulkString(Some(b)) => Some(b.clone()),
+                Value::SimpleString(s) => Some(s.as_bytes().to_vec()),
+                _ => None,
+            }
+        }
         let Some(tag) = items.first().and_then(text) else {
             return;
         };
-        let rest: Vec<String> = items[1..].iter().filter_map(text).collect();
+        // Values may be arbitrary bytes; hash fields, set and sorted-set
+        // members are identifiers and stay text. `raw` keeps the bytes, `as_text`
+        // reinterprets a slot when the position calls for an identifier.
+        let raw: Vec<Vec<u8>> = items[1..].iter().filter_map(bytes).collect();
+        let as_text = |b: &Vec<u8>| String::from_utf8_lossy(b).into_owned();
 
         // Clear first so removed members do not linger.
         self.store.execute(Command::Del(vec![key.clone()]));
         match tag.as_str() {
             "hash" => {
-                let pairs: Vec<(String, String)> = rest
+                let pairs: Vec<(String, Vec<u8>)> = raw
                     .chunks_exact(2)
-                    .map(|c| (c[0].clone(), c[1].clone()))
+                    .map(|c| (as_text(&c[0]), c[1].clone()))
                     .collect();
                 if !pairs.is_empty() {
                     self.store.execute(Command::HSet(key, pairs));
                 }
             }
             "list" => {
-                if !rest.is_empty() {
-                    self.store.execute(Command::RPush(key, rest));
+                if !raw.is_empty() {
+                    self.store.execute(Command::RPush(key, raw));
                 }
             }
             "set" => {
-                if !rest.is_empty() {
-                    self.store.execute(Command::SAdd(key, rest));
+                if !raw.is_empty() {
+                    self.store
+                        .execute(Command::SAdd(key, raw.iter().map(as_text).collect()));
                 }
             }
             "zset" => {
-                let members: Vec<(f64, String)> = rest
+                let members: Vec<(f64, String)> = raw
                     .chunks_exact(2)
-                    .filter_map(|c| c[1].parse::<f64>().ok().map(|sc| (sc, c[0].clone())))
+                    .filter_map(|c| {
+                        as_text(&c[1])
+                            .parse::<f64>()
+                            .ok()
+                            .map(|sc| (sc, as_text(&c[0])))
+                    })
                     .collect();
                 if !members.is_empty() {
                     self.store
@@ -535,9 +549,10 @@ impl SyncClient {
                 }
             }
             "json" => {
-                if let Some(doc) = rest.first() {
+                // JSON is UTF-8 by definition, so this position is text.
+                if let Some(doc) = raw.first() {
                     self.store
-                        .execute(Command::JSet(key, "$".to_string(), doc.clone()));
+                        .execute(Command::JSet(key, "$".to_string(), as_text(doc)));
                 }
             }
             _ => {}
@@ -552,11 +567,8 @@ impl SyncClient {
             let key = String::from_utf8_lossy(k).into_owned();
             match &pair[1] {
                 Value::BulkString(Some(v)) => {
-                    self.store.execute(Command::Set(
-                        key,
-                        String::from_utf8_lossy(v).into_owned(),
-                        Default::default(),
-                    ));
+                    self.store
+                        .execute(Command::Set(key, v.clone(), Default::default()));
                 }
                 // Collections arrive type-tagged, so the initial state of a
                 // live query is complete — no follow-up typed read needed.

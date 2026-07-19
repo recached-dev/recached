@@ -29,18 +29,15 @@ The WebSocket spec requires text frames to be well-formed UTF-8. A command or re
 that are not valid UTF-8 therefore travels in a **binary** frame instead; everything else stays in
 text frames, so existing clients are unaffected. A client must accept both.
 
-::: warning Values must be valid UTF-8
-Binary frames make the *transport* byte-clean, but the engine stores values as UTF-8 strings. A
-command carrying an argument that is not valid UTF-8 is **rejected** — on every transport, TCP
-included — with:
+::: tip Values are binary-safe; identifiers are not
+A value is stored and returned as the exact bytes sent. Keys, hash fields, set and sorted-set
+members, glob patterns and channel names must be valid UTF-8 — they are looked up, matched and routed
+as text — and a command carrying a binary one is rejected with
+`ERR argument <n> is not valid UTF-8. Keys, fields, members and patterns must be text; only values
+may be binary`. Nothing is stored, and the connection stays usable.
 
-```
-ERR argument <n> is not valid UTF-8. Recached stores values as text;
-    base64-encode binary payloads before caching them
-```
-
-Nothing is stored, and the connection stays usable. Base64-encode binary payloads. Byte-transparent
-values are a separate, breaking change — see the [roadmap](/roadmap#byte-transparent-values).
+Before 0.2.2 values were stored as UTF-8 strings and binary was silently replaced with U+FFFD on
+every transport.
 :::
 
 ## Frame taxonomy (WebSocket)

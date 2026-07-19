@@ -103,13 +103,136 @@ fn in_score_range(score: f64, min: &ScoreBound, max: &ScoreBound) -> bool {
     above && below
 }
 
+// ── Byte payloads ─────────────────────────────────────────────────────────────
+
+/// A stored value's bytes.
+///
+/// Values are payloads and may be arbitrary bytes — compressed blobs, protobuf,
+/// images. *Identifiers* (keys, hash fields, set and sorted-set members) stay
+/// `String`: they are looked up, pattern-matched and scope-checked as text, and
+/// making them bytes would spread through the glob matcher, sync scopes and
+/// pub/sub routing for no practical gain.
+///
+/// The serde impls are hand-written for two reasons. `Vec<u8>` serializes as an
+/// array of integers under rmp-serde, which would roughly double snapshot size;
+/// `serialize_bytes` emits a compact msgpack `bin`. And deserialization accepts
+/// *either* a string or bytes, so snapshots written by 0.2.1 and earlier — where
+/// values were `String` — still load.
+#[derive(Clone, PartialEq, Eq, Hash, Default)]
+pub struct Blob(pub Vec<u8>);
+
+impl Blob {
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    pub fn into_vec(self) -> Vec<u8> {
+        self.0
+    }
+    /// Alias of `into_vec`, mirroring `String::into_bytes` at the many call
+    /// sites that build a RESP `BulkString` straight from a stored value.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+    /// Append bytes, for `APPEND`.
+    pub fn extend(&mut self, other: &[u8]) {
+        self.0.extend_from_slice(other);
+    }
+    /// Parse the payload as text, for the commands that require a number.
+    /// Non-UTF-8 fails the same way non-numeric text does.
+    pub fn parse_as<T: std::str::FromStr>(&self) -> Option<T> {
+        self.as_str()?.parse().ok()
+    }
+    /// Interpret the payload as text. Commands that need a number or a JSON
+    /// document (`INCR`, `JSET`, …) go through this and error when it fails,
+    /// rather than the storage layer refusing the write in the first place.
+    pub fn as_str(&self) -> Option<&str> {
+        std::str::from_utf8(&self.0).ok()
+    }
+}
+
+impl From<Vec<u8>> for Blob {
+    fn from(v: Vec<u8>) -> Self {
+        Blob(v)
+    }
+}
+impl From<&[u8]> for Blob {
+    fn from(v: &[u8]) -> Self {
+        Blob(v.to_vec())
+    }
+}
+impl From<String> for Blob {
+    fn from(v: String) -> Self {
+        Blob(v.into_bytes())
+    }
+}
+impl From<&str> for Blob {
+    fn from(v: &str) -> Self {
+        Blob(v.as_bytes().to_vec())
+    }
+}
+
+impl std::fmt::Debug for Blob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Text payloads dominate, so print them readably and fall back to hex.
+        match self.as_str() {
+            Some(t) => write!(f, "{t:?}"),
+            None => write!(f, "<{} bytes>", self.0.len()),
+        }
+    }
+}
+
+impl Serialize for Blob {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Blob {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Blob;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("bytes or a string")
+            }
+            // Pre-0.2.2 snapshots stored values as msgpack strings.
+            fn visit_str<E>(self, v: &str) -> Result<Blob, E> {
+                Ok(Blob(v.as_bytes().to_vec()))
+            }
+            fn visit_string<E>(self, v: String) -> Result<Blob, E> {
+                Ok(Blob(v.into_bytes()))
+            }
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Blob, E> {
+                Ok(Blob(v.to_vec()))
+            }
+            fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Blob, E> {
+                Ok(Blob(v))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Blob, A::Error> {
+                let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(b) = seq.next_element::<u8>()? {
+                    out.push(b);
+                }
+                Ok(Blob(out))
+            }
+        }
+        de.deserialize_any(V)
+    }
+}
+
 // ── Entry value type ──────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 enum EntryValue {
-    Str(String),
-    Hash(HashMap<String, String>),
-    List(VecDeque<String>),
+    Str(Blob),
+    Hash(HashMap<String, Blob>),
+    List(VecDeque<Blob>),
     // IndexSet rather than HashSet: SPOP / SRANDMEMBER need O(1) access to a
     // random member by index, which a hash table cannot provide.
     Set(IndexSet<String>),
@@ -368,17 +491,17 @@ impl Clone for Entry {
 }
 
 impl Entry {
-    fn new_str(value: String) -> Self {
+    fn new_str(value: impl Into<Blob>) -> Self {
         Self {
-            value: EntryValue::Str(value),
+            value: EntryValue::Str(value.into()),
             expires_at_ms: None,
             last_access_ms: AtomicU64::new(now_ms()),
         }
     }
 
-    fn new_str_ex(value: String, expires_at_ms: u64) -> Self {
+    fn new_str_ex(value: impl Into<Blob>, expires_at_ms: u64) -> Self {
         Self {
-            value: EntryValue::Str(value),
+            value: EntryValue::Str(value.into()),
             expires_at_ms: Some(expires_at_ms),
             last_access_ms: AtomicU64::new(now_ms()),
         }
@@ -516,9 +639,9 @@ pub enum EvictionPolicy {
 
 #[derive(Serialize, Deserialize)]
 pub enum SnapshotValue {
-    Str(String),
-    Hash(HashMap<String, String>),
-    List(Vec<String>),
+    Str(Blob),
+    Hash(HashMap<String, Blob>),
+    List(Vec<Blob>),
     Set(Vec<String>),
     ZSet(Vec<(String, f64)>),
     // Appended after the original variants: rmp-serde encodes variants by
@@ -694,6 +817,9 @@ impl KeyValueStore {
         fn bulk(s: &str) -> Value {
             Value::BulkString(Some(s.as_bytes().to_vec()))
         }
+        fn blob(b: &Blob) -> Value {
+            Value::BulkString(Some(b.as_slice().to_vec()))
+        }
 
         let now = now_ms();
         match self.data.get(key) {
@@ -702,15 +828,15 @@ impl KeyValueStore {
             Some(e) => match &e.value {
                 EntryValue::Str(s) => Value::BulkString(Some(s.clone().into_bytes())),
                 EntryValue::Hash(m) => {
-                    let mut fields: Vec<(&String, &String)> = m.iter().collect();
+                    let mut fields: Vec<(&String, &Blob)> = m.iter().collect();
                     fields.sort_by(|a, b| a.0.cmp(b.0));
                     let items = fields
                         .into_iter()
-                        .flat_map(|(f, v)| [bulk(f), bulk(v)])
+                        .flat_map(|(f, v)| [bulk(f), blob(v)])
                         .collect();
                     tagged("hash", items)
                 }
-                EntryValue::List(l) => tagged("list", l.iter().map(|v| bulk(v)).collect()),
+                EntryValue::List(l) => tagged("list", l.iter().map(blob).collect()),
                 EntryValue::Set(st) => tagged("set", st.iter().map(|m| bulk(m)).collect()),
                 EntryValue::ZSet(z) => {
                     let mut pairs: Vec<(&String, &f64)> = z.scores.iter().collect();
@@ -1012,7 +1138,7 @@ impl KeyValueStore {
                 self.data.insert(
                     key,
                     Entry {
-                        value: EntryValue::Str(val),
+                        value: EntryValue::Str(val.into()),
                         expires_at_ms,
                         last_access_ms: AtomicU64::new(now),
                     },
@@ -1058,12 +1184,12 @@ impl KeyValueStore {
                     .entry(key)
                     .or_insert_with(|| Entry::new_str(String::new()));
                 if was_expired {
-                    entry.value = EntryValue::Str(String::new());
+                    entry.value = EntryValue::Str(Blob::default());
                     entry.expires_at_ms = None;
                 }
                 match &mut entry.value {
                     EntryValue::Str(s) => {
-                        s.push_str(&suffix);
+                        s.extend(&suffix);
                         Value::Integer(s.len() as i64)
                     }
                     _ => unreachable!(),
@@ -1361,7 +1487,7 @@ impl KeyValueStore {
                     .filter(|(f, _)| !h.contains_key(f.as_str()))
                     .count();
                 for (field, val) in pairs {
-                    h.insert(field, val);
+                    h.insert(field, val.into());
                 }
                 Value::Integer(new_count as i64)
             }
@@ -1391,15 +1517,15 @@ impl KeyValueStore {
                     Some(e) => match &e.value {
                         EntryValue::Hash(h) => {
                             e.touch(now);
-                            let mut pairs: Vec<(&str, &str)> =
-                                h.iter().map(|(f, v)| (f.as_str(), v.as_str())).collect();
+                            let mut pairs: Vec<(&str, &Blob)> =
+                                h.iter().map(|(f, v)| (f.as_str(), v)).collect();
                             pairs.sort_unstable_by_key(|(f, _)| *f);
                             let out = pairs
                                 .into_iter()
                                 .flat_map(|(f, v)| {
                                     [
                                         Value::BulkString(Some(f.as_bytes().to_vec())),
-                                        Value::BulkString(Some(v.as_bytes().to_vec())),
+                                        Value::BulkString(Some(v.as_slice().to_vec())),
                                     ]
                                 })
                                 .collect();
@@ -1453,13 +1579,13 @@ impl KeyValueStore {
                     Some(e) if e.is_expired(now) => Value::Array(Some(vec![])),
                     Some(e) => match &e.value {
                         EntryValue::Hash(h) => {
-                            let mut pairs: Vec<(&str, &str)> =
-                                h.iter().map(|(f, v)| (f.as_str(), v.as_str())).collect();
+                            let mut pairs: Vec<(&str, &Blob)> =
+                                h.iter().map(|(f, v)| (f.as_str(), v)).collect();
                             pairs.sort_unstable_by_key(|(f, _)| *f);
                             Value::Array(Some(
                                 pairs
                                     .into_iter()
-                                    .map(|(_, v)| Value::BulkString(Some(v.as_bytes().to_vec())))
+                                    .map(|(_, v)| Value::BulkString(Some(v.as_slice().to_vec())))
                                     .collect(),
                             ))
                         }
@@ -1517,7 +1643,7 @@ impl KeyValueStore {
                     _ => unreachable!(),
                 };
                 if let std::collections::hash_map::Entry::Vacant(e) = h.entry(field) {
-                    e.insert(val);
+                    e.insert(val.into());
                     Value::Integer(1)
                 } else {
                     Value::Integer(0)
@@ -1567,7 +1693,7 @@ impl KeyValueStore {
                     _ => unreachable!(),
                 };
                 for v in vals {
-                    list.push_front(v);
+                    list.push_front(v.into());
                 }
                 Value::Integer(list.len() as i64)
             }
@@ -1589,7 +1715,7 @@ impl KeyValueStore {
                     _ => unreachable!(),
                 };
                 for v in vals {
-                    list.push_back(v);
+                    list.push_back(v.into());
                 }
                 Value::Integer(list.len() as i64)
             }
@@ -1602,7 +1728,7 @@ impl KeyValueStore {
                     Some(mut e) => match &mut e.value {
                         EntryValue::List(list) => {
                             for v in vals {
-                                list.push_front(v);
+                                list.push_front(v.into());
                             }
                             Value::Integer(list.len() as i64)
                         }
@@ -1619,7 +1745,7 @@ impl KeyValueStore {
                     Some(mut e) => match &mut e.value {
                         EntryValue::List(list) => {
                             for v in vals {
-                                list.push_back(v);
+                                list.push_back(v.into());
                             }
                             Value::Integer(list.len() as i64)
                         }
@@ -1688,13 +1814,13 @@ impl KeyValueStore {
                     Some(e) => match &e.value {
                         EntryValue::List(list) => {
                             e.touch(now);
-                            let slice: Vec<&String> = list.iter().collect();
+                            let slice: Vec<&Blob> = list.iter().collect();
                             match resolve_range(start, stop, slice.len()) {
                                 None => Value::Array(Some(vec![])),
                                 Some((s, e)) => Value::Array(Some(
                                     slice[s..=e]
                                         .iter()
-                                        .map(|v| Value::BulkString(Some(v.as_bytes().to_vec())))
+                                        .map(|v| Value::BulkString(Some(v.as_slice().to_vec())))
                                         .collect(),
                                 )),
                             }
@@ -1723,9 +1849,9 @@ impl KeyValueStore {
                     Some(e) if e.is_expired(now) => Value::BulkString(None),
                     Some(e) => match &e.value {
                         EntryValue::List(list) => {
-                            let slice: Vec<&String> = list.iter().collect();
+                            let slice: Vec<&Blob> = list.iter().collect();
                             resolve_idx(idx, slice.len())
-                                .map(|i| Value::BulkString(Some(slice[i].as_bytes().to_vec())))
+                                .map(|i| Value::BulkString(Some(slice[i].as_slice().to_vec())))
                                 .unwrap_or(Value::BulkString(None))
                         }
                         _ => Value::Error(WRONGTYPE.to_string()),
@@ -1744,7 +1870,7 @@ impl KeyValueStore {
                             match resolve_idx(idx, len) {
                                 None => Value::Error("ERR index out of range".to_string()),
                                 Some(i) => {
-                                    list[i] = val;
+                                    list[i] = val.into();
                                     Value::SimpleString("OK".to_string())
                                 }
                             }
@@ -1766,7 +1892,7 @@ impl KeyValueStore {
                             if count >= 0 {
                                 let mut i = 0;
                                 while i < list.len() && (count == 0 || removed < abs as i64) {
-                                    if list[i] == element {
+                                    if list[i].as_slice() == element.as_slice() {
                                         list.remove(i);
                                         removed += 1;
                                     } else {
@@ -1777,7 +1903,7 @@ impl KeyValueStore {
                                 let mut i = list.len();
                                 while i > 0 && removed < abs as i64 {
                                     i -= 1;
-                                    if list[i] == element {
+                                    if list[i].as_slice() == element.as_slice() {
                                         list.remove(i);
                                         removed += 1;
                                     }
@@ -1801,7 +1927,7 @@ impl KeyValueStore {
                             match resolve_range(start, stop, len) {
                                 None => list.clear(),
                                 Some((s, e)) => {
-                                    let trimmed: VecDeque<String> = list.drain(s..=e).collect();
+                                    let trimmed: VecDeque<Blob> = list.drain(s..=e).collect();
                                     *list = trimmed;
                                 }
                             }
@@ -2615,16 +2741,18 @@ fn incr_by(data: &DashMap<String, Entry>, key: String, delta: i64) -> Value {
         .entry(key)
         .or_insert_with(|| Entry::new_str("0".to_string()));
     if was_expired {
-        entry.value = EntryValue::Str("0".to_string());
+        entry.value = EntryValue::Str("0".into());
         entry.expires_at_ms = None;
     }
     match &mut entry.value {
-        EntryValue::Str(s) => match s.parse::<i64>() {
-            Err(_) => Value::Error("ERR value is not an integer or out of range".to_string()),
-            Ok(n) => match n.checked_add(delta) {
+        // A non-UTF-8 value fails here exactly as non-numeric text does: the
+        // bytes are stored faithfully, they are simply not a number.
+        EntryValue::Str(s) => match s.parse_as::<i64>() {
+            None => Value::Error("ERR value is not an integer or out of range".to_string()),
+            Some(n) => match n.checked_add(delta) {
                 None => Value::Error("ERR increment or decrement would overflow".to_string()),
                 Some(new) => {
-                    *s = new.to_string();
+                    *s = new.to_string().into();
                     Value::Integer(new)
                 }
             },
@@ -2813,11 +2941,11 @@ fn hash_incr_int(data: &DashMap<String, Entry>, key: String, field: String, delt
         EntryValue::Hash(h) => h,
         _ => unreachable!(),
     };
-    let cur: i64 = h.get(&field).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let cur: i64 = h.get(&field).and_then(|s| s.parse_as()).unwrap_or(0);
     match cur.checked_add(delta) {
         None => Value::Error("ERR increment or decrement would overflow".to_string()),
         Some(new) => {
-            h.insert(field, new.to_string());
+            h.insert(field, new.to_string().into());
             Value::Integer(new)
         }
     }
@@ -2846,13 +2974,13 @@ fn hash_incr_float(data: &DashMap<String, Entry>, key: String, field: String, de
         EntryValue::Hash(h) => h,
         _ => unreachable!(),
     };
-    let cur: f64 = h.get(&field).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let cur: f64 = h.get(&field).and_then(|s| s.parse_as()).unwrap_or(0.0);
     let new = cur + delta;
     if new.is_nan() || new.is_infinite() {
         return Value::Error("ERR increment would produce NaN or Infinity".to_string());
     }
     let new_str = format_score(new);
-    h.insert(field, new_str.clone());
+    h.insert(field, new_str.clone().into());
     Value::BulkString(Some(new_str.into_bytes()))
 }
 
@@ -4696,9 +4824,9 @@ mod capacity_tests {
         let base = s.approximate_memory_bytes();
         s.execute(Command::HSet(
             "h".into(),
-            vec![("f".into(), "v".repeat(500))],
+            vec![("f".into(), "v".repeat(500).into())],
         ));
-        s.execute(Command::LPush("l".into(), vec!["v".repeat(500)]));
+        s.execute(Command::LPush("l".into(), vec!["v".repeat(500).into()]));
         s.execute(Command::SAdd("st".into(), vec!["v".repeat(500)]));
         s.execute(Command::ZAdd(
             "z".into(),
@@ -4826,7 +4954,7 @@ mod capacity_tests {
         for (k, ttl) in [("keep", 600_000u64), ("drop", 1_000)] {
             s.execute(Command::Set(
                 k.into(),
-                "x".repeat(400),
+                "x".repeat(400).into(),
                 SetOptions {
                     expiry: Some(crate::cmd::SetExpiry::Px(ttl)),
                     ..Default::default()
@@ -5279,7 +5407,7 @@ mod critical_path_tests {
         let s = KeyValueStore::new();
         s.execute(Command::Set(
             "n".into(),
-            i64::MAX.to_string(),
+            i64::MAX.to_string().into(),
             SetOptions::default(),
         ));
         let r = s.execute(Command::Incr("n".into()));
@@ -5299,7 +5427,7 @@ mod critical_path_tests {
         let s = KeyValueStore::new();
         s.execute(Command::Set(
             "n".into(),
-            i64::MIN.to_string(),
+            i64::MIN.to_string().into(),
             SetOptions::default(),
         ));
         assert!(matches!(
@@ -5529,7 +5657,7 @@ mod metrics_tests {
         let empty = s.approximate_memory_bytes();
         s.execute(Command::Set(
             "k".into(),
-            "x".repeat(4096),
+            "x".repeat(4096).into(),
             SetOptions::default(),
         ));
         assert!(s.approximate_memory_bytes() >= empty + 4096);

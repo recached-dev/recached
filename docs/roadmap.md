@@ -2,10 +2,6 @@
 
 Recached competes on **where the data can live** — the same engine on the server and in the browser, with sync in between. The [benchmarks](/guide/benchmarks) show this costs nothing in raw speed.
 
-## Near-term
-
-1. **[Byte-transparent values](#byte-transparent-values)** — values are stored as UTF-8 strings, so
-   binary payloads are rejected. The largest remaining drop-in gap.
 
 ---
 
@@ -73,23 +69,16 @@ independent — pick them off in any order.
 **Serialize `LRANGE` straight from the store**, instead of building the full reply `Value` first.
 Diagnosed on the [benchmarks](/guide/benchmarks) page.
 
-### Byte-transparent values
+### Binary keys
 
-**Store values as bytes rather than `String`.** `EntryValue::Str` is a `String`, so a non-UTF-8 value
-cannot be stored faithfully. As of 0.2.2 such a command is **rejected** with an error; before that it
-was silently converted to U+FFFD behind a successful `+OK`. This is a property of the engine, so it
-applies to **every** transport — TCP included, not just WebSocket as previously recorded here.
+**Keys are text; values are not.** Values became byte-transparent in 0.2.2, but keys, hash fields,
+set and sorted-set members, glob patterns and channel names must still be valid UTF-8. Redis allows
+binary in all of those positions.
 
-The practical effect is that compressed blobs, protobuf, images, and anything else Redis users
-routinely cache must be base64-encoded first, at ~33% memory overhead. It is the largest remaining
-gap in "any Redis client works today" — the rejection makes it honest and visible, not fixed.
-
-Closing it means `Vec<u8>`/`Bytes` values through `cmd.rs`, `store.rs`, and the collection types; a
-snapshot format change; and an API decision for the browser SDK, whose `set(key, value)` takes a
-string. That is a breaking change and wants its own release rather than being folded into a patch.
-Current behaviour is pinned by `core-engine/tests/binary_values.rs`. When values become
-byte-transparent the rejection goes away, which is a behaviour change in the *permissive* direction —
-no application that works today can break on it.
+Closing the gap means carrying bytes through the store's key map, the glob matcher, sync-scope prefix
+matching, live-query patterns and pub/sub routing — several of which are security-relevant and were
+hardened separately. The practical demand is low, since keys are identifiers in every workload seen
+so far, so this is recorded rather than scheduled.
 
 ### Security
 

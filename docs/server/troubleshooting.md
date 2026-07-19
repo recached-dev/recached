@@ -110,27 +110,22 @@ On an older server, neither has a client-side workaround — upgrade.
 
 ### `ERR argument N is not valid UTF-8`
 
-The command carried a value (or key) containing bytes that are not valid UTF-8. Recached stores
-values as text, so it refuses rather than storing something different from what you sent. Nothing
+A key, hash field, set or sorted-set member, or glob pattern contained bytes that are not valid
+UTF-8. **Values are binary-safe** — this error only ever refers to an identifier position. Nothing
 was written and the connection is still usable.
 
-Base64-encode the payload:
+Identifiers are looked up, glob-matched and checked against sync scopes as text, so a binary one
+would be unreachable through those paths. Hex- or base64-encode the identifier:
 
 ```js
-await cache.set('blob:1', Buffer.from(binary).toString('base64'));
-const binary = Buffer.from(await cache.get('blob:1'), 'base64');
+await cache.set(`blob:${id.toString('hex')}`, binaryPayload); // value stays raw
 ```
 
-The usual cause during a Redis migration is a client that compresses transparently, or a cache of
-serialized objects (protobuf, pickle, Java serialization) rather than JSON — the client works
-normally right up until the value is not text. See
-[Binary values](/guide/introduction#binary-values).
+Before 0.2.2 *values* were also required to be text and binary was silently corrupted. If you are
+reading back mangled binary written by an older server, that data cannot be recovered — the bytes
+were destroyed on the way in. Re-populate the affected keys.
 
-Before 0.2.2 these values were silently converted to U+FFFD and stored corrupted, with `SET`
-returning `OK`. If you are on an older server and reading back mangled binary, that is why — and the
-stored data cannot be recovered, since the bytes were destroyed on the way in.
-
-### `ERR key too large`
+### `ERR key too large`### `ERR key too large`
 
 A key exceeded the maximum key length. Keys are identifiers, not payloads — put the data in the
 value.
