@@ -145,6 +145,7 @@ See [recached.dev/roadmap](https://recached.dev/roadmap) for what's planned.
 
 Reach out: [dennis@thinkgrid.dev](mailto:dennis@thinkgrid.dev)
 
+
 ## Support Recached
 
 Recached is free and open-source, maintained by one person. If it saves you infrastructure cost or development time, [sponsoring on GitHub](https://github.com/sponsors/thinkgrid-labs) directly funds continued development: more Redis commands, RESP3, cluster support, and performance work.

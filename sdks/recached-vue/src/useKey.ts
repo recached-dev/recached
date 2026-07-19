@@ -30,12 +30,40 @@ import { useRecached } from './plugin';
 export function useKey(key: string): Ref<string | null> {
   const cache = useRecached();
   const value = ref<string | null>(null);
+  // `get` throws on a binary value, which has no string form. Report it as
+  // absent rather than propagating out of a reactive update; read those with
+  // {@link useKeyBytes}.
+  const read = (): string | null => {
+    try {
+      return cache.get(key);
+    } catch {
+      return null;
+    }
+  };
   const unsub = cache.onMutation(() => {
-    value.value = cache.get(key);
+    value.value = read();
   });
-  value.value = cache.get(key);
+  value.value = read();
   onUnmounted(unsub);
   return value;
+}
+
+/**
+ * Reactively read a key as raw bytes.
+ *
+ * Behaves identically to {@link useKey} but returns the value's bytes, so it
+ * works for binary values a backend wrote. Text values come back as their
+ * UTF-8 bytes.
+ */
+export function useKeyBytes(key: string): Ref<Uint8Array | null> {
+  const cache = useRecached();
+  const value = ref<Uint8Array | null>(null);
+  const unsub = cache.onMutation(() => {
+    value.value = cache.getBytes(key);
+  });
+  value.value = cache.getBytes(key);
+  onUnmounted(unsub);
+  return value as Ref<Uint8Array | null>;
 }
 
 /**

@@ -4,7 +4,7 @@ All notable changes to Recached are documented here.
 
 ---
 
-## [0.2.2] — Unreleased
+## [0.2.2] — 2026-07-20
 
 ### Added
 
@@ -179,7 +179,18 @@ All notable changes to Recached are documented here.
 
   `cache.get()` now **throws** on a binary value instead of returning mangled text, `getJSON()`
   treats one as a miss, and an `onMessage` listener receives a `Uint8Array` for a binary pub/sub
-  payload — so the listener signature widened to `string | Uint8Array`.
+  payload — so the listener signature widened to `string | Uint8Array`. `getMatching()` — the read
+  behind every live query — returns a `Uint8Array` for a binary value rather than a lossy string,
+  which was the last silent conversion left on the browser read path.
+
+  **`@recached/react` and `@recached/vue`** follow: `useKeyBytes()` is new, `usePubSub` handlers and
+  the `KeyValuePair` value type widened to `string | Uint8Array`, and `useKey` returns `null` for a
+  binary value rather than letting `get()` throw out of a React `getSnapshot` or a Vue reactive
+  update — which would have taken down the render tree over a value the hook cannot represent.
+
+  These are **compile-time breaking changes for TypeScript users** who annotated a `usePubSub`
+  handler or an `onMessage` listener as `(msg: string) => void`, or who destructured a
+  `KeyValuePair` value as `string | null`. Widen the annotation, or narrow with `typeof v === 'string'`.
 
   Data corrupted by an earlier version cannot be recovered and must be re-populated.
 

@@ -88,7 +88,7 @@ interface RawCache {
   sync_scopes(patterns_csv: string): void;
   live_query(pattern: string): void;
   live_unquery(pattern?: string): void;
-  get_matching(pattern: string): Array<[string, string | null]>;
+  get_matching(pattern: string): Array<[string, string | Uint8Array | null]>;
   set_mutation_callback(cb: () => void): void;
   set_outbox_full_callback(cb: (droppedId: number, pending: number) => void): void;
   pending_writes(): number;
@@ -562,12 +562,13 @@ export class Cache {
 
   /**
    * Snapshot of local keys matching a glob pattern, as `[key, value]` pairs.
-   * Values are strings; keys holding collection types come back as `null`
-   * (read those with typed accessors).
+   * Keys holding collection types come back as `null` (read those with typed
+   * accessors). A value that is not valid UTF-8 comes back as a `Uint8Array`
+   * rather than a mangled string, so narrow the type before treating it as text.
    *
    * Served entirely from local WASM memory — zero network latency.
    */
-  getMatching(pattern: string): Array<[string, string | null]> {
+  getMatching(pattern: string): Array<[string, string | Uint8Array | null]> {
     return this.raw.get_matching(pattern);
   }
 

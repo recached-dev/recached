@@ -1083,7 +1083,13 @@ impl RecachedCache {
             pair.push(&JsValue::from_str(&k));
             match v {
                 Value::BulkString(Some(bytes)) => {
-                    pair.push(&JsValue::from_str(&String::from_utf8_lossy(&bytes)));
+                    match std::str::from_utf8(&bytes) {
+                        Ok(text) => pair.push(&JsValue::from_str(text)),
+                        // A binary value has no string form; handing back a
+                        // lossy rendering would corrupt it silently in the one
+                        // API a live query reads through.
+                        Err(_) => pair.push(&js_sys::Uint8Array::from(&bytes[..]).into()),
+                    };
                 }
                 _ => {
                     pair.push(&JsValue::NULL);

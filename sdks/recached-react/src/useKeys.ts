@@ -2,8 +2,9 @@ import { useEffect, useRef, useSyncExternalStore } from 'react';
 import { useRecached } from './context';
 
 /** A key/value pair from the local store. Collection-typed keys have `null`
- * values — read those with typed accessors. */
-export type KeyValuePair = [key: string, value: string | null];
+ * values — read those with typed accessors. A value that is not valid UTF-8
+ * arrives as a `Uint8Array` rather than a mangled string. */
+export type KeyValuePair = [key: string, value: string | Uint8Array | null];
 
 const EMPTY: KeyValuePair[] = [];
 
