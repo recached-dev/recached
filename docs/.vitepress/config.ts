@@ -1,7 +1,11 @@
 import { defineConfig } from 'vitepress'
 
 export default defineConfig({
-  base: '/recached/',
+  // Served from the root of the custom domain (recached.dev). This was
+  // '/recached/' for the github.io project-pages URL — leaving it set there
+  // makes every asset 404 on a custom domain, which renders the site as
+  // unstyled HTML.
+  base: '/',
   title: 'Recached',
   titleTemplate: ':title — Recached',
   description:
