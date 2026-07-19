@@ -4,11 +4,8 @@ Recached competes on **where the data can live** — the same engine on the serv
 
 ## Near-term
 
-1. **[Replication offset acknowledgement](#operability)** — replicas do not report an applied
-   offset, so true lag cannot be computed. Queue depth is exported as a proxy today.
-2. **[Binary-safe WebSocket values](#ongoing-drop-in-credibility)** — values over WS are UTF-8 and
-   therefore lossy for raw bytes; binary frames would make the two transports equivalent.
-3. **[RESP3](#ongoing-drop-in-credibility)** — push protocol support on the TCP port.
+1. **[Byte-transparent values](#byte-transparent-values)** — values are stored as UTF-8 strings, so
+   raw binary is corrupted on every transport. The largest remaining drop-in gap.
 
 ---
 
@@ -76,11 +73,21 @@ independent — pick them off in any order.
 **Serialize `LRANGE` straight from the store**, instead of building the full reply `Value` first.
 Diagnosed on the [benchmarks](/guide/benchmarks) page.
 
-### Operability
+### Byte-transparent values
 
-**Replication offset acknowledgement.** Replicas do not report an applied offset, so true lag cannot
-be computed — `recached_replication_queue_depth` is exported as a proxy. Closing this means a small
-protocol addition: replicas periodically reporting how far they have applied.
+**Store values as bytes rather than `String`.** `EntryValue::Str` is a `String`, so a value is forced
+through a lossy UTF-8 conversion when the command is parsed: `SET k <0xFF 0xFE>` stores two U+FFFD
+replacement characters instead. This is a property of the engine, so it applies to **every**
+transport — TCP included, not just WebSocket as previously recorded here.
+
+The practical effect is that compressed blobs, protobuf, images, and anything else Redis users
+routinely cache cannot be stored without base64-encoding first. It is the largest remaining gap in
+"any Redis client works today".
+
+Closing it means `Vec<u8>`/`Bytes` values through `cmd.rs`, `store.rs`, and the collection types; a
+snapshot format change; and an API decision for the browser SDK, whose `set(key, value)` takes a
+string. That is a breaking change and wants its own release rather than being folded into a patch.
+Current behaviour is pinned by `core-engine/tests/binary_values.rs`, which fails when it changes.
 
 ### Security
 
@@ -99,8 +106,6 @@ both are procurement checkboxes worth building when someone actually asks.
 
 Not features, but continuous work that keeps "any Redis client works today" honest:
 
-- **Binary-safe WebSocket values** — values over WS are currently UTF-8 (lossy for raw bytes); binary frames would make the two transports equivalent.
-- **RESP3** — push protocol support on the TCP port.
 - **Command coverage** — closing gaps in the supported command set as real workloads surface them (see [Commands](/server/commands)).
 
 ---

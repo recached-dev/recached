@@ -8,6 +8,7 @@ Recached implements the subset of RESP commands that most applications use. Comm
 |---|---|
 | `PING [message]` | Returns `PONG`, or echoes `message` if provided. Used to test connectivity and measure latency. |
 | `AUTH password` | Authenticates the connection. Required on the first command if `RECACHED_PASSWORD` is set. 5 consecutive failures close the connection. |
+| `HELLO [protover]` | Reports server info and negotiates the protocol version. `3` switches the connection to RESP3, `2` back to RESP2, no argument reports without changing. Unsupported versions return `-NOPROTO` and leave the connection unchanged. Requires authentication. See [Wire Protocol](/server/protocol#protocol-version-tcp). |
 
 ---
 

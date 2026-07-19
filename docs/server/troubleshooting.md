@@ -78,11 +78,35 @@ traffic you believed was encrypted was not. If you are on an older version, veri
 assume: a `rediss://` client should connect and a plaintext client should be refused. See
 [Security → Transport encryption](/server/security#transport-encryption).
 
+### A replica is connected but falling behind
+
+`recached_replication_lag_frames` counts frames sent but not acknowledged by the furthest-behind
+replica. Unlike `recached_replication_queue_depth`, it stays high when the primary has written
+everything to the socket and the replica is not keeping up — see
+[Operations → Reading the two replication gauges](/server/operations#reading-the-two-replication-gauges).
+
+Lag that climbs without bound while replication otherwise works usually means the replica predates
+0.2.2 and never acknowledges. Upgrade both ends together.
+
 ### Memory keeps growing
 
 There is no built-in memory metric — monitor process RSS. Set `RECACHED_MAX_MEMORY` and
 `RECACHED_EVICTION` so the cache bounds itself, and `RECACHED_MAX_KEYS` if key count rather than
 value size is the driver. `DBSIZE` reports the current key count on demand.
+
+### A subscriber receives nothing, or cannot parse what it receives
+
+Two separate faults, both fixed in **0.2.2**:
+
+- **Nothing arrives until the subscriber sends another command.** Deliveries were written into a
+  buffered writer that only flushed when handling a client command, so a connection that purely
+  listened saw nothing. A subscriber that also polls appeared to work, which is why this went
+  unnoticed.
+- **Frames arrive but the client errors on them.** Pub/sub was delivered as RESP3 Push (`>`) frames
+  on every connection. RESP2 has no push type, so a standard Redis client that subscribed without
+  sending `HELLO 3` could not parse the frame. Deliveries now follow the negotiated version.
+
+On an older server, neither has a client-side workaround — upgrade.
 
 ### `ERR key too large`
 

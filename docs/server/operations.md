@@ -48,12 +48,27 @@ Sampled every 5 seconds, because these are levels rather than events.
 | `recached_live_queries` | gauge | Registered `QSUB` patterns across all connections. |
 | `recached_watched_keys` | gauge | Keys under `WATCH`. |
 | `recached_dedup_clients_tracked` | gauge | Clients with exactly-once bookkeeping in memory. |
-| `recached_replication_queue_depth` | gauge | Deepest replica send queue, in frames. Replicas never acknowledge an applied offset, so true lag is not observable — a backing-up queue is the available signal that one cannot keep up. |
+| `recached_replication_queue_depth` | gauge | Deepest replica send queue, in frames — work the primary has not yet put on the wire. |
+| `recached_replication_lag_frames` | gauge | Frames the furthest-behind replica has been sent but has not acknowledged applying. Zero means every replica is caught up. |
+
+### Reading the two replication gauges
+
+They fail differently, which is why both exist:
+
+- **Queue depth high, lag high** — the primary cannot hand frames off fast enough. The replica's
+  channel is backing up, usually a slow or saturated network link. A replica whose queue fills is
+  disconnected outright so it resyncs from a snapshot rather than falling further behind.
+- **Queue depth zero, lag high** — everything was written to the socket and the replica is not
+  acknowledging it. The frames are in flight, or the replica is applying them slowly, or it is
+  wedged. This is the case queue depth alone cannot see, and it is the one worth alerting on.
+
+Lag is measured in frames, not bytes or seconds: one frame is one replicated write command.
+
+A replica running a build older than 0.2.2 never acknowledges, so its lag climbs without bound while
+replication works normally. Upgrade both ends together.
 
 ### What is still not exported
 
-- **True replication offset lag.** Replicas do not report an applied offset, so the server cannot
-  compute how far behind one is. `recached_replication_queue_depth` is the available proxy.
 - **Client outbox depth.** That state lives in the browser — read it there with
   `cache.pendingWrites()`.
 
@@ -91,6 +106,7 @@ Thresholds are starting points — tune to your traffic.
 | Memory pressure | `recached_memory_bytes` > 80% of `RECACHED_MAX_MEMORY` | Eviction is about to start, or already has. |
 | Eviction churn | `rate(recached_evictions_total[5m])` climbing | The working set no longer fits; results will start missing. |
 | Replica lost | `recached_replicas_connected` drops | Failover risk — the standby is no longer following. |
+| Replica falling behind | `recached_replication_lag_frames` > 1000 for 5m | The standby is not keeping up; a failover now would lose those writes. |
 
 ## Health checking
 

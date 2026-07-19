@@ -47,6 +47,9 @@ pub struct ZAddOptions {
 pub enum Command {
     Ping(Option<String>),
     Auth(String),
+    /// `HELLO [protover]` — protocol negotiation. Connection-level like AUTH:
+    /// the store never sees it, because the answer depends on the connection.
+    Hello(Option<String>),
     // ── Strings ──────────────────────────────────────────────────────────────
     Set(String, String, SetOptions),
     Get(String),
@@ -233,6 +236,14 @@ impl Command {
                         need!(2);
                         Ok(Command::Auth(extract_string(&arr[1]).unwrap_or_default()))
                     }
+                    // Bare HELLO reports the current version without changing it.
+                    // Trailing AUTH/SETNAME arguments are not supported and are
+                    // rejected by the connection layer rather than ignored.
+                    "HELLO" => Ok(Command::Hello(if arr.len() > 1 {
+                        Some(extract_string(&arr[1]).unwrap_or_default())
+                    } else {
+                        None
+                    })),
 
                     // ── Strings ───────────────────────────────────────────────
                     "SET" => {

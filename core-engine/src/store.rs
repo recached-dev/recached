@@ -948,6 +948,9 @@ impl KeyValueStore {
             Command::Auth(_) => Value::Error(
                 "ERR AUTH is handled by the connection layer, not the store".to_string(),
             ),
+            Command::Hello(_) => Value::Error(
+                "ERR HELLO is handled by the connection layer, not the store".to_string(),
+            ),
 
             // ── Strings ───────────────────────────────────────────────────────
             Command::Set(key, val, opts) => {

@@ -30,8 +30,32 @@ All notable changes to Recached are documented here.
   `recached_replicas_connected`, `recached_live_queries`, `recached_watched_keys`, and
   `recached_dedup_clients_tracked`, and `recached_replication_queue_depth`. Previously only traffic
   was exported, so an operator could not
-  answer "am I near the cap?" or "is eviction thrashing?" from a dashboard. Replication *lag* and
-  browser outbox depth remain unexported — see [Operations](docs/server/operations.md).
+  answer "am I near the cap?" or "is eviction thrashing?" from a dashboard. Replication lag landed
+  separately in this release; browser outbox depth remains unexported because it lives in the client
+  — see [Operations](docs/server/operations.md).
+
+- **`HELLO` and RESP3 negotiation on the TCP port.** A connection starts in RESP2 and `HELLO 3`
+  switches it to RESP3; `HELLO 2` switches back, a bare `HELLO` reports without changing, and an
+  unsupported version returns `-NOPROTO` while leaving the connection on what it had. The reply is a
+  RESP3 map on a RESP3 connection and a flat array on a RESP2 one, matching Redis. `HELLO` requires
+  authentication — the pre-auth reply carries no server details, so it cannot be used to fingerprint
+  a deployment.
+
+  This also adds a `Map` type (`%N`) to the RESP codec, with the header counting *pairs* rather than
+  elements.
+
+- **Replication offset acknowledgement, and a true lag metric.** Replicas now acknowledge each frame
+  they apply on the existing replication socket, and the primary exports
+  `recached_replication_lag_frames` — frames sent to the furthest-behind replica but not yet
+  acknowledged.
+
+  `recached_replication_queue_depth` only ever showed work stuck in the primary's send queue, so the
+  case that matters most read as healthy: a replica that has received everything and is not applying
+  it shows an empty queue and unbounded lag. Acknowledgements are monotonic, so a reordered or
+  replayed ack cannot walk the high-water mark backwards.
+
+  A replica older than 0.2.2 never acknowledges, so its lag climbs while replication works normally —
+  upgrade both ends together.
 
 ### Changed
 
@@ -114,6 +138,29 @@ All notable changes to Recached are documented here.
   stays dependency-free and I/O-free and the sequence remains reproducible in tests.
 
 ### Fixed
+
+- **Pub/sub deliveries never reached a TCP subscriber that only listened.** Deliveries were written
+  into a 32 KB buffered writer and flushed only at the end of a client-command batch, so a
+  connection that subscribed and then waited received nothing until it happened to send another
+  command or 32 KB of messages accumulated. A subscriber that also polled looked fine, which is how
+  this survived. Deliveries are now flushed on write.
+
+- **Pub/sub frames were RESP3 Push on RESP2 connections.** Every delivery was a `>` frame regardless
+  of protocol. RESP2 has no push type, so a standard Redis client that subscribed without sending
+  `HELLO 3` could not parse what it was sent. Frame type now follows the negotiated version. The
+  WebSocket transport is unchanged — it is RESP3 by definition, and `HELLO 2` on it is refused
+  rather than silently ignored.
+
+- **WebSocket command frames must now be accepted in binary as well as text.** The handler matched
+  text frames only, so a binary frame was dropped without a reply — and the WebSocket spec requires
+  text frames to be well-formed UTF-8, which left no way to send bytes at all. Replies are sent as
+  text when the RESP bytes are valid UTF-8 and binary otherwise, so existing clients see no change.
+
+  This makes the *transport* byte-clean. It does **not** make values byte-transparent: the engine
+  stores values as `String`, so invalid UTF-8 is still replaced with U+FFFD before storage, on every
+  transport including TCP. That was true before this release and remains true; it is pinned by
+  `core-engine/tests/binary_values.rs` and is a separate breaking change. Do not store raw binary in
+  Recached today.
 
 - **Exactly-once delivery now survives a server restart.** Dedup high-water marks were held only in
   memory, so a restart inside the acknowledgement window let a client's replayed write apply twice —

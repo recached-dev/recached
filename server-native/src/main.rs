@@ -58,6 +58,7 @@ fn command_name(cmd: &Command) -> &'static str {
     match cmd {
         Command::Ping(_) => "ping",
         Command::Auth(_) => "auth",
+        Command::Hello(_) => "hello",
         Command::Get(_) => "get",
         Command::ESet(_, _) => "eset",
         Command::Set(_, _, _) => "set",
@@ -587,11 +588,26 @@ async fn replay_aof(store: &KeyValueStore, path: &std::path::Path) -> usize {
 
 type ReplSender = mpsc::Sender<Vec<u8>>;
 
+/// A connected replica: its write channel plus the counters that make lag
+/// observable.
+///
+/// Replication was previously one-way, so the primary could only report how
+/// many replicas were attached — never how far behind one had fallen. The
+/// replica now acknowledges each applied frame, and the difference between
+/// what was queued and what was acknowledged is the lag.
+struct ReplicaHandle {
+    tx: ReplSender,
+    /// Frames handed to this replica's channel.
+    sent: Arc<AtomicU64>,
+    /// Frames the replica reports as applied.
+    acked: Arc<AtomicU64>,
+}
+
 /// Connected-replica registry. `count` mirrors `senders.len()` (updated by
 /// every writer while holding the lock) so the per-write hot path can skip
 /// the mutex entirely when no replica is connected.
 struct ReplHub {
-    senders: tokio::sync::Mutex<Vec<ReplSender>>,
+    senders: tokio::sync::Mutex<Vec<ReplicaHandle>>,
     count: AtomicUsize,
 }
 
@@ -607,7 +623,46 @@ impl ReplHub {
         let senders = self.senders.lock().await;
         senders
             .iter()
-            .map(|tx| tx.max_capacity().saturating_sub(tx.capacity()))
+            .map(|r| r.tx.max_capacity().saturating_sub(r.tx.capacity()))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Send one frame to every attached replica, dropping any that cannot keep
+    /// up. Increments each surviving replica's sent counter, which is one half
+    /// of the lag calculation.
+    async fn fan_out(&self, bytes: Vec<u8>) {
+        let mut reg = self.senders.lock().await;
+        reg.retain(|r| match r.tx.try_send(bytes.clone()) {
+            Ok(()) => {
+                r.sent.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(
+                    "Replica fell too far behind (channel full) — disconnecting so it can resync"
+                );
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        });
+        self.count.store(reg.len(), Ordering::Relaxed);
+    }
+
+    /// Frames the furthest-behind replica has yet to acknowledge.
+    ///
+    /// This is true lag: how much of what the primary sent has actually been
+    /// applied downstream. Queue depth only shows what is stuck locally, and
+    /// reads zero for a replica that has received frames but cannot apply them.
+    async fn max_lag_frames(&self) -> u64 {
+        let senders = self.senders.lock().await;
+        senders
+            .iter()
+            .map(|r| {
+                r.sent
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(r.acked.load(Ordering::Relaxed))
+            })
             .max()
             .unwrap_or(0)
     }
@@ -750,19 +805,7 @@ impl ServerState {
         if self.replicas.is_empty() {
             return;
         }
-        let bytes = resp.as_bytes().to_vec();
-        let mut reg = self.replicas.senders.lock().await;
-        reg.retain(|tx| match tx.try_send(bytes.clone()) {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                warn!(
-                    "Replica fell too far behind (channel full) — disconnecting so it can resync"
-                );
-                false
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
-        });
-        self.replicas.count.store(reg.len(), Ordering::Relaxed);
+        self.replicas.fan_out(resp.as_bytes().to_vec()).await;
     }
 
     /// Path of the dedup sidecar, alongside the snapshot.
@@ -990,9 +1033,15 @@ async fn handle_replica(
 
     // 1. Register channel first so subsequent writes are buffered
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(repl_channel_capacity);
+    let sent = Arc::new(AtomicU64::new(0));
+    let acked = Arc::new(AtomicU64::new(0));
     {
         let mut reg = replicas.senders.lock().await;
-        reg.push(tx);
+        reg.push(ReplicaHandle {
+            tx,
+            sent: Arc::clone(&sent),
+            acked: Arc::clone(&acked),
+        });
         replicas.count.store(reg.len(), Ordering::Relaxed);
     }
 
@@ -1004,12 +1053,37 @@ async fn handle_replica(
     socket.write_all(&snap_bytes).await?;
     socket.flush().await?;
 
-    // 3. Stream buffered + ongoing writes
-    while let Some(bytes) = rx.recv().await {
-        let len = bytes.len() as u32;
-        socket.write_all(&len.to_le_bytes()).await?;
-        socket.write_all(&bytes).await?;
-        socket.flush().await?;
+    // 3. Stream buffered + ongoing writes, and read acknowledgements
+    //
+    // The socket is bidirectional but used to carry frames one way only, which
+    // left the primary unable to say how far behind a replica was. The replica
+    // now writes back a cumulative count of applied frames; `sent - acked` is
+    // the lag. Reading and writing are selected over so a replica that stops
+    // acknowledging cannot stall the write side, and vice versa.
+    let (mut rd, mut wr) = socket.split();
+    let mut ack_buf = [0u8; 8];
+    loop {
+        tokio::select! {
+            frame = rx.recv() => {
+                let Some(bytes) = frame else { break };
+                let len = bytes.len() as u32;
+                wr.write_all(&len.to_le_bytes()).await?;
+                wr.write_all(&bytes).await?;
+                wr.flush().await?;
+            }
+            res = rd.read_exact(&mut ack_buf) => {
+                // A replica that closes its read side, or one running a build
+                // that predates acks, simply stops updating the gauge — it is
+                // not an error, so the stream continues either way.
+                if res.is_err() {
+                    break;
+                }
+                let applied = u64::from_le_bytes(ack_buf);
+                // Monotonic: a reordered or replayed ack must never walk the
+                // high-water mark backwards and report negative lag.
+                acked.fetch_max(applied, Ordering::Relaxed);
+            }
+        }
     }
     Ok(())
 }
@@ -1123,7 +1197,12 @@ async fn sync_from_primary(
         }
     }
 
-    // 2. Stream write commands from primary
+    // 2. Stream write commands from primary, acknowledging what we apply
+    //
+    // Every frame is counted, including one that fails to parse: the primary
+    // counts frames it sent, so skipping a bad frame here would desynchronise
+    // the two offsets and understate lag forever after.
+    let mut applied: u64 = 0;
     loop {
         let mut len_buf = [0u8; 4];
         socket.read_exact(&mut len_buf).await?;
@@ -1136,6 +1215,7 @@ async fn sync_from_primary(
         }
         let mut cmd_bytes = vec![0u8; cmd_len];
         socket.read_exact(&mut cmd_bytes).await?;
+        applied += 1;
 
         match Value::parse(&cmd_bytes) {
             Ok((value, _)) => {
@@ -1161,6 +1241,13 @@ async fn sync_from_primary(
                 }
             }
             Err(e) => warn!("Replica: bad command from primary: {}", e),
+        }
+
+        // Acknowledge on the same socket. TcpStream is unbuffered, so this is a
+        // single 8-byte write with no flush; a failure means the primary is
+        // gone, which the next read will surface with a better error.
+        if socket.write_all(&applied.to_le_bytes()).await.is_err() {
+            warn!("Replica: failed to send replication acknowledgement");
         }
     }
 }
@@ -1268,6 +1355,7 @@ fn command_scope(cmd: &Command) -> CommandScope {
     match cmd {
         Command::Ping(_)
         | Command::Auth(_)
+        | Command::Hello(_)
         | Command::Multi
         | Command::Exec
         | Command::Discard
@@ -1857,9 +1945,89 @@ async fn unregister_all_watches(
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-fn encode_pubsub_msg(msg: PubSubMsg) -> Vec<u8> {
+/// Encode a pub/sub delivery for a connection speaking protocol `protover`.
+///
+/// RESP2 has no push type, so a subscribed RESP2 client expects a plain array
+/// and cannot parse a `>` frame at all. RESP3 clients want the push type so
+/// deliveries are distinguishable from command replies on a multiplexed
+/// connection. The WebSocket transport is RESP3 by definition — the sync
+/// protocol is specified in terms of push frames — and passes 3.
+/// Handle `HELLO [protover]`, updating `protover` in place on success.
+///
+/// Returns the serialized reply. An unsupported version leaves the connection's
+/// current protocol untouched and replies `-NOPROTO`, which is what lets a
+/// client probe for RESP3 and fall back cleanly rather than being disconnected.
+fn process_hello(
+    requested: Option<&str>,
+    protover: &mut u8,
+    is_authenticated: bool,
+    is_replica: bool,
+) -> Vec<u8> {
+    if let Some(raw) = requested {
+        match raw.parse::<u8>() {
+            Ok(v @ (2 | 3)) => *protover = v,
+            _ => {
+                return Value::Error("NOPROTO unsupported protocol version".to_string())
+                    .serialize();
+            }
+        }
+    }
+
+    // Pre-auth HELLO reports the protocol but nothing about the server, so an
+    // unauthenticated client cannot use it to fingerprint the deployment.
+    if !is_authenticated {
+        return Value::Error("NOAUTH HELLO must be called with authentication".to_string())
+            .serialize();
+    }
+
+    let fields = vec![
+        ("server", Value::BulkString(Some(b"recached".to_vec()))),
+        (
+            "version",
+            Value::BulkString(Some(env!("CARGO_PKG_VERSION").as_bytes().to_vec())),
+        ),
+        ("proto", Value::Integer(*protover as i64)),
+        ("mode", Value::BulkString(Some(b"standalone".to_vec()))),
+        (
+            "role",
+            Value::BulkString(Some(if is_replica {
+                b"replica".to_vec()
+            } else {
+                b"master".to_vec()
+            })),
+        ),
+        ("modules", Value::Array(Some(vec![]))),
+    ];
+
+    if *protover >= 3 {
+        Value::Map(
+            fields
+                .into_iter()
+                .map(|(k, v)| (Value::BulkString(Some(k.as_bytes().to_vec())), v))
+                .collect(),
+        )
+        .serialize()
+    } else {
+        // RESP2 has no map type; Redis flattens to alternating key/value.
+        let mut flat = Vec::with_capacity(fields.len() * 2);
+        for (k, v) in fields {
+            flat.push(Value::BulkString(Some(k.as_bytes().to_vec())));
+            flat.push(v);
+        }
+        Value::Array(Some(flat)).serialize()
+    }
+}
+
+fn encode_pubsub_msg(msg: PubSubMsg, protover: u8) -> Vec<u8> {
+    let frame = |parts: Vec<Value>| {
+        if protover >= 3 {
+            Value::Push(parts)
+        } else {
+            Value::Array(Some(parts))
+        }
+    };
     match msg {
-        PubSubMsg::Message { channel, message } => Value::Push(vec![
+        PubSubMsg::Message { channel, message } => frame(vec![
             Value::BulkString(Some(b"message".to_vec())),
             Value::BulkString(Some(channel.into_bytes())),
             Value::BulkString(Some(message.into_bytes())),
@@ -1869,7 +2037,7 @@ fn encode_pubsub_msg(msg: PubSubMsg) -> Vec<u8> {
             pattern,
             channel,
             message,
-        } => Value::Push(vec![
+        } => frame(vec![
             Value::BulkString(Some(b"pmessage".to_vec())),
             Value::BulkString(Some(pattern.into_bytes())),
             Value::BulkString(Some(channel.into_bytes())),
@@ -2674,6 +2842,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .set(state_m.replicas.count.load(Ordering::Relaxed) as f64);
                 gauge!("recached_replication_queue_depth")
                     .set(state_m.replicas.max_queue_depth().await as f64);
+                gauge!("recached_replication_lag_frames")
+                    .set(state_m.replicas.max_lag_frames().await as f64);
                 gauge!("recached_live_queries")
                     .set(registry_m.watched_patterns.load(Ordering::Relaxed) as f64);
                 gauge!("recached_watched_keys")
@@ -2878,6 +3048,10 @@ async fn handle_tcp<S>(
     let mut resp_buf = Vec::<u8>::with_capacity(4 * 1024);
     let mut is_authenticated = password.is_none();
     let mut auth_failures: u32 = 0;
+    // RESP2 until the client negotiates otherwise. Defaulting to 2 keeps every
+    // existing client working: they never send HELLO and must not start
+    // receiving RESP3-only types.
+    let mut protover: u8 = 2;
     let mut multi_queue: Option<Vec<Command>> = None;
     let mut subscribed_channels: HashSet<String> = HashSet::new();
     let mut subscribed_patterns: HashSet<String> = HashSet::new();
@@ -2925,6 +3099,17 @@ async fn handle_tcp<S>(
                                             let _ = writer.flush().await;
                                             break 'outer;
                                         }
+                                        continue 'parse;
+                                    }
+
+                                    if let Command::Hello(ref requested) = cmd {
+                                        let resp = process_hello(
+                                            requested.as_deref(),
+                                            &mut protover,
+                                            is_authenticated,
+                                            state.is_replica(),
+                                        );
+                                        if writer.write_all(&resp).await.is_err() { break 'outer; }
                                         continue 'parse;
                                     }
 
@@ -3213,7 +3398,15 @@ async fn handle_tcp<S>(
             msg = ps_rx.recv(), if is_subscribed => {
                 match msg {
                     Some(m) => {
-                        if writer.write_all(&encode_pubsub_msg(m)).await.is_err() {
+                        if writer.write_all(&encode_pubsub_msg(m, protover)).await.is_err() {
+                            break;
+                        }
+                        // `writer` is a BufWriter, and a delivery is not a
+                        // response to anything this connection sent — nothing
+                        // else is going to flush it. Without this a subscriber
+                        // that only listens receives nothing until it happens
+                        // to send a command or 32 KB of pushes accumulate.
+                        if writer.flush().await.is_err() {
                             break;
                         }
                     }
@@ -3285,14 +3478,19 @@ async fn handle_ws<S>(
     let mut qsub_patterns: HashSet<String> = HashSet::new();
     let (q_tx, mut q_rx) = mpsc::unbounded_channel::<WatchNotif>();
 
-    // NOTE: the WebSocket transport uses *text* frames, so values must be valid
-    // UTF-8. Non-UTF-8 bytes are replaced (lossy) on the way out. This is safe
-    // for the SDK, whose `set(key, value)` API only accepts `&str` values; raw
-    // binary values are only fully round-trippable over the TCP (RESP) port.
+    // Replies go out as *text* frames whenever the RESP bytes are valid UTF-8,
+    // which is the overwhelming majority and is what every existing client
+    // expects. A reply carrying a value that is not valid UTF-8 goes out as a
+    // *binary* frame instead of being mangled by a lossy conversion, which is
+    // what made raw binary values round-trip only over the TCP port.
     macro_rules! ws_send {
         ($bytes:expr) => {{
-            let text = String::from_utf8_lossy($bytes).into_owned();
-            if ws_sender.send(Message::Text(text.into())).await.is_err() {
+            let bytes: &[u8] = $bytes;
+            let msg = match std::str::from_utf8(bytes) {
+                Ok(text) => Message::Text(text.into()),
+                Err(_) => Message::Binary(bytes.to_vec().into()),
+            };
+            if ws_sender.send(msg).await.is_err() {
                 break;
             }
         }};
@@ -3304,8 +3502,17 @@ async fn handle_ws<S>(
         tokio::select! {
             msg = ws_receiver.next() => {
                 match msg {
-                    Some(Ok(Message::Text(text))) => {
-                        let (value, _) = match Value::parse(text.as_bytes()) {
+                    // Binary frames carry the same RESP bytes as text frames.
+                    // They exist so a client can write a value that is not
+                    // valid UTF-8 — impossible over a text frame, which the
+                    // WebSocket spec requires to be well-formed UTF-8.
+                    Some(Ok(frame @ (Message::Text(_) | Message::Binary(_)))) => {
+                        let raw: Vec<u8> = match &frame {
+                            Message::Text(t) => t.as_bytes().to_vec(),
+                            Message::Binary(b) => b.to_vec(),
+                            _ => unreachable!("pattern restricts to text and binary"),
+                        };
+                        let (value, _) = match Value::parse(&raw) {
                             Ok(v) => v,
                             Err(e) => {
                                 let err = Value::Error(format!("ERR Protocol error: {}", e)).serialize();
@@ -3330,6 +3537,28 @@ async fn handle_ws<S>(
                             );
                             ws_send!(&resp);
                             if disconnect { break; }
+                            continue;
+                        }
+
+                        // The WebSocket sync protocol is specified in terms of
+                        // RESP3 push frames, so this transport is always RESP3
+                        // and HELLO cannot downgrade it — a client asking for 2
+                        // is refused rather than silently left on 3.
+                        if let Command::Hello(ref requested) = cmd {
+                            let mut ws_protover: u8 = 3;
+                            let resp = match requested.as_deref() {
+                                Some("2") => Value::Error(
+                                    "NOPROTO the WebSocket transport requires RESP3".to_string(),
+                                )
+                                .serialize(),
+                                other => process_hello(
+                                    other,
+                                    &mut ws_protover,
+                                    is_authenticated,
+                                    state.is_replica(),
+                                ),
+                            };
+                            ws_send!(&resp);
                             continue;
                         }
 
@@ -3754,11 +3983,8 @@ async fn handle_ws<S>(
             msg = ps_rx.recv(), if is_subscribed => {
                 match msg {
                     Some(m) => {
-                        let bytes = encode_pubsub_msg(m);
-                        let text = String::from_utf8_lossy(&bytes).into_owned();
-                        if ws_sender.send(Message::Text(text.into())).await.is_err() {
-                            break;
-                        }
+                        let bytes = encode_pubsub_msg(m, 3);
+                        ws_send!(&bytes);
                     }
                     None => break,
                 }
@@ -3771,10 +3997,7 @@ async fn handle_ws<S>(
                     // client for the observable-keys feature.
                     watch_dirty = true;
                     let bytes = encode_keychange(&key, &value);
-                    let text = String::from_utf8_lossy(&bytes).into_owned();
-                    if ws_sender.send(Message::Text(text.into())).await.is_err() {
-                        break;
-                    }
+                    ws_send!(&bytes);
                 }
             }
 
@@ -3783,10 +4006,7 @@ async fn handle_ws<S>(
             notif = q_rx.recv(), if !qsub_patterns.is_empty() => {
                 if let Some((key, value)) = notif {
                     let bytes = encode_keychange(&key, &value);
-                    let text = String::from_utf8_lossy(&bytes).into_owned();
-                    if ws_sender.send(Message::Text(text.into())).await.is_err() {
-                        break;
-                    }
+                    ws_send!(&bytes);
                 }
             }
         }
@@ -3940,12 +4160,16 @@ mod tests {
             }
         }
 
+        /// Send `args` and read one value. An empty `args` sends nothing and
+        /// just reads the next frame — used to await an out-of-band push.
         async fn cmd(&mut self, args: &[&str]) -> Value {
-            let mut req = format!("*{}\r\n", args.len());
-            for a in args {
-                req.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+            if !args.is_empty() {
+                let mut req = format!("*{}\r\n", args.len());
+                for a in args {
+                    req.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+                }
+                self.stream.write_all(req.as_bytes()).await.unwrap();
             }
-            self.stream.write_all(req.as_bytes()).await.unwrap();
             loop {
                 match Value::parse(&self.buf[..self.filled]) {
                     Ok((val, n)) => {
@@ -4128,6 +4352,72 @@ mod tests {
         assert_eq!(c.cmd(&["DEL", "k"]).await, int(1));
         assert_eq!(c.cmd(&["GET", "k"]).await, nil());
         assert_eq!(c.cmd(&["DEL", "k"]).await, int(0)); // already gone
+    }
+
+    #[tokio::test]
+    async fn integration_hello_negotiates_the_protocol() {
+        let srv = spawn_server().await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        // Default is RESP2: the reply is a flat array, not a map.
+        let v = c.cmd(&["HELLO"]).await;
+        let Value::Array(Some(items)) = v else {
+            panic!("RESP2 HELLO must reply with an array, got {v:?}")
+        };
+        assert!(items.contains(&bulk("recached")));
+        assert!(items.contains(&Value::Integer(2)));
+
+        // Upgrading yields a map keyed the same way.
+        let v = c.cmd(&["HELLO", "3"]).await;
+        let Value::Map(pairs) = v else {
+            panic!("RESP3 HELLO must reply with a map, got {v:?}")
+        };
+        let proto = pairs
+            .iter()
+            .find(|(k, _)| *k == bulk("proto"))
+            .map(|(_, v)| v.clone());
+        assert_eq!(proto, Some(Value::Integer(3)));
+
+        // An unsupported version is refused and the connection stays usable.
+        let v = c.cmd(&["HELLO", "9"]).await;
+        assert!(
+            matches!(&v, Value::Error(e) if e.starts_with("NOPROTO")),
+            "expected NOPROTO, got {v:?}"
+        );
+        assert_eq!(c.cmd(&["PING"]).await, Value::SimpleString("PONG".into()));
+    }
+
+    #[tokio::test]
+    async fn integration_pubsub_frame_type_follows_the_negotiated_protocol() {
+        // The bug this pins: pub/sub deliveries were RESP3 push frames on every
+        // connection, including RESP2 ones that cannot parse `>` at all.
+        for (protover, want_push) in [(None, false), (Some("3"), true)] {
+            let srv = spawn_server().await;
+            let mut sub = RespClient::connect(srv.tcp_addr).await;
+            if let Some(v) = protover {
+                sub.cmd(&["HELLO", v]).await;
+            }
+            assert!(matches!(
+                sub.cmd(&["SUBSCRIBE", "news"]).await,
+                Value::Array(_) | Value::Push(_)
+            ));
+
+            let mut pubr = RespClient::connect(srv.tcp_addr).await;
+            // Wait for the subscription to register before publishing.
+            for _ in 0..50 {
+                if pubr.cmd(&["PUBLISH", "news", "hi"]).await == int(1) {
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+            }
+
+            let delivery = sub.cmd(&[]).await;
+            match (&delivery, want_push) {
+                (Value::Push(_), true) => {}
+                (Value::Array(Some(_)), false) => {}
+                _ => panic!("protover {protover:?}: expected push={want_push}, got {delivery:?}"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -4849,6 +5139,148 @@ mod tests {
             replica_store.execute(Command::Get("replkey".into())),
             Value::BulkString(Some(b"replval".to_vec()))
         );
+
+        // The replica acknowledges what it applies, so once it has caught up the
+        // primary must observe zero lag. Before acknowledgements existed the
+        // primary had no way to distinguish this from a replica that had
+        // received the frame and silently failed to apply it.
+        let mut lag = u64::MAX;
+        for _ in 0..50 {
+            lag = repl_registry.max_lag_frames().await;
+            if lag == 0 {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(lag, 0, "caught-up replica must report zero lag");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn integration_ws_accepts_binary_command_frames() {
+        // A WebSocket text frame must be well-formed UTF-8, so a command
+        // carrying raw bytes can only travel in a binary frame. The server
+        // previously handled text frames only and dropped binary ones.
+        let srv = spawn_ws_server().await;
+        let mut c = WsClient::connect(srv.tcp_addr).await;
+
+        let raw = b"*3\r\n$3\r\nSET\r\n$3\r\nbin\r\n$3\r\n\xff\xfe\x41\r\n".to_vec();
+        assert_eq!(c.cmd_binary(raw).await, ok());
+
+        // The command was accepted and executed — the key exists.
+        assert_eq!(c.cmd(&["EXISTS", "bin"]).await, int(1));
+
+        // NOTE: the *value* is still lossy, because the engine stores values as
+        // `String` (see core-engine/tests/binary_values.rs). Binary frames make
+        // the transport byte-clean; byte-clean storage is a separate change.
+        let Value::BulkString(Some(got)) = c.cmd(&["GET", "bin"]).await else {
+            panic!("expected a value")
+        };
+        assert_eq!(got, b"\xef\xbf\xbd\xef\xbf\xbd\x41".to_vec());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn integration_ws_hello_reports_resp3_and_refuses_downgrade() {
+        let srv = spawn_ws_server().await;
+        let mut c = WsClient::connect(srv.tcp_addr).await;
+
+        // The sync protocol is defined in terms of RESP3 push frames.
+        let v = c.cmd(&["HELLO"]).await;
+        let Value::Map(pairs) = v else {
+            panic!("WS HELLO must reply with a RESP3 map, got {v:?}")
+        };
+        assert!(
+            pairs
+                .iter()
+                .any(|(k, v)| *k == bulk("proto") && *v == Value::Integer(3))
+        );
+
+        // Downgrading would silently break push delivery, so it is refused
+        // rather than accepted-and-ignored.
+        let v = c.cmd(&["HELLO", "2"]).await;
+        assert!(
+            matches!(&v, Value::Error(e) if e.starts_with("NOPROTO")),
+            "expected NOPROTO, got {v:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replication_lag_counts_unacknowledged_frames() {
+        // A replica that receives frames but never acknowledges them is exactly
+        // the case queue depth cannot see: the frames left the primary's
+        // channel, so the queue reads empty while the replica is arbitrarily
+        // far behind. Lag must report them.
+        let store = Arc::new(KeyValueStore::new());
+        let registry: ReplRegistry = ReplHub::new();
+        let snap_cfg = Arc::new(SnapshotConfig {
+            path: tmp_path("lag_snap.rdb"),
+            last_save: AtomicI64::new(0),
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        {
+            let (s, sc, r) = (
+                Arc::clone(&store),
+                Arc::clone(&snap_cfg),
+                Arc::clone(&registry),
+            );
+            tokio::spawn(async move {
+                if let Ok((socket, _)) = listener.accept().await {
+                    let _ =
+                        handle_replica(socket, s, sc, r, None, DEFAULT_REPL_CHANNEL_CAPACITY).await;
+                }
+            });
+        }
+
+        // A replica that reads the snapshot and then goes silent.
+        let mut sock = TcpStream::connect(addr).await.unwrap();
+        let mut len_buf = [0u8; 4];
+        sock.read_exact(&mut len_buf).await.unwrap();
+        let mut snap = vec![0u8; u32::from_le_bytes(len_buf) as usize];
+        sock.read_exact(&mut snap).await.unwrap();
+
+        // Wait for registration, then fan out three writes.
+        for _ in 0..50 {
+            if registry.count.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+        for i in 0..3 {
+            registry
+                .fan_out(format!("*1\r\n$4\r\nPING{i}\r\n").into_bytes())
+                .await;
+        }
+
+        let mut lag = 0;
+        for _ in 0..50 {
+            lag = registry.max_lag_frames().await;
+            if lag == 3 {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(lag, 3, "three unacknowledged frames must show as lag 3");
+
+        // Acknowledging two of them retires exactly two frames of lag.
+        sock.write_all(&2u64.to_le_bytes()).await.unwrap();
+        for _ in 0..50 {
+            lag = registry.max_lag_frames().await;
+            if lag == 1 {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(lag, 1, "after acking 2 of 3, one frame remains outstanding");
+
+        // A stale ack must not walk the high-water mark backwards.
+        sock.write_all(&1u64.to_le_bytes()).await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            registry.max_lag_frames().await,
+            1,
+            "a replayed lower ack must not increase reported lag"
+        );
     }
 
     // ── Integration: 3e load (ignored in normal CI) ───────────────────────────
@@ -5124,6 +5556,14 @@ mod tests {
             self.next_reply().await
         }
 
+        /// Send pre-encoded RESP bytes in a *binary* frame. Text frames must be
+        /// well-formed UTF-8 per the WebSocket spec, so this is the only way to
+        /// put arbitrary bytes on the wire.
+        async fn cmd_binary(&mut self, raw: Vec<u8>) -> Value {
+            self.ws.send(Message::Binary(raw.into())).await.unwrap();
+            self.next_reply().await
+        }
+
         /// Wait up to `ms` for the next frame of any kind — RESP3 Push
         /// broadcasts *and* plain arrays. `keychange` notifications are encoded
         /// as arrays, so `recv_push` skips them entirely.
@@ -5206,24 +5646,24 @@ mod tests {
         /// (RESP3 Push broadcasts and `keychange` observable-key pushes).
         async fn next_reply(&mut self) -> Value {
             loop {
-                match self.ws.next().await {
-                    Some(Ok(Message::Text(t))) => {
-                        let Ok((v, _)) = Value::parse(t.as_bytes()) else {
-                            continue;
-                        };
-                        if matches!(v, Value::Push(_)) {
-                            continue;
-                        }
-                        if let Value::Array(Some(items)) = &v
-                            && matches!(items.first(), Some(Value::BulkString(Some(k))) if k == b"keychange")
-                        {
-                            continue;
-                        }
-                        return v;
-                    }
+                let raw: Vec<u8> = match self.ws.next().await {
+                    Some(Ok(Message::Text(t))) => t.as_bytes().to_vec(),
+                    Some(Ok(Message::Binary(b))) => b.to_vec(),
                     Some(Ok(_)) => continue,
                     _ => panic!("ws closed unexpectedly"),
+                };
+                let Ok((v, _)) = Value::parse(&raw) else {
+                    continue;
+                };
+                if matches!(v, Value::Push(_)) {
+                    continue;
                 }
+                if let Value::Array(Some(items)) = &v
+                    && matches!(items.first(), Some(Value::BulkString(Some(k))) if k == b"keychange")
+                {
+                    continue;
+                }
+                return v;
             }
         }
     }
@@ -6026,11 +6466,14 @@ mod tests {
     // ── Wire encoding ─────────────────────────────────────────────────────────
 
     #[test]
-    fn pubsub_message_encodes_as_a_resp_push_frame() {
-        let bytes = encode_pubsub_msg(PubSubMsg::Message {
-            channel: "news".into(),
-            message: "hello".into(),
-        });
+    fn pubsub_message_encodes_as_a_resp3_push_frame() {
+        let bytes = encode_pubsub_msg(
+            PubSubMsg::Message {
+                channel: "news".into(),
+                message: "hello".into(),
+            },
+            3,
+        );
         let text = String::from_utf8_lossy(&bytes);
         assert!(
             text.starts_with('>'),
@@ -6042,18 +6485,120 @@ mod tests {
     }
 
     #[test]
+    fn pubsub_message_encodes_as_an_array_for_resp2() {
+        // RESP2 has no push type. Sending `>` to a RESP2 client — which is
+        // every client that has not sent HELLO 3 — is unparseable, so a
+        // subscribed connection would break outright.
+        let bytes = encode_pubsub_msg(
+            PubSubMsg::Message {
+                channel: "news".into(),
+                message: "hello".into(),
+            },
+            2,
+        );
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.starts_with("*3\r\n"),
+            "RESP2 delivery must be a 3-element array: {text:?}"
+        );
+        assert!(!text.contains('>'), "no push frame on RESP2: {text:?}");
+    }
+
+    #[test]
     fn pattern_message_carries_the_matching_pattern() {
         // A pmessage must name the pattern that matched, or a client
         // subscribed to several patterns cannot tell them apart.
-        let bytes = encode_pubsub_msg(PubSubMsg::PMessage {
-            pattern: "news.*".into(),
-            channel: "news.tech".into(),
-            message: "hi".into(),
-        });
+        for protover in [2u8, 3u8] {
+            let bytes = encode_pubsub_msg(
+                PubSubMsg::PMessage {
+                    pattern: "news.*".into(),
+                    channel: "news.tech".into(),
+                    message: "hi".into(),
+                },
+                protover,
+            );
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(text.contains("pmessage"), "protover {protover}");
+            assert!(text.contains("news.*"), "protover {protover}");
+            assert!(text.contains("news.tech"), "protover {protover}");
+        }
+    }
+
+    // ── HELLO / protocol negotiation ─────────────────────────────────────────
+
+    #[test]
+    fn hello_defaults_to_the_connections_current_version() {
+        // Bare HELLO reports, it does not change. A client using it purely to
+        // read server info must not be silently switched to another protocol.
+        let mut protover = 2u8;
+        let bytes = process_hello(None, &mut protover, true, false);
+        assert_eq!(protover, 2, "bare HELLO must not change the version");
         let text = String::from_utf8_lossy(&bytes);
-        assert!(text.contains("pmessage"));
-        assert!(text.contains("news.*"));
-        assert!(text.contains("news.tech"));
+        assert!(
+            text.starts_with('*'),
+            "RESP2 reply must be an array: {text:?}"
+        );
+        assert!(text.contains("recached"));
+        assert!(text.contains(":2\r\n"), "proto must report 2: {text:?}");
+    }
+
+    #[test]
+    fn hello_3_upgrades_and_replies_with_a_map() {
+        let mut protover = 2u8;
+        let bytes = process_hello(Some("3"), &mut protover, true, false);
+        assert_eq!(protover, 3);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.starts_with("%6\r\n"), "must be a 6-pair map: {text:?}");
+        assert!(text.contains(":3\r\n"), "proto must report 3: {text:?}");
+    }
+
+    #[test]
+    fn hello_3_then_2_downgrades_again() {
+        let mut protover = 2u8;
+        process_hello(Some("3"), &mut protover, true, false);
+        assert_eq!(protover, 3);
+        let bytes = process_hello(Some("2"), &mut protover, true, false);
+        assert_eq!(protover, 2, "HELLO 2 must downgrade");
+        assert!(String::from_utf8_lossy(&bytes).starts_with('*'));
+    }
+
+    #[test]
+    fn hello_rejects_unsupported_versions_without_changing_protocol() {
+        // A client probing for a version the server does not speak must get a
+        // clean NOPROTO and stay on what it had — not be left in a half-state.
+        for bad in ["4", "1", "0", "abc", "", "255", "-1", "3.0"] {
+            let mut protover = 2u8;
+            let bytes = process_hello(Some(bad), &mut protover, true, false);
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(
+                text.starts_with("-NOPROTO"),
+                "HELLO {bad:?} must be refused: {text:?}"
+            );
+            assert_eq!(protover, 2, "HELLO {bad:?} must not change the version");
+        }
+    }
+
+    #[test]
+    fn hello_does_not_leak_server_details_before_auth() {
+        let mut protover = 2u8;
+        let bytes = process_hello(Some("3"), &mut protover, false, false);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.starts_with("-NOAUTH"), "{text:?}");
+        assert!(
+            !text.contains("recached") && !text.contains(env!("CARGO_PKG_VERSION")),
+            "unauthenticated HELLO must not fingerprint the server: {text:?}"
+        );
+    }
+
+    #[test]
+    fn hello_reports_replica_role() {
+        let mut protover = 3u8;
+        let primary =
+            String::from_utf8_lossy(&process_hello(None, &mut protover, true, false)).into_owned();
+        let replica =
+            String::from_utf8_lossy(&process_hello(None, &mut protover, true, true)).into_owned();
+        assert!(primary.contains("master"), "{primary:?}");
+        assert!(replica.contains("replica"), "{replica:?}");
     }
 
     #[test]

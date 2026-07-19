@@ -6,10 +6,35 @@ This page is **normative**: client SDKs (browser `recached-edge`, the planned mo
 
 | Port | Transport | Framing | Audience |
 |---|---|---|---|
-| 6379 | TCP | RESP2, pipelined | Trusted backends (any Redis client) |
-| 6380 | WebSocket | One RESP value per **text** frame | Untrusted browsers / apps |
+| 6379 | TCP | RESP2 by default, RESP3 after `HELLO 3`, pipelined | Trusted backends (any Redis client) |
+| 6380 | WebSocket | One RESP value per frame — **text**, or **binary** for bytes that are not valid UTF-8 | Untrusted browsers / apps |
 
-WebSocket text frames imply UTF-8: raw binary values are only fully round-trippable over TCP.
+### Protocol version (TCP)
+
+A TCP connection starts in **RESP2**. `HELLO 3` switches it to RESP3; `HELLO 2` switches back; a
+bare `HELLO` reports without changing anything. An unsupported version is refused with `-NOPROTO`
+and leaves the connection on the protocol it already had, so a client can probe and fall back.
+
+The version changes exactly one thing on the wire today: **pub/sub deliveries are RESP3 Push (`>`)
+frames on a RESP3 connection and plain arrays (`*`) on a RESP2 one.** RESP2 has no push type, so
+sending `>` to a RESP2 client is unparseable — before 0.2.2 the server did exactly that, which broke
+standard Redis clients that subscribed without negotiating.
+
+`HELLO` requires authentication when a password is set; the pre-auth reply is `-NOAUTH` and carries
+no server details.
+
+### Binary frames (WebSocket)
+
+The WebSocket spec requires text frames to be well-formed UTF-8. A command or reply carrying bytes
+that are not valid UTF-8 therefore travels in a **binary** frame instead; everything else stays in
+text frames, so existing clients are unaffected. A client must accept both.
+
+::: warning Values are not yet byte-transparent
+Binary frames make the *transport* byte-clean, but the engine stores values as UTF-8 strings, so a
+value containing invalid UTF-8 is still replaced with U+FFFD before it is stored — on **every**
+transport, TCP included. Byte-transparent values are a separate, breaking change. Do not store raw
+binary (compressed blobs, protobuf, images) in Recached today; base64-encode it or keep it elsewhere.
+:::
 
 ## Frame taxonomy (WebSocket)
 
@@ -19,7 +44,7 @@ Every frame a client receives is exactly one of:
 |---|---|---|
 | **Reply** | any RESP value not matching the rows below | Response to one command this connection sent |
 | **Mutation push** | RESP3 Push `>N` whose elements form a replayable command (`SET`, `HSET`, `JSET`, `JMERGE`, …) | Another client/backend mutated a key in scope — apply to the local store |
-| **Pub/sub push** | RESP3 Push `>3` = `["message", channel, payload]` | Pub/sub delivery |
+| **Pub/sub push** | RESP3 Push `>3` = `["message", channel, payload]` | Pub/sub delivery. The WebSocket transport is always RESP3 — `HELLO 2` on it is refused, because the frame taxonomy below depends on the push type existing |
 | **Keychange push** | Array `["keychange", key, value]` | A watched / live-queried key changed. `value`: full string, nil (deleted), or a type-name marker (`hash`, `list`, `set`, `zset`, `json`, `ratelimit`) whose content travels via mutation pushes instead |
 | **Query state** | Array `["qstate", pattern, k1, v1, …]` | **Both** the reply to a `QSUB` **and** initial state to apply (same value encoding as keychange) |
 
