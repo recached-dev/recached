@@ -251,3 +251,201 @@ fn restore_renumbers_but_preserves_frames_and_order() {
     assert_eq!(frames[1], old_frame_b);
     assert_eq!(frames[2], session_write.frame);
 }
+
+// ── Sync scopes ───────────────────────────────────────────────────────────────
+
+#[test]
+fn sync_scopes_builds_a_sync_frame_from_csv() {
+    let mut c = client();
+    let frame = c.set_sync_scopes("cart:*,user:1:*", true).unwrap();
+    assert!(frame.contains("SYNC"), "{frame}");
+    assert!(frame.contains("cart:*"));
+    assert!(frame.contains("user:1:*"));
+}
+
+#[test]
+fn sync_scopes_ignore_blank_entries_and_whitespace() {
+    let mut c = client();
+    let frame = c.set_sync_scopes(" cart:* , , user:1:* ,", true).unwrap();
+    // Three commas but only two real patterns → SYNC + 2 args.
+    assert!(frame.starts_with("*3\r\n"), "expected 3 parts, got {frame}");
+    assert!(frame.contains("cart:*") && frame.contains("user:1:*"));
+}
+
+#[test]
+fn an_all_empty_scope_list_produces_no_frame() {
+    // Sending a bare SYNC would *clear* scopes on the server, which is the
+    // opposite of what an accidental empty string intends.
+    let mut c = client();
+    assert!(c.set_sync_scopes("", true).is_none());
+    assert!(c.set_sync_scopes("  ,  , ", true).is_none());
+}
+
+#[test]
+fn scopes_are_replayed_on_reconnect() {
+    let mut c = client();
+    c.set_sync_scopes("cart:*", false);
+    let frames = c.on_open();
+    assert!(
+        frames.iter().any(|f| f.contains("cart:*")),
+        "scopes must be re-established after reconnect: {frames:?}"
+    );
+}
+
+#[test]
+fn a_sync_token_takes_precedence_over_raw_scope_patterns() {
+    // The token carries server-signed scopes; sending raw patterns as well
+    // would be redundant and could widen what the connection asks for.
+    let mut c = client();
+    c.set_sync_scopes("cart:*", false);
+    c.set_sync_token("tok-123", false);
+    let frames = c.on_open();
+    assert!(frames.iter().any(|f| f.contains("tok-123")));
+    assert!(
+        !frames.iter().any(|f| f.contains("cart:*")),
+        "raw scopes must not be sent alongside a token: {frames:?}"
+    );
+}
+
+// ── Live queries ──────────────────────────────────────────────────────────────
+
+#[test]
+fn live_queries_register_once_and_replay_on_open() {
+    let mut c = client();
+    c.add_live_query("cart:*", false);
+    c.add_live_query("cart:*", false); // idempotent
+    c.add_live_query("user:*", false);
+
+    let frames = c.on_open();
+    let qsubs = frames.iter().filter(|f| f.contains("QSUB")).count();
+    assert_eq!(
+        qsubs, 2,
+        "duplicate patterns must not double-subscribe: {frames:?}"
+    );
+}
+
+#[test]
+fn removing_one_live_query_leaves_the_others() {
+    let mut c = client();
+    c.add_live_query("cart:*", false);
+    c.add_live_query("user:*", false);
+
+    let frame = c.remove_live_query(Some("cart:*"), true).unwrap();
+    assert!(
+        frame.contains("QUNSUB") && frame.contains("cart:*"),
+        "{frame}"
+    );
+
+    let frames = c.on_open();
+    assert!(
+        frames.iter().any(|f| f.contains("user:*")),
+        "survivor replays"
+    );
+    assert!(
+        !frames.iter().any(|f| f.contains("cart:*")),
+        "removed query must not replay: {frames:?}"
+    );
+}
+
+#[test]
+fn removing_all_live_queries_sends_a_bare_qunsub() {
+    let mut c = client();
+    c.add_live_query("cart:*", false);
+    c.add_live_query("user:*", false);
+
+    let frame = c.remove_live_query(None, true).unwrap();
+    assert!(frame.contains("QUNSUB"), "{frame}");
+    assert!(
+        !frame.contains("cart:*"),
+        "bare QUNSUB carries no pattern: {frame}"
+    );
+
+    let frames = c.on_open();
+    assert!(
+        !frames.iter().any(|f| f.contains("QSUB")),
+        "nothing should replay after clearing: {frames:?}"
+    );
+}
+
+// ── Session frame ordering ────────────────────────────────────────────────────
+
+#[test]
+fn on_open_sends_auth_before_scopes_before_queries() {
+    // Order is load-bearing: the server rejects scoped commands until it has
+    // authenticated, and a QSUB before SYNC would be refused.
+    let mut c = client();
+    c.set_password("pw", false);
+    c.set_sync_token("tok", false);
+    c.add_live_query("cart:*", false);
+
+    let frames = c.on_open();
+    let pos = |needle: &str| frames.iter().position(|f| f.contains(needle));
+    let (auth, sync, qsub) = (
+        pos("AUTH").unwrap(),
+        pos("TOKEN").unwrap(),
+        pos("QSUB").unwrap(),
+    );
+    assert!(auth < sync, "AUTH must precede SYNC: {frames:?}");
+    assert!(sync < qsub, "SYNC must precede QSUB: {frames:?}");
+}
+
+#[test]
+fn on_open_resets_attempt_count_and_inflight() {
+    let mut c = client();
+    c.on_close();
+    c.on_close();
+    c.enqueue_write(&to_resp(&["SET", "k", "v"]), true, true);
+
+    c.on_open();
+    // Backoff restarts from the floor after a successful open.
+    assert_eq!(c.on_close(), 500);
+}
+
+#[test]
+fn session_frames_are_withheld_until_connected() {
+    let mut c = client();
+    assert!(
+        c.add_live_query("cart:*", false).is_none(),
+        "nothing to send while disconnected — it replays on open instead"
+    );
+    assert!(
+        c.add_live_query("user:*", true).is_some(),
+        "sent immediately when open"
+    );
+}
+
+// ── Outbox management ─────────────────────────────────────────────────────────
+
+#[test]
+fn clear_outbox_drops_queued_and_inflight_writes() {
+    let mut c = client();
+    c.enqueue_write(&to_resp(&["SET", "a", "1"]), true, true);
+    c.enqueue_write(&to_resp(&["SET", "b", "2"]), true, true);
+    assert_eq!(c.outbox_len(), 2);
+
+    c.clear_outbox();
+    assert_eq!(c.outbox_len(), 0);
+    // A reply arriving after a clear must not retire a row that no longer
+    // exists or panic on an empty inflight queue.
+    c.handle_frame("+OK\r\n");
+    assert_eq!(c.outbox_len(), 0);
+}
+
+#[test]
+fn no_writes_yet_tracks_whether_an_identity_can_still_be_adopted() {
+    let mut c = client();
+    assert!(c.no_writes_yet(), "fresh client has written nothing");
+    c.enqueue_write(&to_resp(&["SET", "k", "v"]), true, true);
+    assert!(
+        !c.no_writes_yet(),
+        "after a write the client id is committed to the wire"
+    );
+}
+
+#[test]
+fn epoch_is_readable_and_settable() {
+    let mut c = client();
+    assert_eq!(c.epoch(), 0);
+    c.set_epoch(7);
+    assert_eq!(c.epoch(), 7);
+}

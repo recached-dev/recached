@@ -41,6 +41,18 @@ cargo install recached && recached-server
 npm install recached-edge
 ```
 
+> [!IMPORTANT]
+> **`recached-edge` 0.1.1 – 0.2.0 do not work in the browser.** `core-engine` read the clock via
+> `std::time::SystemTime::now()`, which panics on `wasm32-unknown-unknown`. The clock is read on
+> nearly every operation, so **no store write completes** on those versions — and a client whose
+> write-ahead log passed the compaction threshold erased its own persisted cache before the
+> replacement snapshot was written.
+>
+> Fixed in **0.2.1** — install `recached-edge@^0.2.1` or later.
+>
+> **The server is unaffected.** It runs on a native target where the clock works normally; this is
+> browser/WASM only.
+
 ---
 
 ## How it works

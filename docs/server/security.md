@@ -49,10 +49,15 @@ RECACHED_TLS_CERT=./cert.pem RECACHED_TLS_KEY=./key.pem recached-server
 TLS applies to **both** ports when enabled: clients use `rediss://` for RESP and `wss://` for the
 browser sync socket.
 
-::: warning TLS is all-or-nothing, and fails open
-If either variable is missing, the server silently falls back to **plain TCP and plain WebSocket**.
-There is no error and no refusal to start. After enabling TLS, verify it took effect rather than
-assuming — connect with `rediss://` and confirm a plaintext client is refused.
+::: tip TLS is all-or-nothing, and fails loudly
+Set both variables or neither. If exactly one is present the server **refuses to start** with an
+explicit error, rather than falling back to plaintext — an operator who set `RECACHED_TLS_CERT`
+intends TLS, and silently serving unencrypted traffic because the key variable was misspelled is a
+failure you would not notice until traffic had already been exposed.
+
+Prior to v0.2.1 this fell back to plain TCP and plain WebSocket silently. If you are on an earlier
+version, verify TLS took effect rather than assuming: connect with `rediss://` and confirm a
+plaintext client is refused.
 :::
 
 ## IP allowlisting
@@ -62,13 +67,13 @@ RECACHED_ALLOW_IPS="10.0.1.5,10.0.1.6" recached-server
 ```
 
 ::: warning Exact IP addresses only — CIDR is not supported
-Each entry must parse as a single IP. Anything else — `10.0.0.0/8`, a hostname, a typo — is
-**logged as a warning and dropped from the list**.
+Each entry must parse as a single IP address. Anything else — `10.0.0.0/8`, a hostname, a typo —
+causes the server to **refuse to start**, naming the offending entry.
 
-The failure mode this creates is worth internalising: if *every* entry is invalid, the allowlist
-becomes empty, and an empty allowlist rejects **every** connection. The server starts normally and
-appears completely unreachable, with only a `warn!` line explaining why. It fails closed, which is
-the safe direction, but it does not fail loudly.
+Prior to v0.2.1 invalid entries were logged and dropped, which quietly produced a *narrower*
+allowlist than configured: a mistyped CIDR range excluded every host it was meant to admit, and a
+wholly invalid list produced an empty allowlist that rejected every connection while the process
+still started and passed health checks. Failing to start makes the misconfiguration unmissable.
 :::
 
 Treat the allowlist as defence in depth, not a primary control. In cloud environments where addresses

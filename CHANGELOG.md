@@ -4,7 +4,89 @@ All notable changes to Recached are documented here.
 
 ---
 
-## [0.2.1] — Unreleased
+## [0.2.1] — 2026-07-19
+
+### Fixed — Browser SDK (critical)
+
+- **Every store operation panicked in the browser.** `core-engine` read the clock through
+  `std::time::SystemTime::now()`, which is unsupported on `wasm32-unknown-unknown` and **panics**
+  rather than returning an error. Because the clock is read on essentially every operation — TTL
+  evaluation and LRU recency, including `Entry::new_str` on every `SET` — no write could complete in
+  `recached-edge`. The panic path is present in the published `recached-edge_bg.wasm`.
+
+  This was invisible to the existing test suite: `SystemTime::now()` works on every native target, so
+  the whole native suite passed while the browser build was non-functional. It surfaced within
+  minutes of standing up `wasm-bindgen-test` against headless Chrome.
+
+  **Affected releases: 0.1.1 through 0.2.0** — every published version since the TTL feature landed.
+  Confirmed by checking out `v0.2.0` unmodified and running a plain `SET` through `core-engine` in
+  headless Chrome, which panics. `v0.1.0` predates the change and is unaffected. **The server is not
+  affected on any version**: it runs on a native target where the clock works normally.
+
+- **WAL compaction destroyed the persisted cache.** The same panic sat inside
+  `snapshot_to_resp_cmds`, called by compaction *after* the WAL had already been cleared:
+
+  ```rust
+  JsFuture::from(idb_wal_clear_js(&db)).await?;        // WAL wiped
+  let cmds = snapshot_to_resp_cmds(&store.snapshot()); // panics before rewrite
+  ```
+
+  Any client whose WAL passed `WAL_COMPACT_THRESHOLD` (1,000 entries) therefore erased its persisted
+  cache and aborted before writing the replacement. The existing comment anticipated a data-loss
+  window "if the tab is closed during compaction"; in practice the window was hit every time.
+
+  Both sites now read `js_sys::Date::now()` on wasm — the clock `wasm-edge` already used elsewhere
+  for client-id generation. Native builds are unchanged; `core-engine` gains a wasm-only `js-sys`
+  dependency.
+
+### Fixed — Security
+
+- **Denial of service via `PSUBSCRIBE` pattern matching.** `server-native` carried its own recursive
+  glob matcher, separate from the dynamic-programming one in `core-engine`, and used it to match
+  every `PUBLISH` against every registered pattern subscription. That matcher backtracks
+  exponentially: a pattern with ten wildcards against a 36-character channel name took **~7 seconds**
+  (measured 69 ms → 371 ms → 1.9 s → 7.2 s as the channel grew from 24 to 36 characters, roughly 5×
+  per four characters). Because `PSUBSCRIBE` patterns are supplied by the client and every publish is
+  matched against all of them, a single subscriber could stall pub/sub delivery for every connected
+  client. The match runs while holding the global `PubSubHub` mutex, so a slow match blocks not only
+  the publishing task but every concurrent `PUBLISH`, `SUBSCRIBE`, and `PSUBSCRIBE` on the server.
+
+  The exposure is wider than the RESP port: `PSubscribe` is classified `KeyLess` by
+  `command_scope`, so it is permitted even on scope-restricted WebSocket connections — the
+  untrusted-browser-client case.
+
+  Pub/sub now uses `core_engine::store::glob_match`, the same matcher already used for sync-scope
+  authorization, whose iterative implementation has no backtracking. The two were verified
+  equivalent over an exhaustive differential test of **94,501 pattern/string pairs with zero
+  disagreements** before the swap, so matching behaviour is unchanged. The duplicate matcher has been
+  deleted, and a regression test asserts a 200-character channel matches in under 500 ms.
+
+- **TLS silently downgraded to plaintext when half-configured.** `load_tls_acceptor` required *both*
+  `RECACHED_TLS_CERT` and `RECACHED_TLS_KEY`, and returned "no TLS" if either was missing — so a
+  misspelled key variable served unencrypted traffic on both the RESP and WebSocket ports, with no
+  error and no failed startup. An operator who sets a certificate path intends TLS; the failure was
+  undetectable until traffic had already been exposed. The server now **refuses to start** when
+  exactly one of the pair is set, naming the missing variable.
+
+- **`RECACHED_ALLOW_IPS` silently narrowed the allowlist.** Entries that failed to parse were logged
+  at `warn` level and dropped. Because only exact IP addresses are supported, a natural-looking CIDR
+  range such as `10.0.0.0/8` was discarded — leaving an allowlist that excluded every host the
+  operator meant to admit. If *all* entries were invalid the result was an empty allowlist, which
+  rejects **every** connection while the process starts normally and passes health checks. Parsing is
+  now strict: an unparseable entry, or a list that yields no addresses, aborts startup with a message
+  naming the offending value.
+
+### Fixed — Browser client
+
+- **Panic during outbox hydration on page load.** `recached-edge` held a `RefCell` borrow of its
+  core state across two `await` points while renumbering restored outbox rows against IndexedDB.
+  WebAssembly is single-threaded but asynchronous: a WebSocket frame arriving inside that window
+  re-entered the same `RefCell` and panicked on a double borrow, taking down the client at exactly
+  the moment queued offline writes were being restored — leaving them in an indeterminate state. The
+  borrow is now released before any await.
+
+  This was reachable on any reload where the socket connected while a non-empty outbox was still
+  being replayed, which is the common case for a client that went offline with pending writes.
 
 ### Changed — License
 
@@ -92,6 +174,60 @@ All notable changes to Recached are documented here.
     round-trip for every value type including TTL preservation.
   - **Per-command arity and error paths** across ~80 commands, table-driven so a single off-by-one
     guard is caught per command rather than in aggregate.
+- **`server-native` line coverage raised from 55.52% to 70.18%** (regions 57.29% → 68.37%, functions
+  64.81% → 75.07%), with tests going from 40 to **69**. **CI gates it at 65%.** The floor is
+  deliberately lower than `core-engine`'s: most of what remains uncovered is async I/O — accept
+  loops, TLS handshakes, replication streams, `main` — which the socket-driven load and chaos tests
+  exercise but line coverage on this binary cannot credit. The gate protects the pure decision
+  functions, not the I/O layer.
+- All **107 `Command` variants** are now asserted through `command_scope`, `command_name`, and
+  `primary_keys`. `command_scope` decides whether a command is scope-checked *at all* — a
+  key-touching command misclassified as `KeyLess` would bypass tenant isolation silently, and
+  `scopes_match` treats an empty key list as permitted. The match has no catch-all arm, so a new
+  variant cannot compile until it is classified; these tests guard the remaining risk of classifying
+  one wrongly. All passed on the first run — no misclassification existed. Also pinned: `DEDUP`
+  inheriting its inner command's scope (otherwise a smuggling vector), multi-key commands
+  (`RENAME`, `SMOVE`, `SINTERSTORE`) reporting every key they touch, and administrative commands
+  mapping to `Admin` rather than `KeyLess`.
+- Additional `server-native` coverage: pub/sub wire encoding (RESP3 Push frames, `pmessage` carrying
+  its matching pattern, subscribe acknowledgement counts), sorted-set score formatting (`1` not
+  `1.0`, infinities, the 1e15 integer-truncation boundary), `parse_memory_bytes` unit handling, and
+  `parse_save_conditions` — including that one malformed pair is skipped rather than disabling
+  autosave entirely.
+- Prometheus metric labels are now asserted stable and lowercase for every command, since renaming
+  one silently breaks existing dashboards and alerts.
+- **`sync-client` line coverage raised from 80.00% to 95.77%, with every function now covered**
+  (31 of 31, previously 8 uncovered); tests went from 15 to **29**. The crate is deliberately
+  I/O-free, so there is no structural reason for anything in it to be untested. New coverage: sync
+  scope frame construction — including that an all-empty pattern list produces **no** frame, since a
+  bare `SYNC` would *clear* scopes server-side, the opposite of what an accidental empty string
+  intends — live-query registration, idempotency and replay, and the `AUTH` → `SYNC` → `QSUB`
+  ordering the server depends on for a scoped reconnect.
+- **`wasm-edge` went from zero tests to 14**, covering `snapshot_to_resp_cmds` — the WAL encoder that
+  determines whether browser-persisted data survives a page reload. Pinned: lists round-trip through
+  `RPUSH` rather than `LPUSH` (which would silently reverse them), already-expired entries are
+  dropped rather than resurrected, empty collections emit nothing (`RPUSH key` with no members is a
+  syntax error that would abort hydration part-way), strings carry a *relative* `PX` while
+  collections get a separate absolute `PEXPIREAT`, and rate-limiter state never reaches the browser
+  WAL. The strongest test replays an encoded snapshot through the real `core-engine` and asserts
+  every value type comes back intact.
+
+- **Browser tests, via `wasm-bindgen-test` in headless Chrome** — a new `browser-tests` CI job runs
+  `wasm-pack test --headless --chrome wasm-edge`. 13 tests cover the IndexedDB persistence layer:
+  object-store creation across the v2/v3 upgrades, WAL append and sequence ordering, compaction
+  clearing the WAL while **preserving the outbox** (wiping it would discard writes still awaiting
+  server acknowledgement), outbox durability across a database reopen, delete/replace semantics, and
+  `meta` round-tripping the client identity and session epoch that make delivery exactly-once. A
+  further test exercises `core-engine` itself on a real wasm target — the regression guard for the
+  clock panic above, which no native test can catch.
+
+  Still uncovered: the WebSocket and reconnect paths, which need a live server running alongside the
+  browser. Those remain follow-up work.
+- **CI no longer excludes `wasm-edge` from lint and test.** The exclusion was documented as "requires
+  the wasm32 target to compile", which was not accurate — the crate builds and tests natively. The
+  real blocker was four clippy findings, one of which was the `RefCell`-across-await panic fixed
+  above. Excluding the crate is what allowed that bug to persist; all four are resolved and the
+  workspace now lints and tests with nothing skipped.
 
 ---
 

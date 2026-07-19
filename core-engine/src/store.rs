@@ -8,12 +8,25 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
 
 // ── time ──────────────────────────────────────────────────────────────────────
 
+/// Milliseconds since the Unix epoch.
+///
+/// `std::time::SystemTime::now()` panics outright on wasm32-unknown-unknown —
+/// std has no clock for that target. Because this is called on essentially
+/// every store operation (TTL checks, LRU recency), an unguarded call makes the
+/// whole engine unusable in the browser, so the wasm build reads `Date.now()`.
+#[cfg(target_arch = "wasm32")]
+fn now_ms() -> u64 {
+    js_sys::Date::now() as u64
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

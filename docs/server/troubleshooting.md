@@ -4,27 +4,31 @@ Symptoms, causes, and fixes — ordered roughly by how often each one bites.
 
 ## Server
 
-### The server accepts no connections at all
-
-Everything times out; the process is running and logs look normal apart from a warning at startup.
-
-**Most likely: a malformed `RECACHED_ALLOW_IPS`.** The allowlist accepts **exact IP addresses only**.
-CIDR ranges, hostnames, and typos are logged as warnings and silently dropped. If every entry is
-invalid the list ends up empty — and an empty allowlist rejects **every** connection.
+### The server will not start, complaining about `RECACHED_ALLOW_IPS`
 
 ```
-WARN RECACHED_ALLOW_IPS: ignoring invalid entry '10.0.0.0/8'
+ERROR RECACHED_ALLOW_IPS: '10.0.0.0/8' is not a valid IP address. Exact addresses only —
+      CIDR ranges and hostnames are not supported.
 ```
 
-Check the startup logs for that warning and for which mode you are in:
+The allowlist accepts **exact IP addresses only**. Expand the range into individual addresses, or
+unset the variable and enforce the boundary at your firewall or security group — which is the better
+choice in cloud environments where addresses rotate.
+
+Since v0.2.1 an unparseable entry is fatal at startup. Earlier versions logged a warning and dropped
+the entry, which silently produced a narrower allowlist than configured — and if *every* entry was
+invalid, an empty allowlist that rejected every connection while the process appeared healthy. If you
+are on an older version and the server is unreachable, check the startup log for
+`ignoring invalid entry`.
+
+Confirm which mode you are in from the startup log:
 
 ```
-INFO  IP allowlist ENABLED: [10.0.1.5]     ← list parsed, only these IPs
+INFO  IP allowlist ENABLED: [10.0.1.5]     ← only these IPs may connect
 WARN  IP allowlist DISABLED. Accepting all connections.
 ```
 
-Fix by expanding CIDR to individual addresses, or unset the variable and enforce the boundary at the
-firewall. See [Security → IP allowlisting](/server/security#ip-allowlisting).
+See [Security → IP allowlisting](/server/security#ip-allowlisting).
 
 ### `NOAUTH Authentication required.`
 
@@ -60,11 +64,19 @@ primary requires a restart with a new `RECACHED_REPLICAOF`.
 outright rather than queued. Watch `recached_connections_active` and raise the limit, or find the
 client that is leaking connections.
 
-### TLS does not seem to be active
+### The server will not start, complaining about TLS
 
-If either `RECACHED_TLS_CERT` or `RECACHED_TLS_KEY` is missing, the server **falls back to plaintext
-without erroring**. Verify rather than assume: a `rediss://` client should connect and a plaintext
-client should fail. See [Security → Transport encryption](/server/security#transport-encryption).
+```
+ERROR RECACHED_TLS_CERT is set but RECACHED_TLS_KEY is not — refusing to start
+      rather than silently serving plaintext. Set both, or neither.
+```
+
+TLS is all-or-nothing: set both variables or neither. Since v0.2.1 setting exactly one is fatal.
+
+Earlier versions fell back to plaintext silently in this case, which is worse than a failed start —
+traffic you believed was encrypted was not. If you are on an older version, verify rather than
+assume: a `rediss://` client should connect and a plaintext client should be refused. See
+[Security → Transport encryption](/server/security#transport-encryption).
 
 ### Memory keeps growing
 
