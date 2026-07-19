@@ -9,7 +9,6 @@ use core_engine::resp::Value;
 use core_engine::store::{EvictionPolicy, KeyValueStore, SnapshotEntry};
 use futures_util::{SinkExt, StreamExt};
 use metrics::{counter, gauge};
-use rustls_pemfile::{certs, private_key};
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::net::IpAddr;
@@ -23,6 +22,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, broadcast, mpsc};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -267,17 +267,19 @@ fn make_tcp_listeners(addr: &str, n: usize) -> std::io::Result<Vec<TcpListener>>
 
 // ── TLS ───────────────────────────────────────────────────────────────────────
 
+// PEM parsing comes from rustls-pki-types, the crate rustls itself uses.
+// `rustls-pemfile` was deprecated in favour of it (RUSTSEC-2025-0134), and an
+// unmaintained dependency is a poor thing to have sitting in the TLS path.
 fn load_certs(path: &str) -> std::io::Result<Vec<CertificateDer<'static>>> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
-    certs(&mut reader).collect()
+    CertificateDer::pem_file_iter(path)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
+        .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))
+        .collect()
 }
 
 fn load_private_key(path: &str) -> std::io::Result<PrivateKeyDer<'static>> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
-    private_key(&mut reader)?
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no private key found"))
+    PrivateKeyDer::from_pem_file(path)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
 }
 
 /// Decides what a (cert, key) environment pair means, without touching the
@@ -4850,16 +4852,24 @@ mod tests {
         assert_eq!(c.cmd(&["SET", "b", "2"]).await, ok());
         assert_eq!(srv.store.dirty_count(), 2);
 
-        let last_save_before = srv.state.snap.last_save.load(Ordering::Relaxed);
-
         // Trigger a save — dirty resets to 0
         assert_eq!(c.cmd(&["SAVE"]).await, ok());
         assert_eq!(srv.store.dirty_count(), 0);
 
+        // Baseline *after* the explicit save, not before it: SAVE writes
+        // last_save itself, so a baseline taken beforehand differs by one
+        // whenever the save lands in the next whole second — which is what this
+        // test used to fail on, roughly one run in thirty. The assertion below
+        // is about no *further* save happening.
+        let last_save = srv.state.snap.last_save.load(Ordering::Relaxed);
+
         // No new writes → save condition not met → last_save unchanged after 1s
         tokio::time::sleep(tokio::time::Duration::from_millis(1100)).await;
-        let last_save_after = srv.state.snap.last_save.load(Ordering::Relaxed);
-        assert_eq!(last_save_before, last_save_after); // no autosave fired (no conditions configured)
+        assert_eq!(
+            last_save,
+            srv.state.snap.last_save.load(Ordering::Relaxed),
+            "no autosave should fire with no conditions configured"
+        );
     }
 
     // ── Integration: 3d replication ───────────────────────────────────────────
@@ -7196,11 +7206,93 @@ mod tests {
 }
 
 #[cfg(test)]
+mod tls_loading_tests {
+    use super::*;
+
+    // A self-signed cert and its key, generated once with:
+    //   openssl req -x509 -newkey rsa:2048 -keyout k -out c -days 3650 -nodes \
+    //     -subj "/CN=recached-test"
+    // Embedded rather than generated at test time so the test needs no openssl
+    // on the runner and cannot fail for reasons unrelated to parsing.
+    const TEST_CERT: &str = "-----BEGIN CERTIFICATE-----\nMIIDETCCAfmgAwIBAgIUDpGtGZ5z4j/X0RMdVgiZt5TyukwwDQYJKoZIhvcNAQEL\nBQAwGDEWMBQGA1UEAwwNcmVjYWNoZWQtdGVzdDAeFw0yNjA3MTkxNDUyMDVaFw0z\nNjA3MTYxNDUyMDVaMBgxFjAUBgNVBAMMDXJlY2FjaGVkLXRlc3QwggEiMA0GCSqG\nSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDdi5zyxNocCEi6elQKsS0onYh9aOMW5Hjz\n7zAcWa6EPp1g4Zz1tLF2Nk92CBG/iWzF5OckDChuIYjM+MTRws5UOSXwwkbLplKR\nSMGEst1mP3rZPGHq57w52OmxO599kBR4BpeWhFMC4w5xGEO9Gp4P+QdCIYaUEBxz\nLeEyCwapimzamKRYKO0VoZWzF0bLhYUHxc9FD2QMbaPUmRZZGdcttg/0Gq4U/P5N\n6jhWo+ekIKu1kpLSAZPiHtYNAzGu1sk0lTPyVxdmmwqPueV9MLUgVIpDWA+QL80I\nXIjTfaQAOl4k31AeC+yglCyhB/yl/0ROQUAXGgozsFJnpxujLGMPAgMBAAGjUzBR\nMB0GA1UdDgQWBBSWbJJErt4zE9+u8lbBnAPXaRSI0TAfBgNVHSMEGDAWgBSWbJJE\nrt4zE9+u8lbBnAPXaRSI0TAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUA\nA4IBAQBGslzIW0Q46r7eQGK22fTEfNReSy4f7PZPGn/BZbj499LKSfRP1z8A3bbF\n2CdQKswbhVUbHfLUoaRwRfmJWhR/I/UxNkUfVlQ/jQBaUvg2ZCy1l/3kRM6N1t5K\ntkwg+dzai/6LwT7RHmbl8Dx32on3+x9vJMYtoxeBk4nfHZTQMIOd3zsaXp/+RWUY\nzuIWXX/rf862GerYhoHVCWzMcHMLnI/Mwzlm2tgVnfW1XpI/La3fxnTWYT4g4PIJ\nfXe3WrO9VyC1ZZ7PjE4Pq4unCRbJ2yZ5toybr4kcT4UGFrsXjnAsT+RyLY4By50D\nkaBPsvjq5ZvbiPBtEINXbmF3A7cq\n-----END CERTIFICATE-----";
+    const TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDdi5zyxNocCEi6\nelQKsS0onYh9aOMW5Hjz7zAcWa6EPp1g4Zz1tLF2Nk92CBG/iWzF5OckDChuIYjM\n+MTRws5UOSXwwkbLplKRSMGEst1mP3rZPGHq57w52OmxO599kBR4BpeWhFMC4w5x\nGEO9Gp4P+QdCIYaUEBxzLeEyCwapimzamKRYKO0VoZWzF0bLhYUHxc9FD2QMbaPU\nmRZZGdcttg/0Gq4U/P5N6jhWo+ekIKu1kpLSAZPiHtYNAzGu1sk0lTPyVxdmmwqP\nueV9MLUgVIpDWA+QL80IXIjTfaQAOl4k31AeC+yglCyhB/yl/0ROQUAXGgozsFJn\npxujLGMPAgMBAAECggEAQ4xj6ClZDx7/fcv6f+ARksalbQdj5gD3V/jfxGUbrrqg\npX9kqg3T5eUdSTGgp7Ow9I2cZANI+HtFCKn46LPq0QczqDqz9zfZCO8UAe+/TYOh\nY0bj3AmX/FNEvYMeV9xsQURRR9VEsiakqprpXGkXNGuLaQBr1g0rf3rHpMhz2ZEH\nw7QxoUfH3YL7fMIWwAvHanl6HwzE3TVh3felFGGGiqUaGg2Pll+/s5AiYnnZuq39\nW+t0RVH36rSFh037Su/ScCs44WZS+kGyqcuxyWLwvNwXEVXC3h42N62MHGgY8xQw\nP8wMSxGejEIr8IGpwhl86+oW+44nxarmrMBzMPRIcQKBgQD6VnpsIwxWV1zNC1LD\nbTVRQOoqJWDzxdXB47IB29ADHJnfBLbMr/6kIgIfuCu1Kf9wWTZGHwFUOKFhJDBC\ngLHpWFMWKSew4UmNyc0a16a9Pb7mdNyxnTY1oQucEbzS3pLMzda2dAdxYJE0Cuc6\nJ8Xp2Jo73LnRxY+NyEyl28frAwKBgQDijmtG0cDESNPMhxqJO/9KoRqRT3T+JqNf\noWaKlfSlQFaGecjdk9dNPZ1Aew4xI0v/C5YTwT6MUVDEXmoaSsa+S1atoDLNsojL\nuWqUno9mF6o3U23pi4vlEYh6c/V7Bd1VYde8ZQqVq0KxbCmYp1VE+DBeyNNT7Q5X\nN2lst0hEBQKBgQCXjds3tFA3xVQNXpmQboEk2+Pn+BEmA9NROoP91BGukJYnCjeQ\n28uRmnUmttzfJLncTmYpNYQcdNxebwY4fKk415wVgnzg/MMG7/EYGw566vKzmnQx\noze6Z/EbXzGth8nf643dj4kh/pBprWAnOQT8eYGGVC667Jvn/idJEjGJ+QKBgQCz\nGmgQio3cHr7huATwbO/7rbT1H12b9iu91DjeYoIPifddRDXZhaD1vTnt2dp0WjUg\nIaa5Y1HxV++D7ifvNSI9Gg4iIL1JBFVEyQZLC7bNvPOh3WDM+rbTlrLQK4/re81o\nTHtiwnZFsCh/XsTbm527coG6zQTUGln19SZw/cwxiQKBgA8dcEyBvPi6JgAqLy+5\n3Ev1uZEKkAeAQAkOV9jzqDN9NTi7GWOz3mtY2zopYjef7Wl0V4Qjkr7Jkxlx2wyn\nHboOuCEjComkRxn5vrHm6EBp0uTrdFIknLysxmQFgNamp9E8mX9p/q9rq7aZWzPu\nr+3jOYvwFyzAQ4j2tGzUm7Zd\n-----END PRIVATE KEY-----";
+
+    fn write(name: &str, body: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("recached_test_{name}_{}", std::process::id()));
+        std::fs::write(&path, body).expect("write pem");
+        path
+    }
+
+    #[test]
+    fn a_pem_certificate_and_key_load() {
+        // PEM parsing moved from the deprecated rustls-pemfile to
+        // rustls-pki-types. These two functions had no coverage at all, so the
+        // swap would have been verified only by the code compiling.
+        let cert_path = write("tls_load.crt", TEST_CERT);
+        let key_path = write("tls_load.key", TEST_KEY);
+
+        let certs = load_certs(cert_path.to_str().unwrap()).expect("cert must parse");
+        assert_eq!(certs.len(), 1, "one certificate in the chain");
+        assert!(!certs[0].as_ref().is_empty(), "DER body must be non-empty");
+
+        let key = load_private_key(key_path.to_str().unwrap()).expect("key must parse");
+        assert!(!key.secret_der().is_empty(), "key DER must be non-empty");
+
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+    }
+
+    #[test]
+    fn a_missing_file_is_an_error_not_a_panic() {
+        assert!(load_certs("/nonexistent/recached-test.crt").is_err());
+        assert!(load_private_key("/nonexistent/recached-test.key").is_err());
+    }
+
+    #[test]
+    fn a_file_with_no_pem_content_is_rejected() {
+        // Pointing RECACHED_TLS_CERT at the wrong file must fail loudly rather
+        // than yielding an empty chain that rustls would later reject with a
+        // much less obvious error.
+        let junk = write("tls_junk.crt", "this is not a PEM file\n");
+        assert!(
+            load_certs(junk.to_str().unwrap())
+                .map(|c| c.is_empty())
+                .unwrap_or(true),
+            "non-PEM input must not yield certificates"
+        );
+        let junk_key = write("tls_junk.key", "still not PEM\n");
+        assert!(load_private_key(junk_key.to_str().unwrap()).is_err());
+
+        let _ = std::fs::remove_file(&junk);
+        let _ = std::fs::remove_file(&junk_key);
+    }
+}
+
+#[cfg(test)]
 mod limit_config_tests {
     use super::*;
 
+    /// Serialises the tests in this module.
+    ///
+    /// Environment variables are process-global and `cargo test` runs tests on
+    /// parallel threads, so a test that sets `RECACHED_MAX_*` races any test
+    /// reading the same variable — which is why `set_var` is `unsafe`. This
+    /// surfaced as `compiled_defaults_match_the_documented_values`
+    /// intermittently observing an override (`7`) instead of a default
+    /// (`10_000`): it passed locally and failed in CI purely on thread timing.
+    ///
+    /// Poisoning is ignored deliberately: one failing test must not cascade
+    /// into unrelated failures in the rest of the module.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn env_limit_falls_back_to_the_default() {
+        let _guard = env_guard();
         // Unset, empty, non-numeric, and zero all mean "use the default" —
         // a zero limit would disable the feature rather than tune it.
         assert_eq!(env_limit("RECACHED_DEFINITELY_UNSET_VAR_XYZ", 64), 64);
@@ -7213,6 +7305,7 @@ mod limit_config_tests {
 
     #[test]
     fn env_limit_accepts_a_positive_override() {
+        let _guard = env_guard();
         unsafe { std::env::set_var("RECACHED_TEST_LIMIT_OK", " 256 ") };
         assert_eq!(
             env_limit("RECACHED_TEST_LIMIT_OK", 64),
@@ -7224,6 +7317,7 @@ mod limit_config_tests {
 
     #[test]
     fn overrides_are_read_from_the_documented_variable_names() {
+        let _guard = env_guard();
         // A bulk rename once rewrote these string literals along with the
         // function names, leaving variables like `RECACHED_max_watches_per_conn()`
         // that no operator would ever set — the override silently did nothing.
@@ -7248,6 +7342,7 @@ mod limit_config_tests {
 
     #[test]
     fn compiled_defaults_match_the_documented_values() {
+        let _guard = env_guard();
         // These appear in docs/server/operations.md; drift would mislead
         // operators sizing a deployment.
         assert_eq!(max_multi_queue_len(), 10_000);
