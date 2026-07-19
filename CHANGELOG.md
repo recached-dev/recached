@@ -28,11 +28,50 @@ All notable changes to Recached are documented here.
 - **Capacity and sync metrics.** Seven new series, sampled every 5 seconds because capacity is a
   level rather than an event: `recached_memory_bytes`, `recached_keys`, `recached_evictions_total`,
   `recached_replicas_connected`, `recached_live_queries`, `recached_watched_keys`, and
-  `recached_dedup_clients_tracked`. Previously only traffic was exported, so an operator could not
+  `recached_dedup_clients_tracked`, and `recached_replication_queue_depth`. Previously only traffic
+  was exported, so an operator could not
   answer "am I near the cap?" or "is eviction thrashing?" from a dashboard. Replication *lag* and
   browser outbox depth remain unexported — see [Operations](docs/server/operations.md).
 
 ### Changed
+
+- **Command arguments are moved rather than copied.** `extract_string` built every argument with
+  `from_utf8_lossy(..).into_owned()`, which allocates a fresh `String` and memcpys the payload even
+  when the bytes are already valid UTF-8 — which they nearly always are. Parsing now moves the byte
+  buffer the RESP parser already allocated, so a 1 MB `SET` value costs no copy at all.
+
+  Applied to the commands that actually carry payloads: `SET`, `MSET`, `HSET`/`HMSET`, `APPEND`,
+  `GETSET`, `SETNX`, `JSET`, `JMERGE`, and all 22 bulk argument lists (`RPUSH`, `SADD`, `ZADD`, …).
+  The long tail of small-argument commands still copies; the remaining win there is negligible and
+  the risk of touching 125 parse arms is not.
+
+  Argument slots are consumed, so an arm must read each index once — new tests cover the shapes
+  where that matters (`SET`'s option scan after moving key and value, `MSET`/`HSET` pair splitting,
+  a 1 MB round-trip, and invalid UTF-8 falling back to a lossy re-encode).
+
+  **Not benchmarked.** The gain is a removed allocation and memcpy per argument, which is
+  structural, but the machine available could not produce trustworthy figures — see the
+  [benchmarks](docs/guide/benchmarks) caveat. Re-measure on a quiet host before quoting numbers.
+
+- **Rate-limiter memory is bounded.** A limiter stored one timestamp per attempt, so
+  `RLSET key 100000 3600` held 100 000 `u64`s — roughly 800 KB for a single key, and token-cost
+  limiting (roadmap #9) makes six-figure limits ordinary. Attempts are now counted into 64 buckets,
+  capping a limiter at about 1 KB whatever the limit.
+
+  The trade-off is granularity: the window advances one bucket at a time, so a limiter is exact to
+  within `window / 64`. Attempts are never under-counted — a bucket leaves the window only once it
+  is entirely outside it — so the limiter errs toward rejecting slightly early rather than admitting
+  over the limit. `retry_after_ms` is clamped to the window.
+
+  Limiter *attempt* state is no longer persisted in snapshots (configuration still is). It ages out
+  within a single window and a restart has already interrupted that window, so a restored limiter
+  enforces the same policy from a clean slate rather than a stale partial count.
+
+- **Per-connection limits are configurable** rather than compiled in, because the right value is
+  workload-dependent: `RECACHED_MAX_MULTI_QUEUE`, `RECACHED_MAX_WATCHES_PER_CONN`,
+  `RECACHED_MAX_LIVE_QUERIES`, `RECACHED_MAX_QSUB_INITIAL_KEYS`, and `RECACHED_EVICTION_SAMPLE` (the
+  knob Redis exposes as `maxmemory-samples`). Defaults are unchanged. The browser outbox cap is now
+  settable through `sync-client` rather than fixed at 10 000.
 
 - **Live queries now carry collection values.** `qstate` and `keychange` previously delivered only a
   *type name* for hashes, lists, sets, sorted sets and JSON, so every subscriber had to follow up with

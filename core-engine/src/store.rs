@@ -267,15 +267,29 @@ fn json_approx_size(v: &serde_json::Value) -> usize {
 
 // ── Sliding-window rate limiter (RLSET / RLCHECK) ─────────────────────────────
 
+/// Buckets the sliding window is divided into. Memory per limiter is fixed at
+/// this many `(start, count)` pairs regardless of the configured limit.
+const RL_BUCKETS: u64 = 64;
+
 #[derive(Clone)]
 struct RateLimiterInner {
     limit: u64,
     window_ms: u64,
-    /// Timestamps (ms) of recorded attempts, oldest first. Attempts arrive in
-    /// monotonically non-decreasing time, so the deque stays sorted and window
-    /// pruning is O(pruned) pops from the front — no sorted-set machinery
-    /// needed. Length is bounded by `limit` (denied attempts are not recorded).
-    events: VecDeque<u64>,
+    /// `(bucket_start_ms, attempts)` for buckets inside the window, oldest
+    /// first.
+    ///
+    /// Storing one timestamp per attempt was exact but unbounded in practice:
+    /// a `RLSET key 100000 3600` limiter held 100 000 `u64`s — roughly 800 KB
+    /// for a single key, and token-cost limiting (roadmap #9) makes six-figure
+    /// limits ordinary. Counting into a fixed number of buckets caps a limiter
+    /// at ~1 KB whatever the limit.
+    ///
+    /// The cost is granularity: the window advances one bucket at a time, so a
+    /// limiter is exact to within `window_ms / RL_BUCKETS`. Attempts are never
+    /// under-counted — a bucket only leaves the window once it is entirely
+    /// outside it — so the limiter errs toward rejecting slightly early rather
+    /// than admitting over the limit.
+    buckets: VecDeque<(u64, u64)>,
 }
 
 impl RateLimiterInner {
@@ -283,28 +297,50 @@ impl RateLimiterInner {
         Self {
             limit,
             window_ms,
-            events: VecDeque::new(),
+            buckets: VecDeque::new(),
         }
+    }
+
+    /// Width of one bucket, at least 1 ms.
+    fn bucket_ms(&self) -> u64 {
+        (self.window_ms / RL_BUCKETS).max(1)
     }
 
     /// Record an attempt at `now`, returning `(allowed, remaining, retry_after_ms)`.
     /// Denied attempts are not recorded — a client hammering a full limiter
     /// does not push its own recovery further away.
     fn check(&mut self, now: u64) -> (i64, u64, u64) {
+        let width = self.bucket_ms();
         let cutoff = now.saturating_sub(self.window_ms);
-        while self.events.front().is_some_and(|&t| t <= cutoff) {
-            self.events.pop_front();
+        // A bucket leaves the window only once its whole span is behind the
+        // cutoff, so attempts are never dropped early.
+        while self
+            .buckets
+            .front()
+            .is_some_and(|&(start, _)| start + width <= cutoff)
+        {
+            self.buckets.pop_front();
         }
-        if (self.events.len() as u64) < self.limit {
-            self.events.push_back(now);
-            let remaining = self.limit - self.events.len() as u64;
-            (1, remaining, 0)
+
+        let used: u64 = self.buckets.iter().map(|&(_, c)| c).sum();
+        if used < self.limit {
+            let current = now - (now % width);
+            match self.buckets.back_mut() {
+                Some((start, count)) if *start == current => *count += 1,
+                _ => self.buckets.push_back((current, 1)),
+            }
+            (1, self.limit - used - 1, 0)
         } else {
+            // Recovery arrives when the oldest bucket falls out of the window.
             let retry_after = self
-                .events
+                .buckets
                 .front()
-                .map(|&t| (t + self.window_ms).saturating_sub(now))
-                .unwrap_or(0);
+                .map(|&(start, _)| (start + width + self.window_ms).saturating_sub(now))
+                .unwrap_or(0)
+                // A bucket spans forward from its start, so the raw figure can
+                // land a fraction past the window. The wait never legitimately
+                // exceeds one window.
+                .min(self.window_ms);
             (0, 0, retry_after)
         }
     }
@@ -510,6 +546,12 @@ pub struct KeyValueStore {
     max_memory_bytes: Option<usize>,
     eviction_policy: EvictionPolicy,
     dirty: Arc<AtomicU64>,
+    /// Keys sampled per eviction pass. Approximate-LRU quality rises with the
+    /// sample and so does the cost, so the right value is workload-dependent —
+    /// Redis exposes the same knob as `maxmemory-samples`. Configured rather
+    /// than read from the environment because this crate also runs in the
+    /// browser, where there is no environment to read.
+    eviction_sample: usize,
     /// Total keys evicted since start. Exported as a metric: without it an
     /// operator cannot tell a healthy cache from one thrashing at its cap.
     evicted: Arc<AtomicU64>,
@@ -529,6 +571,7 @@ impl KeyValueStore {
             max_memory_bytes: None,
             eviction_policy: EvictionPolicy::NoEviction,
             dirty: Arc::new(AtomicU64::new(0)),
+            eviction_sample: 10,
             evicted: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -540,6 +583,7 @@ impl KeyValueStore {
             max_memory_bytes: None,
             eviction_policy: EvictionPolicy::NoEviction,
             dirty: Arc::new(AtomicU64::new(0)),
+            eviction_sample: 10,
             evicted: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -555,6 +599,7 @@ impl KeyValueStore {
             max_memory_bytes,
             eviction_policy,
             dirty: Arc::new(AtomicU64::new(0)),
+            eviction_sample: 10,
             evicted: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -720,6 +765,14 @@ impl KeyValueStore {
 
     /// Evict a single entry per the configured policy. Returns the number of
     /// bytes freed (`Some`), or `None` if nothing could be evicted.
+    /// Set how many keys each eviction pass samples (default 10, minimum 1).
+    ///
+    /// A larger sample approximates true LRU/TTL ordering more closely at the
+    /// cost of more work per eviction.
+    pub fn set_eviction_sample(&mut self, sample: usize) {
+        self.eviction_sample = sample.max(1);
+    }
+
     /// Keys evicted since start.
     pub fn evicted_count(&self) -> u64 {
         self.evicted.load(Ordering::Relaxed)
@@ -735,7 +788,7 @@ impl KeyValueStore {
     }
 
     fn evict_one(&self, now: u64) -> Option<usize> {
-        const SAMPLE: usize = 10;
+        let sample = self.eviction_sample;
         let mut rng = rand::rng();
         let chosen: Option<String> = match self.eviction_policy {
             EvictionPolicy::NoEviction => None,
@@ -749,7 +802,7 @@ impl KeyValueStore {
                             r.value().last_access_ms.load(Ordering::Relaxed),
                         )
                     })
-                    .choose_multiple(&mut rng, SAMPLE);
+                    .choose_multiple(&mut rng, sample);
                 sample.into_iter().min_by_key(|(_, w)| *w).map(|(k, _)| k)
             }
             EvictionPolicy::AllKeysRandom => {
@@ -766,7 +819,7 @@ impl KeyValueStore {
                             r.value().last_access_ms.load(Ordering::Relaxed),
                         )
                     })
-                    .choose_multiple(&mut rng, SAMPLE);
+                    .choose_multiple(&mut rng, sample);
                 sample.into_iter().min_by_key(|(_, w)| *w).map(|(k, _)| k)
             }
             EvictionPolicy::VolatileTtl => {
@@ -781,7 +834,7 @@ impl KeyValueStore {
                             Some((r.key().clone(), exp))
                         }
                     })
-                    .choose_multiple(&mut rng, SAMPLE);
+                    .choose_multiple(&mut rng, sample);
                 sample
                     .into_iter()
                     .min_by_key(|(_, exp)| *exp)
@@ -813,10 +866,14 @@ impl KeyValueStore {
                     EntryValue::ZSet(z) => {
                         SnapshotValue::ZSet(z.scores.iter().map(|(k, &v)| (k.clone(), v)).collect())
                     }
+                    // Attempt counts are deliberately not persisted: they age
+                    // out within a single window, and a restart has already
+                    // interrupted that window. Only the configuration is
+                    // restored. The field remains for snapshot compatibility.
                     EntryValue::RateLimiter(rl) => SnapshotValue::RateLimiter {
                         limit: rl.limit,
                         window_ms: rl.window_ms,
-                        events: rl.events.iter().copied().collect(),
+                        events: Vec::new(),
                     },
                     EntryValue::Json(doc) => {
                         SnapshotValue::Json(serde_json::to_string(doc).unwrap_or_default())
@@ -851,11 +908,14 @@ impl KeyValueStore {
                     limit,
                     window_ms,
                     events,
-                } => EntryValue::RateLimiter(RateLimiterInner {
-                    limit,
-                    window_ms,
-                    events: events.into(),
-                }),
+                } => {
+                    let _ = events; // older snapshots carried attempt timestamps
+                    EntryValue::RateLimiter(RateLimiterInner {
+                        limit,
+                        window_ms,
+                        buckets: VecDeque::new(),
+                    })
+                }
                 SnapshotValue::Json(s) => {
                     EntryValue::Json(serde_json::from_str(&s).unwrap_or(serde_json::Value::Null))
                 }
@@ -2532,7 +2592,7 @@ fn entry_size(key: &str, e: &Entry) -> usize {
         EntryValue::List(l) => l.iter().map(|s| s.len()).sum(),
         EntryValue::Set(s) => s.iter().map(|m| m.len()).sum::<usize>(),
         EntryValue::ZSet(z) => z.scores.keys().map(|m| m.len() + 8).sum(),
-        EntryValue::RateLimiter(rl) => rl.events.len() * 8 + 16,
+        EntryValue::RateLimiter(rl) => rl.buckets.len() * 16 + 16,
         EntryValue::Json(doc) => json_approx_size(doc),
     };
     key.len() + val_size + 64
@@ -4225,17 +4285,26 @@ mod tests {
     }
 
     #[test]
-    fn rl_snapshot_roundtrip_preserves_state() {
+    fn rl_snapshot_preserves_config_but_not_attempt_state() {
+        // Attempt counts are transient: they age out within one window, and a
+        // restart has already interrupted that window. Only the configuration
+        // is restored, so a limiter comes back enforcing the same policy with a
+        // clean slate rather than a stale partial count.
         let s = store();
-        s.execute(Command::RlSet("api".into(), 2, 60));
-        rl(s.execute(Command::RlCheck("api".into(), None)));
-        rl(s.execute(Command::RlCheck("api".into(), None)));
+        s.execute(Command::RlSet("api".into(), 3, 60));
+        s.execute(Command::RlCheck("api".into(), None));
+        s.execute(Command::RlCheck("api".into(), None));
 
-        let s2 = store();
-        s2.restore(s.snapshot());
-        let (allowed, remaining, retry) = rl(s2.execute(Command::RlCheck("api".into(), None)));
-        assert_eq!((allowed, remaining), (0, 0));
-        assert!(retry > 0);
+        let restored = store();
+        restored.restore(s.snapshot());
+
+        // Config survived: still a 3-per-60s limiter.
+        let (allowed, remaining, _) = rl(restored.execute(Command::RlCheck("api".into(), None)));
+        assert_eq!(allowed, 1);
+        assert_eq!(
+            remaining, 2,
+            "attempts reset on restore — the limiter enforces the same policy afresh"
+        );
     }
 
     // ── JSON (JSET / JGET / JMERGE) ───────────────────────────────────────────
@@ -5461,5 +5530,106 @@ mod metrics_tests {
             SetOptions::default(),
         ));
         assert!(s.approximate_memory_bytes() >= empty + 4096);
+    }
+}
+
+#[cfg(test)]
+mod rate_limiter_memory_tests {
+    use super::*;
+    use crate::cmd::Command;
+
+    fn rl(v: Value) -> (i64, u64, u64) {
+        match v {
+            Value::Array(Some(items)) => match (&items[0], &items[1], &items[2]) {
+                (Value::Integer(a), Value::Integer(r), Value::Integer(w)) => {
+                    (*a, *r as u64, *w as u64)
+                }
+                _ => panic!("unexpected RLCHECK reply shape"),
+            },
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_is_bounded_regardless_of_limit() {
+        // The reason for bucketing: one timestamp per attempt meant ~800 KB for
+        // a single `RLSET key 100000 3600` limiter. Buckets cap it at ~1 KB.
+        let s = KeyValueStore::new();
+        s.execute(Command::RlSet("big".into(), 100_000, 3600));
+        for _ in 0..5_000 {
+            s.execute(Command::RlCheck("big".into(), None));
+        }
+        let bytes = s.approximate_memory_bytes();
+        assert!(
+            bytes < 4_096,
+            "5000 attempts against a 100k limiter should stay small, got {bytes} bytes"
+        );
+    }
+
+    #[test]
+    fn a_high_limit_still_admits_every_attempt_under_it() {
+        // Bounding memory must not bound throughput.
+        let s = KeyValueStore::new();
+        s.execute(Command::RlSet("api".into(), 10_000, 3600));
+        for i in 0..2_000 {
+            let (allowed, _, _) = rl(s.execute(Command::RlCheck("api".into(), None)));
+            assert_eq!(allowed, 1, "attempt {i} should be allowed");
+        }
+    }
+
+    #[test]
+    fn the_limit_is_still_enforced_exactly_at_the_boundary() {
+        // Bucketing approximates *when* attempts age out, never *how many* are
+        // counted inside the window.
+        let s = KeyValueStore::new();
+        s.execute(Command::RlSet("api".into(), 5, 60));
+        for expected in [4, 3, 2, 1, 0] {
+            let (allowed, remaining, retry) = rl(s.execute(Command::RlCheck("api".into(), None)));
+            assert_eq!(allowed, 1);
+            assert_eq!(remaining, expected);
+            assert_eq!(retry, 0);
+        }
+        let (allowed, remaining, retry) = rl(s.execute(Command::RlCheck("api".into(), None)));
+        assert_eq!(allowed, 0, "the 6th attempt against a limit of 5 is denied");
+        assert_eq!(remaining, 0);
+        assert!(retry > 0, "a denied attempt must say when to retry");
+    }
+
+    #[test]
+    fn retry_after_never_exceeds_the_window() {
+        // Retry-After is handed straight to HTTP clients; a value past the
+        // window would park them longer than the policy requires.
+        let s = KeyValueStore::new();
+        s.execute(Command::RlSet("api".into(), 1, 60));
+        s.execute(Command::RlCheck("api".into(), None));
+        let (_, _, retry) = rl(s.execute(Command::RlCheck("api".into(), None)));
+        assert!(
+            retry > 0 && retry <= 60_000,
+            "retry_after_ms = {retry}, window is 60000"
+        );
+    }
+
+    #[test]
+    fn the_shortest_window_recovers_after_it_elapses() {
+        // RLSET takes the window in *seconds*, so one second is the floor. At
+        // that width each bucket is ~15 ms; the bucket-width floor of 1 ms
+        // exists so an even shorter window could never divide to zero.
+        let s = KeyValueStore::new();
+        s.execute(Command::RlSet("fast".into(), 2, 1));
+        assert_eq!(rl(s.execute(Command::RlCheck("fast".into(), None))).0, 1);
+        assert_eq!(rl(s.execute(Command::RlCheck("fast".into(), None))).0, 1);
+        assert_eq!(
+            rl(s.execute(Command::RlCheck("fast".into(), None))).0,
+            0,
+            "third attempt against a limit of 2 is denied"
+        );
+
+        // Past the window the limiter admits traffic again.
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        assert_eq!(
+            rl(s.execute(Command::RlCheck("fast".into(), None))).0,
+            1,
+            "buckets older than the window must age out"
+        );
     }
 }

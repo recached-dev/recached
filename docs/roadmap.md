@@ -4,19 +4,11 @@ Recached competes on **where the data can live** — the same engine on the serv
 
 ## Near-term
 
-**[Byte-slice command arguments](#performance)** is the one substantial piece left in the hardening
-list, and the main remaining lever on unpipelined latency. It is a large mechanical refactor — 125
-parse arms, ~210 argument extractions — and its payoff needs a quiet machine to measure, so it wants
-its own focused pass rather than being folded into a release alongside other work.
-
-After that, in order:
-
-1. **[Replication lag](#operability)** — replica *count* is exported, but not how far behind each one
-   is, which is the signal that matters before a failover.
-2. **[Bound rate-limiter memory](#operability)** — one timestamp per attempt means ~800 KB for a
-   single `RLSET key 100000 3600` limiter.
-3. **[Make the compiled-in limits configurable](#operability)** — outbox size, live queries per
-   connection, eviction sample size.
+1. **[Replication offset acknowledgement](#operability)** — replicas do not report an applied
+   offset, so true lag cannot be computed. Queue depth is exported as a proxy today.
+2. **[Binary-safe WebSocket values](#ongoing-drop-in-credibility)** — values over WS are UTF-8 and
+   therefore lossy for raw bytes; binary frames would make the two transports equivalent.
+3. **[RESP3](#ongoing-drop-in-credibility)** — push protocol support on the TCP port.
 
 ---
 
@@ -79,33 +71,16 @@ Under consideration behind these: a CRDT text type for collaborative editing (li
 Improvements to shipped functionality rather than new surface. Unnumbered because they are small and
 independent — pick them off in any order.
 
-### Reliability
-
-### Live queries
-
 ### Performance
 
-Both of these are diagnosed on the [benchmarks](/guide/benchmarks) page; the analysis is done, the
-work is not.
-
-**Byte-slice command arguments.** RESP parsing allocates a `String` per argument. This is the main
-remaining lever on unpipelined latency and the likeliest explanation for `HSET` sitting at ~46 % of
-Redis while *beating* it pipelined.
-
 **Serialize `LRANGE` straight from the store**, instead of building the full reply `Value` first.
+Diagnosed on the [benchmarks](/guide/benchmarks) page.
 
 ### Operability
 
-**Replication lag.** The number of connected replicas is exported, but not how far behind each one
-is — the signal that actually matters before a failover.
-
-**Make the compiled-in limits configurable.** The 10 000-write outbox, 64 live queries per
-connection, and eviction's fixed 10-key sample are all constants. Redis exposes `maxmemory-samples`
-for the same reason: the right value is workload-dependent.
-
-**Bound rate-limiter memory.** The limiter stores one timestamp per attempt, so `RLSET key 100000
-3600` holds 100 000 `u64`s — roughly 800 KB for a single key. The cost-weighted rework in
-[#9](#_9-token-cost-rate-limiting) is the natural moment to move to bucketed counts.
+**Replication offset acknowledgement.** Replicas do not report an applied offset, so true lag cannot
+be computed — `recached_replication_queue_depth` is exported as a proxy. Closing this means a small
+protocol addition: replicas periodically reporting how far they have applied.
 
 ### Security
 

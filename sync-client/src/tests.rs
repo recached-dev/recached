@@ -743,3 +743,36 @@ fn flushdb_sentinel_is_harmless_when_nothing_matches() {
     c.handle_frame("*3\r\n$9\r\nkeychange\r\n$6\r\ncart:*\r\n$-1\r\n");
     assert_eq!(c.store().execute(Command::DbSize), Value::Integer(0));
 }
+
+// ── Configurable outbox cap ───────────────────────────────────────────────────
+
+#[test]
+fn outbox_cap_defaults_to_the_documented_limit() {
+    assert_eq!(client().max_pending(), MAX_PENDING_WRITES);
+}
+
+#[test]
+fn a_lower_cap_evicts_sooner() {
+    // The right depth depends on how long a client may be offline and how large
+    // its writes are, so it is configurable rather than fixed.
+    let mut c = client();
+    c.set_max_pending(3);
+    for i in 0..3 {
+        let e = c.enqueue_write(&to_resp(&["SET", &format!("k{i}"), "v"]), true, false);
+        assert!(e.dropped.is_none(), "within the cap, nothing is evicted");
+    }
+    let e = c.enqueue_write(&to_resp(&["SET", "k3", "v"]), true, false);
+    assert!(e.dropped.is_some(), "past the cap the oldest is evicted");
+    assert_eq!(c.outbox_len(), 3, "depth stays at the cap");
+}
+
+#[test]
+fn a_cap_of_zero_is_clamped_to_one() {
+    // A zero cap would discard every write immediately; clamp rather than
+    // silently break the client.
+    let mut c = client();
+    c.set_max_pending(0);
+    assert_eq!(c.max_pending(), 1);
+    c.enqueue_write(&to_resp(&["SET", "k", "v"]), true, false);
+    assert_eq!(c.outbox_len(), 1);
+}

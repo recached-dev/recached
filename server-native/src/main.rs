@@ -338,12 +338,42 @@ fn load_tls_acceptor() -> Option<TlsAcceptor> {
 
 const TCP_READ_BUFFER_BYTES: usize = 16 * 1024; // 16 KB — matches Redis default
 const MAX_TCP_READ_BUFFER_BYTES: usize = 64 * 1024 * 1024; // 64 MB per connection
-const MAX_MULTI_QUEUE_LEN: usize = 10_000;
-const MAX_WATCHES_PER_CONN: usize = 1_024;
-const MAX_QSUBS_PER_CONN: usize = 64;
+/// Per-connection limits. Compiled-in defaults, overridable at startup because
+/// the right value is workload-dependent — Redis exposes `maxmemory-samples`
+/// for the same reason. Read once and cached; changing one needs a restart.
+fn env_limit(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
+}
+
+/// Commands queued inside one `MULTI`. Override: `RECACHED_MAX_MULTI_QUEUE`.
+fn max_multi_queue_len() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_limit("RECACHED_MAX_MULTI_QUEUE", 10_000))
+}
+
+/// Keys one connection may `WATCH`. Override: `RECACHED_MAX_WATCHES_PER_CONN`.
+fn max_watches_per_conn() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_limit("RECACHED_MAX_WATCHES_PER_CONN", 1_024))
+}
+
+/// Live queries one connection may hold. Override: `RECACHED_MAX_LIVE_QUERIES`.
+fn max_qsubs_per_conn() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_limit("RECACHED_MAX_LIVE_QUERIES", 64))
+}
 /// Cap on the number of key/value pairs returned as QSUB initial state, so a
 /// pattern matching a huge keyspace cannot produce an unbounded reply frame.
-const MAX_QSUB_INITIAL_KEYS: usize = 10_000;
+/// Keys returned in a live query's initial state.
+/// Override: `RECACHED_MAX_QSUB_INITIAL_KEYS`.
+fn max_qsub_initial_keys() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_limit("RECACHED_MAX_QSUB_INITIAL_KEYS", 10_000))
+}
 const BROADCAST_CHANNEL_CAPACITY: usize = 512;
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 const MAX_AUTH_FAILURES: u32 = 5;
@@ -566,6 +596,22 @@ struct ReplHub {
 }
 
 impl ReplHub {
+    /// Deepest send queue across connected replicas, in frames.
+    ///
+    /// Replication is fire-and-forget — replicas never acknowledge an applied
+    /// offset — so true offset lag is not observable without a protocol change.
+    /// Queue depth is the honest proxy available today: a replica that cannot
+    /// keep up backs its channel up, and a queue at capacity means frames are
+    /// about to be dropped.
+    async fn max_queue_depth(&self) -> usize {
+        let senders = self.senders.lock().await;
+        senders
+            .iter()
+            .map(|tx| tx.max_capacity().saturating_sub(tx.capacity()))
+            .max()
+            .unwrap_or(0)
+    }
+
     fn new() -> ReplRegistry {
         Arc::new(ReplHub {
             senders: tokio::sync::Mutex::new(Vec::new()),
@@ -2372,11 +2418,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let store = Arc::new(KeyValueStore::with_config(
-        max_keys,
-        max_memory_bytes,
-        eviction_policy,
-    ));
+    let mut store_inner = KeyValueStore::with_config(max_keys, max_memory_bytes, eviction_policy);
+    // Eviction sample size — the knob Redis exposes as `maxmemory-samples`.
+    // Configured before the store is shared, so no interior mutability is needed.
+    store_inner.set_eviction_sample(env_limit("RECACHED_EVICTION_SAMPLE", 10));
+    let store = Arc::new(store_inner);
 
     // ── snapshot persistence ──────────────────────────────────────────────
     let save_path = PathBuf::from(
@@ -2626,6 +2672,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 counter!("recached_evictions_total").absolute(store_m.evicted_count());
                 gauge!("recached_replicas_connected")
                     .set(state_m.replicas.count.load(Ordering::Relaxed) as f64);
+                gauge!("recached_replication_queue_depth")
+                    .set(state_m.replicas.max_queue_depth().await as f64);
                 gauge!("recached_live_queries")
                     .set(registry_m.watched_patterns.load(Ordering::Relaxed) as f64);
                 gauge!("recached_watched_keys")
@@ -2967,7 +3015,7 @@ async fn handle_tcp<S>(
                                                 if writer.write_all(err).await.is_err() { break 'outer; }
                                             }
                                             _ => {
-                                                if queue.len() >= MAX_MULTI_QUEUE_LEN {
+                                                if queue.len() >= max_multi_queue_len() {
                                                     let err = b"-ERR transaction queue limit reached\r\n";
                                                     if writer.write_all(err).await.is_err() { break 'outer; }
                                                 } else {
@@ -3041,7 +3089,7 @@ async fn handle_tcp<S>(
 
                                         Command::Watch(keys) => {
                                             let new_count = keys.iter().filter(|k| !watched_keys.contains(*k)).count();
-                                            if watched_keys.len() + new_count > MAX_WATCHES_PER_CONN {
+                                            if watched_keys.len() + new_count > max_watches_per_conn() {
                                                 if writer.write_all(b"-ERR watch limit per connection reached\r\n").await.is_err() { break 'outer; }
                                             } else {
                                                 {
@@ -3411,7 +3459,7 @@ async fn handle_ws<S>(
                                     ws_send!(b"-ERR Command not allowed inside a transaction\r\n");
                                 }
                                 _ => {
-                                    if queue.len() >= MAX_MULTI_QUEUE_LEN {
+                                    if queue.len() >= max_multi_queue_len() {
                                         ws_send!(b"-ERR transaction queue limit reached\r\n");
                                     } else {
                                         queue.push(cmd);
@@ -3480,7 +3528,7 @@ async fn handle_ws<S>(
                                     .iter()
                                     .filter(|k| !watched_keys.contains(*k))
                                     .count();
-                                if watched_keys.len() + new_count > MAX_WATCHES_PER_CONN {
+                                if watched_keys.len() + new_count > max_watches_per_conn() {
                                     ws_send!(b"-ERR watch limit per connection reached\r\n");
                                 } else {
                                     {
@@ -3542,7 +3590,7 @@ async fn handle_ws<S>(
                                     }
                                 }
                                 if !qsub_patterns.contains(&pattern)
-                                    && qsub_patterns.len() >= MAX_QSUBS_PER_CONN
+                                    && qsub_patterns.len() >= max_qsubs_per_conn()
                                 {
                                     ws_send!(b"-ERR live query limit per connection reached\r\n");
                                     continue 'outer;
@@ -3558,7 +3606,7 @@ async fn handle_ws<S>(
                                         .push((conn_id, q_tx.clone()));
                                     watch_registry.sync_patterns_len(&pats);
                                 }
-                                let kvs = store.matching_key_values(&pattern, MAX_QSUB_INITIAL_KEYS);
+                                let kvs = store.matching_key_values(&pattern, max_qsub_initial_keys());
                                 // Tagged reply so clients can recognise it among
                                 // interleaved frames: ["qstate", pattern, k, v, ...]
                                 let mut items = Vec::with_capacity(kvs.len() * 2 + 2);
@@ -6449,5 +6497,67 @@ mod tests {
         assert_eq!(writer.cmd(&["SET", "cart:42:item", "x"]).await, ok());
         let (key, _) = client.recv_keychange(1000).await.expect("scoped diff");
         assert_eq!(key, "cart:42:item");
+    }
+}
+
+#[cfg(test)]
+mod limit_config_tests {
+    use super::*;
+
+    #[test]
+    fn env_limit_falls_back_to_the_default() {
+        // Unset, empty, non-numeric, and zero all mean "use the default" —
+        // a zero limit would disable the feature rather than tune it.
+        assert_eq!(env_limit("RECACHED_DEFINITELY_UNSET_VAR_XYZ", 64), 64);
+        for bad in ["", "  ", "abc", "0", "-5", "1.5"] {
+            unsafe { std::env::set_var("RECACHED_TEST_LIMIT", bad) };
+            assert_eq!(env_limit("RECACHED_TEST_LIMIT", 64), 64, "input {bad:?}");
+        }
+        unsafe { std::env::remove_var("RECACHED_TEST_LIMIT") };
+    }
+
+    #[test]
+    fn env_limit_accepts_a_positive_override() {
+        unsafe { std::env::set_var("RECACHED_TEST_LIMIT_OK", " 256 ") };
+        assert_eq!(
+            env_limit("RECACHED_TEST_LIMIT_OK", 64),
+            256,
+            "whitespace tolerated"
+        );
+        unsafe { std::env::remove_var("RECACHED_TEST_LIMIT_OK") };
+    }
+
+    #[test]
+    fn overrides_are_read_from_the_documented_variable_names() {
+        // A bulk rename once rewrote these string literals along with the
+        // function names, leaving variables like `RECACHED_max_watches_per_conn()`
+        // that no operator would ever set — the override silently did nothing.
+        // Assert the names the docs promise.
+        for (var, default) in [
+            ("RECACHED_MAX_MULTI_QUEUE", 10_000usize),
+            ("RECACHED_MAX_WATCHES_PER_CONN", 1_024),
+            ("RECACHED_MAX_LIVE_QUERIES", 64),
+            ("RECACHED_MAX_QSUB_INITIAL_KEYS", 10_000),
+            ("RECACHED_EVICTION_SAMPLE", 10),
+        ] {
+            assert!(
+                var.chars()
+                    .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit()),
+                "{var} is not a plausible environment variable name"
+            );
+            unsafe { std::env::set_var(var, "7") };
+            assert_eq!(env_limit(var, default), 7, "{var} override ignored");
+            unsafe { std::env::remove_var(var) };
+        }
+    }
+
+    #[test]
+    fn compiled_defaults_match_the_documented_values() {
+        // These appear in docs/server/operations.md; drift would mislead
+        // operators sizing a deployment.
+        assert_eq!(max_multi_queue_len(), 10_000);
+        assert_eq!(max_watches_per_conn(), 1_024);
+        assert_eq!(max_qsubs_per_conn(), 64);
+        assert_eq!(max_qsub_initial_keys(), 10_000);
     }
 }

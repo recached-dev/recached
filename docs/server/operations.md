@@ -48,11 +48,14 @@ Sampled every 5 seconds, because these are levels rather than events.
 | `recached_live_queries` | gauge | Registered `QSUB` patterns across all connections. |
 | `recached_watched_keys` | gauge | Keys under `WATCH`. |
 | `recached_dedup_clients_tracked` | gauge | Clients with exactly-once bookkeeping in memory. |
+| `recached_replication_queue_depth` | gauge | Deepest replica send queue, in frames. Replicas never acknowledge an applied offset, so true lag is not observable — a backing-up queue is the available signal that one cannot keep up. |
 
 ### What is still not exported
 
-- **Replication lag.** Replica connection count is exported, but not how far behind each one is.
-- **Client outbox depth.** That state lives in the browser, not the server.
+- **True replication offset lag.** Replicas do not report an applied offset, so the server cannot
+  compute how far behind one is. `recached_replication_queue_depth` is the available proxy.
+- **Client outbox depth.** That state lives in the browser — read it there with
+  `cache.pendingWrites()`.
 
 ## Useful queries
 
@@ -119,17 +122,18 @@ healthy — they are separate listeners. Probe the cache port.
 Hard limits compiled into the server. Exceeding them produces errors rather than degradation, so it
 is worth knowing where the walls are:
 
-| Limit | Value | Configurable |
+| Limit | Default | Configurable |
 |---|---|---|
 | Max connections | 1024 | `RECACHED_MAX_CONNECTIONS` |
 | Consecutive auth failures before disconnect | 5 | No |
 | Read buffer per TCP connection | 64 MB | No |
-| Queued commands per `MULTI` | 10,000 | No |
-| `WATCH`ed keys per connection | 1,024 | No |
-| Live queries (`QSUB`) per connection | 64 | No |
-| Keys returned in a live query's initial state | 10,000 | No |
+| Queued commands per `MULTI` | 10,000 | `RECACHED_MAX_MULTI_QUEUE` |
+| `WATCH`ed keys per connection | 1,024 | `RECACHED_MAX_WATCHES_PER_CONN` |
+| Live queries (`QSUB`) per connection | 64 | `RECACHED_MAX_LIVE_QUERIES` |
+| Keys returned in a live query's initial state | 10,000 | `RECACHED_MAX_QSUB_INITIAL_KEYS` |
+| Keys sampled per eviction pass | 10 | `RECACHED_EVICTION_SAMPLE` |
 | Replication frame | 512 MB | No |
-| Client outbox (browser, offline writes) | 10,000 writes | No |
+| Client outbox (browser, offline writes) | 10,000 writes | via `sync-client` |
 
 The keyspace cap (`RECACHED_MAX_KEYS`) and memory cap (`RECACHED_MAX_MEMORY`) are configured rather
 than compiled — see [Configuration](/server/configuration#environment-variable-reference).

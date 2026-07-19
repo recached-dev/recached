@@ -93,6 +93,10 @@ pub struct SyncClient {
     sync_scopes_csv: Option<String>,
     live_queries: Vec<String>,
     attempts: u32,
+    /// Cap on queued-but-unacknowledged writes. Beyond it the oldest is
+    /// evicted. Configurable because the right depth depends on how long a
+    /// client is expected to be offline and how large its writes are.
+    max_pending: usize,
     /// Jitter source for reconnect backoff. Seeded from `client_id` rather than
     /// a system RNG so this crate stays dependency-free and I/O-free — and so
     /// the sequence is reproducible in tests. Different clients get different
@@ -115,6 +119,7 @@ impl SyncClient {
             sync_scopes_csv: None,
             live_queries: Vec::new(),
             attempts: 0,
+            max_pending: MAX_PENDING_WRITES,
             jitter,
         }
     }
@@ -125,6 +130,17 @@ impl SyncClient {
 
     pub fn client_id(&self) -> &str {
         &self.client_id
+    }
+
+    /// Set the outbox cap (minimum 1). Writes past it evict the oldest, which
+    /// is reported through the adapter's overflow callback.
+    pub fn set_max_pending(&mut self, max: usize) {
+        self.max_pending = max.max(1);
+    }
+
+    /// Current outbox cap.
+    pub fn max_pending(&self) -> usize {
+        self.max_pending
     }
 
     pub fn epoch(&self) -> u32 {
@@ -290,7 +306,7 @@ impl SyncClient {
         } else {
             encoded.to_string()
         };
-        let dropped = if self.outbox.len() >= MAX_PENDING_WRITES {
+        let dropped = if self.outbox.len() >= self.max_pending {
             self.outbox.pop_front().map(|(old, _)| old)
         } else {
             None
