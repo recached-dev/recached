@@ -1681,6 +1681,42 @@ async fn notify_watchers(registry: &WatchRegistry, cmd: &Command, store: &KeyVal
     }
 }
 
+/// Announce a `FLUSHDB` to live queries.
+///
+/// Emitting a keychange per deleted key would mean one frame per key in the
+/// keyspace — potentially millions — for a single command. Instead each
+/// registered pattern receives one sentinel, delivered as a keychange whose key
+/// is the pattern and whose value is nil. Subscribers treat it as "every key
+/// matching this pattern is gone", which is exactly what happened, at O(patterns)
+/// instead of O(keys).
+///
+/// Explicitly `WATCH`ed keys are notified individually — that set is bounded by
+/// the connection limit and callers expect per-key precision there.
+async fn notify_flushdb(registry: &WatchRegistry, watched_before: Vec<String>) {
+    if registry.watched_keys.load(Ordering::Relaxed) > 0 && !watched_before.is_empty() {
+        let mut reg = registry.map.lock().await;
+        for key in &watched_before {
+            if let Some(subs) = reg.get_mut(key) {
+                subs.retain(|(_, tx)| tx.send((key.clone(), Value::BulkString(None))).is_ok());
+            }
+        }
+        registry.sync_len(&reg);
+    }
+    if registry.watched_patterns.load(Ordering::Relaxed) > 0 {
+        let mut pats = registry.patterns.lock().await;
+        let mut emptied = false;
+        for (pattern, subs) in pats.iter_mut() {
+            let sentinel = pattern.clone();
+            subs.retain(|(_, tx)| tx.send((sentinel.clone(), Value::BulkString(None))).is_ok());
+            emptied |= subs.is_empty();
+        }
+        if emptied {
+            pats.retain(|_, subs| !subs.is_empty());
+        }
+        registry.sync_patterns_len(&pats);
+    }
+}
+
 /// Drop all of `conn_id`'s live-query subscriptions. Called on QUNSUB (all
 /// form) and on connection close.
 async fn unregister_all_qsubs(
@@ -1729,7 +1765,17 @@ async fn apply_write_effects(
         state.on_write(&msg).await;
     }
     if has_watch {
-        notify_watchers(watch_registry, cmd, store).await;
+        if matches!(cmd, Command::FlushDb) {
+            // primary_keys() is empty for FLUSHDB, so the generic notifier has
+            // nothing to announce — subscribers would silently miss the wipe.
+            let watched: Vec<String> = {
+                let reg = watch_registry.map.lock().await;
+                reg.keys().cloned().collect()
+            };
+            notify_flushdb(watch_registry, watched).await;
+        } else {
+            notify_watchers(watch_registry, cmd, store).await;
+        }
     }
     if has_ws {
         let _ = tx.send(Arc::new(SyncPush {
@@ -4362,6 +4408,70 @@ mod tests {
         assert!(!srv.state.is_replica());
     }
 
+    // ── FLUSHDB reaches live queries ──────────────────────────────────────────
+
+    /// Collect every frame arriving within `ms`, so a test can assert on the
+    /// keychange among the command-replay pushes that travel alongside it.
+    async fn drain_frames(c: &mut WsClient, ms: u64) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Some(f) = c.recv_any(ms).await {
+            out.push(f);
+        }
+        out
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flushdb_notifies_live_query_subscribers() {
+        // Previously FLUSHDB emitted nothing to live queries: primary_keys() is
+        // empty for it, so subscribers kept serving data the server had wiped.
+        let srv = spawn_ws_server().await;
+        let mut watcher = WsClient::connect(srv.tcp_addr).await;
+        watcher.cmd(&["QSUB", "cart:*"]).await;
+
+        let mut writer = WsClient::connect(srv.tcp_addr).await;
+        writer.cmd(&["SET", "cart:item:1", "a"]).await;
+        drain_frames(&mut watcher, 400).await;
+
+        writer.cmd(&["FLUSHDB"]).await;
+
+        let frames = drain_frames(&mut watcher, 800).await;
+        assert!(
+            frames
+                .iter()
+                .any(|f| f.contains("keychange") && f.contains("cart:*")),
+            "expected a keychange sentinel naming the pattern, got: {frames:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flushdb_sends_one_sentinel_per_pattern_not_per_key() {
+        // The reason for a sentinel: announcing per key would be one frame per
+        // key in the keyspace for a single command.
+        let srv = spawn_ws_server().await;
+        let mut watcher = WsClient::connect(srv.tcp_addr).await;
+        watcher.cmd(&["QSUB", "bulk:*"]).await;
+
+        let mut writer = WsClient::connect(srv.tcp_addr).await;
+        for i in 0..25 {
+            writer.cmd(&["SET", &format!("bulk:{i}"), "v"]).await;
+        }
+        drain_frames(&mut watcher, 500).await;
+
+        writer.cmd(&["FLUSHDB"]).await;
+
+        let keychanges: Vec<String> = drain_frames(&mut watcher, 800)
+            .await
+            .into_iter()
+            .filter(|f| f.contains("keychange"))
+            .collect();
+        assert_eq!(
+            keychanges.len(),
+            1,
+            "25 keys wiped must produce one sentinel, not 25 frames: {keychanges:?}"
+        );
+        assert!(keychanges[0].contains("bulk:*"));
+    }
+
     // ── Exactly-once across a restart ─────────────────────────────────────────
 
     /// Build a `ServerState` whose snapshot path (and therefore dedup sidecar)
@@ -4506,11 +4616,13 @@ mod tests {
             let _ = watcher.recv_push(1000).await;
         }
 
-        let push = watcher
-            .recv_push(3000)
-            .await
-            .expect("expected a keychange for the departing peer");
-        assert!(push.contains("presence:user:7"), "unexpected push: {push}");
+        let frames = drain_frames(&mut watcher, 1500).await;
+        assert!(
+            frames
+                .iter()
+                .any(|f| f.contains("keychange") && f.contains("presence:user:7")),
+            "a live query must receive a keychange for the departing peer, got: {frames:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4962,6 +5074,25 @@ mod tests {
             }
             self.ws.send(Message::Text(req.into())).await.unwrap();
             self.next_reply().await
+        }
+
+        /// Wait up to `ms` for the next frame of any kind — RESP3 Push
+        /// broadcasts *and* plain arrays. `keychange` notifications are encoded
+        /// as arrays, so `recv_push` skips them entirely.
+        async fn recv_any(&mut self, ms: u64) -> Option<String> {
+            let fut = async {
+                loop {
+                    match self.ws.next().await {
+                        Some(Ok(Message::Text(t))) => return Some(t.to_string()),
+                        Some(Ok(_)) => continue,
+                        _ => return None,
+                    }
+                }
+            };
+            tokio::time::timeout(tokio::time::Duration::from_millis(ms), fut)
+                .await
+                .ok()
+                .flatten()
         }
 
         /// Wait up to `ms` for the next RESP3 Push broadcast frame, returning

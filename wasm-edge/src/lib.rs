@@ -311,6 +311,8 @@ struct WsShared {
     core: Rc<RefCell<SyncClient>>,
     on_mutation: Rc<RefCell<Option<js_sys::Function>>>,
     on_message: Rc<RefCell<Option<js_sys::Function>>>,
+    /// Invoked when the offline outbox overflows and a queued write is dropped.
+    on_outbox_full: Rc<RefCell<Option<js_sys::Function>>>,
     ws: Rc<RefCell<Option<WebSocket>>>,
     handlers: Rc<RefCell<WsHandlers>>,
     /// Shared with `RecachedCache.idb` — the open IndexedDB handle, if any.
@@ -395,6 +397,15 @@ fn queue_write(sh: &WsShared, encoded: &str, dedup: bool) {
         web_sys::console::warn_1(&JsValue::from_str(
             "recached: offline write queue full — dropped the oldest queued write",
         ));
+        // A silent drop is data loss the application cannot detect. Give it the
+        // dropped frame so it can persist or reconcile the write itself.
+        if let Some(cb) = sh.on_outbox_full.borrow().as_ref() {
+            let _ = cb.call2(
+                &JsValue::NULL,
+                &JsValue::from_f64(old as f64),
+                &JsValue::from_f64(sh.core.borrow().outbox_len() as f64),
+            );
+        }
     }
     outbox_put(sh, e.id, &e.frame);
     if e.send_now
@@ -535,6 +546,7 @@ impl RecachedCache {
     pub fn new() -> RecachedCache {
         let store = Arc::new(KeyValueStore::new());
         let on_mutation = Rc::new(RefCell::new(None));
+        let on_outbox_full: Rc<RefCell<Option<js_sys::Function>>> = Rc::new(RefCell::new(None));
         let on_message = Rc::new(RefCell::new(None));
         let idb = Rc::new(RefCell::new(None));
         let core = Rc::new(RefCell::new(SyncClient::new(
@@ -546,6 +558,7 @@ impl RecachedCache {
                 core,
                 on_mutation: Rc::clone(&on_mutation),
                 on_message: Rc::clone(&on_message),
+                on_outbox_full: Rc::clone(&on_outbox_full),
                 ws: Rc::new(RefCell::new(None)),
                 handlers: Rc::new(RefCell::new(WsHandlers::default())),
                 idb: Rc::clone(&idb),
@@ -582,6 +595,23 @@ impl RecachedCache {
     /// The SDK's `onMutation()` wires this up automatically.
     pub fn set_mutation_callback(&mut self, cb: js_sys::Function) {
         *self.on_mutation.borrow_mut() = Some(cb);
+    }
+
+    /// Register a JS callback invoked when the offline outbox overflows and the
+    /// oldest queued write is dropped. Signature:
+    /// `cb(droppedId: number, pendingWrites: number)`.
+    ///
+    /// Without this an overflow is invisible to the application: the write is
+    /// discarded, no error is raised, and the data is simply gone. The SDK's
+    /// `onOutboxFull()` wires this up automatically.
+    pub fn set_outbox_full_callback(&mut self, cb: js_sys::Function) {
+        *self.shared.on_outbox_full.borrow_mut() = Some(cb);
+    }
+
+    /// Writes queued locally and not yet acknowledged by the server. Poll this
+    /// to show sync state, or to back off before the queue overflows.
+    pub fn pending_writes(&self) -> usize {
+        self.shared.core.borrow().outbox_len()
     }
 
     /// Register a JS callback invoked when a pub/sub message arrives.

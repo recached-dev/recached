@@ -19,6 +19,12 @@ All notable changes to Recached are documented here.
   offline. Replicas receive the write as a plain `SET` — they have no connection to scope a lifetime
   to, and the owning server broadcasts the deletion.
 
+- **`onOutboxFull()` and `pendingWrites()` on the browser SDK.** The offline queue holds 10 000
+  writes and evicts the oldest past that — previously in silence, with no error and no signal, so an
+  application could not tell that a user's write had been discarded. `onOutboxFull(cb)` reports the
+  dropped row id and the remaining depth; `pendingWrites()` exposes the depth for a "syncing…"
+  indicator or to apply back-pressure before the cap is reached.
+
 - **Capacity and sync metrics.** Seven new series, sampled every 5 seconds because capacity is a
   level rather than an event: `recached_memory_bytes`, `recached_keys`, `recached_evictions_total`,
   `recached_replicas_connected`, `recached_live_queries`, `recached_watched_keys`, and
@@ -51,6 +57,16 @@ All notable changes to Recached are documented here.
   from live queries. Server and SDKs are released in lockstep at the same version — run matching
   versions.
   :::
+
+- **`FLUSHDB` now reaches live queries.** `primary_keys()` is empty for `FLUSHDB`, so the generic
+  notifier had nothing to announce and subscribers silently kept serving data the server had already
+  wiped.
+
+  Announcing per deleted key would mean one frame per key in the keyspace for a single command, so
+  the server emits **one sentinel per registered pattern** instead — a `keychange` whose key is the
+  pattern and whose value is nil. Clients expand it locally to "every key matching this pattern is
+  gone", which is O(patterns) rather than O(keys). Explicitly `WATCH`ed keys are still notified
+  individually, since that set is bounded and callers expect per-key precision there.
 
 - **Reconnect backoff is jittered.** Delays now land in `[nominal/2, nominal]` instead of an exact
   `500ms × 2^attempts`. Without jitter every client disconnected by the same event computes an

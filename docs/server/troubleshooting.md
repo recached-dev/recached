@@ -122,6 +122,10 @@ connections — by design, since they would leak or destroy data outside the con
 The client outbox holds **10,000 pending writes**. Past that, each new write **evicts the oldest one**
 — silently, with no error surfaced to your code.
 
+Register `cache.onOutboxFull((droppedId, pending) => …)` to be told when this happens — without it
+the loss is invisible. `cache.pendingWrites()` reports the current depth, so an application can apply
+back-pressure before the cap is reached.
+
 If a client can be offline long enough to exceed 10,000 writes, do not rely on the outbox as the
 system of record for those mutations. Batch them, or persist them yourself and reconcile on
 reconnect.
@@ -151,7 +155,8 @@ See [Offline & Reconnection](/browser/offline).
 A live query's initial state is capped at **10,000 keys**. Beyond that the snapshot is truncated.
 Narrow the pattern.
 
-Also note a remaining limit: `FLUSHDB` does not emit per-key diffs.
+`FLUSHDB` arrives as one sentinel per subscribed pattern rather than one frame per key — if your
+client is hand-written, expand it locally.
 
 If collection values arrive as a bare type name (`"hash"`) rather than their contents, the server and
 SDK are on different versions — collection values ship complete from 0.2.2 onward, and the two are

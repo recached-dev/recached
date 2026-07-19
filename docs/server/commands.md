@@ -301,7 +301,10 @@ two clients receiving the same notification build identical local state.
 Each notification carries the **complete** current value, so the receiver replaces the key rather than
 merging — which is what allows a removed member to propagate.
 
-Remaining limitation: `FLUSHDB` does not emit per-key diffs to live queries.
+`FLUSHDB` is announced as a single sentinel per subscribed pattern — a `keychange` whose key is the
+pattern and whose value is nil — meaning "every key matching this pattern is gone". Announcing each
+deleted key would mean one frame per key in the keyspace for one command. The browser SDK expands the
+sentinel locally; a hand-written client should do the same.
 
 ::: warning Changed in 0.2.2
 Before 0.2.2 collections arrived as a bare type name (`"hash"`), and subscribers had to follow up with

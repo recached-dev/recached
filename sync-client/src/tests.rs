@@ -695,3 +695,51 @@ fn an_unknown_type_tag_is_ignored_rather_than_guessed() {
     ]));
     assert_eq!(get(&c, "k"), Value::BulkString(None));
 }
+
+// ── FLUSHDB propagation ───────────────────────────────────────────────────────
+
+#[test]
+fn flushdb_sentinel_clears_every_key_matching_the_pattern() {
+    // The server announces a flush once per registered pattern rather than once
+    // per deleted key — a keyspace-sized frame storm for a single command.
+    let mut c = client();
+    c.add_live_query("cart:*", false);
+    c.handle_frame("*3\r\n$9\r\nkeychange\r\n$11\r\ncart:item:1\r\n$1\r\na\r\n");
+    c.handle_frame("*3\r\n$9\r\nkeychange\r\n$11\r\ncart:item:2\r\n$1\r\nb\r\n");
+    c.handle_frame("*3\r\n$9\r\nkeychange\r\n$7\r\nother:1\r\n$1\r\nc\r\n");
+    assert_eq!(get(&c, "cart:item:1"), bulk("a"));
+
+    // Sentinel: nil value whose "key" is the registered pattern.
+    c.handle_frame("*3\r\n$9\r\nkeychange\r\n$6\r\ncart:*\r\n$-1\r\n");
+
+    assert_eq!(get(&c, "cart:item:1"), Value::BulkString(None));
+    assert_eq!(get(&c, "cart:item:2"), Value::BulkString(None));
+    assert_eq!(
+        get(&c, "other:1"),
+        bulk("c"),
+        "keys outside the pattern must be untouched"
+    );
+}
+
+#[test]
+fn a_nil_for_an_unregistered_pattern_deletes_only_that_key() {
+    // Without this distinction, a literal key that happens to contain a glob
+    // character would wipe unrelated data.
+    let mut c = client();
+    c.handle_frame("*3\r\n$9\r\nkeychange\r\n$5\r\nkey:1\r\n$1\r\na\r\n");
+    c.handle_frame("*3\r\n$9\r\nkeychange\r\n$5\r\nkey:2\r\n$1\r\nb\r\n");
+
+    // Not a registered live query — treat it as an ordinary single-key delete.
+    c.handle_frame("*3\r\n$9\r\nkeychange\r\n$5\r\nkey:1\r\n$-1\r\n");
+
+    assert_eq!(get(&c, "key:1"), Value::BulkString(None));
+    assert_eq!(get(&c, "key:2"), bulk("b"), "unrelated key survives");
+}
+
+#[test]
+fn flushdb_sentinel_is_harmless_when_nothing_matches() {
+    let mut c = client();
+    c.add_live_query("cart:*", false);
+    c.handle_frame("*3\r\n$9\r\nkeychange\r\n$6\r\ncart:*\r\n$-1\r\n");
+    assert_eq!(c.store().execute(Command::DbSize), Value::Integer(0));
+}

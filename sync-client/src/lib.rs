@@ -440,7 +440,24 @@ impl SyncClient {
                 ));
             }
             Value::BulkString(None) => {
-                self.store.execute(Command::Del(vec![key]));
+                // A nil value whose "key" is one of our registered live-query
+                // patterns is the FLUSHDB sentinel: every matching key is gone.
+                // Sending one frame per deleted key would mean millions of
+                // frames for a single command, so the server announces it once
+                // per pattern and the client expands it locally.
+                if self.live_queries.contains(&key) {
+                    let matched: Vec<String> = self
+                        .store
+                        .matching_key_values(&key, usize::MAX)
+                        .into_iter()
+                        .map(|(k, _)| k)
+                        .collect();
+                    if !matched.is_empty() {
+                        self.store.execute(Command::Del(matched));
+                    }
+                } else {
+                    self.store.execute(Command::Del(vec![key]));
+                }
             }
             // Type-tagged collection: ["hash"|"list"|"set"|"zset"|"json", ...].
             Value::Array(Some(items)) => self.apply_tagged(key, items),

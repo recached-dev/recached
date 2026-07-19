@@ -4,14 +4,20 @@ Recached competes on **where the data can live** — the same engine on the serv
 
 ## Near-term
 
-The next three things worth doing, in order:
+**[Byte-slice command arguments](#performance)** is the one substantial piece left in the hardening
+list, and the main remaining lever on unpipelined latency. It is a large mechanical refactor — 125
+parse arms, ~210 argument extractions — and its payoff needs a quiet machine to measure, so it wants
+its own focused pass rather than being folded into a release alongside other work.
 
-1. **[Byte-slice command arguments](#performance)** — the main remaining lever on unpipelined
-   latency, and the likeliest explanation for `HSET` trailing Redis.
-2. **[Surface outbox overflow](#reliability)** — the client silently drops the oldest write past
-   10 000; applications get no signal.
-3. **[Live queries carry `FLUSHDB` diffs](#live-queries)** — subscribers currently miss a mass
-   deletion entirely.
+After that, in order:
+
+1. **[Replication lag](#operability)** — replica *count* is exported, but not how far behind each one
+   is, which is the signal that matters before a failover.
+2. **[Bound rate-limiter memory](#operability)** — one timestamp per attempt means ~800 KB for a
+   single `RLSET key 100000 3600` limiter.
+3. **[Make the compiled-in limits configurable](#operability)** — outbox size, live queries per
+   connection, eviction sample size.
+
 ---
 
 ## 6. Mobile SDKs — React Native, Flutter, Kotlin, Swift
@@ -75,13 +81,7 @@ independent — pick them off in any order.
 
 ### Reliability
 
-**Surface outbox overflow.** The client outbox holds 10 000 writes and silently evicts the oldest
-past that. An `onOutboxFull` callback, or a `pendingWrites()` accessor, lets an application degrade
-deliberately instead of losing writes without a signal.
-
 ### Live queries
-
-**`FLUSHDB` should emit per-key diffs.** Subscribers currently miss a mass deletion entirely.
 
 ### Performance
 

@@ -87,6 +87,8 @@ interface RawCache {
   live_unquery(pattern?: string): void;
   get_matching(pattern: string): Array<[string, string | null]>;
   set_mutation_callback(cb: () => void): void;
+  set_outbox_full_callback(cb: (droppedId: number, pending: number) => void): void;
+  pending_writes(): number;
   set_message_callback(cb: (channel: string, message: string) => void): void;
   free(): void;
 }
@@ -130,10 +132,16 @@ export class Cache {
 
   private readonly _mutationListeners = new Set<() => void>();
   private readonly _messageListeners = new Map<string, Set<(msg: string) => void>>();
+  private readonly _outboxFullListeners = new Set<(droppedId: number, pending: number) => void>();
 
   /** @internal Arrow function so `this` is always bound when passed as a callback. */
   private readonly _notifyMutation = (): void => {
     for (const cb of this._mutationListeners) cb();
+  };
+
+  /** @internal */
+  private readonly _notifyOutboxFull = (droppedId: number, pending: number): void => {
+    for (const cb of this._outboxFullListeners) cb(droppedId, pending);
   };
 
   /** @internal */
@@ -149,6 +157,7 @@ export class Cache {
     this.raw = raw;
     raw.set_mutation_callback(this._notifyMutation);
     raw.set_message_callback(this._notifyMessage);
+    raw.set_outbox_full_callback(this._notifyOutboxFull);
   }
 
   /**
@@ -169,6 +178,39 @@ export class Cache {
   onMutation(cb: () => void): () => void {
     this._mutationListeners.add(cb);
     return () => this._mutationListeners.delete(cb);
+  }
+
+  /**
+   * Called when the offline write queue overflows and the **oldest** queued
+   * write is discarded.
+   *
+   * The queue holds 10,000 writes. Past that, each new write evicts the oldest
+   * one — without this callback that is silent data loss: no error is thrown
+   * and the write is simply gone. If a client can plausibly be offline long
+   * enough to hit the cap, do not treat the outbox as the system of record;
+   * persist the mutation yourself and reconcile on reconnect.
+   *
+   * Returns an unsubscribe function.
+   *
+   * ```ts
+   * cache.onOutboxFull((droppedId, pending) => {
+   *   console.error(`dropped queued write ${droppedId}; ${pending} still pending`);
+   * });
+   * ```
+   */
+  onOutboxFull(cb: (droppedId: number, pending: number) => void): () => void {
+    this._outboxFullListeners.add(cb);
+    return () => this._outboxFullListeners.delete(cb);
+  }
+
+  /**
+   * Writes queued locally and not yet acknowledged by the server.
+   *
+   * Useful for a "syncing…" indicator, or to apply back-pressure before the
+   * queue reaches its 10,000-write cap.
+   */
+  pendingWrites(): number {
+    return this.raw.pending_writes();
   }
 
   /**
