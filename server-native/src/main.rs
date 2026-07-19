@@ -4355,6 +4355,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn integration_binary_value_is_refused_over_resp() {
+        // The drop-in claim runs through this port, so the refusal has to be a
+        // clean RESP error that leaves the connection usable — not a
+        // disconnect, and emphatically not a silent lossy store.
+        let srv = spawn_server().await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        let raw = b"*3\r\n$3\r\nSET\r\n$3\r\nbin\r\n$3\r\n\xff\xfe\x41\r\n";
+        c.stream.write_all(raw).await.unwrap();
+        let reply = c.cmd(&[]).await;
+        let Value::Error(e) = &reply else {
+            panic!("binary value must be refused, got {reply:?}")
+        };
+        assert!(e.contains("base64"), "error must be actionable: {e:?}");
+
+        // Nothing was stored, and the connection still works.
+        assert_eq!(c.cmd(&["EXISTS", "bin"]).await, int(0));
+        assert_eq!(c.cmd(&["SET", "bin", "ok"]).await, ok());
+        assert_eq!(c.cmd(&["GET", "bin"]).await, bulk("ok"));
+    }
+
+    #[tokio::test]
     async fn integration_hello_negotiates_the_protocol() {
         let srv = spawn_server().await;
         let mut c = RespClient::connect(srv.tcp_addr).await;
@@ -5163,19 +5185,24 @@ mod tests {
         let srv = spawn_ws_server().await;
         let mut c = WsClient::connect(srv.tcp_addr).await;
 
-        let raw = b"*3\r\n$3\r\nSET\r\n$3\r\nbin\r\n$3\r\n\xff\xfe\x41\r\n".to_vec();
+        // A binary frame whose contents are valid UTF-8 is a normal command.
+        let raw = b"*3\r\n$3\r\nSET\r\n$3\r\nbin\r\n$5\r\nhello\r\n".to_vec();
         assert_eq!(c.cmd_binary(raw).await, ok());
+        assert_eq!(c.cmd(&["GET", "bin"]).await, bulk("hello"));
 
-        // The command was accepted and executed — the key exists.
-        assert_eq!(c.cmd(&["EXISTS", "bin"]).await, int(1));
-
-        // NOTE: the *value* is still lossy, because the engine stores values as
-        // `String` (see core-engine/tests/binary_values.rs). Binary frames make
-        // the transport byte-clean; byte-clean storage is a separate change.
-        let Value::BulkString(Some(got)) = c.cmd(&["GET", "bin"]).await else {
-            panic!("expected a value")
+        // A binary *value* is refused rather than silently corrupted, and
+        // nothing is stored — the transport accepted the frame, the engine
+        // declined the payload.
+        let raw = b"*3\r\n$3\r\nSET\r\n$3\r\nraw\r\n$3\r\n\xff\xfe\x41\r\n".to_vec();
+        let reply = c.cmd_binary(raw).await;
+        let Value::Error(e) = &reply else {
+            panic!("binary value must be refused, got {reply:?}")
         };
-        assert_eq!(got, b"\xef\xbf\xbd\xef\xbf\xbd\x41".to_vec());
+        assert!(e.contains("base64"), "error must be actionable: {e:?}");
+        assert_eq!(c.cmd(&["EXISTS", "raw"]).await, int(0));
+
+        // The connection stays usable after a rejection.
+        assert_eq!(c.cmd(&["PING"]).await, Value::SimpleString("PONG".into()));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

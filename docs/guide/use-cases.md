@@ -88,8 +88,13 @@ It is not durable storage. See the persistence caveats in
 **Working set larger than RAM → a database, or Redis with eviction tuned.** There is no disk-backed
 tier.
 
-**You need Lua scripting, cluster mode, RESP3, or `INFO`/`SLOWLOG` introspection → Redis.** These are
-explicitly out of scope; see [Commands](/server/commands).
+**You need Lua scripting, cluster mode, or `INFO`/`SLOWLOG` introspection → Redis.** These are
+explicitly out of scope; see [Commands](/server/commands). RESP3 exists only for protocol
+negotiation and pub/sub framing (`HELLO 3`), not the full type surface.
+
+**You cache binary payloads → Redis.** Redis values are binary-safe; Recached values must be valid
+UTF-8 and a binary value is rejected outright. Compressed responses, protobuf, and serialized
+objects need base64 first — see [Binary values](/guide/introduction#binary-values).
 
 ## Compared directly
 
@@ -139,9 +144,14 @@ Before switching a workload over, check:
 1. **Command coverage.** Diff your actual command usage against [Commands](/server/commands).
    `MONITOR` on your existing Redis for a representative window is the fastest way to get that list.
    Lua scripts, cluster commands, streams, and `INFO`-based tooling will not carry over.
-2. **Persistence expectations.** Confirm snapshot + AOF semantics match what you assume today.
-3. **Replication topology.** Single-replica auto-failover only; no Sentinel or quorum election.
-4. **Eviction.** Review the key cap and TTL behaviour in
+2. **Value encoding.** Recached values must be valid UTF-8 — binary is rejected, not stored. Check
+   whether your client compresses transparently (many do), and whether anything caches serialized
+   objects rather than JSON. This is the migration surprise most likely to bite, because the client
+   works perfectly right up until the value is not text. See
+   [Binary values](/guide/introduction#binary-values).
+3. **Persistence expectations.** Confirm snapshot + AOF semantics match what you assume today.
+4. **Replication topology.** Single-replica auto-failover only; no Sentinel or quorum election.
+5. **Eviction.** Review the key cap and TTL behaviour in
    [Configuration](/server/configuration) against your memory budget.
 
 There is no data migration path from an RDB file — treat it as a cold cache and let it fill.

@@ -108,6 +108,28 @@ Two separate faults, both fixed in **0.2.2**:
 
 On an older server, neither has a client-side workaround — upgrade.
 
+### `ERR argument N is not valid UTF-8`
+
+The command carried a value (or key) containing bytes that are not valid UTF-8. Recached stores
+values as text, so it refuses rather than storing something different from what you sent. Nothing
+was written and the connection is still usable.
+
+Base64-encode the payload:
+
+```js
+await cache.set('blob:1', Buffer.from(binary).toString('base64'));
+const binary = Buffer.from(await cache.get('blob:1'), 'base64');
+```
+
+The usual cause during a Redis migration is a client that compresses transparently, or a cache of
+serialized objects (protobuf, pickle, Java serialization) rather than JSON — the client works
+normally right up until the value is not text. See
+[Binary values](/guide/introduction#binary-values).
+
+Before 0.2.2 these values were silently converted to U+FFFD and stored corrupted, with `SET`
+returning `OK`. If you are on an older server and reading back mangled binary, that is why — and the
+stored data cannot be recovered, since the bytes were destroyed on the way in.
+
 ### `ERR key too large`
 
 A key exceeded the maximum key length. Keys are identifiers, not payloads — put the data in the

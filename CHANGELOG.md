@@ -139,6 +139,32 @@ All notable changes to Recached are documented here.
 
 ### Fixed
 
+- **Non-UTF-8 values were silently corrupted; they are now rejected.** Values are stored as `String`,
+  so a value containing invalid UTF-8 was converted to U+FFFD replacement characters on the way in.
+  `SET` returned `OK`, `GET` returned bytes that differed from what was written, and nothing anywhere
+  reported a problem — the original bytes were destroyed at parse time, before storage, so there was
+  nothing to recover.
+
+  This affected **every transport, TCP included** — not only WebSocket, as the roadmap previously
+  recorded. `SET k <0xFF 0xFE 0x41>` over plain RESP came back as `EF BF BD EF BF BD 41`.
+
+  Such a command is now refused before anything is stored:
+
+  ```
+  ERR argument 2 is not valid UTF-8. Recached stores values as text;
+      base64-encode binary payloads before caching them
+  ```
+
+  Keys are checked the same way, and the connection stays usable after a rejection. Nothing that
+  worked before can break: the affected values were already being destroyed, so no application can
+  have depended on the old behaviour.
+
+  **Action required if you cache binary payloads** — compressed responses, protobuf, pickled objects,
+  images — base64-encode them, or keep them elsewhere. Check whether your client compresses
+  transparently; several do by default. Byte-transparent values are on the
+  [roadmap](docs/roadmap.md) as a breaking change; this release makes the limitation visible rather
+  than silent.
+
 - **Pub/sub deliveries never reached a TCP subscriber that only listened.** Deliveries were written
   into a 32 KB buffered writer and flushed only at the end of a client-command batch, so a
   connection that subscribed and then waited received nothing until it happened to send another
@@ -156,11 +182,7 @@ All notable changes to Recached are documented here.
   text frames to be well-formed UTF-8, which left no way to send bytes at all. Replies are sent as
   text when the RESP bytes are valid UTF-8 and binary otherwise, so existing clients see no change.
 
-  This makes the *transport* byte-clean. It does **not** make values byte-transparent: the engine
-  stores values as `String`, so invalid UTF-8 is still replaced with U+FFFD before storage, on every
-  transport including TCP. That was true before this release and remains true; it is pinned by
-  `core-engine/tests/binary_values.rs` and is a separate breaking change. Do not store raw binary in
-  Recached today.
+  This makes the *transport* byte-clean. Values are a separate matter — see below.
 
 - **Exactly-once delivery now survives a server restart.** Dedup high-water marks were held only in
   memory, so a restart inside the acknowledgement window let a client's replayed write apply twice —

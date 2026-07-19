@@ -205,6 +205,22 @@ impl Command {
                 if arr.is_empty() {
                     return Err("Empty command".to_string());
                 }
+                // Reject the whole command if any argument is not valid UTF-8.
+                //
+                // Values are stored as `String`, so a non-UTF-8 byte would
+                // otherwise be silently replaced with U+FFFD: SET returns OK,
+                // GET returns different bytes than were written, and nothing
+                // anywhere reports a problem. Failing loudly here — before
+                // anything is stored — is the only honest option until values
+                // are byte-transparent. See docs/roadmap.md.
+                if let Some(pos) = arr.iter().position(
+                    |v| matches!(v, Value::BulkString(Some(b)) if std::str::from_utf8(b).is_err()),
+                ) {
+                    return Err(format!(
+                        "ERR argument {pos} is not valid UTF-8. Recached stores values as text; \
+                         base64-encode binary payloads before caching them"
+                    ));
+                }
                 let cmd_name = match &arr[0] {
                     Value::BulkString(Some(data)) => String::from_utf8_lossy(data).to_uppercase(),
                     Value::SimpleString(s) => s.to_uppercase(),
@@ -1205,8 +1221,10 @@ fn extract_keys(vals: &[Value]) -> Result<Vec<String>, String> {
 /// twice — call this last, once per argument.
 fn take_string(val: &mut Value) -> Option<String> {
     match std::mem::replace(val, Value::Array(None)) {
-        // `from_utf8` reuses the buffer on success; only genuinely invalid
-        // UTF-8 pays for a lossy re-encode.
+        // `from_utf8` reuses the buffer, so this is a move rather than a copy.
+        // `from_value` has already rejected non-UTF-8 arguments, so the lossy
+        // branch is unreachable in practice — it is kept only so a future
+        // caller that bypasses that check degrades rather than panics.
         Value::BulkString(Some(data)) => Some(
             String::from_utf8(data)
                 .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
@@ -2688,18 +2706,27 @@ mod zero_copy_parse_tests {
     }
 
     #[test]
-    fn invalid_utf8_still_parses_losslessly_enough() {
-        // `from_utf8` reuses the buffer on success; invalid input falls back to
-        // a lossy re-encode rather than failing the command.
+    fn invalid_utf8_fails_the_command_instead_of_being_re_encoded() {
+        // The move-based parse must not resurrect the lossy fallback: a value
+        // that cannot be stored faithfully has to fail loudly, not arrive
+        // half-corrupted behind a successful reply.
         let frame = Value::Array(Some(vec![
             bulk("SET"),
             bulk("k"),
             Value::BulkString(Some(vec![0xff, 0xfe, b'o', b'k'])),
         ]));
-        match Command::from_value(frame).unwrap() {
+        let err = Command::from_value(frame).expect_err("must be refused");
+        assert!(err.contains("not valid UTF-8"), "got {err:?}");
+    }
+
+    #[test]
+    fn utf8_multibyte_arguments_are_not_mistaken_for_binary() {
+        // The validation runs over every argument, so an over-eager check would
+        // break ordinary non-ASCII payloads.
+        match parse(&["SET", "ключ", "日本語 ✓"]).unwrap() {
             Command::Set(key, val, _) => {
-                assert_eq!(key, "k");
-                assert!(val.ends_with("ok"), "got {val:?}");
+                assert_eq!(key, "ключ");
+                assert_eq!(val, "日本語 ✓");
             }
             other => panic!("{other:?}"),
         }

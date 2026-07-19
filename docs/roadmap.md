@@ -5,7 +5,7 @@ Recached competes on **where the data can live** — the same engine on the serv
 ## Near-term
 
 1. **[Byte-transparent values](#byte-transparent-values)** — values are stored as UTF-8 strings, so
-   raw binary is corrupted on every transport. The largest remaining drop-in gap.
+   binary payloads are rejected. The largest remaining drop-in gap.
 
 ---
 
@@ -75,19 +75,21 @@ Diagnosed on the [benchmarks](/guide/benchmarks) page.
 
 ### Byte-transparent values
 
-**Store values as bytes rather than `String`.** `EntryValue::Str` is a `String`, so a value is forced
-through a lossy UTF-8 conversion when the command is parsed: `SET k <0xFF 0xFE>` stores two U+FFFD
-replacement characters instead. This is a property of the engine, so it applies to **every**
-transport — TCP included, not just WebSocket as previously recorded here.
+**Store values as bytes rather than `String`.** `EntryValue::Str` is a `String`, so a non-UTF-8 value
+cannot be stored faithfully. As of 0.2.2 such a command is **rejected** with an error; before that it
+was silently converted to U+FFFD behind a successful `+OK`. This is a property of the engine, so it
+applies to **every** transport — TCP included, not just WebSocket as previously recorded here.
 
 The practical effect is that compressed blobs, protobuf, images, and anything else Redis users
-routinely cache cannot be stored without base64-encoding first. It is the largest remaining gap in
-"any Redis client works today".
+routinely cache must be base64-encoded first, at ~33% memory overhead. It is the largest remaining
+gap in "any Redis client works today" — the rejection makes it honest and visible, not fixed.
 
 Closing it means `Vec<u8>`/`Bytes` values through `cmd.rs`, `store.rs`, and the collection types; a
 snapshot format change; and an API decision for the browser SDK, whose `set(key, value)` takes a
 string. That is a breaking change and wants its own release rather than being folded into a patch.
-Current behaviour is pinned by `core-engine/tests/binary_values.rs`, which fails when it changes.
+Current behaviour is pinned by `core-engine/tests/binary_values.rs`. When values become
+byte-transparent the rejection goes away, which is a behaviour change in the *permissive* direction —
+no application that works today can break on it.
 
 ### Security
 
