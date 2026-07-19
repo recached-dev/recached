@@ -67,6 +67,7 @@ interface RawCache {
   connect(url: string): void;
   auth(password: string): string;
   set(key: string, value: string): string;
+  setBytes(key: string, value: Uint8Array): string;
   set_ex(key: string, value: string, seconds: number): string;
   get(key: string): string | undefined;
   getBytes(key: string): Uint8Array | undefined;
@@ -77,6 +78,7 @@ interface RawCache {
   ttl(key: string): number;
   exists(key: string): boolean;
   publish(channel: string, message: string): void;
+  publishBytes(channel: string, message: Uint8Array): void;
   subscribe(channel: string): void;
   unsubscribe(channel: string): void;
   jset(key: string, path: string, value: string): string;
@@ -132,7 +134,10 @@ export class Cache {
   readonly raw: RawCache;
 
   private readonly _mutationListeners = new Set<() => void>();
-  private readonly _messageListeners = new Map<string, Set<(msg: string) => void>>();
+  private readonly _messageListeners = new Map<
+    string,
+    Set<(msg: string | Uint8Array) => void>
+  >();
   private readonly _outboxFullListeners = new Set<(droppedId: number, pending: number) => void>();
 
   /** @internal Arrow function so `this` is always bound when passed as a callback. */
@@ -146,7 +151,10 @@ export class Cache {
   };
 
   /** @internal */
-  private readonly _notifyMessage = (channel: string, message: string): void => {
+  private readonly _notifyMessage = (
+    channel: string,
+    message: string | Uint8Array,
+  ): void => {
     const listeners = this._messageListeners.get(channel);
     if (listeners) {
       for (const cb of listeners) cb(message);
@@ -228,7 +236,10 @@ export class Cache {
    * cache.unsubscribe('notifications');
    * ```
    */
-  onMessage(channel: string, cb: (msg: string) => void): () => void {
+  onMessage(
+    channel: string,
+    cb: (msg: string | Uint8Array) => void,
+  ): () => void {
     let listeners = this._messageListeners.get(channel);
     if (!listeners) {
       listeners = new Set();
@@ -325,6 +336,21 @@ export class Cache {
     // raw.set fires the mutation callback registered in the constructor, so
     // listeners are already notified — no second _notifyMutation() here.
     this.raw.set(key, value);
+  }
+
+  /**
+   * Store raw bytes. Syncs to the server and other tabs when connected.
+   *
+   * Values are byte-transparent: the exact bytes given are stored, replicated,
+   * and persisted. Use this for compressed payloads, protobuf, or images —
+   * anything a JS string cannot hold. Read them back with {@link getBytes}.
+   *
+   * ```ts
+   * cache.setBytes('thumb:42', new Uint8Array(await blob.arrayBuffer()));
+   * ```
+   */
+  setBytes(key: string, value: Uint8Array): void {
+    this.raw.setBytes(key, value);
   }
 
   /**
@@ -463,6 +489,16 @@ export class Cache {
    */
   publish(channel: string, message: string): void {
     this.raw.publish(channel, message);
+  }
+
+  /**
+   * Publish raw bytes to a server pub/sub channel.
+   *
+   * Subscribers receive a `Uint8Array` rather than a string when the payload is
+   * not valid UTF-8 — see {@link onMessage}.
+   */
+  publishBytes(channel: string, message: Uint8Array): void {
+    this.raw.publishBytes(channel, message);
   }
 
   // ── Sync scoping & live queries ───────────────────────────────────────────

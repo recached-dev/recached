@@ -46,7 +46,9 @@ pub enum Incoming {
     /// local store — notify UI subscribers.
     Applied,
     /// A pub/sub message — deliver to channel subscribers.
-    PubSub { channel: String, message: String },
+    /// A pub/sub message. The payload is bytes because a publisher may send
+    /// binary; the adapter decides how to surface it.
+    PubSub { channel: String, message: Vec<u8> },
     /// A command reply. When `retired` is set, that outbox row is now
     /// acknowledged — delete it from durable storage.
     Reply { retired: Option<u64> },
@@ -62,9 +64,13 @@ pub enum Incoming {
 pub struct Enqueued {
     /// Outbox row id — persist the row under this key.
     pub id: u64,
-    /// The wire frame (dedup-wrapped when requested). This exact string is
+    /// The wire frame (dedup-wrapped when requested). These exact bytes are
     /// stored in the outbox and replayed on reconnect.
-    pub frame: String,
+    ///
+    /// Bytes rather than `String`: a frame carries a stored value, which may be
+    /// arbitrary binary. Holding it as text would corrupt the queued write and,
+    /// on reconnect, replay the corrupted version to the server.
+    pub frame: Vec<u8>,
     /// Send `frame` now (the caller reported the socket open, and the write
     /// was recorded as inflight).
     pub send_now: bool,
@@ -78,7 +84,7 @@ pub struct Enqueued {
 pub struct SyncClient {
     store: Arc<KeyValueStore>,
     /// Writes not yet acknowledged by the server, in send order.
-    outbox: VecDeque<(u64, String)>,
+    outbox: VecDeque<(u64, Vec<u8>)>,
     outbox_seq: u64,
     /// One entry per frame sent on the current socket: `Some(outbox id)` for
     /// data writes, `None` for session commands. Replies arrive in send
@@ -175,19 +181,19 @@ impl SyncClient {
     // inflight — session replies must occupy a reply slot or they would
     // falsely acknowledge a data write).
 
-    pub fn set_password(&mut self, password: &str, connected: bool) -> Option<String> {
+    pub fn set_password(&mut self, password: &str, connected: bool) -> Option<Vec<u8>> {
         self.password = Some(password.to_string());
         self.session_frame(to_resp(&["AUTH", password]), connected)
     }
 
-    pub fn set_sync_token(&mut self, token: &str, connected: bool) -> Option<String> {
+    pub fn set_sync_token(&mut self, token: &str, connected: bool) -> Option<Vec<u8>> {
         self.sync_token = Some(token.to_string());
         self.session_frame(to_resp(&["SYNC", "TOKEN", token]), connected)
     }
 
     /// Comma-separated glob patterns. Returns `None` (and records nothing)
     /// when the list is empty.
-    pub fn set_sync_scopes(&mut self, patterns_csv: &str, connected: bool) -> Option<String> {
+    pub fn set_sync_scopes(&mut self, patterns_csv: &str, connected: bool) -> Option<Vec<u8>> {
         let frame = sync_scopes_frame(patterns_csv)?;
         self.sync_scopes_csv = Some(patterns_csv.to_string());
         self.session_frame(frame, connected)
@@ -195,14 +201,14 @@ impl SyncClient {
 
     /// Register a live query (idempotent). The returned frame re-hydrates
     /// matching keys via the `qstate` reply.
-    pub fn add_live_query(&mut self, pattern: &str, connected: bool) -> Option<String> {
+    pub fn add_live_query(&mut self, pattern: &str, connected: bool) -> Option<Vec<u8>> {
         if !self.live_queries.iter().any(|p| p == pattern) {
             self.live_queries.push(pattern.to_string());
         }
         self.session_frame(to_resp(&["QSUB", pattern]), connected)
     }
 
-    pub fn remove_live_query(&mut self, pattern: Option<&str>, connected: bool) -> Option<String> {
+    pub fn remove_live_query(&mut self, pattern: Option<&str>, connected: bool) -> Option<Vec<u8>> {
         let frame = match pattern {
             Some(p) => {
                 self.live_queries.retain(|q| q != p);
@@ -216,7 +222,7 @@ impl SyncClient {
         self.session_frame(frame, connected)
     }
 
-    fn session_frame(&mut self, frame: String, connected: bool) -> Option<String> {
+    fn session_frame(&mut self, frame: Vec<u8>, connected: bool) -> Option<Vec<u8>> {
         if connected {
             self.inflight.push_back(None);
             Some(frame)
@@ -231,7 +237,7 @@ impl SyncClient {
     /// state first (AUTH → SYNC → live queries), then the full outbox replay.
     /// Live-query re-subscription re-hydrates local state; outbox entries
     /// stay queued until their replies acknowledge them.
-    pub fn on_open(&mut self) -> Vec<String> {
+    pub fn on_open(&mut self) -> Vec<Vec<u8>> {
         self.attempts = 0;
         self.inflight.clear();
         let mut frames = Vec::new();
@@ -298,13 +304,13 @@ impl SyncClient {
     /// envelope — store writes want this; connection-scoped commands
     /// (pub/sub) must not be wrapped, or a legitimately replayed SUBSCRIBE
     /// would be skipped as a duplicate.
-    pub fn enqueue_write(&mut self, encoded: &str, dedup: bool, connected: bool) -> Enqueued {
+    pub fn enqueue_write(&mut self, encoded: &[u8], dedup: bool, connected: bool) -> Enqueued {
         let id = self.outbox_seq;
         self.outbox_seq += 1;
         let frame = if dedup {
             self.wrap_dedup(encoded, id)
         } else {
-            encoded.to_string()
+            encoded.to_vec()
         };
         let dropped = if self.outbox.len() >= self.max_pending {
             self.outbox.pop_front().map(|(old, _)| old)
@@ -325,25 +331,35 @@ impl SyncClient {
 
     /// Splice a `DEDUP <client> <wire-id>` envelope into an already-encoded
     /// RESP array: bump the element count and prepend three elements.
-    fn wrap_dedup(&self, plain: &str, outbox_id: u64) -> String {
-        let Some((head, rest)) = plain.split_once("\r\n") else {
-            return plain.to_string();
+    fn wrap_dedup(&self, plain: &[u8], outbox_id: u64) -> Vec<u8> {
+        // Only the header is text; `rest` is copied through untouched so a
+        // binary value inside the frame is never reinterpreted.
+        let Some(split) = plain.windows(2).position(|w| w == b"\r\n") else {
+            return plain.to_vec();
         };
-        let n: usize = head.trim_start_matches('*').parse().unwrap_or(0);
+        let head = &plain[..split];
+        let rest = &plain[split + 2..];
+        let n: usize = std::str::from_utf8(head)
+            .ok()
+            .map(|h| h.trim_start_matches('*'))
+            .and_then(|h| h.parse().ok())
+            .unwrap_or(0);
         if n == 0 {
-            return plain.to_string();
+            return plain.to_vec();
         }
         let wire_id = ((self.epoch as u64) << 32) | (outbox_id & 0xFFFF_FFFF);
         let id_s = wire_id.to_string();
-        format!(
-            "*{}\r\n$5\r\nDEDUP\r\n${}\r\n{}\r\n${}\r\n{}\r\n{}",
+        let mut out = format!(
+            "*{}\r\n$5\r\nDEDUP\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
             n + 3,
             self.client_id.len(),
             self.client_id,
             id_s.len(),
             id_s,
-            rest
         )
+        .into_bytes();
+        out.extend_from_slice(rest);
+        out
     }
 
     /// Restore outbox rows persisted by a previous session (ordered by their
@@ -352,7 +368,7 @@ impl SyncClient {
     /// verbatim, so their embedded dedup ids still match what the server may
     /// have already applied. Returns `(old_id, new_id, frame)` for the
     /// adapter to rewrite durable storage.
-    pub fn restore_outbox(&mut self, mut rows: Vec<(u64, String)>) -> Vec<(u64, u64, String)> {
+    pub fn restore_outbox(&mut self, mut rows: Vec<(u64, Vec<u8>)>) -> Vec<(u64, u64, Vec<u8>)> {
         rows.sort_by_key(|(id, _)| *id);
         let mut rewrites = Vec::with_capacity(rows.len());
         for (old_id, frame) in rows.into_iter().rev() {
@@ -382,8 +398,8 @@ impl SyncClient {
     /// or surfaced; everything else is a command reply that acknowledges the
     /// oldest inflight command — `qstate` arrays are both the reply to a
     /// QSUB *and* state to apply. See `docs/server/protocol.md`.
-    pub fn handle_frame(&mut self, text: &str) -> Incoming {
-        match Value::parse(text.as_bytes()) {
+    pub fn handle_frame(&mut self, raw: &[u8]) -> Incoming {
+        match Value::parse(raw) {
             Ok((Value::Push(arr), _)) => {
                 if arr.len() == 3
                     && let (
@@ -395,7 +411,7 @@ impl SyncClient {
                 {
                     return Incoming::PubSub {
                         channel: String::from_utf8_lossy(channel).into_owned(),
-                        message: String::from_utf8_lossy(payload).into_owned(),
+                        message: payload.clone(),
                     };
                 }
                 if let Ok(cmd) = Command::from_value(Value::Array(Some(arr)))
@@ -579,7 +595,7 @@ impl SyncClient {
     }
 }
 
-fn sync_scopes_frame(patterns_csv: &str) -> Option<String> {
+fn sync_scopes_frame(patterns_csv: &str) -> Option<Vec<u8>> {
     let pats: Vec<&str> = patterns_csv
         .split(',')
         .map(str::trim)
@@ -638,12 +654,25 @@ pub fn is_replayable_mutation(cmd: &Command) -> bool {
 }
 
 /// RESP array encoding, shared by adapters.
-pub fn to_resp(parts: &[&str]) -> String {
-    let mut s = format!("*{}\r\n", parts.len());
+/// Encode a RESP array frame from text arguments.
+///
+/// Returns bytes, not a `String`: frames are concatenated with, and replayed
+/// alongside, frames carrying binary values, so the whole pipeline is byte-based.
+pub fn to_resp(parts: &[&str]) -> Vec<u8> {
+    let byte_parts: Vec<&[u8]> = parts.iter().map(|p| p.as_bytes()).collect();
+    to_resp_bytes(&byte_parts)
+}
+
+/// Encode a RESP array frame from raw byte arguments, for commands carrying a
+/// binary value.
+pub fn to_resp_bytes(parts: &[&[u8]]) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", parts.len()).into_bytes();
     for part in parts {
-        s.push_str(&format!("${}\r\n{}\r\n", part.len(), part));
+        out.extend_from_slice(format!("${}\r\n", part.len()).as_bytes());
+        out.extend_from_slice(part);
+        out.extend_from_slice(b"\r\n");
     }
-    s
+    out
 }
 
 #[cfg(test)]

@@ -171,10 +171,15 @@ All notable changes to Recached are documented here.
   encode as msgpack `bin` rather than an array of integers, so snapshot size is unchanged for text
   and roughly halved versus the naive encoding for binary.
 
-  **Browser SDK: binary is read-only.** The browser cache stores and syncs binary faithfully and
-  `cache.getBytes(key)` returns a `Uint8Array`, but `cache.set()` still takes a string — binary
-  values originate from a backend writing over the RESP port. `cache.get()` now **throws** on a
-  binary value instead of returning mangled text, and `getJSON()` treats one as a miss.
+  **The browser SDK handles binary end to end.** `setBytes()` / `getBytes()` and `publishBytes()`
+  are new, and binary survives the offline outbox, the exactly-once `DEDUP` envelope, cross-tab
+  `BroadcastChannel` sync and IndexedDB persistence unchanged. Frames that carry binary now travel
+  in WebSocket *binary* frames in both directions — the socket's `binaryType` is `arraybuffer`, so
+  an inbound binary frame is no longer silently dropped by the message handler.
+
+  `cache.get()` now **throws** on a binary value instead of returning mangled text, `getJSON()`
+  treats one as a miss, and an `onMessage` listener receives a `Uint8Array` for a binary pub/sub
+  payload — so the listener signature widened to `string | Uint8Array`.
 
   Data corrupted by an earlier version cannot be recovered and must be re-populated.
 

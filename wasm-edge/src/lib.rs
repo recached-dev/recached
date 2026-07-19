@@ -5,7 +5,7 @@ use js_sys::Promise;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
-use sync_client::{Incoming, SyncClient, is_replayable_mutation, to_resp};
+use sync_client::{Incoming, SyncClient, is_replayable_mutation, to_resp, to_resp_bytes};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{BroadcastChannel, Event, MessageEvent, WebSocket};
@@ -128,7 +128,7 @@ extern "C" {
     #[wasm_bindgen(js_name = "idbAppend")]
     fn idb_append_js(db: &JsValue, seq: f64, cmd: &[u8]) -> Promise;
     #[wasm_bindgen(js_name = "idbOutboxPut")]
-    fn idb_outbox_put_js(db: &JsValue, id: f64, cmd: &str) -> Promise;
+    fn idb_outbox_put_js(db: &JsValue, id: f64, cmd: &[u8]) -> Promise;
     #[wasm_bindgen(js_name = "idbOutboxDelete")]
     fn idb_outbox_delete_js(db: &JsValue, id: f64) -> Promise;
     #[wasm_bindgen(js_name = "idbWalClear")]
@@ -353,9 +353,9 @@ fn outbox_delete(sh: &WsShared, id: u64) {
 }
 
 /// Persist an outbox row to durable storage.
-fn outbox_put(sh: &WsShared, id: u64, frame: &str) {
+fn outbox_put(sh: &WsShared, id: u64, frame: &[u8]) {
     if let Some(db) = sh.idb.borrow().clone() {
-        let cmd = frame.to_string();
+        let cmd = frame.to_vec();
         spawn_local(async move {
             let _ = JsFuture::from(idb_outbox_put_js(&db, id as f64, &cmd)).await;
         });
@@ -368,11 +368,13 @@ fn dispatch_incoming(sh: &WsShared, incoming: Incoming) {
         Incoming::Applied => notify_mutation(&sh.on_mutation),
         Incoming::PubSub { channel, message } => {
             if let Some(f) = sh.on_message.borrow().as_ref() {
-                let _ = f.call2(
-                    &JsValue::NULL,
-                    &JsValue::from_str(&channel),
-                    &JsValue::from_str(&message),
-                );
+                let payload = match std::str::from_utf8(&message) {
+                    Ok(text) => JsValue::from_str(text),
+                    // A binary publish cannot be a JS string; the listener gets
+                    // the bytes rather than a lossy rendering of them.
+                    Err(_) => js_sys::Uint8Array::from(&message[..]).into(),
+                };
+                let _ = f.call2(&JsValue::NULL, &JsValue::from_str(&channel), &payload);
             }
         }
         Incoming::Reply { retired } => {
@@ -392,7 +394,7 @@ fn dispatch_incoming(sh: &WsShared, incoming: Incoming) {
 
 /// Queue a write through the core and mirror its effects: durable outbox row,
 /// possible overflow eviction, and an immediate send when connected.
-fn queue_write(sh: &WsShared, encoded: &str, dedup: bool) {
+fn queue_write(sh: &WsShared, encoded: &[u8], dedup: bool) {
     // Local-only mode (no connect() and no persistence): nothing to sync to.
     if sh.url.borrow().is_none() && sh.idb.borrow().is_none() {
         return;
@@ -424,7 +426,50 @@ fn queue_write(sh: &WsShared, encoded: &str, dedup: bool) {
     if e.send_now
         && let Some(ws) = sh.ws.borrow().as_ref()
     {
-        let _ = ws.send_with_str(&e.frame);
+        ws_send_frame(ws, &e.frame);
+    }
+}
+
+/// Extract the RESP bytes from a message event, whether the peer sent a text
+/// frame or a binary one.
+fn event_frame_bytes(e: &MessageEvent) -> Option<Vec<u8>> {
+    let data = e.data();
+    if let Some(text) = data.as_string() {
+        return Some(text.into_bytes());
+    }
+    if let Ok(buf) = data.clone().dyn_into::<js_sys::ArrayBuffer>() {
+        return Some(js_sys::Uint8Array::new(&buf).to_vec());
+    }
+    if let Ok(arr) = data.dyn_into::<js_sys::Uint8Array>() {
+        return Some(arr.to_vec());
+    }
+    None
+}
+
+/// Post a RESP frame to other tabs, as a string when the bytes are text and a
+/// `Uint8Array` when they are not.
+fn bc_post(bc: &BroadcastChannel, frame: &[u8]) {
+    let msg = match std::str::from_utf8(frame) {
+        Ok(text) => JsValue::from_str(text),
+        Err(_) => js_sys::Uint8Array::from(frame).into(),
+    };
+    let _ = bc.post_message(&msg);
+}
+
+/// Send one RESP frame over the socket.
+///
+/// Text frames must be well-formed UTF-8 per the WebSocket spec, so a frame
+/// carrying a binary value goes out as a binary frame — which the server
+/// accepts from 0.2.2. Everything else stays text, so nothing changes for the
+/// overwhelming majority of traffic.
+fn ws_send_frame(ws: &WebSocket, frame: &[u8]) {
+    match std::str::from_utf8(frame) {
+        Ok(text) => {
+            let _ = ws.send_with_str(text);
+        }
+        Err(_) => {
+            let _ = ws.send_with_u8_array(frame);
+        }
     }
 }
 
@@ -446,12 +491,19 @@ fn open_socket(sh: &WsShared) {
     };
 
     // ── onmessage: classify + apply via the core, execute its effects ────
+    //
+    // ArrayBuffer rather than the default Blob: the server sends a *binary*
+    // frame whenever a reply carries a value that is not valid UTF-8, and a
+    // Blob would have to be read asynchronously — the handler below would drop
+    // it on the floor.
+    ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
     let sh_msg = sh.clone();
     let onmessage = Closure::wrap(Box::new(move |e: MessageEvent| {
-        if let Ok(text) = e.data().dyn_into::<js_sys::JsString>() {
-            let incoming = sh_msg.core.borrow_mut().handle_frame(&String::from(text));
-            dispatch_incoming(&sh_msg, incoming);
-        }
+        let Some(raw) = event_frame_bytes(&e) else {
+            return;
+        };
+        let incoming = sh_msg.core.borrow_mut().handle_frame(&raw);
+        dispatch_incoming(&sh_msg, incoming);
     }) as Box<dyn FnMut(MessageEvent)>);
     ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
 
@@ -460,7 +512,7 @@ fn open_socket(sh: &WsShared) {
     let ws_for_open = ws.clone();
     let onopen = Closure::wrap(Box::new(move |_e: Event| {
         for frame in sh_open.core.borrow_mut().on_open() {
-            let _ = ws_for_open.send_with_str(&frame);
+            ws_send_frame(&ws_for_open, &frame);
         }
     }) as Box<dyn FnMut(Event)>);
     ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
@@ -592,14 +644,14 @@ impl RecachedCache {
     }
 
     /// Queue a store write (dedup-wrapped for exactly-once delivery).
-    fn ws_enqueue(&self, encoded: &str) {
+    fn ws_enqueue(&self, encoded: &[u8]) {
         queue_write(&self.shared, encoded, true);
     }
 
     /// Queue a connection-scoped command (pub/sub) — replayed on reconnect
     /// but never dedup-wrapped: skipping a re-sent SUBSCRIBE would silently
     /// drop the subscription.
-    fn ws_enqueue_nodedup(&self, encoded: &str) {
+    fn ws_enqueue_nodedup(&self, encoded: &[u8]) {
         queue_write(&self.shared, encoded, false);
     }
 
@@ -694,10 +746,16 @@ impl RecachedCache {
                 let pair = js_sys::Array::from(&result);
                 let keys = js_sys::Array::from(&pair.get(0));
                 let vals = js_sys::Array::from(&pair.get(1));
-                let mut restored: Vec<(u64, String)> = Vec::with_capacity(keys.length() as usize);
+                let mut restored: Vec<(u64, Vec<u8>)> = Vec::with_capacity(keys.length() as usize);
                 for i in 0..keys.length() {
                     let id = keys.get(i).as_f64().unwrap_or(0.0) as u64;
-                    let cmd = vals.get(i).as_string().unwrap_or_default();
+                    let raw = vals.get(i);
+                    let cmd = match raw.as_string() {
+                        // Rows written by 0.2.1 and earlier, when frames were
+                        // strings rather than Uint8Array.
+                        Some(t) => t.into_bytes(),
+                        None => js_sys::Uint8Array::new(&raw).to_vec(),
+                    };
                     if !cmd.is_empty() {
                         restored.push((id, cmd));
                     }
@@ -802,15 +860,13 @@ impl RecachedCache {
         let on_mut = Rc::clone(&self.on_mutation);
 
         let onbc = Closure::wrap(Box::new(move |e: MessageEvent| {
-            if let Ok(text) = e.data().dyn_into::<js_sys::JsString>() {
-                let s = String::from(text);
-                if let Ok((value, _)) = Value::parse(s.as_bytes())
-                    && let Ok(cmd) = Command::from_value(value)
-                    && is_replayable_mutation(&cmd)
-                {
-                    store_clone.execute(cmd);
-                    notify_mutation(&on_mut);
-                }
+            if let Some(raw) = event_frame_bytes(&e)
+                && let Ok((value, _)) = Value::parse(&raw)
+                && let Ok(cmd) = Command::from_value(value)
+                && is_replayable_mutation(&cmd)
+            {
+                store_clone.execute(cmd);
+                notify_mutation(&on_mut);
             }
         }) as Box<dyn FnMut(MessageEvent)>);
 
@@ -866,11 +922,11 @@ impl RecachedCache {
 
     /// Send a session frame the core produced (it has already recorded the
     /// inflight reply slot).
-    fn send_session_frame(&self, frame: Option<String>) {
+    fn send_session_frame(&self, frame: Option<Vec<u8>>) {
         if let Some(frame) = frame
             && let Some(ws) = self.shared.ws.borrow().as_ref()
         {
-            let _ = ws.send_with_str(&frame);
+            ws_send_frame(ws, &frame);
         }
     }
 
@@ -952,9 +1008,9 @@ impl RecachedCache {
         let encoded = to_resp(&["INCRBY", key, &delta_s]);
         self.ws_enqueue(&encoded);
         if let Some(bc) = &self.bc {
-            let _ = bc.post_message(&JsValue::from_str(&encoded));
+            bc_post(bc, &encoded);
         }
-        persist_cmd(&self.idb, &self.seq, encoded.as_bytes());
+        persist_cmd(&self.idb, &self.seq, &encoded);
         notify_mutation(&self.on_mutation);
         Ok(n)
     }
@@ -974,9 +1030,9 @@ impl RecachedCache {
         let encoded = to_resp(&["JSET", key, path, value]);
         self.ws_enqueue(&encoded);
         if let Some(bc) = &self.bc {
-            let _ = bc.post_message(&JsValue::from_str(&encoded));
+            bc_post(bc, &encoded);
         }
-        persist_cmd(&self.idb, &self.seq, encoded.as_bytes());
+        persist_cmd(&self.idb, &self.seq, &encoded);
         notify_mutation(&self.on_mutation);
         "OK".to_string()
     }
@@ -1006,9 +1062,9 @@ impl RecachedCache {
         let encoded = to_resp(&["JMERGE", key, patch]);
         self.ws_enqueue(&encoded);
         if let Some(bc) = &self.bc {
-            let _ = bc.post_message(&JsValue::from_str(&encoded));
+            bc_post(bc, &encoded);
         }
-        persist_cmd(&self.idb, &self.seq, encoded.as_bytes());
+        persist_cmd(&self.idb, &self.seq, &encoded);
         notify_mutation(&self.on_mutation);
         "OK".to_string()
     }
@@ -1049,9 +1105,37 @@ impl RecachedCache {
         let encoded = to_resp(&["SET", key, value]);
         self.ws_enqueue(&encoded);
         if let Some(bc) = &self.bc {
-            let _ = bc.post_message(&JsValue::from_str(&encoded));
+            bc_post(bc, &encoded);
         }
-        persist_cmd(&self.idb, &self.seq, encoded.as_bytes());
+        persist_cmd(&self.idb, &self.seq, &encoded);
+        notify_mutation(&self.on_mutation);
+
+        match resp {
+            Value::SimpleString(s) => s,
+            Value::Error(e) => e,
+            _ => "ERR".to_string(),
+        }
+    }
+
+    /// Set a key to raw bytes, synced to the server and other tabs.
+    ///
+    /// Values are byte-transparent, so this stores and replicates exactly the
+    /// bytes given — compressed payloads, protobuf, images. `set()` is the
+    /// right call for text; this exists for everything a JS string cannot hold.
+    #[wasm_bindgen(js_name = "setBytes")]
+    pub fn set_bytes(&self, key: &str, value: &[u8]) -> String {
+        let resp = self.store.execute(Command::Set(
+            key.to_string(),
+            value.to_vec(),
+            SetOptions::default(),
+        ));
+
+        let encoded = to_resp_bytes(&[b"SET", key.as_bytes(), value]);
+        self.ws_enqueue(&encoded);
+        if let Some(bc) = &self.bc {
+            bc_post(bc, &encoded);
+        }
+        persist_cmd(&self.idb, &self.seq, &encoded);
         notify_mutation(&self.on_mutation);
 
         match resp {
@@ -1076,9 +1160,9 @@ impl RecachedCache {
         let encoded = to_resp(&["SET", key, value, "EX", &seconds.to_string()]);
         self.ws_enqueue(&encoded);
         if let Some(bc) = &self.bc {
-            let _ = bc.post_message(&JsValue::from_str(&encoded));
+            bc_post(bc, &encoded);
         }
-        persist_cmd(&self.idb, &self.seq, encoded.as_bytes());
+        persist_cmd(&self.idb, &self.seq, &encoded);
         notify_mutation(&self.on_mutation);
 
         match resp {
@@ -1125,9 +1209,9 @@ impl RecachedCache {
         let encoded = to_resp(&["DEL", key]);
         self.ws_enqueue(&encoded);
         if let Some(bc) = &self.bc {
-            let _ = bc.post_message(&JsValue::from_str(&encoded));
+            bc_post(bc, &encoded);
         }
-        persist_cmd(&self.idb, &self.seq, encoded.as_bytes());
+        persist_cmd(&self.idb, &self.seq, &encoded);
         notify_mutation(&self.on_mutation);
 
         match resp {
@@ -1155,6 +1239,15 @@ impl RecachedCache {
     /// Publish a message to a channel on the server.
     pub fn publish(&self, channel: &str, message: &str) {
         self.ws_enqueue_nodedup(&to_resp(&["PUBLISH", channel, message]));
+    }
+
+    /// Publish raw bytes to a channel on the server.
+    ///
+    /// Subscribers receive a `Uint8Array` rather than a string when the payload
+    /// is not valid UTF-8.
+    #[wasm_bindgen(js_name = "publishBytes")]
+    pub fn publish_bytes(&self, channel: &str, message: &[u8]) {
+        self.ws_enqueue_nodedup(&to_resp_bytes(&[b"PUBLISH", channel.as_bytes(), message]));
     }
 
     /// Subscribe to a channel on the server. Push messages arrive via the `onmessage` callback.
@@ -1599,7 +1692,7 @@ mod browser_tests {
         JsFuture::from(idb_append_js(&db, 1.0, b"SET a 1"))
             .await
             .expect("append");
-        JsFuture::from(idb_outbox_put_js(&db, 10.0, "PENDING WRITE"))
+        JsFuture::from(idb_outbox_put_js(&db, 10.0, b"PENDING WRITE"))
             .await
             .expect("outbox put");
 
@@ -1618,7 +1711,7 @@ mod browser_tests {
         JsFuture::from(idb_append_js(&db, 1.0, b"SET a 1"))
             .await
             .unwrap();
-        JsFuture::from(idb_outbox_put_js(&db, 1.0, "SET b 2"))
+        JsFuture::from(idb_outbox_put_js(&db, 1.0, b"SET b 2"))
             .await
             .unwrap();
 
@@ -1635,7 +1728,7 @@ mod browser_tests {
         // The durability guarantee: a write made offline must still be there
         // after the page is reloaded and the database reopened.
         let db = fresh_db().await;
-        JsFuture::from(idb_outbox_put_js(&db, 7.0, "SET offline 1"))
+        JsFuture::from(idb_outbox_put_js(&db, 7.0, b"SET offline 1"))
             .await
             .expect("put");
         drop(db);
@@ -1650,7 +1743,7 @@ mod browser_tests {
     async fn deleting_an_acknowledged_row_leaves_the_others() {
         let db = fresh_db().await;
         for (id, cmd) in [(1.0, "SET a 1"), (2.0, "SET b 2"), (3.0, "SET c 3")] {
-            JsFuture::from(idb_outbox_put_js(&db, id, cmd))
+            JsFuture::from(idb_outbox_put_js(&db, id, cmd.as_bytes()))
                 .await
                 .unwrap();
         }
@@ -1667,10 +1760,10 @@ mod browser_tests {
         // Renumbering on restore re-puts rows; duplicates would replay a write
         // twice.
         let db = fresh_db().await;
-        JsFuture::from(idb_outbox_put_js(&db, 5.0, "FIRST"))
+        JsFuture::from(idb_outbox_put_js(&db, 5.0, b"FIRST"))
             .await
             .unwrap();
-        JsFuture::from(idb_outbox_put_js(&db, 5.0, "SECOND"))
+        JsFuture::from(idb_outbox_put_js(&db, 5.0, b"SECOND"))
             .await
             .unwrap();
 
@@ -1735,7 +1828,7 @@ mod browser_tests {
         JsFuture::from(idb_append_js(&db, 0.0, b"SET a 1"))
             .await
             .unwrap();
-        JsFuture::from(idb_outbox_put_js(&db, 5.0, "PENDING"))
+        JsFuture::from(idb_outbox_put_js(&db, 5.0, b"PENDING"))
             .await
             .unwrap();
 
@@ -1746,6 +1839,42 @@ mod browser_tests {
         let (ids, vals) = outbox_rows(&db).await;
         assert_eq!(ids, vec![5.0]);
         assert_eq!(vals[0], "PENDING");
+    }
+
+    #[wasm_bindgen_test]
+    async fn binary_writes_survive_the_outbox() {
+        // An offline write is stored in IndexedDB and replayed on reconnect. A
+        // binary value has to come back out of that queue byte-identical, or
+        // the replayed write differs from the one the application made.
+        let db = fresh_db().await;
+        let binary = vec![0xffu8, 0xfe, 0x00, 0x41, 0x80];
+        let frame = to_resp_bytes(&[b"SET", b"k", &binary]);
+
+        JsFuture::from(idb_outbox_put_js(&db, 0.0, &frame))
+            .await
+            .expect("outbox put");
+
+        let res = JsFuture::from(idb_outbox_read_all(&db))
+            .await
+            .expect("outbox read");
+        let pair = js_sys::Array::from(&res);
+        let vals = js_sys::Array::from(&pair.get(1));
+        let raw = vals.get(0);
+        let stored = match raw.as_string() {
+            Some(t) => t.into_bytes(),
+            None => js_sys::Uint8Array::new(&raw).to_vec(),
+        };
+
+        assert_eq!(stored, frame, "outbox row must round-trip unchanged");
+
+        // And it still parses into the write the application made.
+        let (value, _) = core_engine::resp::Value::parse(&stored).unwrap();
+        let store = KeyValueStore::new();
+        store.execute(Command::from_value(value).unwrap());
+        assert_eq!(
+            store.execute(Command::Get("k".into())),
+            Value::BulkString(Some(binary))
+        );
     }
 
     #[wasm_bindgen_test]

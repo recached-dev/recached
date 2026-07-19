@@ -18,6 +18,9 @@ js-sys.workspace         = true
 workspace = true
 features = [
     "WebSocket",
+    # WebSocket.binaryType, so binary frames arrive as ArrayBuffer rather than
+    # a Blob that would need an async read.
+    "BinaryType",
     "BroadcastChannel",
     "MessageEvent",
     "ErrorEvent",

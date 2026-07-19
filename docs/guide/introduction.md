@@ -76,12 +76,13 @@ Commands that interpret a value still require the right shape: `INCR` on a binar
 `ERR value is not an integer`, and JSON documents must be UTF-8 because JSON is defined that way.
 Those are type errors, not encoding losses — the stored bytes are unchanged either way.
 
-::: warning Browser SDK: binary is read-only
-The browser cache stores and syncs binary values faithfully, and `cache.getBytes(key)` returns them
-as a `Uint8Array`. But `cache.set()` takes a string, so binary values can only *originate* from a
-backend writing over the RESP port. `cache.get()` throws on a binary value rather than returning
-mangled text.
-:::
+**The browser SDK handles binary too.** `cache.setBytes(key, uint8array)` writes it,
+`cache.getBytes(key)` reads it back, and `cache.publishBytes(channel, uint8array)` publishes it.
+Binary values survive the offline outbox, cross-tab sync and IndexedDB persistence unchanged.
+
+`cache.get()` **throws** on a binary value rather than returning mangled text, and `getJSON()`
+treats one as a miss — reach for `getBytes()` when a value may not be text. A binary pub/sub payload
+arrives at an `onMessage` listener as a `Uint8Array` instead of a string.
 
 Before 0.2.2 values were stored as UTF-8 strings and binary was silently replaced with U+FFFD: `SET`
 returned `OK` and `GET` returned different bytes than were written, on every transport. If you are

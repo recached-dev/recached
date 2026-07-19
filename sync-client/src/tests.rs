@@ -15,6 +15,12 @@ fn bulk(s: &str) -> Value {
 
 // ── dedup envelopes ───────────────────────────────────────────────────────────
 
+/// Render a wire frame as text for assertions. Frames are bytes because values
+/// may be binary; every frame in these tests has a text payload.
+fn t(frame: &[u8]) -> String {
+    String::from_utf8_lossy(frame).into_owned()
+}
+
 #[test]
 fn enqueue_wraps_writes_in_dedup_envelope() {
     let mut c = client();
@@ -22,13 +28,13 @@ fn enqueue_wraps_writes_in_dedup_envelope() {
     assert_eq!(e.id, 0);
     assert!(!e.send_now);
     assert_eq!(
-        e.frame,
+        t(&e.frame),
         "*6\r\n$5\r\nDEDUP\r\n$8\r\nclient-a\r\n$1\r\n0\r\n$6\r\nINCRBY\r\n$1\r\nn\r\n$1\r\n2\r\n"
     );
     // Ids are monotonic.
     let e2 = c.enqueue_write(&to_resp(&["SET", "k", "v"]), true, false);
     assert_eq!(e2.id, 1);
-    assert!(e2.frame.contains("$1\r\n1\r\n"));
+    assert!(t(&e2.frame).contains("$1\r\n1\r\n"));
 }
 
 #[test]
@@ -37,7 +43,7 @@ fn epoch_forms_upper_bits_of_wire_id() {
     c.set_epoch(2);
     let e = c.enqueue_write(&to_resp(&["SET", "k", "v"]), true, false);
     let wire_id = (2u64 << 32).to_string();
-    assert!(e.frame.contains(&wire_id), "frame: {}", e.frame);
+    assert!(t(&e.frame).contains(&wire_id), "frame: {}", t(&e.frame));
 }
 
 #[test]
@@ -46,6 +52,72 @@ fn nodedup_writes_pass_through_unwrapped() {
     let plain = to_resp(&["SUBSCRIBE", "news"]);
     let e = c.enqueue_write(&plain, false, false);
     assert_eq!(e.frame, plain);
+}
+
+// ── binary values on the write path ──────────────────────────────────────────
+
+#[test]
+fn dedup_envelope_preserves_a_binary_payload() {
+    // wrap_dedup splices a header onto an already-encoded frame. Parsing that
+    // frame as text to do so would corrupt a binary value on the way out — and
+    // again on every reconnect replay, since the outbox stores the wrapped form.
+    let mut c = client();
+    let binary: &[u8] = &[0xff, 0xfe, 0x00, 0x41, 0x80];
+    let plain = to_resp_bytes(&[b"SET", b"k", binary]);
+
+    let e = c.enqueue_write(&plain, true, false);
+
+    // The envelope is spliced in front and the original payload is intact.
+    assert!(e.frame.starts_with(b"*6\r\n$5\r\nDEDUP\r\n"));
+    assert!(
+        e.frame.windows(binary.len()).any(|w| w == binary),
+        "binary payload must survive dedup wrapping"
+    );
+    // Byte count: the wrapped frame is the plain frame plus the envelope, so
+    // nothing was re-encoded or replaced along the way.
+    // Both headers are one digit wide (*3 -> *6), so the wrapped frame is
+    // exactly the plain frame plus the three spliced elements.
+    assert_eq!(
+        e.frame.len(),
+        plain.len() + b"$5\r\nDEDUP\r\n$8\r\nclient-a\r\n$1\r\n0\r\n".len(),
+        "frame: {:?}",
+        e.frame
+    );
+}
+
+#[test]
+fn a_binary_write_replays_unchanged_after_reconnect() {
+    let mut c = client();
+    let binary: &[u8] = &[0x00, 0xff, 0x1b, 0x80];
+    let e = c.enqueue_write(&to_resp_bytes(&[b"SET", b"k", binary]), true, false);
+
+    let frames = c.on_open();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(
+        frames[0], e.frame,
+        "replayed frame must be byte-identical to the queued one"
+    );
+}
+
+#[test]
+fn a_binary_pubsub_payload_is_delivered_as_bytes() {
+    // Rendering the payload as text here would hand the application a mangled
+    // message with no indication anything was lost.
+    let mut c = client();
+    let binary = vec![0xffu8, 0xfe, 0x41];
+    let mut frame = b"*3\r\n$7\r\nmessage\r\n$4\r\nnews\r\n$3\r\n".to_vec();
+    frame.extend_from_slice(&binary);
+    frame.extend_from_slice(b"\r\n");
+    // Re-tag as a Push frame, which is how pub/sub arrives.
+    frame[0] = b'>';
+
+    match c.handle_frame(&frame) {
+        Incoming::PubSub { channel, message } => {
+            assert_eq!(channel, "news");
+            assert_eq!(message, binary);
+        }
+        other => panic!("expected a pub/sub delivery, got {other:?}"),
+    }
 }
 
 // ── connection lifecycle & replay order ───────────────────────────────────────
@@ -61,9 +133,9 @@ fn on_open_replays_session_then_outbox_in_order() {
 
     let frames = c.on_open();
     assert_eq!(frames.len(), 5);
-    assert!(frames[0].contains("AUTH"));
-    assert!(frames[1].contains("TOKEN"));
-    assert!(frames[2].contains("QSUB"));
+    assert!(t(&frames[0]).contains("AUTH"));
+    assert!(t(&frames[1]).contains("TOKEN"));
+    assert!(t(&frames[2]).contains("QSUB"));
     assert_eq!(frames[3], w1.frame);
     assert_eq!(frames[4], w2.frame);
 }
@@ -80,11 +152,11 @@ fn session_commands_sent_while_open_occupy_reply_slots() {
     let w = c.enqueue_write(&to_resp(&["SET", "a", "1"]), true, true);
     assert!(w.send_now);
     assert_eq!(
-        c.handle_frame("*1\r\n$6\r\ncart:*\r\n"),
+        c.handle_frame(b"*1\r\n$6\r\ncart:*\r\n"),
         Incoming::Reply { retired: None }
     );
     assert_eq!(
-        c.handle_frame("+OK\r\n"),
+        c.handle_frame(b"+OK\r\n"),
         Incoming::Reply {
             retired: Some(w.id)
         }
@@ -175,7 +247,7 @@ fn replies_retire_outbox_rows_in_order() {
     assert_eq!(frames.len(), 2);
 
     assert_eq!(
-        c.handle_frame("+OK\r\n"),
+        c.handle_frame(b"+OK\r\n"),
         Incoming::Reply {
             retired: Some(w1.id)
         }
@@ -183,7 +255,7 @@ fn replies_retire_outbox_rows_in_order() {
     assert_eq!(c.outbox_len(), 1);
     // +DUP is a reply like any other — the row still retires.
     assert_eq!(
-        c.handle_frame("+DUP\r\n"),
+        c.handle_frame(b"+DUP\r\n"),
         Incoming::Reply {
             retired: Some(w2.id)
         }
@@ -211,15 +283,15 @@ fn pushes_are_not_replies() {
     // A mutation push and a keychange arrive before our reply — neither may
     // consume the reply slot.
     assert_eq!(
-        c.handle_frame(">3\r\n$3\r\nSET\r\n$1\r\nx\r\n$1\r\ny\r\n"),
+        c.handle_frame(b">3\r\n$3\r\nSET\r\n$1\r\nx\r\n$1\r\ny\r\n"),
         Incoming::Applied
     );
     assert_eq!(
-        c.handle_frame("*3\r\n$9\r\nkeychange\r\n$1\r\nx\r\n$1\r\nz\r\n"),
+        c.handle_frame(b"*3\r\n$9\r\nkeychange\r\n$1\r\nx\r\n$1\r\nz\r\n"),
         Incoming::Applied
     );
     assert_eq!(
-        c.handle_frame("+OK\r\n"),
+        c.handle_frame(b"+OK\r\n"),
         Incoming::Reply {
             retired: Some(w.id)
         }
@@ -247,7 +319,7 @@ fn qstate_applies_state_and_counts_as_reply() {
     c.on_open();
     let qstate = "*4\r\n$6\r\nqstate\r\n$6\r\ncart:*\r\n$6\r\ncart:1\r\n$5\r\napple\r\n";
     assert_eq!(
-        c.handle_frame(qstate),
+        c.handle_frame(qstate.as_bytes()),
         Incoming::AppliedReply { retired: None }
     );
     assert_eq!(get(&c, "cart:1"), bulk("apple"));
@@ -256,16 +328,16 @@ fn qstate_applies_state_and_counts_as_reply() {
 #[test]
 fn keychange_sets_and_deletes() {
     let mut c = client();
-    c.handle_frame("*3\r\n$9\r\nkeychange\r\n$1\r\nk\r\n$1\r\nv\r\n");
+    c.handle_frame(b"*3\r\n$9\r\nkeychange\r\n$1\r\nk\r\n$1\r\nv\r\n");
     assert_eq!(get(&c, "k"), bulk("v"));
-    c.handle_frame("*3\r\n$9\r\nkeychange\r\n$1\r\nk\r\n$-1\r\n");
+    c.handle_frame(b"*3\r\n$9\r\nkeychange\r\n$1\r\nk\r\n$-1\r\n");
     assert_eq!(get(&c, "k"), Value::BulkString(None));
 }
 
 #[test]
 fn pubsub_messages_surface_without_touching_store() {
     let mut c = client();
-    let msg = c.handle_frame(">3\r\n$7\r\nmessage\r\n$4\r\nnews\r\n$5\r\nhello\r\n");
+    let msg = c.handle_frame(b">3\r\n$7\r\nmessage\r\n$4\r\nnews\r\n$5\r\nhello\r\n");
     assert_eq!(
         msg,
         Incoming::PubSub {
@@ -304,8 +376,8 @@ fn restore_renumbers_but_preserves_frames_and_order() {
     // Replay order: restored rows first (oldest first), then this session's.
     let frames = c.on_open();
     assert_eq!(frames.len(), 3);
-    assert_eq!(frames[0], old_frame_a);
-    assert_eq!(frames[1], old_frame_b);
+    assert_eq!(t(&frames[0]), old_frame_a);
+    assert_eq!(t(&frames[1]), old_frame_b);
     assert_eq!(frames[2], session_write.frame);
 }
 
@@ -315,9 +387,9 @@ fn restore_renumbers_but_preserves_frames_and_order() {
 fn sync_scopes_builds_a_sync_frame_from_csv() {
     let mut c = client();
     let frame = c.set_sync_scopes("cart:*,user:1:*", true).unwrap();
-    assert!(frame.contains("SYNC"), "{frame}");
-    assert!(frame.contains("cart:*"));
-    assert!(frame.contains("user:1:*"));
+    assert!(t(&frame).contains("SYNC"), "{}", t(&frame));
+    assert!(t(&frame).contains("cart:*"));
+    assert!(t(&frame).contains("user:1:*"));
 }
 
 #[test]
@@ -325,8 +397,12 @@ fn sync_scopes_ignore_blank_entries_and_whitespace() {
     let mut c = client();
     let frame = c.set_sync_scopes(" cart:* , , user:1:* ,", true).unwrap();
     // Three commas but only two real patterns → SYNC + 2 args.
-    assert!(frame.starts_with("*3\r\n"), "expected 3 parts, got {frame}");
-    assert!(frame.contains("cart:*") && frame.contains("user:1:*"));
+    assert!(
+        t(&frame).starts_with("*3\r\n"),
+        "expected 3 parts, got {}",
+        t(&frame)
+    );
+    assert!(t(&frame).contains("cart:*") && t(&frame).contains("user:1:*"));
 }
 
 #[test]
@@ -344,7 +420,7 @@ fn scopes_are_replayed_on_reconnect() {
     c.set_sync_scopes("cart:*", false);
     let frames = c.on_open();
     assert!(
-        frames.iter().any(|f| f.contains("cart:*")),
+        frames.iter().any(|f| t(f).contains("cart:*")),
         "scopes must be re-established after reconnect: {frames:?}"
     );
 }
@@ -357,9 +433,9 @@ fn a_sync_token_takes_precedence_over_raw_scope_patterns() {
     c.set_sync_scopes("cart:*", false);
     c.set_sync_token("tok-123", false);
     let frames = c.on_open();
-    assert!(frames.iter().any(|f| f.contains("tok-123")));
+    assert!(frames.iter().any(|f| t(f).contains("tok-123")));
     assert!(
-        !frames.iter().any(|f| f.contains("cart:*")),
+        !frames.iter().any(|f| t(f).contains("cart:*")),
         "raw scopes must not be sent alongside a token: {frames:?}"
     );
 }
@@ -374,7 +450,7 @@ fn live_queries_register_once_and_replay_on_open() {
     c.add_live_query("user:*", false);
 
     let frames = c.on_open();
-    let qsubs = frames.iter().filter(|f| f.contains("QSUB")).count();
+    let qsubs = frames.iter().filter(|f| t(f).contains("QSUB")).count();
     assert_eq!(
         qsubs, 2,
         "duplicate patterns must not double-subscribe: {frames:?}"
@@ -389,17 +465,18 @@ fn removing_one_live_query_leaves_the_others() {
 
     let frame = c.remove_live_query(Some("cart:*"), true).unwrap();
     assert!(
-        frame.contains("QUNSUB") && frame.contains("cart:*"),
-        "{frame}"
+        t(&frame).contains("QUNSUB") && t(&frame).contains("cart:*"),
+        "{}",
+        t(&frame)
     );
 
     let frames = c.on_open();
     assert!(
-        frames.iter().any(|f| f.contains("user:*")),
+        frames.iter().any(|f| t(f).contains("user:*")),
         "survivor replays"
     );
     assert!(
-        !frames.iter().any(|f| f.contains("cart:*")),
+        !frames.iter().any(|f| t(f).contains("cart:*")),
         "removed query must not replay: {frames:?}"
     );
 }
@@ -411,15 +488,16 @@ fn removing_all_live_queries_sends_a_bare_qunsub() {
     c.add_live_query("user:*", false);
 
     let frame = c.remove_live_query(None, true).unwrap();
-    assert!(frame.contains("QUNSUB"), "{frame}");
+    assert!(t(&frame).contains("QUNSUB"), "{}", t(&frame));
     assert!(
-        !frame.contains("cart:*"),
-        "bare QUNSUB carries no pattern: {frame}"
+        !t(&frame).contains("cart:*"),
+        "bare QUNSUB carries no pattern: {}",
+        t(&frame)
     );
 
     let frames = c.on_open();
     assert!(
-        !frames.iter().any(|f| f.contains("QSUB")),
+        !frames.iter().any(|f| t(f).contains("QSUB")),
         "nothing should replay after clearing: {frames:?}"
     );
 }
@@ -436,7 +514,7 @@ fn on_open_sends_auth_before_scopes_before_queries() {
     c.add_live_query("cart:*", false);
 
     let frames = c.on_open();
-    let pos = |needle: &str| frames.iter().position(|f| f.contains(needle));
+    let pos = |needle: &str| frames.iter().position(|f| t(f).contains(needle));
     let (auth, sync, qsub) = (
         pos("AUTH").unwrap(),
         pos("TOKEN").unwrap(),
@@ -485,7 +563,7 @@ fn clear_outbox_drops_queued_and_inflight_writes() {
     assert_eq!(c.outbox_len(), 0);
     // A reply arriving after a clear must not retire a row that no longer
     // exists or panic on an empty inflight queue.
-    c.handle_frame("+OK\r\n");
+    c.handle_frame(b"+OK\r\n");
     assert_eq!(c.outbox_len(), 0);
 }
 
@@ -538,7 +616,7 @@ fn keychange_rebuilds_a_hash_without_a_re_read() {
     ));
 
     let mut c = client();
-    c.handle_frame(&push(keychange_frame(&source, "cart:42")));
+    c.handle_frame(push(keychange_frame(&source, "cart:42")).as_bytes());
 
     assert_eq!(
         c.store()
@@ -561,7 +639,7 @@ fn keychange_rebuilds_lists_in_order() {
     ));
 
     let mut c = client();
-    c.handle_frame(&push(keychange_frame(&source, "queue")));
+    c.handle_frame(push(keychange_frame(&source, "queue")).as_bytes());
 
     assert_eq!(
         c.store().execute(Command::LRange("queue".into(), 0, -1)),
@@ -584,8 +662,8 @@ fn keychange_rebuilds_sets_and_zsets() {
     ));
 
     let mut c = client();
-    c.handle_frame(&push(keychange_frame(&source, "tags")));
-    c.handle_frame(&push(keychange_frame(&source, "board")));
+    c.handle_frame(push(keychange_frame(&source, "tags")).as_bytes());
+    c.handle_frame(push(keychange_frame(&source, "board")).as_bytes());
 
     assert_eq!(
         c.store().execute(Command::SCard("tags".into())),
@@ -608,7 +686,7 @@ fn keychange_rebuilds_json_documents() {
     ));
 
     let mut c = client();
-    c.handle_frame(&push(keychange_frame(&source, "doc")));
+    c.handle_frame(push(keychange_frame(&source, "doc")).as_bytes());
 
     assert_eq!(
         c.store().execute(Command::JGet("doc".into(), None)),
@@ -627,14 +705,14 @@ fn a_removed_member_disappears_from_the_local_copy() {
     ));
 
     let mut c = client();
-    c.handle_frame(&push(keychange_frame(&source, "tags")));
+    c.handle_frame(push(keychange_frame(&source, "tags")).as_bytes());
     assert_eq!(
         c.store().execute(Command::SCard("tags".into())),
         Value::Integer(2)
     );
 
     source.execute(Command::SRem("tags".into(), vec!["red".into()]));
-    c.handle_frame(&push(keychange_frame(&source, "tags")));
+    c.handle_frame(push(keychange_frame(&source, "tags")).as_bytes());
 
     assert_eq!(
         c.store()
@@ -667,7 +745,7 @@ fn qstate_delivers_complete_collections_on_subscribe() {
         Value::BulkString(Some(b"cart:2".to_vec())),
         source.get_current("cart:2"),
     ]);
-    c.handle_frame(&frame);
+    c.handle_frame(frame.as_bytes());
 
     assert_eq!(
         c.store()
@@ -685,14 +763,17 @@ fn an_unknown_type_tag_is_ignored_rather_than_guessed() {
     // Forward compatibility: a newer server sending a type this client does not
     // know must not corrupt the local copy.
     let mut c = client();
-    c.handle_frame(&push(vec![
-        Value::BulkString(Some(b"keychange".to_vec())),
-        Value::BulkString(Some(b"k".to_vec())),
-        Value::Array(Some(vec![
-            Value::BulkString(Some(b"futuretype".to_vec())),
-            Value::BulkString(Some(b"payload".to_vec())),
-        ])),
-    ]));
+    c.handle_frame(
+        push(vec![
+            Value::BulkString(Some(b"keychange".to_vec())),
+            Value::BulkString(Some(b"k".to_vec())),
+            Value::Array(Some(vec![
+                Value::BulkString(Some(b"futuretype".to_vec())),
+                Value::BulkString(Some(b"payload".to_vec())),
+            ])),
+        ])
+        .as_bytes(),
+    );
     assert_eq!(get(&c, "k"), Value::BulkString(None));
 }
 
@@ -704,13 +785,13 @@ fn flushdb_sentinel_clears_every_key_matching_the_pattern() {
     // per deleted key — a keyspace-sized frame storm for a single command.
     let mut c = client();
     c.add_live_query("cart:*", false);
-    c.handle_frame("*3\r\n$9\r\nkeychange\r\n$11\r\ncart:item:1\r\n$1\r\na\r\n");
-    c.handle_frame("*3\r\n$9\r\nkeychange\r\n$11\r\ncart:item:2\r\n$1\r\nb\r\n");
-    c.handle_frame("*3\r\n$9\r\nkeychange\r\n$7\r\nother:1\r\n$1\r\nc\r\n");
+    c.handle_frame(b"*3\r\n$9\r\nkeychange\r\n$11\r\ncart:item:1\r\n$1\r\na\r\n");
+    c.handle_frame(b"*3\r\n$9\r\nkeychange\r\n$11\r\ncart:item:2\r\n$1\r\nb\r\n");
+    c.handle_frame(b"*3\r\n$9\r\nkeychange\r\n$7\r\nother:1\r\n$1\r\nc\r\n");
     assert_eq!(get(&c, "cart:item:1"), bulk("a"));
 
     // Sentinel: nil value whose "key" is the registered pattern.
-    c.handle_frame("*3\r\n$9\r\nkeychange\r\n$6\r\ncart:*\r\n$-1\r\n");
+    c.handle_frame(b"*3\r\n$9\r\nkeychange\r\n$6\r\ncart:*\r\n$-1\r\n");
 
     assert_eq!(get(&c, "cart:item:1"), Value::BulkString(None));
     assert_eq!(get(&c, "cart:item:2"), Value::BulkString(None));
@@ -726,11 +807,11 @@ fn a_nil_for_an_unregistered_pattern_deletes_only_that_key() {
     // Without this distinction, a literal key that happens to contain a glob
     // character would wipe unrelated data.
     let mut c = client();
-    c.handle_frame("*3\r\n$9\r\nkeychange\r\n$5\r\nkey:1\r\n$1\r\na\r\n");
-    c.handle_frame("*3\r\n$9\r\nkeychange\r\n$5\r\nkey:2\r\n$1\r\nb\r\n");
+    c.handle_frame(b"*3\r\n$9\r\nkeychange\r\n$5\r\nkey:1\r\n$1\r\na\r\n");
+    c.handle_frame(b"*3\r\n$9\r\nkeychange\r\n$5\r\nkey:2\r\n$1\r\nb\r\n");
 
     // Not a registered live query — treat it as an ordinary single-key delete.
-    c.handle_frame("*3\r\n$9\r\nkeychange\r\n$5\r\nkey:1\r\n$-1\r\n");
+    c.handle_frame(b"*3\r\n$9\r\nkeychange\r\n$5\r\nkey:1\r\n$-1\r\n");
 
     assert_eq!(get(&c, "key:1"), Value::BulkString(None));
     assert_eq!(get(&c, "key:2"), bulk("b"), "unrelated key survives");
@@ -740,7 +821,7 @@ fn a_nil_for_an_unregistered_pattern_deletes_only_that_key() {
 fn flushdb_sentinel_is_harmless_when_nothing_matches() {
     let mut c = client();
     c.add_live_query("cart:*", false);
-    c.handle_frame("*3\r\n$9\r\nkeychange\r\n$6\r\ncart:*\r\n$-1\r\n");
+    c.handle_frame(b"*3\r\n$9\r\nkeychange\r\n$6\r\ncart:*\r\n$-1\r\n");
     assert_eq!(c.store().execute(Command::DbSize), Value::Integer(0));
 }
 
