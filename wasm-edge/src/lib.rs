@@ -5,7 +5,7 @@ use js_sys::Promise;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
-use sync_client::{Incoming, SyncClient, is_replayable_mutation, to_resp};
+use sync_client::{Incoming, SyncClient, is_replayable_mutation, to_resp, to_resp_bytes};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{BroadcastChannel, Event, MessageEvent, WebSocket};
@@ -69,6 +69,21 @@ export function idbOutboxDelete(db, id) {
         req.onerror   = (e) => reject(e.target.error);
     });
 }
+export function idbWalReplace(db, cmds) {
+    return new Promise((resolve, reject) => {
+        // One transaction: the clear and the rewrite commit together or not at
+        // all. Clearing in a separate transaction (as this used to) leaves the
+        // WAL empty if the tab closes before the snapshot is written, losing the
+        // entire persisted cache.
+        const tx    = db.transaction('wal', 'readwrite');
+        const store = tx.objectStore('wal');
+        store.clear();
+        for (let i = 0; i < cmds.length; i++) store.put(cmds[i], i);
+        tx.oncomplete = () => resolve(undefined);
+        tx.onerror    = (e) => reject(e.target.error);
+        tx.onabort    = (e) => reject(e.target.error);
+    });
+}
 export function idbWalClear(db) {
     return new Promise((resolve, reject) => {
         const tx  = db.transaction('wal', 'readwrite');
@@ -111,13 +126,15 @@ extern "C" {
     #[wasm_bindgen(js_name = "idbOutboxReadAll")]
     fn idb_outbox_read_all(db: &JsValue) -> Promise;
     #[wasm_bindgen(js_name = "idbAppend")]
-    fn idb_append_js(db: &JsValue, seq: f64, cmd: &str) -> Promise;
+    fn idb_append_js(db: &JsValue, seq: f64, cmd: &[u8]) -> Promise;
     #[wasm_bindgen(js_name = "idbOutboxPut")]
-    fn idb_outbox_put_js(db: &JsValue, id: f64, cmd: &str) -> Promise;
+    fn idb_outbox_put_js(db: &JsValue, id: f64, cmd: &[u8]) -> Promise;
     #[wasm_bindgen(js_name = "idbOutboxDelete")]
     fn idb_outbox_delete_js(db: &JsValue, id: f64) -> Promise;
     #[wasm_bindgen(js_name = "idbWalClear")]
     fn idb_wal_clear_js(db: &JsValue) -> Promise;
+    #[wasm_bindgen(js_name = "idbWalReplace")]
+    fn idb_wal_replace_js(db: &JsValue, cmds: &JsValue) -> Promise;
     #[wasm_bindgen(js_name = "idbMetaGet")]
     fn idb_meta_get(db: &JsValue, key: &str) -> Promise;
     #[wasm_bindgen(js_name = "idbMetaPut")]
@@ -128,9 +145,19 @@ extern "C" {
 
 // ── RESP helper ───────────────────────────────────────────────────────────────
 
-fn to_resp_owned(parts: &[String]) -> String {
-    let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
-    to_resp(&refs)
+/// Build a RESP array frame from owned byte arguments.
+///
+/// Bytes rather than `String`: WAL compaction re-encodes stored values, and a
+/// value pushed from the server may be arbitrary binary. Going through a
+/// `String` here would corrupt exactly the values the store holds correctly.
+fn to_resp_owned(parts: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", parts.len()).into_bytes();
+    for part in parts {
+        out.extend_from_slice(format!("${}\r\n", part.len()).as_bytes());
+        out.extend_from_slice(part);
+        out.extend_from_slice(b"\r\n");
+    }
+    out
 }
 
 // ── WAL compaction ────────────────────────────────────────────────────────────
@@ -157,7 +184,7 @@ fn wall_clock_ms() -> u64 {
 /// Convert snapshot entries into minimal RESP command strings suitable for
 /// storing in the WAL. Each entry produces one command; entries with a TTL on
 /// collection types produce an extra PEXPIREAT command.
-fn snapshot_to_resp_cmds(entries: &[SnapshotEntry]) -> Vec<String> {
+fn snapshot_to_resp_cmds(entries: &[SnapshotEntry]) -> Vec<Vec<u8>> {
     // `SystemTime::now()` is unsupported on wasm32-unknown-unknown and panics
     // outright. This runs inside WAL compaction, immediately after the WAL has
     // been cleared — a panic here therefore destroys the entire persisted cache
@@ -170,29 +197,32 @@ fn snapshot_to_resp_cmds(entries: &[SnapshotEntry]) -> Vec<String> {
         if e.expires_at_ms.is_some_and(|exp| now_ms >= exp) {
             continue;
         }
-        let data_parts: Vec<String> = match &e.value {
+        // Identifiers are text and values are bytes, so every part is built as
+        // bytes and the text ones are converted on the way in.
+        let t = |x: &str| x.as_bytes().to_vec();
+        let data_parts: Vec<Vec<u8>> = match &e.value {
             SnapshotValue::Str(s) => {
                 if let Some(exp) = e.expires_at_ms {
                     let rem_ms = exp.saturating_sub(now_ms);
                     vec![
-                        "SET".into(),
-                        e.key.clone(),
-                        s.clone(),
-                        "PX".into(),
-                        rem_ms.to_string(),
+                        t("SET"),
+                        t(&e.key),
+                        s.as_slice().to_vec(),
+                        t("PX"),
+                        t(&rem_ms.to_string()),
                     ]
                 } else {
-                    vec!["SET".into(), e.key.clone(), s.clone()]
+                    vec![t("SET"), t(&e.key), s.as_slice().to_vec()]
                 }
             }
             SnapshotValue::Hash(map) => {
                 if map.is_empty() {
                     continue;
                 }
-                let mut parts = vec!["HSET".to_string(), e.key.clone()];
+                let mut parts = vec![t("HSET"), t(&e.key)];
                 for (f, v) in map {
-                    parts.push(f.clone());
-                    parts.push(v.clone());
+                    parts.push(t(f));
+                    parts.push(v.as_slice().to_vec());
                 }
                 parts
             }
@@ -200,26 +230,26 @@ fn snapshot_to_resp_cmds(entries: &[SnapshotEntry]) -> Vec<String> {
                 if list.is_empty() {
                     continue;
                 }
-                let mut parts = vec!["RPUSH".to_string(), e.key.clone()];
-                parts.extend(list.iter().cloned());
+                let mut parts = vec![t("RPUSH"), t(&e.key)];
+                parts.extend(list.iter().map(|v| v.as_slice().to_vec()));
                 parts
             }
             SnapshotValue::Set(set) => {
                 if set.is_empty() {
                     continue;
                 }
-                let mut parts = vec!["SADD".to_string(), e.key.clone()];
-                parts.extend(set.iter().cloned());
+                let mut parts = vec![t("SADD"), t(&e.key)];
+                parts.extend(set.iter().map(|m| t(m)));
                 parts
             }
             SnapshotValue::ZSet(pairs) => {
                 if pairs.is_empty() {
                     continue;
                 }
-                let mut parts = vec!["ZADD".to_string(), e.key.clone()];
+                let mut parts = vec![t("ZADD"), t(&e.key)];
                 for (member, score) in pairs {
-                    parts.push(format_score(*score));
-                    parts.push(member.clone());
+                    parts.push(t(&format_score(*score)));
+                    parts.push(t(member));
                 }
                 parts
             }
@@ -227,7 +257,7 @@ fn snapshot_to_resp_cmds(entries: &[SnapshotEntry]) -> Vec<String> {
             // not persisted in the browser WAL.
             SnapshotValue::RateLimiter { .. } => continue,
             SnapshotValue::Json(doc) => {
-                vec!["JSET".into(), e.key.clone(), "$".into(), doc.clone()]
+                vec![t("JSET"), t(&e.key), t("$"), t(doc)]
             }
         };
         out.push(to_resp_owned(&data_parts));
@@ -236,9 +266,9 @@ fn snapshot_to_resp_cmds(entries: &[SnapshotEntry]) -> Vec<String> {
             && let Some(exp) = e.expires_at_ms
         {
             out.push(to_resp_owned(&[
-                "PEXPIREAT".to_string(),
-                e.key.clone(),
-                exp.to_string(),
+                t("PEXPIREAT"),
+                t(&e.key),
+                t(&exp.to_string()),
             ]));
         }
     }
@@ -294,6 +324,8 @@ struct WsShared {
     core: Rc<RefCell<SyncClient>>,
     on_mutation: Rc<RefCell<Option<js_sys::Function>>>,
     on_message: Rc<RefCell<Option<js_sys::Function>>>,
+    /// Invoked when the offline outbox overflows and a queued write is dropped.
+    on_outbox_full: Rc<RefCell<Option<js_sys::Function>>>,
     ws: Rc<RefCell<Option<WebSocket>>>,
     handlers: Rc<RefCell<WsHandlers>>,
     /// Shared with `RecachedCache.idb` — the open IndexedDB handle, if any.
@@ -321,9 +353,9 @@ fn outbox_delete(sh: &WsShared, id: u64) {
 }
 
 /// Persist an outbox row to durable storage.
-fn outbox_put(sh: &WsShared, id: u64, frame: &str) {
+fn outbox_put(sh: &WsShared, id: u64, frame: &[u8]) {
     if let Some(db) = sh.idb.borrow().clone() {
-        let cmd = frame.to_string();
+        let cmd = frame.to_vec();
         spawn_local(async move {
             let _ = JsFuture::from(idb_outbox_put_js(&db, id as f64, &cmd)).await;
         });
@@ -336,11 +368,13 @@ fn dispatch_incoming(sh: &WsShared, incoming: Incoming) {
         Incoming::Applied => notify_mutation(&sh.on_mutation),
         Incoming::PubSub { channel, message } => {
             if let Some(f) = sh.on_message.borrow().as_ref() {
-                let _ = f.call2(
-                    &JsValue::NULL,
-                    &JsValue::from_str(&channel),
-                    &JsValue::from_str(&message),
-                );
+                let payload = match std::str::from_utf8(&message) {
+                    Ok(text) => JsValue::from_str(text),
+                    // A binary publish cannot be a JS string; the listener gets
+                    // the bytes rather than a lossy rendering of them.
+                    Err(_) => js_sys::Uint8Array::from(&message[..]).into(),
+                };
+                let _ = f.call2(&JsValue::NULL, &JsValue::from_str(&channel), &payload);
             }
         }
         Incoming::Reply { retired } => {
@@ -360,7 +394,7 @@ fn dispatch_incoming(sh: &WsShared, incoming: Incoming) {
 
 /// Queue a write through the core and mirror its effects: durable outbox row,
 /// possible overflow eviction, and an immediate send when connected.
-fn queue_write(sh: &WsShared, encoded: &str, dedup: bool) {
+fn queue_write(sh: &WsShared, encoded: &[u8], dedup: bool) {
     // Local-only mode (no connect() and no persistence): nothing to sync to.
     if sh.url.borrow().is_none() && sh.idb.borrow().is_none() {
         return;
@@ -378,12 +412,64 @@ fn queue_write(sh: &WsShared, encoded: &str, dedup: bool) {
         web_sys::console::warn_1(&JsValue::from_str(
             "recached: offline write queue full — dropped the oldest queued write",
         ));
+        // A silent drop is data loss the application cannot detect. Give it the
+        // dropped frame so it can persist or reconcile the write itself.
+        if let Some(cb) = sh.on_outbox_full.borrow().as_ref() {
+            let _ = cb.call2(
+                &JsValue::NULL,
+                &JsValue::from_f64(old as f64),
+                &JsValue::from_f64(sh.core.borrow().outbox_len() as f64),
+            );
+        }
     }
     outbox_put(sh, e.id, &e.frame);
     if e.send_now
         && let Some(ws) = sh.ws.borrow().as_ref()
     {
-        let _ = ws.send_with_str(&e.frame);
+        ws_send_frame(ws, &e.frame);
+    }
+}
+
+/// Extract the RESP bytes from a message event, whether the peer sent a text
+/// frame or a binary one.
+fn event_frame_bytes(e: &MessageEvent) -> Option<Vec<u8>> {
+    let data = e.data();
+    if let Some(text) = data.as_string() {
+        return Some(text.into_bytes());
+    }
+    if let Ok(buf) = data.clone().dyn_into::<js_sys::ArrayBuffer>() {
+        return Some(js_sys::Uint8Array::new(&buf).to_vec());
+    }
+    if let Ok(arr) = data.dyn_into::<js_sys::Uint8Array>() {
+        return Some(arr.to_vec());
+    }
+    None
+}
+
+/// Post a RESP frame to other tabs, as a string when the bytes are text and a
+/// `Uint8Array` when they are not.
+fn bc_post(bc: &BroadcastChannel, frame: &[u8]) {
+    let msg = match std::str::from_utf8(frame) {
+        Ok(text) => JsValue::from_str(text),
+        Err(_) => js_sys::Uint8Array::from(frame).into(),
+    };
+    let _ = bc.post_message(&msg);
+}
+
+/// Send one RESP frame over the socket.
+///
+/// Text frames must be well-formed UTF-8 per the WebSocket spec, so a frame
+/// carrying a binary value goes out as a binary frame — which the server
+/// accepts from 0.2.2. Everything else stays text, so nothing changes for the
+/// overwhelming majority of traffic.
+fn ws_send_frame(ws: &WebSocket, frame: &[u8]) {
+    match std::str::from_utf8(frame) {
+        Ok(text) => {
+            let _ = ws.send_with_str(text);
+        }
+        Err(_) => {
+            let _ = ws.send_with_u8_array(frame);
+        }
     }
 }
 
@@ -405,12 +491,19 @@ fn open_socket(sh: &WsShared) {
     };
 
     // ── onmessage: classify + apply via the core, execute its effects ────
+    //
+    // ArrayBuffer rather than the default Blob: the server sends a *binary*
+    // frame whenever a reply carries a value that is not valid UTF-8, and a
+    // Blob would have to be read asynchronously — the handler below would drop
+    // it on the floor.
+    ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
     let sh_msg = sh.clone();
     let onmessage = Closure::wrap(Box::new(move |e: MessageEvent| {
-        if let Ok(text) = e.data().dyn_into::<js_sys::JsString>() {
-            let incoming = sh_msg.core.borrow_mut().handle_frame(&String::from(text));
-            dispatch_incoming(&sh_msg, incoming);
-        }
+        let Some(raw) = event_frame_bytes(&e) else {
+            return;
+        };
+        let incoming = sh_msg.core.borrow_mut().handle_frame(&raw);
+        dispatch_incoming(&sh_msg, incoming);
     }) as Box<dyn FnMut(MessageEvent)>);
     ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
 
@@ -419,7 +512,7 @@ fn open_socket(sh: &WsShared) {
     let ws_for_open = ws.clone();
     let onopen = Closure::wrap(Box::new(move |_e: Event| {
         for frame in sh_open.core.borrow_mut().on_open() {
-            let _ = ws_for_open.send_with_str(&frame);
+            ws_send_frame(&ws_for_open, &frame);
         }
     }) as Box<dyn FnMut(Event)>);
     ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
@@ -492,12 +585,12 @@ impl Default for RecachedCache {
 
 // ── persistence helper ────────────────────────────────────────────────────────
 
-fn persist_cmd(idb: &Rc<RefCell<Option<JsValue>>>, seq: &Rc<Cell<u64>>, encoded: &str) {
+fn persist_cmd(idb: &Rc<RefCell<Option<JsValue>>>, seq: &Rc<Cell<u64>>, encoded: &[u8]) {
     let maybe_db = idb.borrow().as_ref().cloned();
     if let Some(db) = maybe_db {
         let s = seq.get();
         seq.set(s + 1);
-        let cmd = encoded.to_string();
+        let cmd = encoded.to_vec();
         spawn_local(async move {
             let _ = JsFuture::from(idb_append_js(&db, s as f64, &cmd)).await;
         });
@@ -518,6 +611,7 @@ impl RecachedCache {
     pub fn new() -> RecachedCache {
         let store = Arc::new(KeyValueStore::new());
         let on_mutation = Rc::new(RefCell::new(None));
+        let on_outbox_full: Rc<RefCell<Option<js_sys::Function>>> = Rc::new(RefCell::new(None));
         let on_message = Rc::new(RefCell::new(None));
         let idb = Rc::new(RefCell::new(None));
         let core = Rc::new(RefCell::new(SyncClient::new(
@@ -529,6 +623,7 @@ impl RecachedCache {
                 core,
                 on_mutation: Rc::clone(&on_mutation),
                 on_message: Rc::clone(&on_message),
+                on_outbox_full: Rc::clone(&on_outbox_full),
                 ws: Rc::new(RefCell::new(None)),
                 handlers: Rc::new(RefCell::new(WsHandlers::default())),
                 idb: Rc::clone(&idb),
@@ -549,14 +644,14 @@ impl RecachedCache {
     }
 
     /// Queue a store write (dedup-wrapped for exactly-once delivery).
-    fn ws_enqueue(&self, encoded: &str) {
+    fn ws_enqueue(&self, encoded: &[u8]) {
         queue_write(&self.shared, encoded, true);
     }
 
     /// Queue a connection-scoped command (pub/sub) — replayed on reconnect
     /// but never dedup-wrapped: skipping a re-sent SUBSCRIBE would silently
     /// drop the subscription.
-    fn ws_enqueue_nodedup(&self, encoded: &str) {
+    fn ws_enqueue_nodedup(&self, encoded: &[u8]) {
         queue_write(&self.shared, encoded, false);
     }
 
@@ -565,6 +660,23 @@ impl RecachedCache {
     /// The SDK's `onMutation()` wires this up automatically.
     pub fn set_mutation_callback(&mut self, cb: js_sys::Function) {
         *self.on_mutation.borrow_mut() = Some(cb);
+    }
+
+    /// Register a JS callback invoked when the offline outbox overflows and the
+    /// oldest queued write is dropped. Signature:
+    /// `cb(droppedId: number, pendingWrites: number)`.
+    ///
+    /// Without this an overflow is invisible to the application: the write is
+    /// discarded, no error is raised, and the data is simply gone. The SDK's
+    /// `onOutboxFull()` wires this up automatically.
+    pub fn set_outbox_full_callback(&mut self, cb: js_sys::Function) {
+        *self.shared.on_outbox_full.borrow_mut() = Some(cb);
+    }
+
+    /// Writes queued locally and not yet acknowledged by the server. Poll this
+    /// to show sync state, or to back off before the queue overflows.
+    pub fn pending_writes(&self) -> usize {
+        self.shared.core.borrow().outbox_len()
     }
 
     /// Register a JS callback invoked when a pub/sub message arrives.
@@ -634,10 +746,16 @@ impl RecachedCache {
                 let pair = js_sys::Array::from(&result);
                 let keys = js_sys::Array::from(&pair.get(0));
                 let vals = js_sys::Array::from(&pair.get(1));
-                let mut restored: Vec<(u64, String)> = Vec::with_capacity(keys.length() as usize);
+                let mut restored: Vec<(u64, Vec<u8>)> = Vec::with_capacity(keys.length() as usize);
                 for i in 0..keys.length() {
                     let id = keys.get(i).as_f64().unwrap_or(0.0) as u64;
-                    let cmd = vals.get(i).as_string().unwrap_or_default();
+                    let raw = vals.get(i);
+                    let cmd = match raw.as_string() {
+                        // Rows written by 0.2.1 and earlier, when frames were
+                        // strings rather than Uint8Array.
+                        Some(t) => t.into_bytes(),
+                        None => js_sys::Uint8Array::new(&raw).to_vec(),
+                    };
                     if !cmd.is_empty() {
                         restored.push((id, cmd));
                     }
@@ -663,8 +781,13 @@ impl RecachedCache {
             let mut max_seq: u64 = 0;
             for i in 0..entry_count {
                 let s = keys.get(i).as_f64().unwrap_or(0.0) as u64;
-                let cmd_str = vals.get(i).as_string().unwrap_or_default();
-                if let Ok((value, _)) = Value::parse(cmd_str.as_bytes())
+                let raw = vals.get(i);
+                let cmd_bytes = match raw.as_string() {
+                    // Written by 0.2.1 and earlier, when frames were strings.
+                    Some(t) => t.into_bytes(),
+                    None => js_sys::Uint8Array::new(&raw).to_vec(),
+                };
+                if let Ok((value, _)) = Value::parse(&cmd_bytes)
                     && let Ok(cmd) = Command::from_value(value)
                 {
                     store.execute(cmd);
@@ -683,14 +806,17 @@ impl RecachedCache {
             let next_seq = if entry_count > WAL_COMPACT_THRESHOLD {
                 // WAL only — the outbox holds writes still awaiting server
                 // acknowledgment and must survive compaction.
-                JsFuture::from(idb_wal_clear_js(&db)).await?;
+                // Atomic: the old log is only dropped if the replacement
+                // commits with it. Previously this cleared first and wrote
+                // after, so an interruption in between left an empty WAL and
+                // the persisted cache was gone.
                 let cmds = snapshot_to_resp_cmds(&store.snapshot());
-                let mut seq: u64 = 0;
-                for cmd_str in &cmds {
-                    let _ = JsFuture::from(idb_append_js(&db, seq as f64, cmd_str)).await;
-                    seq += 1;
+                let arr = js_sys::Array::new();
+                for cmd in &cmds {
+                    arr.push(&js_sys::Uint8Array::from(&cmd[..]));
                 }
-                seq
+                JsFuture::from(idb_wal_replace_js(&db, &arr)).await?;
+                cmds.len() as u64
             } else if entry_count == 0 {
                 0
             } else {
@@ -734,15 +860,13 @@ impl RecachedCache {
         let on_mut = Rc::clone(&self.on_mutation);
 
         let onbc = Closure::wrap(Box::new(move |e: MessageEvent| {
-            if let Ok(text) = e.data().dyn_into::<js_sys::JsString>() {
-                let s = String::from(text);
-                if let Ok((value, _)) = Value::parse(s.as_bytes())
-                    && let Ok(cmd) = Command::from_value(value)
-                    && is_replayable_mutation(&cmd)
-                {
-                    store_clone.execute(cmd);
-                    notify_mutation(&on_mut);
-                }
+            if let Some(raw) = event_frame_bytes(&e)
+                && let Ok((value, _)) = Value::parse(&raw)
+                && let Ok(cmd) = Command::from_value(value)
+                && is_replayable_mutation(&cmd)
+            {
+                store_clone.execute(cmd);
+                notify_mutation(&on_mut);
             }
         }) as Box<dyn FnMut(MessageEvent)>);
 
@@ -798,11 +922,11 @@ impl RecachedCache {
 
     /// Send a session frame the core produced (it has already recorded the
     /// inflight reply slot).
-    fn send_session_frame(&self, frame: Option<String>) {
+    fn send_session_frame(&self, frame: Option<Vec<u8>>) {
         if let Some(frame) = frame
             && let Some(ws) = self.shared.ws.borrow().as_ref()
         {
-            let _ = ws.send_with_str(&frame);
+            ws_send_frame(ws, &frame);
         }
     }
 
@@ -884,7 +1008,7 @@ impl RecachedCache {
         let encoded = to_resp(&["INCRBY", key, &delta_s]);
         self.ws_enqueue(&encoded);
         if let Some(bc) = &self.bc {
-            let _ = bc.post_message(&JsValue::from_str(&encoded));
+            bc_post(bc, &encoded);
         }
         persist_cmd(&self.idb, &self.seq, &encoded);
         notify_mutation(&self.on_mutation);
@@ -906,7 +1030,7 @@ impl RecachedCache {
         let encoded = to_resp(&["JSET", key, path, value]);
         self.ws_enqueue(&encoded);
         if let Some(bc) = &self.bc {
-            let _ = bc.post_message(&JsValue::from_str(&encoded));
+            bc_post(bc, &encoded);
         }
         persist_cmd(&self.idb, &self.seq, &encoded);
         notify_mutation(&self.on_mutation);
@@ -938,7 +1062,7 @@ impl RecachedCache {
         let encoded = to_resp(&["JMERGE", key, patch]);
         self.ws_enqueue(&encoded);
         if let Some(bc) = &self.bc {
-            let _ = bc.post_message(&JsValue::from_str(&encoded));
+            bc_post(bc, &encoded);
         }
         persist_cmd(&self.idb, &self.seq, &encoded);
         notify_mutation(&self.on_mutation);
@@ -959,7 +1083,13 @@ impl RecachedCache {
             pair.push(&JsValue::from_str(&k));
             match v {
                 Value::BulkString(Some(bytes)) => {
-                    pair.push(&JsValue::from_str(&String::from_utf8_lossy(&bytes)));
+                    match std::str::from_utf8(&bytes) {
+                        Ok(text) => pair.push(&JsValue::from_str(text)),
+                        // A binary value has no string form; handing back a
+                        // lossy rendering would corrupt it silently in the one
+                        // API a live query reads through.
+                        Err(_) => pair.push(&js_sys::Uint8Array::from(&bytes[..]).into()),
+                    };
                 }
                 _ => {
                     pair.push(&JsValue::NULL);
@@ -974,14 +1104,42 @@ impl RecachedCache {
     pub fn set(&self, key: &str, value: &str) -> String {
         let resp = self.store.execute(Command::Set(
             key.to_string(),
-            value.to_string(),
+            value.as_bytes().to_vec(),
             SetOptions::default(),
         ));
 
         let encoded = to_resp(&["SET", key, value]);
         self.ws_enqueue(&encoded);
         if let Some(bc) = &self.bc {
-            let _ = bc.post_message(&JsValue::from_str(&encoded));
+            bc_post(bc, &encoded);
+        }
+        persist_cmd(&self.idb, &self.seq, &encoded);
+        notify_mutation(&self.on_mutation);
+
+        match resp {
+            Value::SimpleString(s) => s,
+            Value::Error(e) => e,
+            _ => "ERR".to_string(),
+        }
+    }
+
+    /// Set a key to raw bytes, synced to the server and other tabs.
+    ///
+    /// Values are byte-transparent, so this stores and replicates exactly the
+    /// bytes given — compressed payloads, protobuf, images. `set()` is the
+    /// right call for text; this exists for everything a JS string cannot hold.
+    #[wasm_bindgen(js_name = "setBytes")]
+    pub fn set_bytes(&self, key: &str, value: &[u8]) -> String {
+        let resp = self.store.execute(Command::Set(
+            key.to_string(),
+            value.to_vec(),
+            SetOptions::default(),
+        ));
+
+        let encoded = to_resp_bytes(&[b"SET", key.as_bytes(), value]);
+        self.ws_enqueue(&encoded);
+        if let Some(bc) = &self.bc {
+            bc_post(bc, &encoded);
         }
         persist_cmd(&self.idb, &self.seq, &encoded);
         notify_mutation(&self.on_mutation);
@@ -999,14 +1157,16 @@ impl RecachedCache {
             expiry: Some(core_engine::cmd::SetExpiry::Ex(seconds as u64)),
             ..Default::default()
         };
-        let resp = self
-            .store
-            .execute(Command::Set(key.to_string(), value.to_string(), opts));
+        let resp = self.store.execute(Command::Set(
+            key.to_string(),
+            value.as_bytes().to_vec(),
+            opts,
+        ));
 
         let encoded = to_resp(&["SET", key, value, "EX", &seconds.to_string()]);
         self.ws_enqueue(&encoded);
         if let Some(bc) = &self.bc {
-            let _ = bc.post_message(&JsValue::from_str(&encoded));
+            bc_post(bc, &encoded);
         }
         persist_cmd(&self.idb, &self.seq, &encoded);
         notify_mutation(&self.on_mutation);
@@ -1019,9 +1179,31 @@ impl RecachedCache {
     }
 
     /// Get a value from the local store (zero latency).
-    pub fn get(&self, key: &str) -> Option<String> {
+    pub fn get(&self, key: &str) -> Result<Option<String>, JsValue> {
         match self.store.execute(Command::Get(key.to_string())) {
-            Value::BulkString(Some(data)) => Some(String::from_utf8_lossy(&data).into_owned()),
+            Value::BulkString(Some(data)) => match String::from_utf8(data) {
+                Ok(text) => Ok(Some(text)),
+                // A backend can write binary that syncs into this cache.
+                // Returning it lossily would hand the application text that is
+                // not what was stored, so this throws instead.
+                Err(_) => Err(JsValue::from_str(
+                    "value is not valid UTF-8 — use getBytes() to read binary values",
+                )),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    /// Read a key as raw bytes, whatever it contains.
+    ///
+    /// `get()` is the right call for text; this exists for values a backend
+    /// wrote as binary — compressed payloads, protobuf, images — which cannot
+    /// be represented as a JS string. Returns `undefined` when the key is
+    /// absent.
+    #[wasm_bindgen(js_name = "getBytes")]
+    pub fn get_bytes(&self, key: &str) -> Option<js_sys::Uint8Array> {
+        match self.store.execute(Command::Get(key.to_string())) {
+            Value::BulkString(Some(data)) => Some(js_sys::Uint8Array::from(&data[..])),
             _ => None,
         }
     }
@@ -1033,7 +1215,7 @@ impl RecachedCache {
         let encoded = to_resp(&["DEL", key]);
         self.ws_enqueue(&encoded);
         if let Some(bc) = &self.bc {
-            let _ = bc.post_message(&JsValue::from_str(&encoded));
+            bc_post(bc, &encoded);
         }
         persist_cmd(&self.idb, &self.seq, &encoded);
         notify_mutation(&self.on_mutation);
@@ -1063,6 +1245,15 @@ impl RecachedCache {
     /// Publish a message to a channel on the server.
     pub fn publish(&self, channel: &str, message: &str) {
         self.ws_enqueue_nodedup(&to_resp(&["PUBLISH", channel, message]));
+    }
+
+    /// Publish raw bytes to a channel on the server.
+    ///
+    /// Subscribers receive a `Uint8Array` rather than a string when the payload
+    /// is not valid UTF-8.
+    #[wasm_bindgen(js_name = "publishBytes")]
+    pub fn publish_bytes(&self, channel: &str, message: &[u8]) {
+        self.ws_enqueue_nodedup(&to_resp_bytes(&[b"PUBLISH", channel.as_bytes(), message]));
     }
 
     /// Subscribe to a channel on the server. Push messages arrive via the `onmessage` callback.
@@ -1108,15 +1299,30 @@ mod tests {
     }
 
     /// Join the emitted RESP frames for substring assertions.
+    ///
+    /// Frames are bytes now that values can be binary; these tests all use text
+    /// payloads, so rendering them lossily for assertions is safe here and
+    /// keeps the assertions readable.
     fn joined(entries: &[SnapshotEntry]) -> String {
-        snapshot_to_resp_cmds(entries).join("")
+        as_text(&snapshot_to_resp_cmds(entries)).join("")
+    }
+
+    fn as_text(frames: &[Vec<u8>]) -> Vec<String> {
+        frames
+            .iter()
+            .map(|f| String::from_utf8_lossy(f).into_owned())
+            .collect()
     }
 
     // ── WAL encoding: every value type must survive a page reload ─────────────
 
     #[test]
     fn strings_persist_as_set() {
-        let out = snapshot_to_resp_cmds(&[entry("k", SnapshotValue::Str("v".into()), None)]);
+        let out = as_text(&snapshot_to_resp_cmds(&[entry(
+            "k",
+            SnapshotValue::Str("v".into()),
+            None,
+        )]));
         assert_eq!(out.len(), 1);
         assert!(out[0].contains("SET") && out[0].contains("k") && out[0].contains("v"));
     }
@@ -1124,8 +1330,8 @@ mod tests {
     #[test]
     fn hashes_persist_every_field() {
         let mut m = HashMap::new();
-        m.insert("f1".to_string(), "v1".to_string());
-        m.insert("f2".to_string(), "v2".to_string());
+        m.insert("f1".to_string(), "v1".into());
+        m.insert("f2".to_string(), "v2".into());
         let s = joined(&[entry("h", SnapshotValue::Hash(m), None)]);
         assert!(s.contains("HSET"));
         for part in ["f1", "v1", "f2", "v2"] {
@@ -1188,10 +1394,10 @@ mod tests {
     #[test]
     fn already_expired_entries_are_dropped_not_resurrected() {
         // Replaying an expired key would bring deleted data back on reload.
-        let out = snapshot_to_resp_cmds(&[
+        let out = as_text(&snapshot_to_resp_cmds(&[
             entry("dead", SnapshotValue::Str("v".into()), Some(1)),
             entry("live", SnapshotValue::Str("v".into()), None),
-        ]);
+        ]));
         let s = out.join("");
         assert!(!s.contains("dead"), "expired key resurrected: {s}");
         assert!(s.contains("live"));
@@ -1215,8 +1421,11 @@ mod tests {
         // Collection commands cannot carry an inline TTL, so the expiry rides
         // in a second command — as an absolute timestamp this time.
         let exp = now_ms() + 60_000;
-        let out =
-            snapshot_to_resp_cmds(&[entry("l", SnapshotValue::List(vec!["a".into()]), Some(exp))]);
+        let out = as_text(&snapshot_to_resp_cmds(&[entry(
+            "l",
+            SnapshotValue::List(vec!["a".into()]),
+            Some(exp),
+        )]));
         assert_eq!(out.len(), 2, "expected RPUSH + PEXPIREAT: {out:?}");
         assert!(out[1].contains("PEXPIREAT") && out[1].contains(&exp.to_string()));
     }
@@ -1224,7 +1433,11 @@ mod tests {
     #[test]
     fn a_string_with_a_ttl_emits_only_one_command() {
         let exp = now_ms() + 60_000;
-        let out = snapshot_to_resp_cmds(&[entry("k", SnapshotValue::Str("v".into()), Some(exp))]);
+        let out = as_text(&snapshot_to_resp_cmds(&[entry(
+            "k",
+            SnapshotValue::Str("v".into()),
+            Some(exp),
+        )]));
         assert_eq!(out.len(), 1, "SET carries PX inline: {out:?}");
     }
 
@@ -1234,12 +1447,12 @@ mod tests {
     fn empty_collections_emit_nothing() {
         // `RPUSH key` with no members is a syntax error on replay, which would
         // abort WAL hydration part-way through.
-        let out = snapshot_to_resp_cmds(&[
+        let out = as_text(&snapshot_to_resp_cmds(&[
             entry("h", SnapshotValue::Hash(HashMap::new()), None),
             entry("l", SnapshotValue::List(vec![]), None),
             entry("s", SnapshotValue::Set(vec![]), None),
             entry("z", SnapshotValue::ZSet(vec![]), None),
-        ]);
+        ]));
         assert!(out.is_empty(), "empty collections must be skipped: {out:?}");
     }
 
@@ -1247,7 +1460,7 @@ mod tests {
     fn rate_limiter_state_is_not_persisted_in_the_browser() {
         // Attempt state is server-side and transient; replaying it locally
         // would let a client fabricate its own rate-limit history.
-        let out = snapshot_to_resp_cmds(&[entry(
+        let out = as_text(&snapshot_to_resp_cmds(&[entry(
             "rl",
             SnapshotValue::RateLimiter {
                 limit: 10,
@@ -1255,7 +1468,7 @@ mod tests {
                 events: vec![1, 2, 3],
             },
             None,
-        )]);
+        )]));
         assert!(
             out.is_empty(),
             "rate-limiter state leaked into the WAL: {out:?}"
@@ -1270,13 +1483,13 @@ mod tests {
     #[test]
     fn every_emitted_command_is_a_well_formed_resp_array() {
         let mut m = HashMap::new();
-        m.insert("f".to_string(), "v".to_string());
-        let out = snapshot_to_resp_cmds(&[
+        m.insert("f".to_string(), "v".into());
+        let out = as_text(&snapshot_to_resp_cmds(&[
             entry("s", SnapshotValue::Str("v".into()), None),
             entry("h", SnapshotValue::Hash(m), None),
             entry("l", SnapshotValue::List(vec!["a".into()]), None),
             entry("z", SnapshotValue::ZSet(vec![("m".into(), 1.0)]), None),
-        ]);
+        ]));
         assert_eq!(out.len(), 4);
         for frame in &out {
             assert!(frame.starts_with('*'), "not a RESP array: {frame}");
@@ -1297,7 +1510,7 @@ mod tests {
         use core_engine::store::KeyValueStore;
 
         let mut m = HashMap::new();
-        m.insert("f".to_string(), "v".to_string());
+        m.insert("f".to_string(), "v".into());
         let cmds = snapshot_to_resp_cmds(&[
             entry("str", SnapshotValue::Str("hello".into()), None),
             entry("h", SnapshotValue::Hash(m), None),
@@ -1308,7 +1521,7 @@ mod tests {
 
         let store = KeyValueStore::new();
         for frame in &cmds {
-            let (value, _) = core_engine::resp::Value::parse(frame.as_bytes()).unwrap();
+            let (value, _) = core_engine::resp::Value::parse(frame).unwrap();
             store.execute(Command::from_value(value).unwrap());
         }
 
@@ -1378,7 +1591,14 @@ mod browser_tests {
         (
             keys.iter().map(|k| k.as_f64().unwrap_or(-1.0)).collect(),
             vals.iter()
-                .map(|v| v.as_string().unwrap_or_default())
+                .map(|v| match v.as_string() {
+                    Some(t) => t,
+                    // WAL frames are stored as Uint8Array so binary values
+                    // persist; these tests all use text payloads.
+                    None => {
+                        String::from_utf8_lossy(&js_sys::Uint8Array::new(&v).to_vec()).into_owned()
+                    }
+                })
                 .collect(),
         )
     }
@@ -1461,7 +1681,7 @@ mod browser_tests {
         // order reconstructs the wrong state on reload.
         let db = fresh_db().await;
         for (seq, cmd) in [(1.0, "SET a 1"), (2.0, "SET b 2"), (3.0, "SET a 3")] {
-            JsFuture::from(idb_append_js(&db, seq, cmd))
+            JsFuture::from(idb_append_js(&db, seq, cmd.as_bytes()))
                 .await
                 .expect("append");
         }
@@ -1475,10 +1695,10 @@ mod browser_tests {
         // Compaction clears the WAL only. Wiping the outbox here would discard
         // writes the server has not acknowledged yet — silent data loss.
         let db = fresh_db().await;
-        JsFuture::from(idb_append_js(&db, 1.0, "SET a 1"))
+        JsFuture::from(idb_append_js(&db, 1.0, b"SET a 1"))
             .await
             .expect("append");
-        JsFuture::from(idb_outbox_put_js(&db, 10.0, "PENDING WRITE"))
+        JsFuture::from(idb_outbox_put_js(&db, 10.0, b"PENDING WRITE"))
             .await
             .expect("outbox put");
 
@@ -1494,10 +1714,10 @@ mod browser_tests {
     #[wasm_bindgen_test]
     async fn full_clear_empties_every_store() {
         let db = open_db().await;
-        JsFuture::from(idb_append_js(&db, 1.0, "SET a 1"))
+        JsFuture::from(idb_append_js(&db, 1.0, b"SET a 1"))
             .await
             .unwrap();
-        JsFuture::from(idb_outbox_put_js(&db, 1.0, "SET b 2"))
+        JsFuture::from(idb_outbox_put_js(&db, 1.0, b"SET b 2"))
             .await
             .unwrap();
 
@@ -1514,7 +1734,7 @@ mod browser_tests {
         // The durability guarantee: a write made offline must still be there
         // after the page is reloaded and the database reopened.
         let db = fresh_db().await;
-        JsFuture::from(idb_outbox_put_js(&db, 7.0, "SET offline 1"))
+        JsFuture::from(idb_outbox_put_js(&db, 7.0, b"SET offline 1"))
             .await
             .expect("put");
         drop(db);
@@ -1529,7 +1749,7 @@ mod browser_tests {
     async fn deleting_an_acknowledged_row_leaves_the_others() {
         let db = fresh_db().await;
         for (id, cmd) in [(1.0, "SET a 1"), (2.0, "SET b 2"), (3.0, "SET c 3")] {
-            JsFuture::from(idb_outbox_put_js(&db, id, cmd))
+            JsFuture::from(idb_outbox_put_js(&db, id, cmd.as_bytes()))
                 .await
                 .unwrap();
         }
@@ -1546,10 +1766,10 @@ mod browser_tests {
         // Renumbering on restore re-puts rows; duplicates would replay a write
         // twice.
         let db = fresh_db().await;
-        JsFuture::from(idb_outbox_put_js(&db, 5.0, "FIRST"))
+        JsFuture::from(idb_outbox_put_js(&db, 5.0, b"FIRST"))
             .await
             .unwrap();
-        JsFuture::from(idb_outbox_put_js(&db, 5.0, "SECOND"))
+        JsFuture::from(idb_outbox_put_js(&db, 5.0, b"SECOND"))
             .await
             .unwrap();
 
@@ -1566,6 +1786,185 @@ mod browser_tests {
         JsFuture::from(idb_outbox_delete_js(&db, 999.0))
             .await
             .expect("deleting a missing row should resolve");
+    }
+
+    // ── Atomic WAL compaction ─────────────────────────────────────────────────
+
+    #[wasm_bindgen_test]
+    async fn wal_replace_swaps_contents_in_one_transaction() {
+        let db = fresh_db().await;
+        for (seq, cmd) in [(0.0, "SET a 1"), (1.0, "SET b 2"), (2.0, "SET c 3")] {
+            JsFuture::from(idb_append_js(&db, seq, cmd.as_bytes()))
+                .await
+                .unwrap();
+        }
+
+        let arr = js_sys::Array::new();
+        arr.push(&JsValue::from_str("SET compacted 1"));
+        JsFuture::from(idb_wal_replace_js(&db, &arr))
+            .await
+            .expect("replace");
+
+        let (keys, vals) = wal_rows(&db).await;
+        assert_eq!(keys, vec![0.0], "old entries must be gone");
+        assert_eq!(vals, vec!["SET compacted 1".to_string()]);
+    }
+
+    #[wasm_bindgen_test]
+    async fn wal_replace_with_an_empty_snapshot_empties_the_log() {
+        // An empty store compacts to zero commands; the WAL should end empty
+        // rather than retaining stale entries.
+        let db = fresh_db().await;
+        JsFuture::from(idb_append_js(&db, 0.0, b"SET a 1"))
+            .await
+            .unwrap();
+
+        let empty = js_sys::Array::new();
+        JsFuture::from(idb_wal_replace_js(&db, &empty))
+            .await
+            .expect("replace");
+
+        assert!(wal_rows(&db).await.0.is_empty());
+    }
+
+    #[wasm_bindgen_test]
+    async fn wal_replace_leaves_the_outbox_untouched() {
+        // Compaction must never drop writes still awaiting acknowledgement.
+        let db = fresh_db().await;
+        JsFuture::from(idb_append_js(&db, 0.0, b"SET a 1"))
+            .await
+            .unwrap();
+        JsFuture::from(idb_outbox_put_js(&db, 5.0, b"PENDING"))
+            .await
+            .unwrap();
+
+        let arr = js_sys::Array::new();
+        arr.push(&JsValue::from_str("SET compacted 1"));
+        JsFuture::from(idb_wal_replace_js(&db, &arr)).await.unwrap();
+
+        let (ids, vals) = outbox_rows(&db).await;
+        assert_eq!(ids, vec![5.0]);
+        assert_eq!(vals[0], "PENDING");
+    }
+
+    #[wasm_bindgen_test]
+    async fn binary_writes_survive_the_outbox() {
+        // An offline write is stored in IndexedDB and replayed on reconnect. A
+        // binary value has to come back out of that queue byte-identical, or
+        // the replayed write differs from the one the application made.
+        let db = fresh_db().await;
+        let binary = vec![0xffu8, 0xfe, 0x00, 0x41, 0x80];
+        let frame = to_resp_bytes(&[b"SET", b"k", &binary]);
+
+        JsFuture::from(idb_outbox_put_js(&db, 0.0, &frame))
+            .await
+            .expect("outbox put");
+
+        let res = JsFuture::from(idb_outbox_read_all(&db))
+            .await
+            .expect("outbox read");
+        let pair = js_sys::Array::from(&res);
+        let vals = js_sys::Array::from(&pair.get(1));
+        let raw = vals.get(0);
+        let stored = match raw.as_string() {
+            Some(t) => t.into_bytes(),
+            None => js_sys::Uint8Array::new(&raw).to_vec(),
+        };
+
+        assert_eq!(stored, frame, "outbox row must round-trip unchanged");
+
+        // And it still parses into the write the application made.
+        let (value, _) = core_engine::resp::Value::parse(&stored).unwrap();
+        let store = KeyValueStore::new();
+        store.execute(Command::from_value(value).unwrap());
+        assert_eq!(
+            store.execute(Command::Get("k".into())),
+            Value::BulkString(Some(binary))
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn binary_values_survive_the_wal() {
+        // A backend can write a binary value that reaches this browser through
+        // a live query. The WAL persists frames in IndexedDB, so it has to
+        // carry those bytes intact — a UTF-8 round trip here would corrupt on
+        // reload exactly the values the store holds correctly in memory.
+        let db = fresh_db().await;
+        let binary = vec![0xffu8, 0xfe, 0x00, 0x41, 0x80];
+
+        let source = KeyValueStore::new();
+        source.execute(Command::Set(
+            "b".into(),
+            binary.clone(),
+            core_engine::cmd::SetOptions::default(),
+        ));
+
+        let cmds = snapshot_to_resp_cmds(&source.snapshot());
+        let arr = js_sys::Array::new();
+        for c in &cmds {
+            arr.push(&js_sys::Uint8Array::from(&c[..]));
+        }
+        JsFuture::from(idb_wal_replace_js(&db, &arr)).await.unwrap();
+
+        // Read the raw rows back and replay them, as a page load would.
+        let res = JsFuture::from(idb_read_all(&db)).await.expect("wal read");
+        let pair = js_sys::Array::from(&res);
+        let vals = js_sys::Array::from(&pair.get(1));
+        let restored = KeyValueStore::new();
+        for i in 0..vals.length() {
+            let raw = vals.get(i);
+            let bytes = match raw.as_string() {
+                Some(t) => t.into_bytes(),
+                None => js_sys::Uint8Array::new(&raw).to_vec(),
+            };
+            let (value, _) = core_engine::resp::Value::parse(&bytes).unwrap();
+            restored.execute(Command::from_value(value).unwrap());
+        }
+
+        assert_eq!(
+            restored.execute(Command::Get("b".into())),
+            Value::BulkString(Some(binary)),
+            "binary value must survive the WAL round trip"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn compacted_wal_replays_to_the_same_state() {
+        // End to end: snapshot a store, compact through the atomic path, read
+        // back, and rebuild — the persisted cache must be intact.
+        use core_engine::cmd::Command;
+        use core_engine::store::KeyValueStore;
+
+        let db = fresh_db().await;
+        let source = KeyValueStore::new();
+        source.execute(Command::Set(
+            "k".into(),
+            "v".into(),
+            core_engine::cmd::SetOptions::default(),
+        ));
+        source.execute(Command::RPush("l".into(), vec!["a".into(), "b".into()]));
+
+        let cmds = snapshot_to_resp_cmds(&source.snapshot());
+        let arr = js_sys::Array::new();
+        for c in &cmds {
+            arr.push(&js_sys::Uint8Array::from(&c[..]));
+        }
+        JsFuture::from(idb_wal_replace_js(&db, &arr)).await.unwrap();
+
+        let (_, vals) = wal_rows(&db).await;
+        let restored = KeyValueStore::new();
+        for frame in &vals {
+            let (value, _) = core_engine::resp::Value::parse(frame.as_bytes()).unwrap();
+            restored.execute(Command::from_value(value).unwrap());
+        }
+        assert_eq!(
+            restored.execute(Command::Get("k".into())),
+            core_engine::resp::Value::BulkString(Some(b"v".to_vec()))
+        );
+        assert_eq!(
+            restored.execute(Command::LLen("l".into())),
+            core_engine::resp::Value::Integer(2)
+        );
     }
 
     // ── Meta (client identity + epoch) ────────────────────────────────────────

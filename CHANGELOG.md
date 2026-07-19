@@ -4,6 +4,241 @@ All notable changes to Recached are documented here.
 
 ---
 
+## [0.2.2] — 2026-07-20
+
+### Added
+
+- **`ESET` — connection-scoped keys for presence.** A key written with `ESET` lives exactly as long
+  as the connection that wrote it; when that connection closes the server deletes it and pushes the
+  deletion to live queries. Presence, cursors and "who is online" previously had to be hand-rolled
+  with `SETEX` plus a heartbeat, which leaves ghost entries for the length of the TTL whenever a tab
+  closes.
+
+  Ownership transfers on each write, which is what makes multiple tabs behave: two tabs both setting
+  `presence:user:42` leave the **later** one as owner, so closing the first does not mark the user
+  offline. Replicas receive the write as a plain `SET` — they have no connection to scope a lifetime
+  to, and the owning server broadcasts the deletion.
+
+- **`onOutboxFull()` and `pendingWrites()` on the browser SDK.** The offline queue holds 10 000
+  writes and evicts the oldest past that — previously in silence, with no error and no signal, so an
+  application could not tell that a user's write had been discarded. `onOutboxFull(cb)` reports the
+  dropped row id and the remaining depth; `pendingWrites()` exposes the depth for a "syncing…"
+  indicator or to apply back-pressure before the cap is reached.
+
+- **Capacity and sync metrics.** Seven new series, sampled every 5 seconds because capacity is a
+  level rather than an event: `recached_memory_bytes`, `recached_keys`, `recached_evictions_total`,
+  `recached_replicas_connected`, `recached_live_queries`, `recached_watched_keys`, and
+  `recached_dedup_clients_tracked`, and `recached_replication_queue_depth`. Previously only traffic
+  was exported, so an operator could not
+  answer "am I near the cap?" or "is eviction thrashing?" from a dashboard. Replication lag landed
+  separately in this release; browser outbox depth remains unexported because it lives in the client
+  — see [Operations](docs/server/operations.md).
+
+- **`HELLO` and RESP3 negotiation on the TCP port.** A connection starts in RESP2 and `HELLO 3`
+  switches it to RESP3; `HELLO 2` switches back, a bare `HELLO` reports without changing, and an
+  unsupported version returns `-NOPROTO` while leaving the connection on what it had. The reply is a
+  RESP3 map on a RESP3 connection and a flat array on a RESP2 one, matching Redis. `HELLO` requires
+  authentication — the pre-auth reply carries no server details, so it cannot be used to fingerprint
+  a deployment.
+
+  This also adds a `Map` type (`%N`) to the RESP codec, with the header counting *pairs* rather than
+  elements.
+
+- **Replication offset acknowledgement, and a true lag metric.** Replicas now acknowledge each frame
+  they apply on the existing replication socket, and the primary exports
+  `recached_replication_lag_frames` — frames sent to the furthest-behind replica but not yet
+  acknowledged.
+
+  `recached_replication_queue_depth` only ever showed work stuck in the primary's send queue, so the
+  case that matters most read as healthy: a replica that has received everything and is not applying
+  it shows an empty queue and unbounded lag. Acknowledgements are monotonic, so a reordered or
+  replayed ack cannot walk the high-water mark backwards.
+
+  A replica older than 0.2.2 never acknowledges, so its lag climbs while replication works normally —
+  upgrade both ends together.
+
+### Changed
+
+- **Command arguments are moved rather than copied.** `extract_string` built every argument with
+  `from_utf8_lossy(..).into_owned()`, which allocates a fresh `String` and memcpys the payload even
+  when the bytes are already valid UTF-8 — which they nearly always are. Parsing now moves the byte
+  buffer the RESP parser already allocated, so a 1 MB `SET` value costs no copy at all.
+
+  Applied to the commands that actually carry payloads: `SET`, `MSET`, `HSET`/`HMSET`, `APPEND`,
+  `GETSET`, `SETNX`, `JSET`, `JMERGE`, and all 22 bulk argument lists (`RPUSH`, `SADD`, `ZADD`, …).
+  The long tail of small-argument commands still copies; the remaining win there is negligible and
+  the risk of touching 125 parse arms is not.
+
+  Argument slots are consumed, so an arm must read each index once — new tests cover the shapes
+  where that matters (`SET`'s option scan after moving key and value, `MSET`/`HSET` pair splitting,
+  a 1 MB round-trip, and invalid UTF-8 falling back to a lossy re-encode).
+
+  **Not benchmarked.** The gain is a removed allocation and memcpy per argument, which is
+  structural, but the machine available could not produce trustworthy figures — see the
+  [benchmarks](docs/guide/benchmarks) caveat. Re-measure on a quiet host before quoting numbers.
+
+- **Rate-limiter memory is bounded.** A limiter stored one timestamp per attempt, so
+  `RLSET key 100000 3600` held 100 000 `u64`s — roughly 800 KB for a single key, and token-cost
+  limiting (roadmap #9) makes six-figure limits ordinary. Attempts are now counted into 64 buckets,
+  capping a limiter at about 1 KB whatever the limit.
+
+  The trade-off is granularity: the window advances one bucket at a time, so a limiter is exact to
+  within `window / 64`. Attempts are never under-counted — a bucket leaves the window only once it
+  is entirely outside it — so the limiter errs toward rejecting slightly early rather than admitting
+  over the limit. `retry_after_ms` is clamped to the window.
+
+  Limiter *attempt* state is no longer persisted in snapshots (configuration still is). It ages out
+  within a single window and a restart has already interrupted that window, so a restored limiter
+  enforces the same policy from a clean slate rather than a stale partial count.
+
+- **Per-connection limits are configurable** rather than compiled in, because the right value is
+  workload-dependent: `RECACHED_MAX_MULTI_QUEUE`, `RECACHED_MAX_WATCHES_PER_CONN`,
+  `RECACHED_MAX_LIVE_QUERIES`, `RECACHED_MAX_QSUB_INITIAL_KEYS`, and `RECACHED_EVICTION_SAMPLE` (the
+  knob Redis exposes as `maxmemory-samples`). Defaults are unchanged. The browser outbox cap is now
+  settable through `sync-client` rather than fixed at 10 000.
+
+- **Live queries now carry collection values.** `qstate` and `keychange` previously delivered only a
+  *type name* for hashes, lists, sets, sorted sets and JSON, so every subscriber had to follow up with
+  `HGETALL`/`LRANGE`/`JGET` — a network round-trip in a system whose premise is that reads are local.
+  Collections now arrive **type-tagged and complete**:
+
+  ```text
+  hash  →  ["hash", field, value, ...]     fields sorted
+  list  →  ["list", element, ...]          head to tail
+  set   →  ["set", member, ...]
+  zset  →  ["zset", member, score, ...]    ascending score
+  json  →  ["json", document]
+  ```
+
+  The tag is required for the payload to be unambiguous — a four-element array would otherwise be
+  indistinguishable between a list of four items and a hash of two pairs. Ordering is deterministic
+  so two clients build identical local state, and each notification carries the complete value, which
+  is what allows a removed member to propagate.
+
+  ::: warning Wire-format change
+  A client older than 0.2.2 does not understand the tagged shape and will ignore collection values
+  from live queries. Server and SDKs are released in lockstep at the same version — run matching
+  versions.
+  :::
+
+- **`FLUSHDB` now reaches live queries.** `primary_keys()` is empty for `FLUSHDB`, so the generic
+  notifier had nothing to announce and subscribers silently kept serving data the server had already
+  wiped.
+
+  Announcing per deleted key would mean one frame per key in the keyspace for a single command, so
+  the server emits **one sentinel per registered pattern** instead — a `keychange` whose key is the
+  pattern and whose value is nil. Clients expand it locally to "every key matching this pattern is
+  gone", which is O(patterns) rather than O(keys). Explicitly `WATCH`ed keys are still notified
+  individually, since that set is bounded and callers expect per-key precision there.
+
+- **Reconnect backoff is jittered.** Delays now land in `[nominal/2, nominal]` instead of an exact
+  `500ms × 2^attempts`. Without jitter every client disconnected by the same event computes an
+  identical schedule and reconnects in lockstep — a thundering herd that can keep a recovering server
+  down. The jitter source is seeded from the client id rather than a system RNG, so `sync-client`
+  stays dependency-free and I/O-free and the sequence remains reproducible in tests.
+
+### Fixed
+
+- **Values were silently corrupted unless they were valid UTF-8; they are now byte-transparent.**
+  Values were stored as `String`, so a value containing invalid UTF-8 was converted to U+FFFD
+  replacement characters on the way in. `SET` returned `OK`, `GET` returned bytes that differed from
+  what was written, and nothing anywhere reported a problem — the original bytes were destroyed at
+  parse time, before storage, so there was nothing to recover.
+
+  This affected **every transport, TCP included** — not only WebSocket, as the roadmap previously
+  recorded. `SET k <0xFF 0xFE 0x41>` over plain RESP came back as `EF BF BD EF BF BD 41`.
+
+  Values are now stored and returned as the exact bytes sent, matching Redis. The change runs the
+  full depth of the stack: the store's string, list and hash types; command parsing; the RESP
+  encoder used for replication, AOF and browser sync; pub/sub payloads; and the browser's IndexedDB
+  write-ahead log.
+
+  **Identifiers stay text.** Keys, hash fields, set and sorted-set members, glob patterns and channel
+  names must be valid UTF-8, and a command carrying a binary one is refused before anything is
+  written:
+
+  ```
+  ERR argument 1 is not valid UTF-8. Keys, fields, members and patterns must be text;
+      only values may be binary
+  ```
+
+  Redis permits binary there too, but those positions are looked up, glob-matched and checked against
+  sync scopes as text, so a binary identifier would be unreachable through its own access paths. It
+  is recorded on the [roadmap](docs/roadmap.md) rather than scheduled.
+
+  **Snapshots remain compatible.** A snapshot written by 0.2.1 or earlier still loads: values were
+  msgpack strings then and are msgpack binary now, and the decoder accepts either. Binary values
+  encode as msgpack `bin` rather than an array of integers, so snapshot size is unchanged for text
+  and roughly halved versus the naive encoding for binary.
+
+  **The browser SDK handles binary end to end.** `setBytes()` / `getBytes()` and `publishBytes()`
+  are new, and binary survives the offline outbox, the exactly-once `DEDUP` envelope, cross-tab
+  `BroadcastChannel` sync and IndexedDB persistence unchanged. Frames that carry binary now travel
+  in WebSocket *binary* frames in both directions — the socket's `binaryType` is `arraybuffer`, so
+  an inbound binary frame is no longer silently dropped by the message handler.
+
+  `cache.get()` now **throws** on a binary value instead of returning mangled text, `getJSON()`
+  treats one as a miss, and an `onMessage` listener receives a `Uint8Array` for a binary pub/sub
+  payload — so the listener signature widened to `string | Uint8Array`. `getMatching()` — the read
+  behind every live query — returns a `Uint8Array` for a binary value rather than a lossy string,
+  which was the last silent conversion left on the browser read path.
+
+  **`@recached/react` and `@recached/vue`** follow: `useKeyBytes()` is new, `usePubSub` handlers and
+  the `KeyValuePair` value type widened to `string | Uint8Array`, and `useKey` returns `null` for a
+  binary value rather than letting `get()` throw out of a React `getSnapshot` or a Vue reactive
+  update — which would have taken down the render tree over a value the hook cannot represent.
+
+  These are **compile-time breaking changes for TypeScript users** who annotated a `usePubSub`
+  handler or an `onMessage` listener as `(msg: string) => void`, or who destructured a
+  `KeyValuePair` value as `string | null`. Widen the annotation, or narrow with `typeof v === 'string'`.
+
+  Data corrupted by an earlier version cannot be recovered and must be re-populated.
+
+- **Pub/sub deliveries never reached a TCP subscriber that only listened.** Deliveries were written
+  into a 32 KB buffered writer and flushed only at the end of a client-command batch, so a
+  connection that subscribed and then waited received nothing until it happened to send another
+  command or 32 KB of messages accumulated. A subscriber that also polled looked fine, which is how
+  this survived. Deliveries are now flushed on write.
+
+- **Pub/sub frames were RESP3 Push on RESP2 connections.** Every delivery was a `>` frame regardless
+  of protocol. RESP2 has no push type, so a standard Redis client that subscribed without sending
+  `HELLO 3` could not parse what it was sent. Frame type now follows the negotiated version. The
+  WebSocket transport is unchanged — it is RESP3 by definition, and `HELLO 2` on it is refused
+  rather than silently ignored.
+
+- **WebSocket command frames must now be accepted in binary as well as text.** The handler matched
+  text frames only, so a binary frame was dropped without a reply — and the WebSocket spec requires
+  text frames to be well-formed UTF-8, which left no way to send bytes at all. Replies are sent as
+  text when the RESP bytes are valid UTF-8 and binary otherwise, so existing clients see no change.
+
+  This makes the transport byte-clean; the values travelling over it became byte-transparent in the
+  same release — see below.
+
+- **Exactly-once delivery now survives a server restart.** Dedup high-water marks were held only in
+  memory, so a restart inside the acknowledgement window let a client's replayed write apply twice —
+  the last standing caveat on the guarantee. Marks are now persisted to a `.dedup` sidecar beside the
+  snapshot, written atomically and only when a mark advances, and restored before the server accepts
+  connections.
+
+  The map is one `u64` per client, so it is flushed on a 1-second timer as well as with each
+  snapshot: the residual window on an unclean shutdown is bounded by that interval rather than by the
+  snapshot cadence. A missing or corrupt sidecar is logged and ignored rather than being fatal —
+  losing the bookkeeping is bad, refusing to boot is worse.
+
+- **WAL compaction could destroy the browser's persisted cache.** Compaction cleared the write-ahead
+  log in one IndexedDB transaction and wrote the replacement snapshot in later ones, so an
+  interruption between them left an empty WAL and no snapshot. The existing code comment anticipated
+  this window; it is now closed by doing the clear and the rewrite in a **single transaction**, which
+  IndexedDB commits or rolls back as a unit.
+
+- **`ESET` would not have replicated.** `is_write_command` is a `matches!` list, which — unlike a
+  `match` — has no exhaustiveness check, so a newly added command silently defaults to "not a write"
+  and never reaches replicas, the AOF, or live queries. Caught while wiring `ESET`; a cross-check test
+  now asserts that every command reporting written keys is also classified as a write, so the next
+  addition cannot repeat it.
+
+---
+
 ## [0.2.1] — 2026-07-19
 
 ### Fixed — Browser SDK (critical)

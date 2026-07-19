@@ -47,19 +47,26 @@ pub struct ZAddOptions {
 pub enum Command {
     Ping(Option<String>),
     Auth(String),
+    /// `HELLO [protover]` — protocol negotiation. Connection-level like AUTH:
+    /// the store never sees it, because the answer depends on the connection.
+    Hello(Option<String>),
     // ── Strings ──────────────────────────────────────────────────────────────
-    Set(String, String, SetOptions),
+    Set(String, Vec<u8>, SetOptions),
     Get(String),
+    /// ESET — a SET whose key is owned by the connection that wrote it.
+    /// The engine stores it like any string; the *server* deletes it when that
+    /// connection closes. Presence, cursors, "who is online".
+    ESet(String, Vec<u8>),
     Del(Vec<String>),
     Unlink(Vec<String>),
-    Append(String, String),
+    Append(String, Vec<u8>),
     Strlen(String),
-    GetSet(String, String),
+    GetSet(String, Vec<u8>),
     MGet(Vec<String>),
-    MSet(Vec<(String, String)>),
-    SetNx(String, String),
-    SetEx(String, u64, String),
-    PSetEx(String, u64, String),
+    MSet(Vec<(String, Vec<u8>)>),
+    SetNx(String, Vec<u8>),
+    SetEx(String, u64, Vec<u8>),
+    PSetEx(String, u64, Vec<u8>),
     Incr(String),
     Decr(String),
     IncrBy(String, i64),
@@ -81,7 +88,7 @@ pub enum Command {
     Rename(String, String),
     Type(String),
     // ── Hash ─────────────────────────────────────────────────────────────────
-    HSet(String, Vec<(String, String)>),
+    HSet(String, Vec<(String, Vec<u8>)>),
     HGet(String, String),
     HGetAll(String),
     HDel(String, Vec<String>),
@@ -91,20 +98,20 @@ pub enum Command {
     HIncrBy(String, String, i64),
     HIncrByFloat(String, String, f64),
     HExists(String, String),
-    HSetNx(String, String, String),
+    HSetNx(String, String, Vec<u8>),
     HMGet(String, Vec<String>),
     // ── List ─────────────────────────────────────────────────────────────────
-    LPush(String, Vec<String>),
-    RPush(String, Vec<String>),
-    LPushX(String, Vec<String>),
-    RPushX(String, Vec<String>),
+    LPush(String, Vec<Vec<u8>>),
+    RPush(String, Vec<Vec<u8>>),
+    LPushX(String, Vec<Vec<u8>>),
+    RPushX(String, Vec<Vec<u8>>),
     LPop(String, Option<u64>),
     RPop(String, Option<u64>),
     LRange(String, i64, i64),
     LLen(String),
     LIndex(String, i64),
-    LSet(String, i64, String),
-    LRem(String, i64, String),
+    LSet(String, i64, Vec<u8>),
+    LRem(String, i64, Vec<u8>),
     LTrim(String, i64, i64),
     // ── Set ──────────────────────────────────────────────────────────────────
     SAdd(String, Vec<String>),
@@ -160,7 +167,7 @@ pub enum Command {
     Unsubscribe(Vec<String>),
     PSubscribe(Vec<String>),
     PUnsubscribe(Vec<String>),
-    Publish(String, String),
+    Publish(String, Vec<u8>),
     // ── Observable keys ───────────────────────────────────────────────────────
     Watch(Vec<String>),
     Unwatch(Vec<String>),
@@ -194,7 +201,7 @@ pub enum Command {
 impl Command {
     pub fn from_value(value: Value) -> Result<Command, String> {
         match value {
-            Value::Array(Some(arr)) => {
+            Value::Array(Some(mut arr)) => {
                 if arr.is_empty() {
                     return Err("Empty command".to_string());
                 }
@@ -203,6 +210,26 @@ impl Command {
                     Value::SimpleString(s) => s.to_uppercase(),
                     _ => return Err("Invalid command name type".to_string()),
                 };
+
+                // Payload arguments may be arbitrary bytes; identifier
+                // arguments may not.
+                //
+                // Keys, hash fields, set and sorted-set members, glob patterns
+                // and channel names are looked up, matched and routed as text,
+                // so a non-UTF-8 one cannot be handled faithfully. Rather than
+                // lossily converting it — which returns OK and stores something
+                // different from what was sent — the command is refused here,
+                // before anything is written. Values are exempt: they are
+                // stored verbatim. See `is_payload_index`.
+                if let Some(pos) = (1..arr.len()).find(|&i| {
+                    !is_payload_index(&cmd_name, i)
+                        && matches!(&arr[i], Value::BulkString(Some(b)) if std::str::from_utf8(b).is_err())
+                }) {
+                    return Err(format!(
+                        "ERR argument {pos} is not valid UTF-8. Keys, fields, members and \
+                         patterns must be text; only values may be binary"
+                    ));
+                }
 
                 macro_rules! need {
                     ($n:expr) => {
@@ -229,12 +256,20 @@ impl Command {
                         need!(2);
                         Ok(Command::Auth(extract_string(&arr[1]).unwrap_or_default()))
                     }
+                    // Bare HELLO reports the current version without changing it.
+                    // Trailing AUTH/SETNAME arguments are not supported and are
+                    // rejected by the connection layer rather than ignored.
+                    "HELLO" => Ok(Command::Hello(if arr.len() > 1 {
+                        Some(extract_string(&arr[1]).unwrap_or_default())
+                    } else {
+                        None
+                    })),
 
                     // ── Strings ───────────────────────────────────────────────
                     "SET" => {
                         need!(3);
-                        let key = extract_key(&arr[1])?;
-                        let val = extract_string(&arr[2]).unwrap_or_default();
+                        let key = take_key(&mut arr[1])?;
+                        let val = take_bytes(&mut arr[2]).unwrap_or_default();
                         let mut opts = SetOptions::default();
                         let mut i = 3usize;
                         while i < arr.len() {
@@ -308,6 +343,13 @@ impl Command {
                         need!(2);
                         Ok(Command::Get(extract_key(&arr[1])?))
                     }
+                    "ESET" => {
+                        need!(3);
+                        Ok(Command::ESet(
+                            extract_key(&arr[1])?,
+                            extract_bytes(&arr[2]).unwrap_or_default(),
+                        ))
+                    }
                     "DEL" => {
                         need!(2);
                         Ok(Command::Del(extract_keys(&arr[1..])?))
@@ -318,10 +360,9 @@ impl Command {
                     }
                     "APPEND" => {
                         need!(3);
-                        Ok(Command::Append(
-                            extract_key(&arr[1])?,
-                            extract_string(&arr[2]).unwrap_or_default(),
-                        ))
+                        let key = take_key(&mut arr[1])?;
+                        let val = take_bytes(&mut arr[2]).unwrap_or_default();
+                        Ok(Command::Append(key, val))
                     }
                     "STRLEN" => {
                         need!(2);
@@ -329,10 +370,9 @@ impl Command {
                     }
                     "GETSET" => {
                         need!(3);
-                        Ok(Command::GetSet(
-                            extract_key(&arr[1])?,
-                            extract_string(&arr[2]).unwrap_or_default(),
-                        ))
+                        let key = take_key(&mut arr[1])?;
+                        let val = take_bytes(&mut arr[2]).unwrap_or_default();
+                        Ok(Command::GetSet(key, val))
                     }
                     "MGET" => {
                         need!(2);
@@ -345,11 +385,12 @@ impl Command {
                             );
                         }
                         let pairs = arr[1..]
-                            .chunks(2)
+                            .chunks_mut(2)
                             .map(|c| {
+                                let (k, v) = c.split_at_mut(1);
                                 Ok((
-                                    extract_key(&c[0])?,
-                                    extract_string(&c[1]).unwrap_or_default(),
+                                    take_key(&mut k[0])?,
+                                    take_bytes(&mut v[0]).unwrap_or_default(),
                                 ))
                             })
                             .collect::<Result<Vec<_>, String>>()?;
@@ -357,10 +398,9 @@ impl Command {
                     }
                     "SETNX" => {
                         need!(3);
-                        Ok(Command::SetNx(
-                            extract_key(&arr[1])?,
-                            extract_string(&arr[2]).unwrap_or_default(),
-                        ))
+                        let key = take_key(&mut arr[1])?;
+                        let val = take_bytes(&mut arr[2]).unwrap_or_default();
+                        Ok(Command::SetNx(key, val))
                     }
                     "SETEX" => {
                         need!(4);
@@ -371,7 +411,7 @@ impl Command {
                         Ok(Command::SetEx(
                             extract_key(&arr[1])?,
                             secs as u64,
-                            extract_string(&arr[3]).unwrap_or_default(),
+                            extract_bytes(&arr[3]).unwrap_or_default(),
                         ))
                     }
                     "PSETEX" => {
@@ -383,7 +423,7 @@ impl Command {
                         Ok(Command::PSetEx(
                             extract_key(&arr[1])?,
                             ms as u64,
-                            extract_string(&arr[3]).unwrap_or_default(),
+                            extract_bytes(&arr[3]).unwrap_or_default(),
                         ))
                     }
                     "INCR" => {
@@ -575,11 +615,10 @@ impl Command {
                     // ── JSON ───────────────────────────────────────────────────
                     "JSET" => {
                         need!(4);
-                        Ok(Command::JSet(
-                            extract_key(&arr[1])?,
-                            extract_string(&arr[2]).unwrap_or_default(),
-                            extract_string(&arr[3]).unwrap_or_default(),
-                        ))
+                        let key = take_key(&mut arr[1])?;
+                        let path = take_string(&mut arr[2]).unwrap_or_default();
+                        let doc = take_string(&mut arr[3]).unwrap_or_default();
+                        Ok(Command::JSet(key, path, doc))
                     }
                     "JGET" => {
                         need!(2);
@@ -592,10 +631,9 @@ impl Command {
                     }
                     "JMERGE" => {
                         need!(3);
-                        Ok(Command::JMerge(
-                            extract_key(&arr[1])?,
-                            extract_string(&arr[2]).unwrap_or_default(),
-                        ))
+                        let key = take_key(&mut arr[1])?;
+                        let patch = take_string(&mut arr[2]).unwrap_or_default();
+                        Ok(Command::JMerge(key, patch))
                     }
 
                     // ── Rate limiting ──────────────────────────────────────────
@@ -629,11 +667,12 @@ impl Command {
                         }
                         let key = extract_key(&arr[1])?;
                         let pairs = arr[2..]
-                            .chunks(2)
+                            .chunks_mut(2)
                             .map(|c| {
+                                let (f, v) = c.split_at_mut(1);
                                 (
-                                    extract_string(&c[0]).unwrap_or_default(),
-                                    extract_string(&c[1]).unwrap_or_default(),
+                                    take_string(&mut f[0]).unwrap_or_default(),
+                                    take_bytes(&mut v[0]).unwrap_or_default(),
                                 )
                             })
                             .collect();
@@ -655,7 +694,7 @@ impl Command {
                     "HDEL" => {
                         need!(3);
                         let key = extract_key(&arr[1])?;
-                        let fields = arr[2..].iter().filter_map(extract_string).collect();
+                        let fields = arr[2..].iter_mut().filter_map(take_string).collect();
                         Ok(Command::HDel(key, fields))
                     }
                     "HKEYS" => {
@@ -699,13 +738,13 @@ impl Command {
                         Ok(Command::HSetNx(
                             extract_string(&arr[1]).unwrap_or_default(),
                             extract_string(&arr[2]).unwrap_or_default(),
-                            extract_string(&arr[3]).unwrap_or_default(),
+                            extract_bytes(&arr[3]).unwrap_or_default(),
                         ))
                     }
                     "HMGET" => {
                         need!(3);
                         let key = extract_key(&arr[1])?;
-                        let fields = arr[2..].iter().filter_map(extract_string).collect();
+                        let fields = arr[2..].iter_mut().filter_map(take_string).collect();
                         Ok(Command::HMGet(key, fields))
                     }
 
@@ -713,25 +752,25 @@ impl Command {
                     "LPUSH" => {
                         need!(3);
                         let key = extract_key(&arr[1])?;
-                        let vals = arr[2..].iter().filter_map(extract_string).collect();
+                        let vals = arr[2..].iter_mut().filter_map(take_bytes).collect();
                         Ok(Command::LPush(key, vals))
                     }
                     "RPUSH" => {
                         need!(3);
                         let key = extract_key(&arr[1])?;
-                        let vals = arr[2..].iter().filter_map(extract_string).collect();
+                        let vals = arr[2..].iter_mut().filter_map(take_bytes).collect();
                         Ok(Command::RPush(key, vals))
                     }
                     "LPUSHX" => {
                         need!(3);
                         let key = extract_key(&arr[1])?;
-                        let vals = arr[2..].iter().filter_map(extract_string).collect();
+                        let vals = arr[2..].iter_mut().filter_map(take_bytes).collect();
                         Ok(Command::LPushX(key, vals))
                     }
                     "RPUSHX" => {
                         need!(3);
                         let key = extract_key(&arr[1])?;
-                        let vals = arr[2..].iter().filter_map(extract_string).collect();
+                        let vals = arr[2..].iter_mut().filter_map(take_bytes).collect();
                         Ok(Command::RPushX(key, vals))
                     }
                     "LPOP" => {
@@ -778,7 +817,7 @@ impl Command {
                         Ok(Command::LSet(
                             extract_string(&arr[1]).unwrap_or_default(),
                             extract_int(&arr[2])?,
-                            extract_string(&arr[3]).unwrap_or_default(),
+                            extract_bytes(&arr[3]).unwrap_or_default(),
                         ))
                     }
                     "LREM" => {
@@ -786,7 +825,7 @@ impl Command {
                         Ok(Command::LRem(
                             extract_string(&arr[1]).unwrap_or_default(),
                             extract_int(&arr[2])?,
-                            extract_string(&arr[3]).unwrap_or_default(),
+                            extract_bytes(&arr[3]).unwrap_or_default(),
                         ))
                     }
                     "LTRIM" => {
@@ -801,8 +840,8 @@ impl Command {
                     // ── Set ────────────────────────────────────────────────────
                     "SADD" => {
                         need!(3);
-                        let key = extract_key(&arr[1])?;
-                        let members = arr[2..].iter().filter_map(extract_string).collect();
+                        let key = take_key(&mut arr[1])?;
+                        let members = arr[2..].iter_mut().filter_map(take_string).collect();
                         Ok(Command::SAdd(key, members))
                     }
                     "SMEMBERS" => {
@@ -814,7 +853,7 @@ impl Command {
                     "SREM" => {
                         need!(3);
                         let key = extract_key(&arr[1])?;
-                        let members = arr[2..].iter().filter_map(extract_string).collect();
+                        let members = arr[2..].iter_mut().filter_map(take_string).collect();
                         Ok(Command::SRem(key, members))
                     }
                     "SCARD" => {
@@ -831,43 +870,43 @@ impl Command {
                     "SMISMEMBER" => {
                         need!(3);
                         let key = extract_key(&arr[1])?;
-                        let members = arr[2..].iter().filter_map(extract_string).collect();
+                        let members = arr[2..].iter_mut().filter_map(take_string).collect();
                         Ok(Command::SMIsMember(key, members))
                     }
                     "SINTER" => {
                         need!(2);
                         Ok(Command::SInter(
-                            arr[1..].iter().filter_map(extract_string).collect(),
+                            arr[1..].iter_mut().filter_map(take_string).collect(),
                         ))
                     }
                     "SINTERSTORE" => {
                         need!(3);
                         let dst = extract_string(&arr[1]).unwrap_or_default();
-                        let keys = arr[2..].iter().filter_map(extract_string).collect();
+                        let keys = arr[2..].iter_mut().filter_map(take_string).collect();
                         Ok(Command::SInterStore(dst, keys))
                     }
                     "SUNION" => {
                         need!(2);
                         Ok(Command::SUnion(
-                            arr[1..].iter().filter_map(extract_string).collect(),
+                            arr[1..].iter_mut().filter_map(take_string).collect(),
                         ))
                     }
                     "SUNIONSTORE" => {
                         need!(3);
                         let dst = extract_string(&arr[1]).unwrap_or_default();
-                        let keys = arr[2..].iter().filter_map(extract_string).collect();
+                        let keys = arr[2..].iter_mut().filter_map(take_string).collect();
                         Ok(Command::SUnionStore(dst, keys))
                     }
                     "SDIFF" => {
                         need!(2);
                         Ok(Command::SDiff(
-                            arr[1..].iter().filter_map(extract_string).collect(),
+                            arr[1..].iter_mut().filter_map(take_string).collect(),
                         ))
                     }
                     "SDIFFSTORE" => {
                         need!(3);
                         let dst = extract_string(&arr[1]).unwrap_or_default();
-                        let keys = arr[2..].iter().filter_map(extract_string).collect();
+                        let keys = arr[2..].iter_mut().filter_map(take_string).collect();
                         Ok(Command::SDiffStore(dst, keys))
                     }
                     "SPOP" => {
@@ -1020,7 +1059,7 @@ impl Command {
                     "ZMSCORE" => {
                         need!(3);
                         let key = extract_key(&arr[1])?;
-                        let members = arr[2..].iter().filter_map(extract_string).collect();
+                        let members = arr[2..].iter_mut().filter_map(take_string).collect();
                         Ok(Command::ZMScore(key, members))
                     }
                     "ZRANK" => {
@@ -1040,7 +1079,7 @@ impl Command {
                     "ZREM" => {
                         need!(3);
                         let key = extract_key(&arr[1])?;
-                        let members = arr[2..].iter().filter_map(extract_string).collect();
+                        let members = arr[2..].iter_mut().filter_map(take_string).collect();
                         Ok(Command::ZRem(key, members))
                     }
                     "ZCARD" => {
@@ -1074,26 +1113,26 @@ impl Command {
                     "SUBSCRIBE" => {
                         need!(2);
                         Ok(Command::Subscribe(
-                            arr[1..].iter().filter_map(extract_string).collect(),
+                            arr[1..].iter_mut().filter_map(take_string).collect(),
                         ))
                     }
                     "UNSUBSCRIBE" => Ok(Command::Unsubscribe(
-                        arr[1..].iter().filter_map(extract_string).collect(),
+                        arr[1..].iter_mut().filter_map(take_string).collect(),
                     )),
                     "PSUBSCRIBE" => {
                         need!(2);
                         Ok(Command::PSubscribe(
-                            arr[1..].iter().filter_map(extract_string).collect(),
+                            arr[1..].iter_mut().filter_map(take_string).collect(),
                         ))
                     }
                     "PUNSUBSCRIBE" => Ok(Command::PUnsubscribe(
-                        arr[1..].iter().filter_map(extract_string).collect(),
+                        arr[1..].iter_mut().filter_map(take_string).collect(),
                     )),
                     "PUBLISH" => {
                         need!(3);
                         Ok(Command::Publish(
                             extract_string(&arr[1]).unwrap_or_default(),
-                            extract_string(&arr[2]).unwrap_or_default(),
+                            extract_bytes(&arr[2]).unwrap_or_default(),
                         ))
                     }
 
@@ -1101,11 +1140,11 @@ impl Command {
                     "WATCH" => {
                         need!(2);
                         Ok(Command::Watch(
-                            arr[1..].iter().filter_map(extract_string).collect(),
+                            arr[1..].iter_mut().filter_map(take_string).collect(),
                         ))
                     }
                     "UNWATCH" => Ok(Command::Unwatch(
-                        arr[1..].iter().filter_map(extract_string).collect(),
+                        arr[1..].iter_mut().filter_map(take_string).collect(),
                     )),
 
                     // ── Persistence ───────────────────────────────────────────
@@ -1173,6 +1212,84 @@ fn extract_key(val: &Value) -> Result<String, String> {
 
 fn extract_keys(vals: &[Value]) -> Result<Vec<String>, String> {
     vals.iter().map(extract_key).collect()
+}
+
+/// Take a string argument by **moving** its bytes out of the parsed frame.
+///
+/// `extract_string` borrows and therefore copies: `from_utf8_lossy(..).into_owned()`
+/// allocates a fresh `String` and memcpys the payload even when the bytes are
+/// already valid UTF-8, which they almost always are. Moving reuses the `Vec`
+/// the parser already allocated, so a 1 MB `SET` value costs no copy at all.
+///
+/// The slot is left as a nil array, so an arm must not read the same index
+/// twice — call this last, once per argument.
+/// Is argument `i` of `cmd_name` a value payload rather than an identifier?
+///
+/// Payloads are stored verbatim and may be any bytes. Everything else is used
+/// as a lookup key, a glob pattern or a routing name, and must be text. Index 0
+/// is the command name and is never a payload.
+fn is_payload_index(cmd_name: &str, i: usize) -> bool {
+    match cmd_name {
+        // key value
+        "SET" | "ESET" | "APPEND" | "GETSET" | "SETNX" => i == 2,
+        // key ttl value
+        "SETEX" | "PSETEX" => i == 3,
+        // key field value
+        "HSETNX" => i == 3,
+        // key index value / key count value
+        "LSET" | "LREM" => i == 3,
+        // channel message
+        "PUBLISH" => i == 2,
+        // key v1 v2 …
+        "LPUSH" | "RPUSH" | "LPUSHX" | "RPUSHX" => i >= 2,
+        // key f1 v1 f2 v2 … — values are the odd positions from 3
+        "HSET" | "HMSET" => i >= 3 && !i.is_multiple_of(2),
+        // k1 v1 k2 v2 … — values are the even positions from 2
+        "MSET" => i >= 2 && i.is_multiple_of(2),
+        _ => false,
+    }
+}
+
+/// Moving counterpart of `take_string` for payload arguments: takes the bytes
+/// as they arrived, with no UTF-8 conversion of any kind.
+fn take_bytes(val: &mut Value) -> Option<Vec<u8>> {
+    match std::mem::replace(val, Value::Array(None)) {
+        Value::BulkString(Some(data)) => Some(data),
+        Value::SimpleString(s) => Some(s.into_bytes()),
+        _ => None,
+    }
+}
+
+fn take_string(val: &mut Value) -> Option<String> {
+    match std::mem::replace(val, Value::Array(None)) {
+        // `from_utf8` reuses the buffer, so this is a move rather than a copy.
+        // `from_value` has already rejected non-UTF-8 arguments, so the lossy
+        // branch is unreachable in practice — it is kept only so a future
+        // caller that bypasses that check degrades rather than panics.
+        Value::BulkString(Some(data)) => Some(
+            String::from_utf8(data)
+                .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
+        ),
+        Value::SimpleString(s) => Some(s),
+        _ => None,
+    }
+}
+
+/// Moving counterpart of `extract_key`, with the same validation.
+fn take_key(val: &mut Value) -> Result<String, String> {
+    let key = take_string(val).unwrap_or_default();
+    validate_key(&key)?;
+    Ok(key)
+}
+
+/// Borrowing counterpart of `take_bytes`, for payload arguments read without
+/// consuming the frame.
+fn extract_bytes(val: &Value) -> Option<Vec<u8>> {
+    match val {
+        Value::BulkString(Some(data)) => Some(data.clone()),
+        Value::SimpleString(s) => Some(s.as_bytes().to_vec()),
+        _ => None,
+    }
 }
 
 fn extract_string(val: &Value) -> Option<String> {
@@ -2591,5 +2708,167 @@ mod arity_and_error_tests {
         // missing argument once stored.
         let err = parse(&["GET", ""]).unwrap_err();
         assert!(err.contains("key cannot be empty"), "got {err}");
+    }
+}
+
+#[cfg(test)]
+mod zero_copy_parse_tests {
+    use super::*;
+
+    fn bulk(s: &str) -> Value {
+        Value::BulkString(Some(s.as_bytes().to_vec()))
+    }
+
+    fn parse(parts: &[&str]) -> Result<Command, String> {
+        Command::from_value(Value::Array(Some(parts.iter().map(|s| bulk(s)).collect())))
+    }
+
+    /// Arguments are now *moved* out of the parsed frame rather than copied, so
+    /// the failure mode is an arm reading the same index twice and getting an
+    /// empty string the second time. These assert full round-trips through the
+    /// converted commands.
+
+    #[test]
+    fn set_preserves_key_value_and_options_together() {
+        // SET reads index 1 and 2 by move, then scans 3.. for options — the
+        // exact shape that breaks if a moved slot were re-read.
+        match parse(&["SET", "k", "v", "EX", "60", "NX"]).unwrap() {
+            Command::Set(key, val, opts) => {
+                assert_eq!(key, "k");
+                assert_eq!(val, b"v");
+                assert_eq!(opts.expiry, Some(SetExpiry::Ex(60)));
+                assert_eq!(opts.condition, Some(SetCondition::Nx));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_large_value_survives_the_move_intact() {
+        // The whole point of moving: a 1 MB payload is no longer memcpy'd.
+        let big = "x".repeat(1024 * 1024);
+        match parse(&["SET", "k", &big]).unwrap() {
+            Command::Set(_, val, _) => {
+                assert_eq!(val.len(), big.len());
+                assert_eq!(
+                    val,
+                    big.as_bytes(),
+                    "payload must be byte-identical after the move"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_binary_value_reaches_the_command_untouched() {
+        // The move-based parse must not reintroduce a UTF-8 conversion on the
+        // value path: the bytes have to arrive exactly as they were sent.
+        let raw = vec![0xff, 0xfe, b'o', b'k'];
+        let frame = Value::Array(Some(vec![
+            bulk("SET"),
+            bulk("k"),
+            Value::BulkString(Some(raw.clone())),
+        ]));
+        match Command::from_value(frame).expect("a binary value is valid") {
+            Command::Set(key, val, _) => {
+                assert_eq!(key, "k");
+                assert_eq!(val, raw);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_binary_key_is_still_refused() {
+        // Keys are matched and routed as text, so this position stays strict
+        // even though the value beside it does not.
+        let frame = Value::Array(Some(vec![
+            bulk("SET"),
+            Value::BulkString(Some(vec![0xff, 0xfe])),
+            bulk("v"),
+        ]));
+        let err = Command::from_value(frame).expect_err("binary key must be refused");
+        assert!(err.contains("must be text"), "got {err:?}");
+    }
+
+    #[test]
+    fn utf8_multibyte_arguments_are_not_mistaken_for_binary() {
+        // The validation runs over every argument, so an over-eager check would
+        // break ordinary non-ASCII payloads.
+        match parse(&["SET", "ключ", "日本語 ✓"]).unwrap() {
+            Command::Set(key, val, _) => {
+                assert_eq!(key, "ключ");
+                assert_eq!(val, "日本語 ✓".as_bytes());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn paired_arguments_keep_their_pairing() {
+        // MSET and HSET split each chunk into two mutable halves; a mistake
+        // there would swap or blank alternate fields.
+        match parse(&["MSET", "a", "1", "b", "2"]).unwrap() {
+            Command::MSet(pairs) => assert_eq!(
+                pairs,
+                vec![
+                    ("a".to_string(), b"1".to_vec()),
+                    ("b".to_string(), b"2".to_vec())
+                ]
+            ),
+            other => panic!("{other:?}"),
+        }
+        match parse(&["HSET", "h", "f1", "v1", "f2", "v2"]).unwrap() {
+            Command::HSet(key, pairs) => {
+                assert_eq!(key, "h");
+                assert_eq!(
+                    pairs,
+                    vec![
+                        ("f1".to_string(), b"v1".to_vec()),
+                        ("f2".to_string(), b"v2".to_vec())
+                    ]
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn bulk_member_lists_keep_every_element_in_order() {
+        match parse(&["RPUSH", "l", "a", "b", "c"]).unwrap() {
+            Command::RPush(key, vals) => {
+                assert_eq!(key, "l");
+                assert_eq!(vals, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse(&["SADD", "s", "m1", "m2"]).unwrap() {
+            Command::SAdd(key, members) => {
+                assert_eq!(key, "s");
+                assert_eq!(members, vec!["m1", "m2"]);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn key_validation_still_applies_to_moved_keys() {
+        // take_key must validate exactly as extract_key did.
+        assert!(parse(&["SET", "", "v"]).is_err(), "empty key rejected");
+        assert!(parse(&["APPEND", "", "v"]).is_err());
+        assert!(parse(&["MSET", "", "1"]).is_err());
+    }
+
+    #[test]
+    fn json_commands_carry_path_and_document_separately() {
+        match parse(&["JSET", "doc", "$.a", "{\"x\":1}"]).unwrap() {
+            Command::JSet(key, path, val) => {
+                assert_eq!(key, "doc");
+                assert_eq!(path, "$.a");
+                assert_eq!(val, "{\"x\":1}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

@@ -29,6 +29,16 @@ pub const MAX_PENDING_WRITES: usize = 10_000;
 pub const BACKOFF_BASE_MS: u32 = 500;
 pub const BACKOFF_CAP_MS: u32 = 30_000;
 
+/// FNV-1a over the client id — a stable, non-zero seed per client.
+fn seed_from(client_id: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in client_id.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h | 1
+}
+
 /// What an incoming frame turned out to be, and what the adapter must do.
 #[derive(Debug, PartialEq)]
 pub enum Incoming {
@@ -36,7 +46,9 @@ pub enum Incoming {
     /// local store — notify UI subscribers.
     Applied,
     /// A pub/sub message — deliver to channel subscribers.
-    PubSub { channel: String, message: String },
+    /// A pub/sub message. The payload is bytes because a publisher may send
+    /// binary; the adapter decides how to surface it.
+    PubSub { channel: String, message: Vec<u8> },
     /// A command reply. When `retired` is set, that outbox row is now
     /// acknowledged — delete it from durable storage.
     Reply { retired: Option<u64> },
@@ -52,9 +64,13 @@ pub enum Incoming {
 pub struct Enqueued {
     /// Outbox row id — persist the row under this key.
     pub id: u64,
-    /// The wire frame (dedup-wrapped when requested). This exact string is
+    /// The wire frame (dedup-wrapped when requested). These exact bytes are
     /// stored in the outbox and replayed on reconnect.
-    pub frame: String,
+    ///
+    /// Bytes rather than `String`: a frame carries a stored value, which may be
+    /// arbitrary binary. Holding it as text would corrupt the queued write and,
+    /// on reconnect, replay the corrupted version to the server.
+    pub frame: Vec<u8>,
     /// Send `frame` now (the caller reported the socket open, and the write
     /// was recorded as inflight).
     pub send_now: bool,
@@ -68,7 +84,7 @@ pub struct Enqueued {
 pub struct SyncClient {
     store: Arc<KeyValueStore>,
     /// Writes not yet acknowledged by the server, in send order.
-    outbox: VecDeque<(u64, String)>,
+    outbox: VecDeque<(u64, Vec<u8>)>,
     outbox_seq: u64,
     /// One entry per frame sent on the current socket: `Some(outbox id)` for
     /// data writes, `None` for session commands. Replies arrive in send
@@ -83,10 +99,20 @@ pub struct SyncClient {
     sync_scopes_csv: Option<String>,
     live_queries: Vec<String>,
     attempts: u32,
+    /// Cap on queued-but-unacknowledged writes. Beyond it the oldest is
+    /// evicted. Configurable because the right depth depends on how long a
+    /// client is expected to be offline and how large its writes are.
+    max_pending: usize,
+    /// Jitter source for reconnect backoff. Seeded from `client_id` rather than
+    /// a system RNG so this crate stays dependency-free and I/O-free — and so
+    /// the sequence is reproducible in tests. Different clients get different
+    /// sequences, which is the only property that matters here.
+    jitter: u64,
 }
 
 impl SyncClient {
     pub fn new(store: Arc<KeyValueStore>, client_id: String) -> Self {
+        let jitter = seed_from(&client_id);
         Self {
             store,
             outbox: VecDeque::new(),
@@ -99,6 +125,8 @@ impl SyncClient {
             sync_scopes_csv: None,
             live_queries: Vec::new(),
             attempts: 0,
+            max_pending: MAX_PENDING_WRITES,
+            jitter,
         }
     }
 
@@ -108,6 +136,17 @@ impl SyncClient {
 
     pub fn client_id(&self) -> &str {
         &self.client_id
+    }
+
+    /// Set the outbox cap (minimum 1). Writes past it evict the oldest, which
+    /// is reported through the adapter's overflow callback.
+    pub fn set_max_pending(&mut self, max: usize) {
+        self.max_pending = max.max(1);
+    }
+
+    /// Current outbox cap.
+    pub fn max_pending(&self) -> usize {
+        self.max_pending
     }
 
     pub fn epoch(&self) -> u32 {
@@ -142,19 +181,19 @@ impl SyncClient {
     // inflight — session replies must occupy a reply slot or they would
     // falsely acknowledge a data write).
 
-    pub fn set_password(&mut self, password: &str, connected: bool) -> Option<String> {
+    pub fn set_password(&mut self, password: &str, connected: bool) -> Option<Vec<u8>> {
         self.password = Some(password.to_string());
         self.session_frame(to_resp(&["AUTH", password]), connected)
     }
 
-    pub fn set_sync_token(&mut self, token: &str, connected: bool) -> Option<String> {
+    pub fn set_sync_token(&mut self, token: &str, connected: bool) -> Option<Vec<u8>> {
         self.sync_token = Some(token.to_string());
         self.session_frame(to_resp(&["SYNC", "TOKEN", token]), connected)
     }
 
     /// Comma-separated glob patterns. Returns `None` (and records nothing)
     /// when the list is empty.
-    pub fn set_sync_scopes(&mut self, patterns_csv: &str, connected: bool) -> Option<String> {
+    pub fn set_sync_scopes(&mut self, patterns_csv: &str, connected: bool) -> Option<Vec<u8>> {
         let frame = sync_scopes_frame(patterns_csv)?;
         self.sync_scopes_csv = Some(patterns_csv.to_string());
         self.session_frame(frame, connected)
@@ -162,14 +201,14 @@ impl SyncClient {
 
     /// Register a live query (idempotent). The returned frame re-hydrates
     /// matching keys via the `qstate` reply.
-    pub fn add_live_query(&mut self, pattern: &str, connected: bool) -> Option<String> {
+    pub fn add_live_query(&mut self, pattern: &str, connected: bool) -> Option<Vec<u8>> {
         if !self.live_queries.iter().any(|p| p == pattern) {
             self.live_queries.push(pattern.to_string());
         }
         self.session_frame(to_resp(&["QSUB", pattern]), connected)
     }
 
-    pub fn remove_live_query(&mut self, pattern: Option<&str>, connected: bool) -> Option<String> {
+    pub fn remove_live_query(&mut self, pattern: Option<&str>, connected: bool) -> Option<Vec<u8>> {
         let frame = match pattern {
             Some(p) => {
                 self.live_queries.retain(|q| q != p);
@@ -183,7 +222,7 @@ impl SyncClient {
         self.session_frame(frame, connected)
     }
 
-    fn session_frame(&mut self, frame: String, connected: bool) -> Option<String> {
+    fn session_frame(&mut self, frame: Vec<u8>, connected: bool) -> Option<Vec<u8>> {
         if connected {
             self.inflight.push_back(None);
             Some(frame)
@@ -198,7 +237,7 @@ impl SyncClient {
     /// state first (AUTH → SYNC → live queries), then the full outbox replay.
     /// Live-query re-subscription re-hydrates local state; outbox entries
     /// stay queued until their replies acknowledge them.
-    pub fn on_open(&mut self) -> Vec<String> {
+    pub fn on_open(&mut self) -> Vec<Vec<u8>> {
         self.attempts = 0;
         self.inflight.clear();
         let mut frames = Vec::new();
@@ -228,12 +267,35 @@ impl SyncClient {
 
     /// The socket closed: returns the delay before the next reconnect
     /// attempt (exponential backoff, capped).
+    /// Delay before the next reconnect attempt, in milliseconds.
+    ///
+    /// Exponential with a cap, then **jittered into `[delay/2, delay]`**. Without
+    /// jitter every client disconnected by the same event computes an identical
+    /// schedule and reconnects in lockstep — a thundering herd that can keep a
+    /// recovering server down. Halving the floor keeps the growth shape intact
+    /// while spreading arrivals across the window.
     pub fn on_close(&mut self) -> u32 {
         let delay = BACKOFF_BASE_MS
             .saturating_mul(1u32 << self.attempts.min(6))
             .min(BACKOFF_CAP_MS);
         self.attempts = self.attempts.saturating_add(1);
-        delay
+
+        let half = delay / 2;
+        if half == 0 {
+            return delay;
+        }
+        half + (self.next_jitter() % (half as u64 + 1)) as u32
+    }
+
+    /// xorshift64* — small, dependency-free, and good enough for spreading
+    /// reconnects. Not for anything security-sensitive.
+    fn next_jitter(&mut self) -> u64 {
+        let mut x = self.jitter;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.jitter = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
 
     // ── writes ────────────────────────────────────────────────────────────
@@ -242,15 +304,15 @@ impl SyncClient {
     /// envelope — store writes want this; connection-scoped commands
     /// (pub/sub) must not be wrapped, or a legitimately replayed SUBSCRIBE
     /// would be skipped as a duplicate.
-    pub fn enqueue_write(&mut self, encoded: &str, dedup: bool, connected: bool) -> Enqueued {
+    pub fn enqueue_write(&mut self, encoded: &[u8], dedup: bool, connected: bool) -> Enqueued {
         let id = self.outbox_seq;
         self.outbox_seq += 1;
         let frame = if dedup {
             self.wrap_dedup(encoded, id)
         } else {
-            encoded.to_string()
+            encoded.to_vec()
         };
-        let dropped = if self.outbox.len() >= MAX_PENDING_WRITES {
+        let dropped = if self.outbox.len() >= self.max_pending {
             self.outbox.pop_front().map(|(old, _)| old)
         } else {
             None
@@ -269,25 +331,35 @@ impl SyncClient {
 
     /// Splice a `DEDUP <client> <wire-id>` envelope into an already-encoded
     /// RESP array: bump the element count and prepend three elements.
-    fn wrap_dedup(&self, plain: &str, outbox_id: u64) -> String {
-        let Some((head, rest)) = plain.split_once("\r\n") else {
-            return plain.to_string();
+    fn wrap_dedup(&self, plain: &[u8], outbox_id: u64) -> Vec<u8> {
+        // Only the header is text; `rest` is copied through untouched so a
+        // binary value inside the frame is never reinterpreted.
+        let Some(split) = plain.windows(2).position(|w| w == b"\r\n") else {
+            return plain.to_vec();
         };
-        let n: usize = head.trim_start_matches('*').parse().unwrap_or(0);
+        let head = &plain[..split];
+        let rest = &plain[split + 2..];
+        let n: usize = std::str::from_utf8(head)
+            .ok()
+            .map(|h| h.trim_start_matches('*'))
+            .and_then(|h| h.parse().ok())
+            .unwrap_or(0);
         if n == 0 {
-            return plain.to_string();
+            return plain.to_vec();
         }
         let wire_id = ((self.epoch as u64) << 32) | (outbox_id & 0xFFFF_FFFF);
         let id_s = wire_id.to_string();
-        format!(
-            "*{}\r\n$5\r\nDEDUP\r\n${}\r\n{}\r\n${}\r\n{}\r\n{}",
+        let mut out = format!(
+            "*{}\r\n$5\r\nDEDUP\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
             n + 3,
             self.client_id.len(),
             self.client_id,
             id_s.len(),
             id_s,
-            rest
         )
+        .into_bytes();
+        out.extend_from_slice(rest);
+        out
     }
 
     /// Restore outbox rows persisted by a previous session (ordered by their
@@ -296,7 +368,7 @@ impl SyncClient {
     /// verbatim, so their embedded dedup ids still match what the server may
     /// have already applied. Returns `(old_id, new_id, frame)` for the
     /// adapter to rewrite durable storage.
-    pub fn restore_outbox(&mut self, mut rows: Vec<(u64, String)>) -> Vec<(u64, u64, String)> {
+    pub fn restore_outbox(&mut self, mut rows: Vec<(u64, Vec<u8>)>) -> Vec<(u64, u64, Vec<u8>)> {
         rows.sort_by_key(|(id, _)| *id);
         let mut rewrites = Vec::with_capacity(rows.len());
         for (old_id, frame) in rows.into_iter().rev() {
@@ -326,8 +398,8 @@ impl SyncClient {
     /// or surfaced; everything else is a command reply that acknowledges the
     /// oldest inflight command — `qstate` arrays are both the reply to a
     /// QSUB *and* state to apply. See `docs/server/protocol.md`.
-    pub fn handle_frame(&mut self, text: &str) -> Incoming {
-        match Value::parse(text.as_bytes()) {
+    pub fn handle_frame(&mut self, raw: &[u8]) -> Incoming {
+        match Value::parse(raw) {
             Ok((Value::Push(arr), _)) => {
                 if arr.len() == 3
                     && let (
@@ -339,7 +411,7 @@ impl SyncClient {
                 {
                     return Incoming::PubSub {
                         channel: String::from_utf8_lossy(channel).into_owned(),
-                        message: String::from_utf8_lossy(payload).into_owned(),
+                        message: payload.clone(),
                     };
                 }
                 if let Ok(cmd) = Command::from_value(Value::Array(Some(arr)))
@@ -393,17 +465,112 @@ impl SyncClient {
         let key = String::from_utf8_lossy(key).into_owned();
         match &items[2] {
             Value::BulkString(Some(v)) => {
-                self.store.execute(Command::Set(
-                    key,
-                    String::from_utf8_lossy(v).into_owned(),
-                    Default::default(),
-                ));
+                self.store
+                    .execute(Command::Set(key, v.clone(), Default::default()));
             }
             Value::BulkString(None) => {
-                self.store.execute(Command::Del(vec![key]));
+                // A nil value whose "key" is one of our registered live-query
+                // patterns is the FLUSHDB sentinel: every matching key is gone.
+                // Sending one frame per deleted key would mean millions of
+                // frames for a single command, so the server announces it once
+                // per pattern and the client expands it locally.
+                if self.live_queries.contains(&key) {
+                    let matched: Vec<String> = self
+                        .store
+                        .matching_key_values(&key, usize::MAX)
+                        .into_iter()
+                        .map(|(k, _)| k)
+                        .collect();
+                    if !matched.is_empty() {
+                        self.store.execute(Command::Del(matched));
+                    }
+                } else {
+                    self.store.execute(Command::Del(vec![key]));
+                }
             }
-            // Collection/JSON type marker: the value is not carried; regular
-            // mutation pushes keep those in sync — nothing to apply here.
+            // Type-tagged collection: ["hash"|"list"|"set"|"zset"|"json", ...].
+            Value::Array(Some(items)) => self.apply_tagged(key, items),
+            // Anything else (e.g. the "ratelimit" marker) carries no client-
+            // usable value.
+            _ => {}
+        }
+    }
+
+    /// Apply a type-tagged collection value from a keychange or qstate frame.
+    ///
+    /// The key is replaced wholesale rather than merged: the frame carries the
+    /// complete current value, so rebuilding is both simpler and correct when a
+    /// member was removed. Anything unrecognised is ignored rather than guessed
+    /// at, so a newer server cannot corrupt an older client's local copy.
+    fn apply_tagged(&self, key: String, items: &[Value]) {
+        fn text(v: &Value) -> Option<String> {
+            match v {
+                Value::BulkString(Some(b)) => Some(String::from_utf8_lossy(b).into_owned()),
+                Value::SimpleString(s) => Some(s.clone()),
+                _ => None,
+            }
+        }
+        fn bytes(v: &Value) -> Option<Vec<u8>> {
+            match v {
+                Value::BulkString(Some(b)) => Some(b.clone()),
+                Value::SimpleString(s) => Some(s.as_bytes().to_vec()),
+                _ => None,
+            }
+        }
+        let Some(tag) = items.first().and_then(text) else {
+            return;
+        };
+        // Values may be arbitrary bytes; hash fields, set and sorted-set
+        // members are identifiers and stay text. `raw` keeps the bytes, `as_text`
+        // reinterprets a slot when the position calls for an identifier.
+        let raw: Vec<Vec<u8>> = items[1..].iter().filter_map(bytes).collect();
+        let as_text = |b: &Vec<u8>| String::from_utf8_lossy(b).into_owned();
+
+        // Clear first so removed members do not linger.
+        self.store.execute(Command::Del(vec![key.clone()]));
+        match tag.as_str() {
+            "hash" => {
+                let pairs: Vec<(String, Vec<u8>)> = raw
+                    .chunks_exact(2)
+                    .map(|c| (as_text(&c[0]), c[1].clone()))
+                    .collect();
+                if !pairs.is_empty() {
+                    self.store.execute(Command::HSet(key, pairs));
+                }
+            }
+            "list" => {
+                if !raw.is_empty() {
+                    self.store.execute(Command::RPush(key, raw));
+                }
+            }
+            "set" => {
+                if !raw.is_empty() {
+                    self.store
+                        .execute(Command::SAdd(key, raw.iter().map(as_text).collect()));
+                }
+            }
+            "zset" => {
+                let members: Vec<(f64, String)> = raw
+                    .chunks_exact(2)
+                    .filter_map(|c| {
+                        as_text(&c[1])
+                            .parse::<f64>()
+                            .ok()
+                            .map(|sc| (sc, as_text(&c[0])))
+                    })
+                    .collect();
+                if !members.is_empty() {
+                    self.store
+                        .execute(Command::ZAdd(key, Default::default(), members));
+                }
+            }
+            "json" => {
+                // JSON is UTF-8 by definition, so this position is text.
+                if let Some(doc) = raw.first() {
+                    self.store
+                        .execute(Command::JSet(key, "$".to_string(), as_text(doc)));
+                }
+            }
             _ => {}
         }
     }
@@ -413,18 +580,22 @@ impl SyncClient {
             let Value::BulkString(Some(k)) = &pair[0] else {
                 continue;
             };
-            if let Value::BulkString(Some(v)) = &pair[1] {
-                self.store.execute(Command::Set(
-                    String::from_utf8_lossy(k).into_owned(),
-                    String::from_utf8_lossy(v).into_owned(),
-                    Default::default(),
-                ));
+            let key = String::from_utf8_lossy(k).into_owned();
+            match &pair[1] {
+                Value::BulkString(Some(v)) => {
+                    self.store
+                        .execute(Command::Set(key, v.clone(), Default::default()));
+                }
+                // Collections arrive type-tagged, so the initial state of a
+                // live query is complete — no follow-up typed read needed.
+                Value::Array(Some(inner)) => self.apply_tagged(key, inner),
+                _ => {}
             }
         }
     }
 }
 
-fn sync_scopes_frame(patterns_csv: &str) -> Option<String> {
+fn sync_scopes_frame(patterns_csv: &str) -> Option<Vec<u8>> {
     let pats: Vec<&str> = patterns_csv
         .split(',')
         .map(str::trim)
@@ -483,12 +654,25 @@ pub fn is_replayable_mutation(cmd: &Command) -> bool {
 }
 
 /// RESP array encoding, shared by adapters.
-pub fn to_resp(parts: &[&str]) -> String {
-    let mut s = format!("*{}\r\n", parts.len());
+/// Encode a RESP array frame from text arguments.
+///
+/// Returns bytes, not a `String`: frames are concatenated with, and replayed
+/// alongside, frames carrying binary values, so the whole pipeline is byte-based.
+pub fn to_resp(parts: &[&str]) -> Vec<u8> {
+    let byte_parts: Vec<&[u8]> = parts.iter().map(|p| p.as_bytes()).collect();
+    to_resp_bytes(&byte_parts)
+}
+
+/// Encode a RESP array frame from raw byte arguments, for commands carrying a
+/// binary value.
+pub fn to_resp_bytes(parts: &[&[u8]]) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", parts.len()).into_bytes();
     for part in parts {
-        s.push_str(&format!("${}\r\n{}\r\n", part.len(), part));
+        out.extend_from_slice(format!("${}\r\n", part.len()).as_bytes());
+        out.extend_from_slice(part);
+        out.extend_from_slice(b"\r\n");
     }
-    s
+    out
 }
 
 #[cfg(test)]

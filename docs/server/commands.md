@@ -8,6 +8,7 @@ Recached implements the subset of RESP commands that most applications use. Comm
 |---|---|
 | `PING [message]` | Returns `PONG`, or echoes `message` if provided. Used to test connectivity and measure latency. |
 | `AUTH password` | Authenticates the connection. Required on the first command if `RECACHED_PASSWORD` is set. 5 consecutive failures close the connection. |
+| `HELLO [protover]` | Reports server info and negotiates the protocol version. `3` switches the connection to RESP3, `2` back to RESP2, no argument reports without changing. Unsupported versions return `-NOPROTO` and leave the connection unchanged. Requires authentication. See [Wire Protocol](/server/protocol#protocol-version-tcp). |
 
 ---
 
@@ -22,6 +23,7 @@ The most common data type. Values are always stored as byte strings; numeric ope
 | `GETSET key value` | Sets the key to a new value and returns the old value atomically. Deprecated in Redis 6.2 — prefer `SET key value GET`. |
 | `MGET key [key ...]` | Returns the values of multiple keys. Keys that do not exist return nil. |
 | `MSET key value [key value ...]` | Sets multiple keys to their respective values in a single atomic operation. |
+| `ESET key value` | **Ephemeral set.** Stores a string like `SET`, but the key's lifetime is bound to the connection that wrote it — when that connection closes, the server deletes the key and the deletion is pushed to live queries. Writing the same key again transfers ownership to the newest connection, so a second browser tab keeps presence alive when the first closes. Intended for presence, cursors, and "who is online"; use `SET` for anything that should outlive a connection. |
 | `SETNX key value` | Set a key only if it does not exist. Returns 1 if set, 0 if the key already existed. |
 | `SETEX key seconds value` | Set a key with an integer-second expiry. Equivalent to `SET key value EX seconds`. |
 | `PSETEX key milliseconds value` | Set a key with a millisecond-precision expiry. |
@@ -197,7 +199,7 @@ JGET doc:42                       # {"meta":{"views":17},"title":"Final"}
 
 The browser SDK exposes the same commands as [`jset` / `jget` / `jmerge`](/browser/api-reference#json-documents) with `JSON.stringify`/`parse` handled for you — a `JMERGE` from any client updates every connected browser's local document.
 
-In live queries (`QSUB` / `useKeys`), JSON keys appear with a `json` type marker rather than the document — subscribe for change signals and read the document with `JGET`/`jget`.
+In live queries (`QSUB` / `useKeys`), JSON keys arrive as `["json", document]` — the document travels with the notification, so no follow-up `JGET` is needed.
 
 ---
 
@@ -265,7 +267,7 @@ A live query delivers the current state of every key matching a glob pattern, th
 
 | Command | Description |
 |---|---|
-| `QSUB pattern` | Subscribe. The reply is `["qstate", pattern, key, value, ...]` — the current state of every live key matching the pattern as flat pairs (strings in full; collection types as their type name, fetch them with a typed read). Afterwards, every mutation to a matching key — including keys created later — arrives as a `["keychange", key, value]` push; deletions arrive with a nil value. Initial state is capped at 10 000 keys. Up to 64 live queries per connection. |
+| `QSUB pattern` | Subscribe. The reply is `["qstate", pattern, key, value, ...]` — the current state of every live key matching the pattern as flat pairs. Afterwards, every mutation to a matching key — including keys created later — arrives as a `["keychange", key, value]` push; deletions arrive with a nil value. Initial state is capped at 10 000 keys. Up to 64 live queries per connection. |
 | `QUNSUB [pattern]` | Drop one live query, or all of them without an argument. |
 
 ```bash
@@ -280,7 +282,36 @@ QSUB cart:42:*
 
 Under strict sync scoping, `QSUB` patterns must sit inside the connection's granted scopes — a grant of `cart:42:*` covers `QSUB cart:42:*` and narrower prefix patterns. Live-query pushes never interfere with `WATCH` transactions (they travel on a separate internal channel).
 
-Two current limitations: `FLUSHDB` does not emit per-key diffs to live queries, and collection-type values arrive as type markers rather than full values — subscribe plus a typed re-read (`HGETALL`, `LRANGE`) on change.
+### Value shapes
+
+Strings arrive as a bulk string and deletions as nil. Collections arrive **type-tagged** — an array
+whose first element names the type — so a subscriber can rebuild the value without a follow-up read:
+
+```text
+hash  →  ["hash", field, value, ...]     fields sorted
+list  →  ["list", element, ...]          head to tail
+set   →  ["set", member, ...]
+zset  →  ["zset", member, score, ...]    ascending score
+json  →  ["json", document]
+```
+
+The tag is what makes the payload unambiguous: a four-element array would otherwise be
+indistinguishable between a list of four items and a hash of two pairs. Ordering is deterministic, so
+two clients receiving the same notification build identical local state.
+
+Each notification carries the **complete** current value, so the receiver replaces the key rather than
+merging — which is what allows a removed member to propagate.
+
+`FLUSHDB` is announced as a single sentinel per subscribed pattern — a `keychange` whose key is the
+pattern and whose value is nil — meaning "every key matching this pattern is gone". Announcing each
+deleted key would mean one frame per key in the keyspace for one command. The browser SDK expands the
+sentinel locally; a hand-written client should do the same.
+
+::: warning Changed in 0.2.2
+Before 0.2.2 collections arrived as a bare type name (`"hash"`), and subscribers had to follow up with
+`HGETALL`/`LRANGE`. Server and SDK are released in lockstep — run matching versions, since a 0.2.1
+client ignores the new shape.
+:::
 
 ---
 

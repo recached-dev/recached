@@ -19,6 +19,11 @@ Recached is configured entirely through environment variables. There is no confi
 | `RECACHED_AOF_PATH` | _(disabled)_ | Path to the append-only file. When set, every write command is appended to this file in addition to snapshot saves. On startup the snapshot is loaded first, then AOF commands are replayed for the delta. The AOF is truncated after each successful snapshot save. |
 | `RECACHED_AOF_SYNC` | `everysec` | AOF fsync policy. `always`: fsync after every write (safest, slowest). `everysec`: fsync once per second (default, good balance). `no`: let the OS decide (fastest, least safe). |
 | `RECACHED_MAX_CONNECTIONS` | `1024` | Maximum number of concurrent client connections (TCP + WebSocket combined). New connections are dropped when the limit is reached. |
+| `RECACHED_EVICTION_SAMPLE` | `10` | Keys sampled per eviction pass. A larger sample approximates true LRU/TTL ordering more closely at the cost of more work per eviction — the knob Redis exposes as `maxmemory-samples`. |
+| `RECACHED_MAX_MULTI_QUEUE` | `10000` | Commands that may be queued inside one `MULTI`. |
+| `RECACHED_MAX_WATCHES_PER_CONN` | `1024` | Keys a single connection may `WATCH`. |
+| `RECACHED_MAX_LIVE_QUERIES` | `64` | Live queries (`QSUB`) a single connection may hold. |
+| `RECACHED_MAX_QSUB_INITIAL_KEYS` | `10000` | Keys returned in a live query's initial `qstate` reply. Beyond this the snapshot is truncated — narrow the pattern instead of raising it. |
 | `RECACHED_REPL_PORT` | `6381` | TCP port the primary listens on for incoming replica connections. Only active when `RECACHED_REPLICAOF` is not set (i.e. this server is a primary). |
 | `RECACHED_REPLICAOF` | _(none)_ | Set to `host:port` to run this server as a read-only replica. On startup it connects to the primary, receives a full snapshot, and then streams all subsequent writes. Reconnects automatically with exponential backoff on disconnect. |
 | `RECACHED_REPL_PASSWORD` | _(none)_ | Shared secret for the replication channel. When set, replicas must send this password during the handshake before receiving any data. Must match on both primary and replica. Strongly recommended for any network-exposed replication port. |

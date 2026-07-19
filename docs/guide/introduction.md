@@ -4,6 +4,9 @@
 
 Recached is an in-memory cache server written in Rust. It speaks RESP (the Redis Serialization Protocol) on port 6379, so any Redis client — `ioredis`, `node-redis`, `redis-py`, `Jedis` — works against it today with no code changes.
 
+Values are binary-safe, as they are in Redis: a value is stored and returned as the exact bytes you
+sent. *Keys* and other identifiers must be text — see [Binary values](#binary-values).
+
 That is where the similarity with Redis ends.
 
 The distinguishing feature is the `core-engine` crate: a pure Rust state machine with no network dependencies, no file I/O, and no OS-specific code. It compiles to native x86-64/ARM64 for the server **and** to `wasm32-unknown-unknown` for the browser. Both targets run the same cache logic from the same source. The WebSocket sync layer (port 6380) keeps the two sides consistent in real time.
@@ -48,8 +51,43 @@ Recached is a good fit when:
 
 - **You need very high-durability persistence.** Recached supports snapshots (RDB-style) and AOF, but it is still primarily an in-memory cache. If you cannot tolerate any data loss between fsync intervals, a purpose-built database is the right tool.
 - **You need multi-replica consensus failover.** Recached supports leader–follower replication with automatic single-replica failover (`RECACHED_FAILOVER_TIMEOUT`). If the primary is unreachable for the configured duration, the designated replica promotes itself. What it does not include is multi-replica quorum election: in a setup with several replicas, split-brain prevention requires you to designate one replica for auto-failover and keep the others as passive standbys.
-- **You depend on uncommon Redis commands.** Recached implements the commands most applications use, not all 250+. Server introspection (`INFO`, `SLOWLOG`, `COMMAND`), Lua scripting, RESP3, and cluster mode are out of scope.
+- **You depend on uncommon Redis commands.** Recached implements the commands most applications use, not all 250+. Server introspection (`INFO`, `SLOWLOG`, `COMMAND`), Lua scripting, and cluster mode are out of scope. RESP3 is supported for protocol negotiation and pub/sub delivery (`HELLO 3`), not for the full RESP3 type surface.
 - **You need very large datasets.** Recached is an in-memory cache — it is not a database. If your working set does not fit in RAM, Redis with RDB persistence or a proper database is the right tool.
+
+## Binary values
+
+**Values are binary-safe.** A value is stored and returned as the exact bytes you sent — compressed
+payloads, protobuf, images, serialized objects — with no encoding step and no size penalty.
+
+**Identifiers must be text.** Keys, hash fields, set and sorted-set members, glob patterns and
+pub/sub channel names must be valid UTF-8, and a command carrying a binary one is rejected:
+
+```
+ERR argument 1 is not valid UTF-8. Keys, fields, members and patterns must be text;
+    only values may be binary
+```
+
+Nothing is stored when this happens and the connection stays usable. This is narrower than Redis,
+where keys are binary-safe too — but keys are looked up, glob-matched and checked against sync scopes
+as text, and a binary key would be unreachable through those paths. Keys are identifiers in practice,
+so this is rarely felt.
+
+Commands that interpret a value still require the right shape: `INCR` on a binary value returns
+`ERR value is not an integer`, and JSON documents must be UTF-8 because JSON is defined that way.
+Those are type errors, not encoding losses — the stored bytes are unchanged either way.
+
+**The browser SDK handles binary too.** `cache.setBytes(key, uint8array)` writes it,
+`cache.getBytes(key)` reads it back, and `cache.publishBytes(channel, uint8array)` publishes it.
+Binary values survive the offline outbox, cross-tab sync and IndexedDB persistence unchanged.
+
+`cache.get()` **throws** on a binary value rather than returning mangled text, and `getJSON()`
+treats one as a miss — reach for `getBytes()` when a value may not be text. A binary pub/sub payload
+arrives at an `onMessage` listener as a `Uint8Array` instead of a string.
+
+Before 0.2.2 values were stored as UTF-8 strings and binary was silently replaced with U+FFFD: `SET`
+returned `OK` and `GET` returned different bytes than were written, on every transport. If you are
+upgrading from an earlier version, data already corrupted that way cannot be recovered — the bytes
+were destroyed on the way in.
 
 ## Maturity
 

@@ -78,13 +78,54 @@ traffic you believed was encrypted was not. If you are on an older version, veri
 assume: a `rediss://` client should connect and a plaintext client should be refused. See
 [Security → Transport encryption](/server/security#transport-encryption).
 
+### A replica is connected but falling behind
+
+`recached_replication_lag_frames` counts frames sent but not acknowledged by the furthest-behind
+replica. Unlike `recached_replication_queue_depth`, it stays high when the primary has written
+everything to the socket and the replica is not keeping up — see
+[Operations → Reading the two replication gauges](/server/operations#reading-the-two-replication-gauges).
+
+Lag that climbs without bound while replication otherwise works usually means the replica predates
+0.2.2 and never acknowledges. Upgrade both ends together.
+
 ### Memory keeps growing
 
 There is no built-in memory metric — monitor process RSS. Set `RECACHED_MAX_MEMORY` and
 `RECACHED_EVICTION` so the cache bounds itself, and `RECACHED_MAX_KEYS` if key count rather than
 value size is the driver. `DBSIZE` reports the current key count on demand.
 
-### `ERR key too large`
+### A subscriber receives nothing, or cannot parse what it receives
+
+Two separate faults, both fixed in **0.2.2**:
+
+- **Nothing arrives until the subscriber sends another command.** Deliveries were written into a
+  buffered writer that only flushed when handling a client command, so a connection that purely
+  listened saw nothing. A subscriber that also polls appeared to work, which is why this went
+  unnoticed.
+- **Frames arrive but the client errors on them.** Pub/sub was delivered as RESP3 Push (`>`) frames
+  on every connection. RESP2 has no push type, so a standard Redis client that subscribed without
+  sending `HELLO 3` could not parse the frame. Deliveries now follow the negotiated version.
+
+On an older server, neither has a client-side workaround — upgrade.
+
+### `ERR argument N is not valid UTF-8`
+
+A key, hash field, set or sorted-set member, or glob pattern contained bytes that are not valid
+UTF-8. **Values are binary-safe** — this error only ever refers to an identifier position. Nothing
+was written and the connection is still usable.
+
+Identifiers are looked up, glob-matched and checked against sync scopes as text, so a binary one
+would be unreachable through those paths. Hex- or base64-encode the identifier:
+
+```js
+await cache.set(`blob:${id.toString('hex')}`, binaryPayload); // value stays raw
+```
+
+Before 0.2.2 *values* were also required to be text and binary was silently corrupted. If you are
+reading back mangled binary written by an older server, that data cannot be recovered — the bytes
+were destroyed on the way in. Re-populate the affected keys.
+
+### `ERR key too large`### `ERR key too large`
 
 A key exceeded the maximum key length. Keys are identifiers, not payloads — put the data in the
 value.
@@ -122,6 +163,10 @@ connections — by design, since they would leak or destroy data outside the con
 The client outbox holds **10,000 pending writes**. Past that, each new write **evicts the oldest one**
 — silently, with no error surfaced to your code.
 
+Register `cache.onOutboxFull((droppedId, pending) => …)` to be told when this happens — without it
+the loss is invisible. `cache.pendingWrites()` reports the current depth, so an application can apply
+back-pressure before the cap is reached.
+
 If a client can be offline long enough to exceed 10,000 writes, do not rely on the outbox as the
 system of record for those mutations. Batch them, or persist them yourself and reconcile on
 reconnect.
@@ -151,9 +196,12 @@ See [Offline & Reconnection](/browser/offline).
 A live query's initial state is capped at **10,000 keys**. Beyond that the snapshot is truncated.
 Narrow the pattern.
 
-Also note two documented limits of live queries: `FLUSHDB` does not emit per-key diffs, and
-collection values arrive as type markers rather than full values — subscribe, then re-read with
-`HGETALL` / `LRANGE` on change.
+`FLUSHDB` arrives as one sentinel per subscribed pattern rather than one frame per key — if your
+client is hand-written, expand it locally.
+
+If collection values arrive as a bare type name (`"hash"`) rather than their contents, the server and
+SDK are on different versions — collection values ship complete from 0.2.2 onward, and the two are
+released in lockstep.
 
 ### Too many live queries
 

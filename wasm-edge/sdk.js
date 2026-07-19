@@ -31,10 +31,16 @@ export class Cache {
     constructor(raw) {
         this._mutationListeners = new Set();
         this._messageListeners = new Map();
+        this._outboxFullListeners = new Set();
         /** @internal Arrow function so `this` is always bound when passed as a callback. */
         this._notifyMutation = () => {
             for (const cb of this._mutationListeners)
                 cb();
+        };
+        /** @internal */
+        this._notifyOutboxFull = (droppedId, pending) => {
+            for (const cb of this._outboxFullListeners)
+                cb(droppedId, pending);
         };
         /** @internal */
         this._notifyMessage = (channel, message) => {
@@ -50,6 +56,7 @@ export class Cache {
         this.raw = raw;
         raw.set_mutation_callback(this._notifyMutation);
         raw.set_message_callback(this._notifyMessage);
+        raw.set_outbox_full_callback(this._notifyOutboxFull);
     }
     /**
      * Subscribe to store mutations from any source — local writes, server
@@ -69,6 +76,37 @@ export class Cache {
     onMutation(cb) {
         this._mutationListeners.add(cb);
         return () => this._mutationListeners.delete(cb);
+    }
+    /**
+     * Called when the offline write queue overflows and the **oldest** queued
+     * write is discarded.
+     *
+     * The queue holds 10,000 writes. Past that, each new write evicts the oldest
+     * one — without this callback that is silent data loss: no error is thrown
+     * and the write is simply gone. If a client can plausibly be offline long
+     * enough to hit the cap, do not treat the outbox as the system of record;
+     * persist the mutation yourself and reconcile on reconnect.
+     *
+     * Returns an unsubscribe function.
+     *
+     * ```ts
+     * cache.onOutboxFull((droppedId, pending) => {
+     *   console.error(`dropped queued write ${droppedId}; ${pending} still pending`);
+     * });
+     * ```
+     */
+    onOutboxFull(cb) {
+        this._outboxFullListeners.add(cb);
+        return () => this._outboxFullListeners.delete(cb);
+    }
+    /**
+     * Writes queued locally and not yet acknowledged by the server.
+     *
+     * Useful for a "syncing…" indicator, or to apply back-pressure before the
+     * queue reaches its 10,000-write cap.
+     */
+    pendingWrites() {
+        return this.raw.pending_writes();
     }
     /**
      * Subscribe to pub/sub messages on `channel`.
@@ -102,9 +140,32 @@ export class Cache {
      * Return the value for `key`, or `null` if the key does not exist or has expired.
      *
      * Always served from local WASM memory — zero network latency.
+     *
+     * @throws if the stored value is not valid UTF-8. Values are byte-transparent,
+     * so a backend can write binary that syncs into this cache; returning it as a
+     * mangled string would be worse than failing. Use {@link getBytes} for those.
      */
     get(key) {
         return this.raw.get(key) ?? null;
+    }
+    /**
+     * Return the value for `key` as raw bytes, or `null` if it does not exist.
+     *
+     * Use this for values a backend wrote as binary — compressed payloads,
+     * protobuf, images — which cannot be represented as a JS string. Text values
+     * work here too, as their UTF-8 bytes.
+     *
+     * ```ts
+     * const bytes = cache.getBytes('thumb:42');
+     * if (bytes) img.src = URL.createObjectURL(new Blob([bytes]));
+     * ```
+     *
+     * Note: the browser SDK can *read* binary values but cannot yet *write* them
+     * — `set()` takes a string. Binary values originate from a backend writing
+     * over the RESP port.
+     */
+    getBytes(key) {
+        return this.raw.getBytes(key) ?? null;
     }
     /**
      * Return a JSON-parsed value stored under `key`, or `null` if the key is
@@ -116,7 +177,15 @@ export class Cache {
      * ```
      */
     getJSON(key) {
-        const raw = this.get(key);
+        let raw;
+        try {
+            raw = this.get(key);
+        }
+        catch {
+            // Binary value: not JSON by definition, so this is a miss rather than an
+            // error — getJSON is documented to return null for anything unparseable.
+            return null;
+        }
         if (raw === null)
             return null;
         try {
@@ -146,6 +215,20 @@ export class Cache {
         // raw.set fires the mutation callback registered in the constructor, so
         // listeners are already notified — no second _notifyMutation() here.
         this.raw.set(key, value);
+    }
+    /**
+     * Store raw bytes. Syncs to the server and other tabs when connected.
+     *
+     * Values are byte-transparent: the exact bytes given are stored, replicated,
+     * and persisted. Use this for compressed payloads, protobuf, or images —
+     * anything a JS string cannot hold. Read them back with {@link getBytes}.
+     *
+     * ```ts
+     * cache.setBytes('thumb:42', new Uint8Array(await blob.arrayBuffer()));
+     * ```
+     */
+    setBytes(key, value) {
+        this.raw.setBytes(key, value);
     }
     /**
      * Store a string value with a TTL (seconds). The key is deleted automatically
@@ -276,6 +359,15 @@ export class Cache {
     publish(channel, message) {
         this.raw.publish(channel, message);
     }
+    /**
+     * Publish raw bytes to a server pub/sub channel.
+     *
+     * Subscribers receive a `Uint8Array` rather than a string when the payload is
+     * not valid UTF-8 — see {@link onMessage}.
+     */
+    publishBytes(channel, message) {
+        this.raw.publishBytes(channel, message);
+    }
     // ── Sync scoping & live queries ───────────────────────────────────────────
     /**
      * Present a signed sync-scope token (strict servers — `RECACHED_SYNC_SECRET`).
@@ -331,8 +423,9 @@ export class Cache {
     }
     /**
      * Snapshot of local keys matching a glob pattern, as `[key, value]` pairs.
-     * Values are strings; keys holding collection types come back as `null`
-     * (read those with typed accessors).
+     * Keys holding collection types come back as `null` (read those with typed
+     * accessors). A value that is not valid UTF-8 comes back as a `Uint8Array`
+     * rather than a mangled string, so narrow the type before treating it as text.
      *
      * Served entirely from local WASM memory — zero network latency.
      */

@@ -9,7 +9,6 @@ use core_engine::resp::Value;
 use core_engine::store::{EvictionPolicy, KeyValueStore, SnapshotEntry};
 use futures_util::{SinkExt, StreamExt};
 use metrics::{counter, gauge};
-use rustls_pemfile::{certs, private_key};
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::net::IpAddr;
@@ -23,6 +22,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, broadcast, mpsc};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -58,7 +58,9 @@ fn command_name(cmd: &Command) -> &'static str {
     match cmd {
         Command::Ping(_) => "ping",
         Command::Auth(_) => "auth",
+        Command::Hello(_) => "hello",
         Command::Get(_) => "get",
+        Command::ESet(_, _) => "eset",
         Command::Set(_, _, _) => "set",
         Command::Del(_) => "del",
         Command::Unlink(_) => "unlink",
@@ -265,17 +267,19 @@ fn make_tcp_listeners(addr: &str, n: usize) -> std::io::Result<Vec<TcpListener>>
 
 // ── TLS ───────────────────────────────────────────────────────────────────────
 
+// PEM parsing comes from rustls-pki-types, the crate rustls itself uses.
+// `rustls-pemfile` was deprecated in favour of it (RUSTSEC-2025-0134), and an
+// unmaintained dependency is a poor thing to have sitting in the TLS path.
 fn load_certs(path: &str) -> std::io::Result<Vec<CertificateDer<'static>>> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
-    certs(&mut reader).collect()
+    CertificateDer::pem_file_iter(path)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
+        .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))
+        .collect()
 }
 
 fn load_private_key(path: &str) -> std::io::Result<PrivateKeyDer<'static>> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
-    private_key(&mut reader)?
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no private key found"))
+    PrivateKeyDer::from_pem_file(path)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
 }
 
 /// Decides what a (cert, key) environment pair means, without touching the
@@ -337,12 +341,42 @@ fn load_tls_acceptor() -> Option<TlsAcceptor> {
 
 const TCP_READ_BUFFER_BYTES: usize = 16 * 1024; // 16 KB — matches Redis default
 const MAX_TCP_READ_BUFFER_BYTES: usize = 64 * 1024 * 1024; // 64 MB per connection
-const MAX_MULTI_QUEUE_LEN: usize = 10_000;
-const MAX_WATCHES_PER_CONN: usize = 1_024;
-const MAX_QSUBS_PER_CONN: usize = 64;
+/// Per-connection limits. Compiled-in defaults, overridable at startup because
+/// the right value is workload-dependent — Redis exposes `maxmemory-samples`
+/// for the same reason. Read once and cached; changing one needs a restart.
+fn env_limit(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
+}
+
+/// Commands queued inside one `MULTI`. Override: `RECACHED_MAX_MULTI_QUEUE`.
+fn max_multi_queue_len() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_limit("RECACHED_MAX_MULTI_QUEUE", 10_000))
+}
+
+/// Keys one connection may `WATCH`. Override: `RECACHED_MAX_WATCHES_PER_CONN`.
+fn max_watches_per_conn() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_limit("RECACHED_MAX_WATCHES_PER_CONN", 1_024))
+}
+
+/// Live queries one connection may hold. Override: `RECACHED_MAX_LIVE_QUERIES`.
+fn max_qsubs_per_conn() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_limit("RECACHED_MAX_LIVE_QUERIES", 64))
+}
 /// Cap on the number of key/value pairs returned as QSUB initial state, so a
 /// pattern matching a huge keyspace cannot produce an unbounded reply frame.
-const MAX_QSUB_INITIAL_KEYS: usize = 10_000;
+/// Keys returned in a live query's initial state.
+/// Override: `RECACHED_MAX_QSUB_INITIAL_KEYS`.
+fn max_qsub_initial_keys() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_limit("RECACHED_MAX_QSUB_INITIAL_KEYS", 10_000))
+}
 const BROADCAST_CHANNEL_CAPACITY: usize = 512;
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 const MAX_AUTH_FAILURES: u32 = 5;
@@ -490,9 +524,9 @@ impl AofWriter {
         })
     }
 
-    async fn append(&self, resp: &str) {
+    async fn append(&self, resp: &[u8]) {
         let mut f = self.file.lock().await;
-        if f.write_all(resp.as_bytes()).await.is_err() {
+        if f.write_all(resp).await.is_err() {
             warn!("AOF write failed");
             return;
         }
@@ -556,15 +590,85 @@ async fn replay_aof(store: &KeyValueStore, path: &std::path::Path) -> usize {
 
 type ReplSender = mpsc::Sender<Vec<u8>>;
 
+/// A connected replica: its write channel plus the counters that make lag
+/// observable.
+///
+/// Replication was previously one-way, so the primary could only report how
+/// many replicas were attached — never how far behind one had fallen. The
+/// replica now acknowledges each applied frame, and the difference between
+/// what was queued and what was acknowledged is the lag.
+struct ReplicaHandle {
+    tx: ReplSender,
+    /// Frames handed to this replica's channel.
+    sent: Arc<AtomicU64>,
+    /// Frames the replica reports as applied.
+    acked: Arc<AtomicU64>,
+}
+
 /// Connected-replica registry. `count` mirrors `senders.len()` (updated by
 /// every writer while holding the lock) so the per-write hot path can skip
 /// the mutex entirely when no replica is connected.
 struct ReplHub {
-    senders: tokio::sync::Mutex<Vec<ReplSender>>,
+    senders: tokio::sync::Mutex<Vec<ReplicaHandle>>,
     count: AtomicUsize,
 }
 
 impl ReplHub {
+    /// Deepest send queue across connected replicas, in frames.
+    ///
+    /// Replication is fire-and-forget — replicas never acknowledge an applied
+    /// offset — so true offset lag is not observable without a protocol change.
+    /// Queue depth is the honest proxy available today: a replica that cannot
+    /// keep up backs its channel up, and a queue at capacity means frames are
+    /// about to be dropped.
+    async fn max_queue_depth(&self) -> usize {
+        let senders = self.senders.lock().await;
+        senders
+            .iter()
+            .map(|r| r.tx.max_capacity().saturating_sub(r.tx.capacity()))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Send one frame to every attached replica, dropping any that cannot keep
+    /// up. Increments each surviving replica's sent counter, which is one half
+    /// of the lag calculation.
+    async fn fan_out(&self, bytes: Vec<u8>) {
+        let mut reg = self.senders.lock().await;
+        reg.retain(|r| match r.tx.try_send(bytes.clone()) {
+            Ok(()) => {
+                r.sent.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(
+                    "Replica fell too far behind (channel full) — disconnecting so it can resync"
+                );
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        });
+        self.count.store(reg.len(), Ordering::Relaxed);
+    }
+
+    /// Frames the furthest-behind replica has yet to acknowledge.
+    ///
+    /// This is true lag: how much of what the primary sent has actually been
+    /// applied downstream. Queue depth only shows what is stuck locally, and
+    /// reads zero for a replica that has received frames but cannot apply them.
+    async fn max_lag_frames(&self) -> u64 {
+        let senders = self.senders.lock().await;
+        senders
+            .iter()
+            .map(|r| {
+                r.sent
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(r.acked.load(Ordering::Relaxed))
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     fn new() -> ReplRegistry {
         Arc::new(ReplHub {
             senders: tokio::sync::Mutex::new(Vec::new()),
@@ -605,6 +709,42 @@ struct ServerState {
     /// client suffices — no seen-set. In-memory only: a server restart
     /// reopens the (already narrow) duplicate window, which is documented.
     dedup: std::sync::Mutex<HashMap<String, (u64, u64)>>,
+    /// Ephemeral (`ESET`) keys → the connection that currently owns them.
+    ///
+    /// Ownership transfers on each `ESET`, which is what makes multiple tabs
+    /// work: two tabs both setting `presence:user:42` leave the *later* one as
+    /// owner, so the first tab closing does not mark the user offline. Only the
+    /// owning connection's close deletes the key.
+    ephemeral: std::sync::Mutex<HashMap<String, u64>>,
+    /// Set when a dedup high-water mark advances; cleared once persisted.
+    dedup_dirty: std::sync::atomic::AtomicBool,
+}
+
+impl ServerState {
+    /// Record `conn_id` as the owner of an ephemeral key, replacing any
+    /// previous owner.
+    fn claim_ephemeral(&self, key: &str, conn_id: u64) {
+        if let Ok(mut map) = self.ephemeral.lock() {
+            map.insert(key.to_string(), conn_id);
+        }
+    }
+
+    /// Keys still owned by `conn_id`, removed from the registry. Called once
+    /// when a connection closes.
+    fn take_ephemeral_for(&self, conn_id: u64) -> Vec<String> {
+        let Ok(mut map) = self.ephemeral.lock() else {
+            return Vec::new();
+        };
+        let owned: Vec<String> = map
+            .iter()
+            .filter(|(_, id)| **id == conn_id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in &owned {
+            map.remove(k);
+        }
+        owned
+    }
 }
 
 /// Sweep dedup client entries idle longer than this once the map is large.
@@ -647,41 +787,89 @@ impl ServerState {
                     true
                 } else {
                     *hwm = id;
+                    self.dedup_dirty.store(true, Ordering::Relaxed);
                     false
                 }
             }
             None => {
                 map.insert(client.to_string(), (id, now));
+                self.dedup_dirty.store(true, Ordering::Relaxed);
                 false
             }
         }
     }
 
     /// Called after every successful write: appends to AOF and fans out to replicas.
-    async fn on_write(&self, resp: &str) {
+    async fn on_write(&self, resp: &[u8]) {
         if let Some(aof) = &self.aof {
             aof.append(resp).await;
         }
         if self.replicas.is_empty() {
             return;
         }
-        let bytes = resp.as_bytes().to_vec();
-        let mut reg = self.replicas.senders.lock().await;
-        reg.retain(|tx| match tx.try_send(bytes.clone()) {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                warn!(
-                    "Replica fell too far behind (channel full) — disconnecting so it can resync"
-                );
-                false
+        self.replicas.fan_out(resp.to_vec()).await;
+    }
+
+    /// Path of the dedup sidecar, alongside the snapshot.
+    fn dedup_path(&self) -> std::path::PathBuf {
+        self.snap.path.with_extension("dedup")
+    }
+
+    /// Persist dedup high-water marks so exactly-once delivery survives a
+    /// restart. Written atomically (temp + rename) and only when a mark has
+    /// advanced. The map is one `u64` per client, so this stays small enough to
+    /// flush far more often than the snapshot.
+    async fn persist_dedup(&self) {
+        if !self.dedup_dirty.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        let marks: Vec<(String, u64)> = match self.dedup.lock() {
+            Ok(map) => map.iter().map(|(c, (hwm, _))| (c.clone(), *hwm)).collect(),
+            Err(_) => return,
+        };
+        let path = self.dedup_path();
+        let tmp = path.with_extension("dedup.tmp");
+        match rmp_serde::to_vec(&marks) {
+            Err(e) => warn!("Dedup serialize failed: {}", e),
+            Ok(bytes) => match tokio::fs::write(&tmp, &bytes).await {
+                Err(e) => warn!("Dedup write failed: {}", e),
+                Ok(()) => {
+                    if let Err(e) = tokio::fs::rename(&tmp, &path).await {
+                        warn!("Dedup rename failed: {}", e);
+                    }
+                }
+            },
+        }
+    }
+
+    /// Restore dedup marks at boot. `seen` timestamps are not persisted — they
+    /// only drive idle sweeping, so restored entries start their idle clock now.
+    async fn load_dedup(&self) {
+        let path = self.dedup_path();
+        let Ok(bytes) = tokio::fs::read(&path).await else {
+            return;
+        };
+        match rmp_serde::from_slice::<Vec<(String, u64)>>(&bytes) {
+            Err(e) => warn!("Dedup sidecar unreadable ({}), ignoring: {:?}", e, path),
+            Ok(marks) => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                if let Ok(mut map) = self.dedup.lock() {
+                    let count = marks.len();
+                    for (client, hwm) in marks {
+                        map.insert(client, (hwm, now));
+                    }
+                    info!("Restored {} dedup high-water mark(s)", count);
+                }
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
-        });
-        self.replicas.count.store(reg.len(), Ordering::Relaxed);
+        }
     }
 
     /// Save snapshot, reset the dirty counter, then truncate AOF (snapshot subsumes the log).
     async fn save(&self, store: &KeyValueStore) {
+        self.persist_dedup().await;
         save_snapshot(store, &self.snap).await;
         store.reset_dirty();
         if let Some(aof) = &self.aof {
@@ -697,6 +885,7 @@ fn is_write_command(cmd: &Command) -> bool {
     matches!(
         cmd,
         Command::Set(..)
+            | Command::ESet(..)
             | Command::Del(..)
             | Command::Unlink(..)
             | Command::Append(..)
@@ -846,9 +1035,15 @@ async fn handle_replica(
 
     // 1. Register channel first so subsequent writes are buffered
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(repl_channel_capacity);
+    let sent = Arc::new(AtomicU64::new(0));
+    let acked = Arc::new(AtomicU64::new(0));
     {
         let mut reg = replicas.senders.lock().await;
-        reg.push(tx);
+        reg.push(ReplicaHandle {
+            tx,
+            sent: Arc::clone(&sent),
+            acked: Arc::clone(&acked),
+        });
         replicas.count.store(reg.len(), Ordering::Relaxed);
     }
 
@@ -860,12 +1055,37 @@ async fn handle_replica(
     socket.write_all(&snap_bytes).await?;
     socket.flush().await?;
 
-    // 3. Stream buffered + ongoing writes
-    while let Some(bytes) = rx.recv().await {
-        let len = bytes.len() as u32;
-        socket.write_all(&len.to_le_bytes()).await?;
-        socket.write_all(&bytes).await?;
-        socket.flush().await?;
+    // 3. Stream buffered + ongoing writes, and read acknowledgements
+    //
+    // The socket is bidirectional but used to carry frames one way only, which
+    // left the primary unable to say how far behind a replica was. The replica
+    // now writes back a cumulative count of applied frames; `sent - acked` is
+    // the lag. Reading and writing are selected over so a replica that stops
+    // acknowledging cannot stall the write side, and vice versa.
+    let (mut rd, mut wr) = socket.split();
+    let mut ack_buf = [0u8; 8];
+    loop {
+        tokio::select! {
+            frame = rx.recv() => {
+                let Some(bytes) = frame else { break };
+                let len = bytes.len() as u32;
+                wr.write_all(&len.to_le_bytes()).await?;
+                wr.write_all(&bytes).await?;
+                wr.flush().await?;
+            }
+            res = rd.read_exact(&mut ack_buf) => {
+                // A replica that closes its read side, or one running a build
+                // that predates acks, simply stops updating the gauge — it is
+                // not an error, so the stream continues either way.
+                if res.is_err() {
+                    break;
+                }
+                let applied = u64::from_le_bytes(ack_buf);
+                // Monotonic: a reordered or replayed ack must never walk the
+                // high-water mark backwards and report negative lag.
+                acked.fetch_max(applied, Ordering::Relaxed);
+            }
+        }
     }
     Ok(())
 }
@@ -979,7 +1199,12 @@ async fn sync_from_primary(
         }
     }
 
-    // 2. Stream write commands from primary
+    // 2. Stream write commands from primary, acknowledging what we apply
+    //
+    // Every frame is counted, including one that fails to parse: the primary
+    // counts frames it sent, so skipping a bad frame here would desynchronise
+    // the two offsets and understate lag forever after.
+    let mut applied: u64 = 0;
     loop {
         let mut len_buf = [0u8; 4];
         socket.read_exact(&mut len_buf).await?;
@@ -992,6 +1217,7 @@ async fn sync_from_primary(
         }
         let mut cmd_bytes = vec![0u8; cmd_len];
         socket.read_exact(&mut cmd_bytes).await?;
+        applied += 1;
 
         match Value::parse(&cmd_bytes) {
             Ok((value, _)) => {
@@ -1007,16 +1233,22 @@ async fn sync_from_primary(
                     // Relay the applied write so this replica's own WebSocket
                     // clients see it, and any sub-replicas / AOF get it too
                     // (enables multi-tier replication and replica WS push).
-                    let frame = String::from_utf8_lossy(&cmd_bytes).into_owned();
                     let _ = tx.send(Arc::new(SyncPush {
                         origin: 0,
                         keys,
-                        resp: frame.clone(),
+                        resp: cmd_bytes.clone(),
                     }));
-                    state.on_write(&frame).await;
+                    state.on_write(&cmd_bytes).await;
                 }
             }
             Err(e) => warn!("Replica: bad command from primary: {}", e),
+        }
+
+        // Acknowledge on the same socket. TcpStream is unbuffered, so this is a
+        // single 8-byte write with no flush; a failure means the primary is
+        // gone, which the next read will surface with a better error.
+        if socket.write_all(&applied.to_le_bytes()).await.is_err() {
+            warn!("Replica: failed to send replication acknowledgement");
         }
     }
 }
@@ -1043,7 +1275,7 @@ fn ct_eq_bytes(a: &[u8], b: &[u8]) -> bool {
 struct SyncPush {
     origin: u64,
     keys: Vec<String>,
-    resp: String,
+    resp: Vec<u8>,
 }
 
 type SyncMsg = Arc<SyncPush>;
@@ -1124,6 +1356,7 @@ fn command_scope(cmd: &Command) -> CommandScope {
     match cmd {
         Command::Ping(_)
         | Command::Auth(_)
+        | Command::Hello(_)
         | Command::Multi
         | Command::Exec
         | Command::Discard
@@ -1147,7 +1380,8 @@ fn command_scope(cmd: &Command) -> CommandScope {
         | Command::LastSave
         | Command::ReplicaOfNoOne => CommandScope::Admin,
 
-        Command::Set(k, _, _)
+        Command::ESet(k, _)
+        | Command::Set(k, _, _)
         | Command::Get(k)
         | Command::Append(k, _)
         | Command::Strlen(k)
@@ -1316,12 +1550,12 @@ fn next_conn_id() -> u64 {
 enum PubSubMsg {
     Message {
         channel: String,
-        message: String,
+        message: Vec<u8>,
     },
     PMessage {
         pattern: String,
         channel: String,
-        message: String,
+        message: Vec<u8>,
     },
 }
 
@@ -1374,7 +1608,7 @@ impl PubSubHub {
     }
 
     /// Deliver to all matching subscribers; returns the count delivered.
-    fn publish(&mut self, channel: &str, message: &str) -> i64 {
+    fn publish(&mut self, channel: &str, message: &[u8]) -> i64 {
         let mut count = 0i64;
 
         if let std::collections::hash_map::Entry::Occupied(mut e) =
@@ -1385,7 +1619,7 @@ impl PubSubHub {
                 let ok = tx
                     .send(PubSubMsg::Message {
                         channel: channel.to_string(),
-                        message: message.to_string(),
+                        message: message.to_vec(),
                     })
                     .is_ok();
                 if ok {
@@ -1409,7 +1643,7 @@ impl PubSubHub {
                 .send(PubSubMsg::PMessage {
                     pattern,
                     channel: channel.to_string(),
-                    message: message.to_string(),
+                    message: message.to_vec(),
                 })
                 .is_ok()
             {
@@ -1474,7 +1708,8 @@ type WatchRegistry = Arc<WatchHub>;
 /// already confirmed a mutation occurred.
 fn primary_keys(cmd: &Command) -> Vec<String> {
     match cmd {
-        Command::Set(k, _, _)
+        Command::ESet(k, _)
+        | Command::Set(k, _, _)
         | Command::Append(k, _)
         | Command::GetSet(k, _)
         | Command::SetNx(k, _)
@@ -1581,6 +1816,42 @@ async fn notify_watchers(registry: &WatchRegistry, cmd: &Command, store: &KeyVal
     }
 }
 
+/// Announce a `FLUSHDB` to live queries.
+///
+/// Emitting a keychange per deleted key would mean one frame per key in the
+/// keyspace — potentially millions — for a single command. Instead each
+/// registered pattern receives one sentinel, delivered as a keychange whose key
+/// is the pattern and whose value is nil. Subscribers treat it as "every key
+/// matching this pattern is gone", which is exactly what happened, at O(patterns)
+/// instead of O(keys).
+///
+/// Explicitly `WATCH`ed keys are notified individually — that set is bounded by
+/// the connection limit and callers expect per-key precision there.
+async fn notify_flushdb(registry: &WatchRegistry, watched_before: Vec<String>) {
+    if registry.watched_keys.load(Ordering::Relaxed) > 0 && !watched_before.is_empty() {
+        let mut reg = registry.map.lock().await;
+        for key in &watched_before {
+            if let Some(subs) = reg.get_mut(key) {
+                subs.retain(|(_, tx)| tx.send((key.clone(), Value::BulkString(None))).is_ok());
+            }
+        }
+        registry.sync_len(&reg);
+    }
+    if registry.watched_patterns.load(Ordering::Relaxed) > 0 {
+        let mut pats = registry.patterns.lock().await;
+        let mut emptied = false;
+        for (pattern, subs) in pats.iter_mut() {
+            let sentinel = pattern.clone();
+            subs.retain(|(_, tx)| tx.send((sentinel.clone(), Value::BulkString(None))).is_ok());
+            emptied |= subs.is_empty();
+        }
+        if emptied {
+            pats.retain(|_, subs| !subs.is_empty());
+        }
+        registry.sync_patterns_len(&pats);
+    }
+}
+
 /// Drop all of `conn_id`'s live-query subscriptions. Called on QUNSUB (all
 /// form) and on connection close.
 async fn unregister_all_qsubs(
@@ -1629,7 +1900,17 @@ async fn apply_write_effects(
         state.on_write(&msg).await;
     }
     if has_watch {
-        notify_watchers(watch_registry, cmd, store).await;
+        if matches!(cmd, Command::FlushDb) {
+            // primary_keys() is empty for FLUSHDB, so the generic notifier has
+            // nothing to announce — subscribers would silently miss the wipe.
+            let watched: Vec<String> = {
+                let reg = watch_registry.map.lock().await;
+                reg.keys().cloned().collect()
+            };
+            notify_flushdb(watch_registry, watched).await;
+        } else {
+            notify_watchers(watch_registry, cmd, store).await;
+        }
     }
     if has_ws {
         let _ = tx.send(Arc::new(SyncPush {
@@ -1665,23 +1946,103 @@ async fn unregister_all_watches(
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-fn encode_pubsub_msg(msg: PubSubMsg) -> Vec<u8> {
+/// Encode a pub/sub delivery for a connection speaking protocol `protover`.
+///
+/// RESP2 has no push type, so a subscribed RESP2 client expects a plain array
+/// and cannot parse a `>` frame at all. RESP3 clients want the push type so
+/// deliveries are distinguishable from command replies on a multiplexed
+/// connection. The WebSocket transport is RESP3 by definition — the sync
+/// protocol is specified in terms of push frames — and passes 3.
+/// Handle `HELLO [protover]`, updating `protover` in place on success.
+///
+/// Returns the serialized reply. An unsupported version leaves the connection's
+/// current protocol untouched and replies `-NOPROTO`, which is what lets a
+/// client probe for RESP3 and fall back cleanly rather than being disconnected.
+fn process_hello(
+    requested: Option<&str>,
+    protover: &mut u8,
+    is_authenticated: bool,
+    is_replica: bool,
+) -> Vec<u8> {
+    if let Some(raw) = requested {
+        match raw.parse::<u8>() {
+            Ok(v @ (2 | 3)) => *protover = v,
+            _ => {
+                return Value::Error("NOPROTO unsupported protocol version".to_string())
+                    .serialize();
+            }
+        }
+    }
+
+    // Pre-auth HELLO reports the protocol but nothing about the server, so an
+    // unauthenticated client cannot use it to fingerprint the deployment.
+    if !is_authenticated {
+        return Value::Error("NOAUTH HELLO must be called with authentication".to_string())
+            .serialize();
+    }
+
+    let fields = vec![
+        ("server", Value::BulkString(Some(b"recached".to_vec()))),
+        (
+            "version",
+            Value::BulkString(Some(env!("CARGO_PKG_VERSION").as_bytes().to_vec())),
+        ),
+        ("proto", Value::Integer(*protover as i64)),
+        ("mode", Value::BulkString(Some(b"standalone".to_vec()))),
+        (
+            "role",
+            Value::BulkString(Some(if is_replica {
+                b"replica".to_vec()
+            } else {
+                b"master".to_vec()
+            })),
+        ),
+        ("modules", Value::Array(Some(vec![]))),
+    ];
+
+    if *protover >= 3 {
+        Value::Map(
+            fields
+                .into_iter()
+                .map(|(k, v)| (Value::BulkString(Some(k.as_bytes().to_vec())), v))
+                .collect(),
+        )
+        .serialize()
+    } else {
+        // RESP2 has no map type; Redis flattens to alternating key/value.
+        let mut flat = Vec::with_capacity(fields.len() * 2);
+        for (k, v) in fields {
+            flat.push(Value::BulkString(Some(k.as_bytes().to_vec())));
+            flat.push(v);
+        }
+        Value::Array(Some(flat)).serialize()
+    }
+}
+
+fn encode_pubsub_msg(msg: PubSubMsg, protover: u8) -> Vec<u8> {
+    let frame = |parts: Vec<Value>| {
+        if protover >= 3 {
+            Value::Push(parts)
+        } else {
+            Value::Array(Some(parts))
+        }
+    };
     match msg {
-        PubSubMsg::Message { channel, message } => Value::Push(vec![
+        PubSubMsg::Message { channel, message } => frame(vec![
             Value::BulkString(Some(b"message".to_vec())),
             Value::BulkString(Some(channel.into_bytes())),
-            Value::BulkString(Some(message.into_bytes())),
+            Value::BulkString(Some(message)),
         ])
         .serialize(),
         PubSubMsg::PMessage {
             pattern,
             channel,
             message,
-        } => Value::Push(vec![
+        } => frame(vec![
             Value::BulkString(Some(b"pmessage".to_vec())),
             Value::BulkString(Some(pattern.into_bytes())),
             Value::BulkString(Some(channel.into_bytes())),
-            Value::BulkString(Some(message.into_bytes())),
+            Value::BulkString(Some(message)),
         ])
         .serialize(),
     }
@@ -1698,18 +2059,29 @@ fn resp_subscribe_ack(kind: &str, channel: &str, count: usize) -> Vec<u8> {
 
 /// Encodes a list of string parts as a RESP3 Push frame for WebSocket fan-out.
 /// Uses `>` prefix so clients can distinguish server-initiated pushes from command responses.
-fn resp_push(parts: &[&str]) -> String {
-    let mut s = format!(">{}\r\n", parts.len());
+/// Build a RESP3 Push frame from raw byte arguments.
+///
+/// Bytes rather than `&str` because these frames carry stored values, which may
+/// be arbitrary binary. Building them as a `String` would have required a lossy
+/// conversion — silently corrupting the replicated, AOF-logged and
+/// browser-synced copy of a value the store itself holds faithfully.
+fn resp_push(parts: &[&[u8]]) -> Vec<u8> {
+    let mut out = format!(">{}\r\n", parts.len()).into_bytes();
     for part in parts {
-        s.push_str(&format!("${}\r\n{}\r\n", part.len(), part));
+        out.extend_from_slice(format!("${}\r\n", part.len()).as_bytes());
+        out.extend_from_slice(part);
+        out.extend_from_slice(b"\r\n");
     }
-    s
+    out
 }
 
 /// Returns the RESP-encoded mutation to broadcast to WebSocket peers, or `None`
 /// if the command mutated nothing (read-only or conditional-and-failed).
-fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
+fn broadcast_for(cmd: &Command, response: &Value) -> Option<Vec<u8>> {
     match cmd {
+        // Replays as SET: a replica has no connection to scope the lifetime to,
+        // and the owning server broadcasts the DEL when the connection closes.
+        Command::ESet(k, v) => Some(resp_push(&[b"SET", k.as_bytes(), v.as_slice()])),
         Command::Set(k, v, opts) => {
             // Without GET: nil response means NX/XX condition failed — don't broadcast.
             // With GET: nil means key didn't exist before, but SET still happened.
@@ -1718,125 +2090,163 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
                 return None;
             }
             match &opts.expiry {
-                None => Some(resp_push(&["SET", k, v])),
+                None => Some(resp_push(&[b"SET", k.as_bytes(), v.as_slice()])),
                 Some(SetExpiry::Ex(s)) => {
                     let px = s.saturating_mul(1000).to_string();
-                    Some(resp_push(&["SET", k, v, "PX", &px]))
+                    Some(resp_push(&[
+                        b"SET",
+                        k.as_bytes(),
+                        v.as_slice(),
+                        b"PX",
+                        px.as_bytes(),
+                    ]))
                 }
                 Some(SetExpiry::Px(ms)) => {
                     let ms_s = ms.to_string();
-                    Some(resp_push(&["SET", k, v, "PX", &ms_s]))
+                    Some(resp_push(&[
+                        b"SET",
+                        k.as_bytes(),
+                        v.as_slice(),
+                        b"PX",
+                        ms_s.as_bytes(),
+                    ]))
                 }
                 Some(SetExpiry::Exat(ts)) => {
                     let pxat = ts.saturating_mul(1000).to_string();
-                    Some(resp_push(&["SET", k, v, "PXAT", &pxat]))
+                    Some(resp_push(&[
+                        b"SET",
+                        k.as_bytes(),
+                        v.as_slice(),
+                        b"PXAT",
+                        pxat.as_bytes(),
+                    ]))
                 }
                 Some(SetExpiry::Pxat(ts)) => {
                     let ts_s = ts.to_string();
-                    Some(resp_push(&["SET", k, v, "PXAT", &ts_s]))
+                    Some(resp_push(&[
+                        b"SET",
+                        k.as_bytes(),
+                        v.as_slice(),
+                        b"PXAT",
+                        ts_s.as_bytes(),
+                    ]))
                 }
-                Some(SetExpiry::KeepTtl) => Some(resp_push(&["SET", k, v, "KEEPTTL"])),
+                Some(SetExpiry::KeepTtl) => {
+                    Some(resp_push(&[b"SET", k.as_bytes(), v.as_slice(), b"KEEPTTL"]))
+                }
             }
         }
         Command::Del(keys) | Command::Unlink(keys) => {
-            let mut parts: Vec<&str> = vec!["DEL"];
-            let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+            let mut parts: Vec<&[u8]> = vec![b"DEL"];
+            let key_refs: Vec<&[u8]> = keys.iter().map(|s| s.as_bytes()).collect();
             parts.extend_from_slice(&key_refs);
             Some(resp_push(&parts))
         }
         Command::MSet(pairs) => {
-            let mut parts: Vec<&str> = vec!["MSET"];
-            let flat: Vec<String> = pairs
+            let mut parts: Vec<&[u8]> = vec![b"MSET"];
+            let flat: Vec<Vec<u8>> = pairs
                 .iter()
-                .flat_map(|(k, v)| [k.clone(), v.clone()])
+                .flat_map(|(k, v)| [k.as_bytes().to_vec(), v.clone()])
                 .collect();
-            let flat_refs: Vec<&str> = flat.iter().map(|s| s.as_str()).collect();
+            let flat_refs: Vec<&[u8]> = flat.iter().map(|s| s.as_slice()).collect();
             parts.extend_from_slice(&flat_refs);
             Some(resp_push(&parts))
         }
         Command::SetNx(k, v) => match response {
-            Value::Integer(1) => Some(resp_push(&["SET", k, v])),
+            Value::Integer(1) => Some(resp_push(&[b"SET", k.as_bytes(), v.as_slice()])),
             _ => None,
         },
         Command::SetEx(k, secs, v) => {
             let px = secs.saturating_mul(1000).to_string();
-            Some(resp_push(&["SET", k, v, "PX", &px]))
+            Some(resp_push(&[
+                b"SET",
+                k.as_bytes(),
+                v.as_slice(),
+                b"PX",
+                px.as_bytes(),
+            ]))
         }
         Command::PSetEx(k, ms, v) => {
             let ms_s = ms.to_string();
-            Some(resp_push(&["SET", k, v, "PX", &ms_s]))
+            Some(resp_push(&[
+                b"SET",
+                k.as_bytes(),
+                v.as_slice(),
+                b"PX",
+                ms_s.as_bytes(),
+            ]))
         }
         Command::Append(k, v) => match response {
-            Value::Integer(_) => Some(resp_push(&["APPEND", k, v])),
+            Value::Integer(_) => Some(resp_push(&[b"APPEND", k.as_bytes(), v.as_slice()])),
             _ => None,
         },
-        Command::GetSet(k, v) => Some(resp_push(&["SET", k, v])),
+        Command::GetSet(k, v) => Some(resp_push(&[b"SET", k.as_bytes(), v.as_slice()])),
         Command::Incr(k) | Command::Decr(k) => match response {
             Value::Integer(n) => {
                 let s = n.to_string();
-                Some(resp_push(&["SET", k, &s]))
+                Some(resp_push(&[b"SET", k.as_bytes(), s.as_bytes()]))
             }
             _ => None,
         },
         Command::IncrBy(k, _) | Command::DecrBy(k, _) => match response {
             Value::Integer(n) => {
                 let s = n.to_string();
-                Some(resp_push(&["SET", k, &s]))
+                Some(resp_push(&[b"SET", k.as_bytes(), s.as_bytes()]))
             }
             _ => None,
         },
         Command::Expire(k, secs) => match response {
             Value::Integer(1) => {
                 let ms = secs.saturating_mul(1000).to_string();
-                Some(resp_push(&["PEXPIRE", k, &ms]))
+                Some(resp_push(&[b"PEXPIRE", k.as_bytes(), ms.as_bytes()]))
             }
             _ => None,
         },
         Command::PExpire(k, ms) => match response {
             Value::Integer(1) => {
                 let ms_s = ms.to_string();
-                Some(resp_push(&["PEXPIRE", k, &ms_s]))
+                Some(resp_push(&[b"PEXPIRE", k.as_bytes(), ms_s.as_bytes()]))
             }
             _ => None,
         },
         Command::ExpireAt(k, ts) => match response {
             Value::Integer(1) => {
                 let ts_ms = ts.saturating_mul(1000).to_string();
-                Some(resp_push(&["PEXPIREAT", k, &ts_ms]))
+                Some(resp_push(&[b"PEXPIREAT", k.as_bytes(), ts_ms.as_bytes()]))
             }
             _ => None,
         },
         Command::PExpireAt(k, ts) => match response {
             Value::Integer(1) => {
                 let ts_s = ts.to_string();
-                Some(resp_push(&["PEXPIREAT", k, &ts_s]))
+                Some(resp_push(&[b"PEXPIREAT", k.as_bytes(), ts_s.as_bytes()]))
             }
             _ => None,
         },
         Command::Persist(k) => match response {
-            Value::Integer(1) => Some(resp_push(&["PERSIST", k])),
+            Value::Integer(1) => Some(resp_push(&[b"PERSIST", k.as_bytes()])),
             _ => None,
         },
-        Command::FlushDb => Some(resp_push(&["FLUSHDB"])),
+        Command::FlushDb => Some(resp_push(&[b"FLUSHDB"])),
         Command::Rename(src, dst) => match response {
             Value::Error(_) => None,
-            _ => Some(resp_push(&["RENAME", src, dst])),
+            _ => Some(resp_push(&[b"RENAME", src.as_bytes(), dst.as_bytes()])),
         },
 
         // ── Hash ─────────────────────────────────────────────────────────────
         Command::HSet(k, pairs) => {
-            let mut parts: Vec<String> = vec!["HSET".into(), k.clone()];
+            let mut parts: Vec<Vec<u8>> = vec![b"HSET".to_vec(), k.as_bytes().to_vec()];
             for (f, v) in pairs {
-                parts.push(f.clone());
+                parts.push(f.as_bytes().to_vec());
                 parts.push(v.clone());
             }
-            let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
+            let refs: Vec<&[u8]> = parts.iter().map(|s| s.as_slice()).collect();
             Some(resp_push(&refs))
         }
         Command::HDel(k, fields) => match response {
             Value::Integer(n) if *n > 0 => {
-                let mut parts: Vec<&str> = vec!["HDEL", k];
-                let field_refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
+                let mut parts: Vec<&[u8]> = vec![b"HDEL", k.as_bytes()];
+                let field_refs: Vec<&[u8]> = fields.iter().map(|s| s.as_bytes()).collect();
                 parts.extend_from_slice(&field_refs);
                 Some(resp_push(&parts))
             }
@@ -1845,19 +2255,34 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
         Command::HIncrBy(k, f, _) => match response {
             Value::Integer(n) => {
                 let s = n.to_string();
-                Some(resp_push(&["HSET", k, f, &s]))
+                Some(resp_push(&[
+                    b"HSET",
+                    k.as_bytes(),
+                    f.as_bytes(),
+                    s.as_bytes(),
+                ]))
             }
             _ => None,
         },
         Command::HIncrByFloat(k, f, _) => match response {
             Value::BulkString(Some(data)) => {
                 let s = String::from_utf8_lossy(data);
-                Some(resp_push(&["HSET", k, f, &s]))
+                Some(resp_push(&[
+                    b"HSET",
+                    k.as_bytes(),
+                    f.as_bytes(),
+                    s.as_bytes(),
+                ]))
             }
             _ => None,
         },
         Command::HSetNx(k, f, v) => match response {
-            Value::Integer(1) => Some(resp_push(&["HSET", k, f, v])),
+            Value::Integer(1) => Some(resp_push(&[
+                b"HSET",
+                k.as_bytes(),
+                f.as_bytes(),
+                v.as_slice(),
+            ])),
             _ => None,
         },
 
@@ -1868,8 +2293,8 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
             } else {
                 "RPUSH"
             };
-            let mut parts: Vec<&str> = vec![cmd_name, k];
-            let val_refs: Vec<&str> = vals.iter().map(|s| s.as_str()).collect();
+            let mut parts: Vec<&[u8]> = vec![cmd_name.as_bytes(), k.as_bytes()];
+            let val_refs: Vec<&[u8]> = vals.iter().map(|v| v.as_slice()).collect();
             parts.extend_from_slice(&val_refs);
             Some(resp_push(&parts))
         }
@@ -1880,8 +2305,8 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
                 } else {
                     "RPUSH"
                 };
-                let mut parts: Vec<&str> = vec![cmd_name, k];
-                let val_refs: Vec<&str> = vals.iter().map(|s| s.as_str()).collect();
+                let mut parts: Vec<&[u8]> = vec![cmd_name.as_bytes(), k.as_bytes()];
+                let val_refs: Vec<&[u8]> = vals.iter().map(|v| v.as_slice()).collect();
                 parts.extend_from_slice(&val_refs);
                 Some(resp_push(&parts))
             }
@@ -1893,8 +2318,8 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
             _ => {
                 let n = count.map(|c| c.to_string());
                 match &n {
-                    Some(ns) => Some(resp_push(&["LPOP", k, ns])),
-                    None => Some(resp_push(&["LPOP", k])),
+                    Some(ns) => Some(resp_push(&[b"LPOP", k.as_bytes(), ns.as_bytes()])),
+                    None => Some(resp_push(&[b"LPOP", k.as_bytes()])),
                 }
             }
         },
@@ -1904,36 +2329,51 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
             _ => {
                 let n = count.map(|c| c.to_string());
                 match &n {
-                    Some(ns) => Some(resp_push(&["RPOP", k, ns])),
-                    None => Some(resp_push(&["RPOP", k])),
+                    Some(ns) => Some(resp_push(&[b"RPOP", k.as_bytes(), ns.as_bytes()])),
+                    None => Some(resp_push(&[b"RPOP", k.as_bytes()])),
                 }
             }
         },
         Command::LSet(k, idx, v) => match response {
             Value::SimpleString(_) => {
                 let idx_s = idx.to_string();
-                Some(resp_push(&["LSET", k, &idx_s, v]))
+                Some(resp_push(&[
+                    b"LSET",
+                    k.as_bytes(),
+                    idx_s.as_bytes(),
+                    v.as_slice(),
+                ]))
             }
             _ => None,
         },
         Command::LRem(k, count, elem) => match response {
             Value::Integer(n) if *n > 0 => {
                 let count_s = count.to_string();
-                Some(resp_push(&["LREM", k, &count_s, elem]))
+                Some(resp_push(&[
+                    b"LREM",
+                    k.as_bytes(),
+                    count_s.as_bytes(),
+                    elem.as_slice(),
+                ]))
             }
             _ => None,
         },
         Command::LTrim(k, start, stop) => {
             let start_s = start.to_string();
             let stop_s = stop.to_string();
-            Some(resp_push(&["LTRIM", k, &start_s, &stop_s]))
+            Some(resp_push(&[
+                b"LTRIM",
+                k.as_bytes(),
+                start_s.as_bytes(),
+                stop_s.as_bytes(),
+            ]))
         }
 
         // ── Set ───────────────────────────────────────────────────────────────
         Command::SAdd(k, members) => match response {
             Value::Integer(n) if *n > 0 => {
-                let mut parts: Vec<&str> = vec!["SADD", k];
-                let m_refs: Vec<&str> = members.iter().map(|s| s.as_str()).collect();
+                let mut parts: Vec<&[u8]> = vec![b"SADD", k.as_bytes()];
+                let m_refs: Vec<&[u8]> = members.iter().map(|s| s.as_bytes()).collect();
                 parts.extend_from_slice(&m_refs);
                 Some(resp_push(&parts))
             }
@@ -1941,8 +2381,8 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
         },
         Command::SRem(k, members) => match response {
             Value::Integer(n) if *n > 0 => {
-                let mut parts: Vec<&str> = vec!["SREM", k];
-                let m_refs: Vec<&str> = members.iter().map(|s| s.as_str()).collect();
+                let mut parts: Vec<&[u8]> = vec![b"SREM", k.as_bytes()];
+                let m_refs: Vec<&[u8]> = members.iter().map(|s| s.as_bytes()).collect();
                 parts.extend_from_slice(&m_refs);
                 Some(resp_push(&parts))
             }
@@ -1969,31 +2409,36 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
                 let _ = count;
                 None
             } else {
-                let mut parts: Vec<&str> = vec!["SREM", k];
-                let m_refs: Vec<&str> = popped.iter().map(|s| s.as_str()).collect();
+                let mut parts: Vec<&[u8]> = vec![b"SREM", k.as_bytes()];
+                let m_refs: Vec<&[u8]> = popped.iter().map(|s| s.as_bytes()).collect();
                 parts.extend_from_slice(&m_refs);
                 Some(resp_push(&parts))
             }
         }
         Command::SMove(src, dst, member) => match response {
-            Value::Integer(1) => Some(resp_push(&["SMOVE", src, dst, member])),
+            Value::Integer(1) => Some(resp_push(&[
+                b"SMOVE",
+                src.as_bytes(),
+                dst.as_bytes(),
+                member.as_bytes(),
+            ])),
             _ => None,
         },
         Command::SInterStore(dst, keys) => {
-            let mut parts: Vec<&str> = vec!["SINTERSTORE", dst];
-            let k_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+            let mut parts: Vec<&[u8]> = vec![b"SINTERSTORE", dst.as_bytes()];
+            let k_refs: Vec<&[u8]> = keys.iter().map(|s| s.as_bytes()).collect();
             parts.extend_from_slice(&k_refs);
             Some(resp_push(&parts))
         }
         Command::SUnionStore(dst, keys) => {
-            let mut parts: Vec<&str> = vec!["SUNIONSTORE", dst];
-            let k_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+            let mut parts: Vec<&[u8]> = vec![b"SUNIONSTORE", dst.as_bytes()];
+            let k_refs: Vec<&[u8]> = keys.iter().map(|s| s.as_bytes()).collect();
             parts.extend_from_slice(&k_refs);
             Some(resp_push(&parts))
         }
         Command::SDiffStore(dst, keys) => {
-            let mut parts: Vec<&str> = vec!["SDIFFSTORE", dst];
-            let k_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+            let mut parts: Vec<&[u8]> = vec![b"SDIFFSTORE", dst.as_bytes()];
+            let k_refs: Vec<&[u8]> = keys.iter().map(|s| s.as_bytes()).collect();
             parts.extend_from_slice(&k_refs);
             Some(resp_push(&parts))
         }
@@ -2017,13 +2462,13 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
                 parts.push(format_f64_score(*score));
                 parts.push(member.clone());
             }
-            let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
+            let refs: Vec<&[u8]> = parts.iter().map(|s| s.as_bytes()).collect();
             Some(resp_push(&refs))
         }
         Command::ZRem(k, members) => match response {
             Value::Integer(n) if *n > 0 => {
-                let mut parts: Vec<&str> = vec!["ZREM", k];
-                let m_refs: Vec<&str> = members.iter().map(|s| s.as_str()).collect();
+                let mut parts: Vec<&[u8]> = vec![b"ZREM", k.as_bytes()];
+                let m_refs: Vec<&[u8]> = members.iter().map(|s| s.as_bytes()).collect();
                 parts.extend_from_slice(&m_refs);
                 Some(resp_push(&parts))
             }
@@ -2031,18 +2476,28 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
         },
         Command::ZIncrBy(k, delta, member) => {
             let delta_s = format_f64_score(*delta);
-            Some(resp_push(&["ZINCRBY", k, &delta_s, member]))
+            Some(resp_push(&[
+                b"ZINCRBY",
+                k.as_bytes(),
+                delta_s.as_bytes(),
+                member.as_bytes(),
+            ]))
         }
 
         // ── JSON ─────────────────────────────────────────────────────────────
         // Replayable as-is on replicas, AOF, and browser stores. Only
         // successful writes replicate (errors reply -ERR, not +OK).
         Command::JSet(k, path, value) => match response {
-            Value::SimpleString(_) => Some(resp_push(&["JSET", k, path, value])),
+            Value::SimpleString(_) => Some(resp_push(&[
+                b"JSET",
+                k.as_bytes(),
+                path.as_bytes(),
+                value.as_bytes(),
+            ])),
             _ => None,
         },
         Command::JMerge(k, patch) => match response {
-            Value::SimpleString(_) => Some(resp_push(&["JMERGE", k, patch])),
+            Value::SimpleString(_) => Some(resp_push(&[b"JMERGE", k.as_bytes(), patch.as_bytes()])),
             _ => None,
         },
 
@@ -2054,7 +2509,12 @@ fn broadcast_for(cmd: &Command, response: &Value) -> Option<String> {
         Command::RlSet(k, limit, window_secs) => {
             let limit_s = limit.to_string();
             let window_s = window_secs.to_string();
-            Some(resp_push(&["RLSET", k, &limit_s, &window_s]))
+            Some(resp_push(&[
+                b"RLSET",
+                k.as_bytes(),
+                limit_s.as_bytes(),
+                window_s.as_bytes(),
+            ]))
         }
 
         // Pub/Sub and transactions carry no store state — no broadcast needed.
@@ -2223,11 +2683,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let store = Arc::new(KeyValueStore::with_config(
-        max_keys,
-        max_memory_bytes,
-        eviction_policy,
-    ));
+    let mut store_inner = KeyValueStore::with_config(max_keys, max_memory_bytes, eviction_policy);
+    // Eviction sample size — the knob Redis exposes as `maxmemory-samples`.
+    // Configured before the store is shared, so no interior mutability is needed.
+    store_inner.set_eviction_sample(env_limit("RECACHED_EVICTION_SAMPLE", 10));
+    let store = Arc::new(store_inner);
 
     // ── snapshot persistence ──────────────────────────────────────────────
     let save_path = PathBuf::from(
@@ -2343,7 +2803,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         replicas: Arc::clone(&replicas),
         is_replica: std::sync::atomic::AtomicBool::new(is_replica_start),
         dedup: std::sync::Mutex::new(HashMap::new()),
+        ephemeral: std::sync::Mutex::new(HashMap::new()),
+        dedup_dirty: std::sync::atomic::AtomicBool::new(false),
     });
+
+    // Restore exactly-once bookkeeping before accepting connections, so a
+    // client replaying an unacknowledged write after a restart is recognised
+    // rather than applied twice.
+    state.load_dedup().await;
+
+    // ── Dedup flush ───────────────────────────────────────────────────────
+    // The map is one u64 per client, so it can be persisted far more often than
+    // the snapshot. This bounds the duplicate window on an unclean shutdown to
+    // roughly this interval rather than to the snapshot cadence.
+    {
+        let state_dedup = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(1));
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                state_dedup.persist_dedup().await;
+            }
+        });
+    }
 
     // ── autosave ──────────────────────────────────────────────────────────
     if !save_conditions.is_empty() {
@@ -2435,6 +2918,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── watch registry ────────────────────────────────────────────────────
     let watch_registry: WatchRegistry = WatchHub::new();
+
+    // ── Capacity & sync metrics ───────────────────────────────────────────
+    // Traffic counters are event-driven, but capacity is a level, not an event:
+    // memory, key count and eviction rate have to be sampled. Without these an
+    // operator cannot answer "am I near the cap?" or "is eviction thrashing?"
+    // from a dashboard — see docs/server/operations.md.
+    {
+        let store_m = Arc::clone(&store);
+        let state_m = Arc::clone(&state);
+        let registry_m = watch_registry.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(5));
+            loop {
+                ticker.tick().await;
+                gauge!("recached_memory_bytes").set(store_m.approximate_memory_bytes() as f64);
+                gauge!("recached_keys").set(store_m.key_count() as f64);
+                counter!("recached_evictions_total").absolute(store_m.evicted_count());
+                gauge!("recached_replicas_connected")
+                    .set(state_m.replicas.count.load(Ordering::Relaxed) as f64);
+                gauge!("recached_replication_queue_depth")
+                    .set(state_m.replicas.max_queue_depth().await as f64);
+                gauge!("recached_replication_lag_frames")
+                    .set(state_m.replicas.max_lag_frames().await as f64);
+                gauge!("recached_live_queries")
+                    .set(registry_m.watched_patterns.load(Ordering::Relaxed) as f64);
+                gauge!("recached_watched_keys")
+                    .set(registry_m.watched_keys.load(Ordering::Relaxed) as f64);
+                gauge!("recached_dedup_clients_tracked")
+                    .set(state_m.dedup.lock().map(|m| m.len()).unwrap_or(0) as f64);
+            }
+        });
+    }
 
     // ── connection limiter ────────────────────────────────────────────────
     let max_connections = std::env::var("RECACHED_MAX_CONNECTIONS")
@@ -2630,6 +3145,10 @@ async fn handle_tcp<S>(
     let mut resp_buf = Vec::<u8>::with_capacity(4 * 1024);
     let mut is_authenticated = password.is_none();
     let mut auth_failures: u32 = 0;
+    // RESP2 until the client negotiates otherwise. Defaulting to 2 keeps every
+    // existing client working: they never send HELLO and must not start
+    // receiving RESP3-only types.
+    let mut protover: u8 = 2;
     let mut multi_queue: Option<Vec<Command>> = None;
     let mut subscribed_channels: HashSet<String> = HashSet::new();
     let mut subscribed_patterns: HashSet<String> = HashSet::new();
@@ -2677,6 +3196,17 @@ async fn handle_tcp<S>(
                                             let _ = writer.flush().await;
                                             break 'outer;
                                         }
+                                        continue 'parse;
+                                    }
+
+                                    if let Command::Hello(ref requested) = cmd {
+                                        let resp = process_hello(
+                                            requested.as_deref(),
+                                            &mut protover,
+                                            is_authenticated,
+                                            state.is_replica(),
+                                        );
+                                        if writer.write_all(&resp).await.is_err() { break 'outer; }
                                         continue 'parse;
                                     }
 
@@ -2767,7 +3297,7 @@ async fn handle_tcp<S>(
                                                 if writer.write_all(err).await.is_err() { break 'outer; }
                                             }
                                             _ => {
-                                                if queue.len() >= MAX_MULTI_QUEUE_LEN {
+                                                if queue.len() >= max_multi_queue_len() {
                                                     let err = b"-ERR transaction queue limit reached\r\n";
                                                     if writer.write_all(err).await.is_err() { break 'outer; }
                                                 } else {
@@ -2841,7 +3371,7 @@ async fn handle_tcp<S>(
 
                                         Command::Watch(keys) => {
                                             let new_count = keys.iter().filter(|k| !watched_keys.contains(*k)).count();
-                                            if watched_keys.len() + new_count > MAX_WATCHES_PER_CONN {
+                                            if watched_keys.len() + new_count > max_watches_per_conn() {
                                                 if writer.write_all(b"-ERR watch limit per connection reached\r\n").await.is_err() { break 'outer; }
                                             } else {
                                                 {
@@ -2965,7 +3495,15 @@ async fn handle_tcp<S>(
             msg = ps_rx.recv(), if is_subscribed => {
                 match msg {
                     Some(m) => {
-                        if writer.write_all(&encode_pubsub_msg(m)).await.is_err() {
+                        if writer.write_all(&encode_pubsub_msg(m, protover)).await.is_err() {
+                            break;
+                        }
+                        // `writer` is a BufWriter, and a delivery is not a
+                        // response to anything this connection sent — nothing
+                        // else is going to flush it. Without this a subscriber
+                        // that only listens receives nothing until it happens
+                        // to send a command or 32 KB of pushes accumulate.
+                        if writer.flush().await.is_err() {
                             break;
                         }
                     }
@@ -3037,14 +3575,19 @@ async fn handle_ws<S>(
     let mut qsub_patterns: HashSet<String> = HashSet::new();
     let (q_tx, mut q_rx) = mpsc::unbounded_channel::<WatchNotif>();
 
-    // NOTE: the WebSocket transport uses *text* frames, so values must be valid
-    // UTF-8. Non-UTF-8 bytes are replaced (lossy) on the way out. This is safe
-    // for the SDK, whose `set(key, value)` API only accepts `&str` values; raw
-    // binary values are only fully round-trippable over the TCP (RESP) port.
+    // Replies go out as *text* frames whenever the RESP bytes are valid UTF-8,
+    // which is the overwhelming majority and is what every existing client
+    // expects. A reply carrying a value that is not valid UTF-8 goes out as a
+    // *binary* frame instead of being mangled by a lossy conversion, which is
+    // what made raw binary values round-trip only over the TCP port.
     macro_rules! ws_send {
         ($bytes:expr) => {{
-            let text = String::from_utf8_lossy($bytes).into_owned();
-            if ws_sender.send(Message::Text(text.into())).await.is_err() {
+            let bytes: &[u8] = $bytes;
+            let msg = match std::str::from_utf8(bytes) {
+                Ok(text) => Message::Text(text.into()),
+                Err(_) => Message::Binary(bytes.to_vec().into()),
+            };
+            if ws_sender.send(msg).await.is_err() {
                 break;
             }
         }};
@@ -3056,8 +3599,17 @@ async fn handle_ws<S>(
         tokio::select! {
             msg = ws_receiver.next() => {
                 match msg {
-                    Some(Ok(Message::Text(text))) => {
-                        let (value, _) = match Value::parse(text.as_bytes()) {
+                    // Binary frames carry the same RESP bytes as text frames.
+                    // They exist so a client can write a value that is not
+                    // valid UTF-8 — impossible over a text frame, which the
+                    // WebSocket spec requires to be well-formed UTF-8.
+                    Some(Ok(frame @ (Message::Text(_) | Message::Binary(_)))) => {
+                        let raw: Vec<u8> = match &frame {
+                            Message::Text(t) => t.as_bytes().to_vec(),
+                            Message::Binary(b) => b.to_vec(),
+                            _ => unreachable!("pattern restricts to text and binary"),
+                        };
+                        let (value, _) = match Value::parse(&raw) {
                             Ok(v) => v,
                             Err(e) => {
                                 let err = Value::Error(format!("ERR Protocol error: {}", e)).serialize();
@@ -3082,6 +3634,28 @@ async fn handle_ws<S>(
                             );
                             ws_send!(&resp);
                             if disconnect { break; }
+                            continue;
+                        }
+
+                        // The WebSocket sync protocol is specified in terms of
+                        // RESP3 push frames, so this transport is always RESP3
+                        // and HELLO cannot downgrade it — a client asking for 2
+                        // is refused rather than silently left on 3.
+                        if let Command::Hello(ref requested) = cmd {
+                            let mut ws_protover: u8 = 3;
+                            let resp = match requested.as_deref() {
+                                Some("2") => Value::Error(
+                                    "NOPROTO the WebSocket transport requires RESP3".to_string(),
+                                )
+                                .serialize(),
+                                other => process_hello(
+                                    other,
+                                    &mut ws_protover,
+                                    is_authenticated,
+                                    state.is_replica(),
+                                ),
+                            };
+                            ws_send!(&resp);
                             continue;
                         }
 
@@ -3211,7 +3785,7 @@ async fn handle_ws<S>(
                                     ws_send!(b"-ERR Command not allowed inside a transaction\r\n");
                                 }
                                 _ => {
-                                    if queue.len() >= MAX_MULTI_QUEUE_LEN {
+                                    if queue.len() >= max_multi_queue_len() {
                                         ws_send!(b"-ERR transaction queue limit reached\r\n");
                                     } else {
                                         queue.push(cmd);
@@ -3280,7 +3854,7 @@ async fn handle_ws<S>(
                                     .iter()
                                     .filter(|k| !watched_keys.contains(*k))
                                     .count();
-                                if watched_keys.len() + new_count > MAX_WATCHES_PER_CONN {
+                                if watched_keys.len() + new_count > max_watches_per_conn() {
                                     ws_send!(b"-ERR watch limit per connection reached\r\n");
                                 } else {
                                     {
@@ -3342,7 +3916,7 @@ async fn handle_ws<S>(
                                     }
                                 }
                                 if !qsub_patterns.contains(&pattern)
-                                    && qsub_patterns.len() >= MAX_QSUBS_PER_CONN
+                                    && qsub_patterns.len() >= max_qsubs_per_conn()
                                 {
                                     ws_send!(b"-ERR live query limit per connection reached\r\n");
                                     continue 'outer;
@@ -3358,7 +3932,7 @@ async fn handle_ws<S>(
                                         .push((conn_id, q_tx.clone()));
                                     watch_registry.sync_patterns_len(&pats);
                                 }
-                                let kvs = store.matching_key_values(&pattern, MAX_QSUB_INITIAL_KEYS);
+                                let kvs = store.matching_key_values(&pattern, max_qsub_initial_keys());
                                 // Tagged reply so clients can recognise it among
                                 // interleaved frames: ["qstate", pattern, k, v, ...]
                                 let mut items = Vec::with_capacity(kvs.len() * 2 + 2);
@@ -3446,6 +4020,15 @@ async fn handle_ws<S>(
                                     }
                                     _ => {}
                                 }
+                                // Ephemeral keys are owned by the connection that wrote
+                                // them until another claims them; the close handler deletes
+                                // whatever is still ours. Claimed outside the write-effects
+                                // branch below, which only runs when a peer, replica, AOF or
+                                // watcher is present — ownership must be recorded even on a
+                                // standalone server with no listeners.
+                                if let Command::ESet(ref k, _) = cmd {
+                                    state.claim_ephemeral(k, conn_id);
+                                }
                                 let response = if is_write_command(&cmd)
                                     && write_effects_armed(&tx, &state, &watch_registry)
                                 {
@@ -3479,10 +4062,8 @@ async fn handle_ws<S>(
                             Some(scopes) => scopes_match(scopes, &push.keys),
                             None => !strict,
                         };
-                        if visible
-                            && ws_sender.send(Message::Text(push.resp.clone().into())).await.is_err()
-                        {
-                            break;
+                        if visible {
+                            ws_send!(&push.resp);
                         }
                     }
                     Ok(_) => {}
@@ -3497,11 +4078,8 @@ async fn handle_ws<S>(
             msg = ps_rx.recv(), if is_subscribed => {
                 match msg {
                     Some(m) => {
-                        let bytes = encode_pubsub_msg(m);
-                        let text = String::from_utf8_lossy(&bytes).into_owned();
-                        if ws_sender.send(Message::Text(text.into())).await.is_err() {
-                            break;
-                        }
+                        let bytes = encode_pubsub_msg(m, 3);
+                        ws_send!(&bytes);
                     }
                     None => break,
                 }
@@ -3514,10 +4092,7 @@ async fn handle_ws<S>(
                     // client for the observable-keys feature.
                     watch_dirty = true;
                     let bytes = encode_keychange(&key, &value);
-                    let text = String::from_utf8_lossy(&bytes).into_owned();
-                    if ws_sender.send(Message::Text(text.into())).await.is_err() {
-                        break;
-                    }
+                    ws_send!(&bytes);
                 }
             }
 
@@ -3526,10 +4101,7 @@ async fn handle_ws<S>(
             notif = q_rx.recv(), if !qsub_patterns.is_empty() => {
                 if let Some((key, value)) = notif {
                     let bytes = encode_keychange(&key, &value);
-                    let text = String::from_utf8_lossy(&bytes).into_owned();
-                    if ws_sender.send(Message::Text(text.into())).await.is_err() {
-                        break;
-                    }
+                    ws_send!(&bytes);
                 }
             }
         }
@@ -3551,6 +4123,25 @@ async fn handle_ws<S>(
         watch_registry.sync_len(&reg);
     }
     unregister_all_qsubs(&watch_registry, conn_id, &mut qsub_patterns).await;
+
+    // Delete ephemeral keys this connection still owns and fan the deletions
+    // out, so every subscriber sees the peer go away immediately rather than
+    // waiting for a heartbeat TTL to lapse.
+    let expired = state.take_ephemeral_for(conn_id);
+    if !expired.is_empty() {
+        let del = Command::Del(expired);
+        let response = store.execute(del.clone());
+        apply_write_effects(
+            &del,
+            &response,
+            &tx,
+            conn_id,
+            &state,
+            &watch_registry,
+            &store,
+        )
+        .await;
+    }
 }
 
 #[cfg(test)]
@@ -3606,6 +4197,8 @@ mod tests {
             replicas: ReplHub::new(),
             is_replica: AtomicBool::new(start_as_replica),
             dedup: std::sync::Mutex::new(HashMap::new()),
+            ephemeral: std::sync::Mutex::new(HashMap::new()),
+            dedup_dirty: std::sync::atomic::AtomicBool::new(false),
         });
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3662,12 +4255,16 @@ mod tests {
             }
         }
 
+        /// Send `args` and read one value. An empty `args` sends nothing and
+        /// just reads the next frame — used to await an out-of-band push.
         async fn cmd(&mut self, args: &[&str]) -> Value {
-            let mut req = format!("*{}\r\n", args.len());
-            for a in args {
-                req.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+            if !args.is_empty() {
+                let mut req = format!("*{}\r\n", args.len());
+                for a in args {
+                    req.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+                }
+                self.stream.write_all(req.as_bytes()).await.unwrap();
             }
-            self.stream.write_all(req.as_bytes()).await.unwrap();
             loop {
                 match Value::parse(&self.buf[..self.filled]) {
                     Ok((val, n)) => {
@@ -3826,7 +4423,7 @@ mod tests {
     async fn aof_writer_append_and_truncate() {
         let path = tmp_path("aof_writer.aof");
         let aof = AofWriter::open(path.clone(), AofSync::No).await.unwrap();
-        aof.append("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
+        aof.append(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
             .await;
         aof.flush().await;
         let len_before = tokio::fs::metadata(&path).await.unwrap().len();
@@ -3850,6 +4447,121 @@ mod tests {
         assert_eq!(c.cmd(&["DEL", "k"]).await, int(1));
         assert_eq!(c.cmd(&["GET", "k"]).await, nil());
         assert_eq!(c.cmd(&["DEL", "k"]).await, int(0)); // already gone
+    }
+
+    #[tokio::test]
+    async fn integration_binary_value_round_trips_over_resp() {
+        // The drop-in claim runs through this port: a value that is not valid
+        // UTF-8 must come back byte-for-byte, exactly as Redis would.
+        let srv = spawn_server().await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        let binary: &[u8] = &[0xff, 0xfe, 0x00, 0x41, 0x80];
+        let mut req = b"*3\r\n$3\r\nSET\r\n$3\r\nbin\r\n".to_vec();
+        req.extend_from_slice(format!("${}\r\n", binary.len()).as_bytes());
+        req.extend_from_slice(binary);
+        req.extend_from_slice(b"\r\n");
+        c.stream.write_all(&req).await.unwrap();
+        assert_eq!(c.cmd(&[]).await, ok());
+
+        assert_eq!(
+            c.cmd(&["GET", "bin"]).await,
+            Value::BulkString(Some(binary.to_vec())),
+            "binary value must survive the round trip"
+        );
+        assert_eq!(
+            c.cmd(&["STRLEN", "bin"]).await,
+            int(binary.len() as i64),
+            "length is counted in bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_binary_key_is_refused_over_resp() {
+        // Keys stay text: they are glob-matched and scope-checked, so a
+        // corrupted one would be silently unreachable. The refusal must be a
+        // clean RESP error that leaves the connection usable.
+        let srv = spawn_server().await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        c.stream
+            .write_all(b"*3\r\n$3\r\nSET\r\n$2\r\n\xff\xfe\r\n$1\r\nv\r\n")
+            .await
+            .unwrap();
+        let reply = c.cmd(&[]).await;
+        let Value::Error(e) = &reply else {
+            panic!("binary key must be refused, got {reply:?}")
+        };
+        assert!(e.contains("must be text"), "error must explain: {e:?}");
+
+        assert_eq!(c.cmd(&["DBSIZE"]).await, int(0), "nothing may be stored");
+        assert_eq!(c.cmd(&["SET", "ok", "v"]).await, ok());
+    }
+
+    #[tokio::test]
+    async fn integration_hello_negotiates_the_protocol() {
+        let srv = spawn_server().await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        // Default is RESP2: the reply is a flat array, not a map.
+        let v = c.cmd(&["HELLO"]).await;
+        let Value::Array(Some(items)) = v else {
+            panic!("RESP2 HELLO must reply with an array, got {v:?}")
+        };
+        assert!(items.contains(&bulk("recached")));
+        assert!(items.contains(&Value::Integer(2)));
+
+        // Upgrading yields a map keyed the same way.
+        let v = c.cmd(&["HELLO", "3"]).await;
+        let Value::Map(pairs) = v else {
+            panic!("RESP3 HELLO must reply with a map, got {v:?}")
+        };
+        let proto = pairs
+            .iter()
+            .find(|(k, _)| *k == bulk("proto"))
+            .map(|(_, v)| v.clone());
+        assert_eq!(proto, Some(Value::Integer(3)));
+
+        // An unsupported version is refused and the connection stays usable.
+        let v = c.cmd(&["HELLO", "9"]).await;
+        assert!(
+            matches!(&v, Value::Error(e) if e.starts_with("NOPROTO")),
+            "expected NOPROTO, got {v:?}"
+        );
+        assert_eq!(c.cmd(&["PING"]).await, Value::SimpleString("PONG".into()));
+    }
+
+    #[tokio::test]
+    async fn integration_pubsub_frame_type_follows_the_negotiated_protocol() {
+        // The bug this pins: pub/sub deliveries were RESP3 push frames on every
+        // connection, including RESP2 ones that cannot parse `>` at all.
+        for (protover, want_push) in [(None, false), (Some("3"), true)] {
+            let srv = spawn_server().await;
+            let mut sub = RespClient::connect(srv.tcp_addr).await;
+            if let Some(v) = protover {
+                sub.cmd(&["HELLO", v]).await;
+            }
+            assert!(matches!(
+                sub.cmd(&["SUBSCRIBE", "news"]).await,
+                Value::Array(_) | Value::Push(_)
+            ));
+
+            let mut pubr = RespClient::connect(srv.tcp_addr).await;
+            // Wait for the subscription to register before publishing.
+            for _ in 0..50 {
+                if pubr.cmd(&["PUBLISH", "news", "hi"]).await == int(1) {
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+            }
+
+            let delivery = sub.cmd(&[]).await;
+            match (&delivery, want_push) {
+                (Value::Push(_), true) => {}
+                (Value::Array(Some(_)), false) => {}
+                _ => panic!("protover {protover:?}: expected push={want_push}, got {delivery:?}"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -4102,14 +4814,16 @@ mod tests {
             replicas: ReplHub::new(),
             is_replica: AtomicBool::new(false),
             dedup: std::sync::Mutex::new(HashMap::new()),
+            ephemeral: std::sync::Mutex::new(HashMap::new()),
+            dedup_dirty: std::sync::atomic::AtomicBool::new(false),
         });
 
         // Simulate writes captured by AOF
         state
-            .on_write("*3\r\n$3\r\nSET\r\n$5\r\nhello\r\n$5\r\nworld\r\n")
+            .on_write(b"*3\r\n$3\r\nSET\r\n$5\r\nhello\r\n$5\r\nworld\r\n")
             .await;
         state
-            .on_write("*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n")
+            .on_write(b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n")
             .await;
         if let Some(ref a) = state.aof {
             a.flush().await;
@@ -4138,16 +4852,24 @@ mod tests {
         assert_eq!(c.cmd(&["SET", "b", "2"]).await, ok());
         assert_eq!(srv.store.dirty_count(), 2);
 
-        let last_save_before = srv.state.snap.last_save.load(Ordering::Relaxed);
-
         // Trigger a save — dirty resets to 0
         assert_eq!(c.cmd(&["SAVE"]).await, ok());
         assert_eq!(srv.store.dirty_count(), 0);
 
+        // Baseline *after* the explicit save, not before it: SAVE writes
+        // last_save itself, so a baseline taken beforehand differs by one
+        // whenever the save lands in the next whole second — which is what this
+        // test used to fail on, roughly one run in thirty. The assertion below
+        // is about no *further* save happening.
+        let last_save = srv.state.snap.last_save.load(Ordering::Relaxed);
+
         // No new writes → save condition not met → last_save unchanged after 1s
         tokio::time::sleep(tokio::time::Duration::from_millis(1100)).await;
-        let last_save_after = srv.state.snap.last_save.load(Ordering::Relaxed);
-        assert_eq!(last_save_before, last_save_after); // no autosave fired (no conditions configured)
+        assert_eq!(
+            last_save,
+            srv.state.snap.last_save.load(Ordering::Relaxed),
+            "no autosave should fire with no conditions configured"
+        );
     }
 
     // ── Integration: 3d replication ───────────────────────────────────────────
@@ -4174,6 +4896,271 @@ mod tests {
         assert_eq!(c.cmd(&["SET", "k", "v"]).await, ok());
         assert_eq!(c.cmd(&["GET", "k"]).await, bulk("v"));
         assert!(!srv.state.is_replica());
+    }
+
+    // ── FLUSHDB reaches live queries ──────────────────────────────────────────
+
+    /// Collect every frame arriving within `ms`, so a test can assert on the
+    /// keychange among the command-replay pushes that travel alongside it.
+    async fn drain_frames(c: &mut WsClient, ms: u64) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Some(f) = c.recv_any(ms).await {
+            out.push(f);
+        }
+        out
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flushdb_notifies_live_query_subscribers() {
+        // Previously FLUSHDB emitted nothing to live queries: primary_keys() is
+        // empty for it, so subscribers kept serving data the server had wiped.
+        let srv = spawn_ws_server().await;
+        let mut watcher = WsClient::connect(srv.tcp_addr).await;
+        watcher.cmd(&["QSUB", "cart:*"]).await;
+
+        let mut writer = WsClient::connect(srv.tcp_addr).await;
+        writer.cmd(&["SET", "cart:item:1", "a"]).await;
+        drain_frames(&mut watcher, 400).await;
+
+        writer.cmd(&["FLUSHDB"]).await;
+
+        let frames = drain_frames(&mut watcher, 800).await;
+        assert!(
+            frames
+                .iter()
+                .any(|f| f.contains("keychange") && f.contains("cart:*")),
+            "expected a keychange sentinel naming the pattern, got: {frames:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flushdb_sends_one_sentinel_per_pattern_not_per_key() {
+        // The reason for a sentinel: announcing per key would be one frame per
+        // key in the keyspace for a single command.
+        let srv = spawn_ws_server().await;
+        let mut watcher = WsClient::connect(srv.tcp_addr).await;
+        watcher.cmd(&["QSUB", "bulk:*"]).await;
+
+        let mut writer = WsClient::connect(srv.tcp_addr).await;
+        for i in 0..25 {
+            writer.cmd(&["SET", &format!("bulk:{i}"), "v"]).await;
+        }
+        drain_frames(&mut watcher, 500).await;
+
+        writer.cmd(&["FLUSHDB"]).await;
+
+        let keychanges: Vec<String> = drain_frames(&mut watcher, 800)
+            .await
+            .into_iter()
+            .filter(|f| f.contains("keychange"))
+            .collect();
+        assert_eq!(
+            keychanges.len(),
+            1,
+            "25 keys wiped must produce one sentinel, not 25 frames: {keychanges:?}"
+        );
+        assert!(keychanges[0].contains("bulk:*"));
+    }
+
+    // ── Exactly-once across a restart ─────────────────────────────────────────
+
+    /// Build a `ServerState` whose snapshot path (and therefore dedup sidecar)
+    /// is `path` — the same file a restarted process would find.
+    fn state_with_snapshot_path(path: PathBuf) -> Arc<ServerState> {
+        Arc::new(ServerState {
+            snap: Arc::new(SnapshotConfig {
+                path,
+                last_save: AtomicI64::new(now_unix_secs()),
+            }),
+            aof: None,
+            replicas: ReplHub::new(),
+            is_replica: AtomicBool::new(false),
+            dedup: std::sync::Mutex::new(HashMap::new()),
+            ephemeral: std::sync::Mutex::new(HashMap::new()),
+            dedup_dirty: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    #[tokio::test]
+    async fn dedup_marks_survive_a_restart() {
+        let snap = tmp_path("dedup_restart.rdb");
+        let _ = std::fs::remove_file(snap.with_extension("dedup"));
+
+        // First run: the client's writes are accepted once each.
+        let first = state_with_snapshot_path(snap.clone());
+        assert!(!first.dedup_seen("client-a", 1));
+        assert!(!first.dedup_seen("client-a", 2));
+        assert!(
+            first.dedup_seen("client-a", 2),
+            "same id twice within a run"
+        );
+        first.persist_dedup().await;
+
+        // Restart: fresh process, same snapshot path.
+        let second = state_with_snapshot_path(snap.clone());
+        assert!(
+            !second.dedup_seen("client-a", 3),
+            "a genuinely new id must still be accepted"
+        );
+
+        let third = state_with_snapshot_path(snap.clone());
+        third.load_dedup().await;
+        assert!(
+            third.dedup_seen("client-a", 2),
+            "a replayed write must be recognised after a restart — this is the \
+             caveat the sidecar exists to close"
+        );
+        assert!(!third.dedup_seen("client-a", 99), "higher ids still apply");
+
+        let _ = std::fs::remove_file(snap.with_extension("dedup"));
+    }
+
+    #[tokio::test]
+    async fn persist_dedup_is_a_no_op_when_nothing_advanced() {
+        // The flusher runs every second; it must not rewrite the file when no
+        // mark moved.
+        let snap = tmp_path("dedup_noop.rdb");
+        let side = snap.with_extension("dedup");
+        let _ = std::fs::remove_file(&side);
+
+        let state = state_with_snapshot_path(snap.clone());
+        state.dedup_seen("c", 1);
+        state.persist_dedup().await;
+        assert!(side.exists(), "first flush should write");
+
+        let before = std::fs::metadata(&side).unwrap().modified().unwrap();
+        state.persist_dedup().await; // nothing changed since
+        let after = std::fs::metadata(&side).unwrap().modified().unwrap();
+        assert_eq!(before, after, "unchanged marks must not rewrite the file");
+
+        let _ = std::fs::remove_file(&side);
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_dedup_sidecar_is_ignored_not_fatal() {
+        // Losing exactly-once bookkeeping is bad; refusing to boot is worse.
+        let snap = tmp_path("dedup_corrupt.rdb");
+        let side = snap.with_extension("dedup");
+        std::fs::write(&side, b"not messagepack").unwrap();
+
+        let state = state_with_snapshot_path(snap.clone());
+        state.load_dedup().await; // must not panic
+        assert!(!state.dedup_seen("client-a", 1), "server still functions");
+
+        let _ = std::fs::remove_file(&side);
+    }
+
+    #[tokio::test]
+    async fn a_missing_dedup_sidecar_is_a_clean_first_boot() {
+        let snap = tmp_path("dedup_absent.rdb");
+        let _ = std::fs::remove_file(snap.with_extension("dedup"));
+        let state = state_with_snapshot_path(snap);
+        state.load_dedup().await;
+        assert!(!state.dedup_seen("fresh", 1));
+    }
+
+    // ── Presence: connection-scoped keys ──────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eset_key_is_deleted_when_its_connection_closes() {
+        let srv = spawn_ws_server().await;
+        let mut watcher = WsClient::connect(srv.tcp_addr).await;
+        watcher.cmd(&["QSUB", "presence:*"]).await;
+
+        {
+            let mut presence = WsClient::connect(srv.tcp_addr).await;
+            assert_eq!(
+                presence.cmd(&["ESET", "presence:user:42", "online"]).await,
+                Value::SimpleString("OK".into())
+            );
+            // Visible to everyone while the connection is open.
+            assert_eq!(
+                srv.store.execute(Command::Get("presence:user:42".into())),
+                Value::BulkString(Some(b"online".to_vec()))
+            );
+        } // connection dropped here
+
+        // The key goes away on its own — no heartbeat, no TTL to wait out.
+        for _ in 0..40 {
+            if srv.store.execute(Command::Get("presence:user:42".into())) == Value::BulkString(None)
+            {
+                return;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+        panic!("ephemeral key outlived its connection");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eset_deletion_is_broadcast_to_live_queries() {
+        // Presence is only useful if peers are *told*; polling for the absence
+        // of a key is the thing this replaces.
+        let srv = spawn_ws_server().await;
+        let mut watcher = WsClient::connect(srv.tcp_addr).await;
+        watcher.cmd(&["QSUB", "presence:*"]).await;
+
+        {
+            let mut presence = WsClient::connect(srv.tcp_addr).await;
+            presence.cmd(&["ESET", "presence:user:7", "online"]).await;
+            // Drain the set notification.
+            let _ = watcher.recv_push(1000).await;
+        }
+
+        let frames = drain_frames(&mut watcher, 1500).await;
+        assert!(
+            frames
+                .iter()
+                .any(|f| f.contains("keychange") && f.contains("presence:user:7")),
+            "a live query must receive a keychange for the departing peer, got: {frames:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_tab_keeps_presence_alive_when_the_first_closes() {
+        // The multi-tab case. Ownership transfers to the most recent writer, so
+        // closing an older tab must not mark the user offline.
+        let srv = spawn_ws_server().await;
+
+        let mut tab_b = WsClient::connect(srv.tcp_addr).await;
+        {
+            let mut tab_a = WsClient::connect(srv.tcp_addr).await;
+            tab_a.cmd(&["ESET", "presence:user:9", "online"]).await;
+            // Tab B claims the same key — it is now the owner.
+            tab_b.cmd(&["ESET", "presence:user:9", "online"]).await;
+        } // tab A closes
+
+        // Give the close handler time to run, then confirm the key survived.
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            srv.store.execute(Command::Get("presence:user:9".into())),
+            Value::BulkString(Some(b"online".to_vec())),
+            "closing an older tab must not clear presence held by a newer one"
+        );
+
+        drop(tab_b);
+        for _ in 0..40 {
+            if srv.store.execute(Command::Get("presence:user:9".into())) == Value::BulkString(None)
+            {
+                return;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+        panic!("key outlived its last owner");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plain_set_is_not_ephemeral() {
+        // Only ESET opts into connection-scoped lifetime; SET must be unaffected.
+        let srv = spawn_ws_server().await;
+        {
+            let mut c = WsClient::connect(srv.tcp_addr).await;
+            c.cmd(&["SET", "durable:key", "value"]).await;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            srv.store.execute(Command::Get("durable:key".into())),
+            Value::BulkString(Some(b"value".to_vec()))
+        );
     }
 
     #[tokio::test]
@@ -4230,6 +5217,8 @@ mod tests {
                 replicas: Arc::clone(&repl_registry),
                 is_replica: AtomicBool::new(false),
                 dedup: std::sync::Mutex::new(HashMap::new()),
+                ephemeral: std::sync::Mutex::new(HashMap::new()),
+                dedup_dirty: std::sync::atomic::AtomicBool::new(false),
             });
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -4277,6 +5266,8 @@ mod tests {
             replicas: ReplHub::new(),
             is_replica: AtomicBool::new(true),
             dedup: std::sync::Mutex::new(HashMap::new()),
+            ephemeral: std::sync::Mutex::new(HashMap::new()),
+            dedup_dirty: std::sync::atomic::AtomicBool::new(false),
         });
         let rs = Arc::clone(&replica_store);
         let rst = Arc::clone(&replica_state);
@@ -4299,6 +5290,155 @@ mod tests {
         assert_eq!(
             replica_store.execute(Command::Get("replkey".into())),
             Value::BulkString(Some(b"replval".to_vec()))
+        );
+
+        // The replica acknowledges what it applies, so once it has caught up the
+        // primary must observe zero lag. Before acknowledgements existed the
+        // primary had no way to distinguish this from a replica that had
+        // received the frame and silently failed to apply it.
+        let mut lag = u64::MAX;
+        for _ in 0..50 {
+            lag = repl_registry.max_lag_frames().await;
+            if lag == 0 {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(lag, 0, "caught-up replica must report zero lag");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn integration_ws_accepts_binary_command_frames() {
+        // A WebSocket text frame must be well-formed UTF-8, so a command
+        // carrying raw bytes can only travel in a binary frame. The server
+        // previously handled text frames only and dropped binary ones.
+        let srv = spawn_ws_server().await;
+        let mut c = WsClient::connect(srv.tcp_addr).await;
+
+        // A binary frame whose contents are valid UTF-8 is a normal command.
+        let raw = b"*3\r\n$3\r\nSET\r\n$3\r\nbin\r\n$5\r\nhello\r\n".to_vec();
+        assert_eq!(c.cmd_binary(raw).await, ok());
+        assert_eq!(c.cmd(&["GET", "bin"]).await, bulk("hello"));
+
+        // A binary value round-trips byte-for-byte, and the reply comes back in
+        // a binary frame because it is not valid UTF-8.
+        let binary: &[u8] = &[0xff, 0xfe, 0x00, 0x41];
+        let mut req = b"*3\r\n$3\r\nSET\r\n$3\r\nraw\r\n".to_vec();
+        req.extend_from_slice(format!("${}\r\n", binary.len()).as_bytes());
+        req.extend_from_slice(binary);
+        req.extend_from_slice(b"\r\n");
+        assert_eq!(c.cmd_binary(req).await, ok());
+        assert_eq!(
+            c.cmd(&["GET", "raw"]).await,
+            Value::BulkString(Some(binary.to_vec()))
+        );
+
+        // The connection stays usable.
+        assert_eq!(c.cmd(&["PING"]).await, Value::SimpleString("PONG".into()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn integration_ws_hello_reports_resp3_and_refuses_downgrade() {
+        let srv = spawn_ws_server().await;
+        let mut c = WsClient::connect(srv.tcp_addr).await;
+
+        // The sync protocol is defined in terms of RESP3 push frames.
+        let v = c.cmd(&["HELLO"]).await;
+        let Value::Map(pairs) = v else {
+            panic!("WS HELLO must reply with a RESP3 map, got {v:?}")
+        };
+        assert!(
+            pairs
+                .iter()
+                .any(|(k, v)| *k == bulk("proto") && *v == Value::Integer(3))
+        );
+
+        // Downgrading would silently break push delivery, so it is refused
+        // rather than accepted-and-ignored.
+        let v = c.cmd(&["HELLO", "2"]).await;
+        assert!(
+            matches!(&v, Value::Error(e) if e.starts_with("NOPROTO")),
+            "expected NOPROTO, got {v:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replication_lag_counts_unacknowledged_frames() {
+        // A replica that receives frames but never acknowledges them is exactly
+        // the case queue depth cannot see: the frames left the primary's
+        // channel, so the queue reads empty while the replica is arbitrarily
+        // far behind. Lag must report them.
+        let store = Arc::new(KeyValueStore::new());
+        let registry: ReplRegistry = ReplHub::new();
+        let snap_cfg = Arc::new(SnapshotConfig {
+            path: tmp_path("lag_snap.rdb"),
+            last_save: AtomicI64::new(0),
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        {
+            let (s, sc, r) = (
+                Arc::clone(&store),
+                Arc::clone(&snap_cfg),
+                Arc::clone(&registry),
+            );
+            tokio::spawn(async move {
+                if let Ok((socket, _)) = listener.accept().await {
+                    let _ =
+                        handle_replica(socket, s, sc, r, None, DEFAULT_REPL_CHANNEL_CAPACITY).await;
+                }
+            });
+        }
+
+        // A replica that reads the snapshot and then goes silent.
+        let mut sock = TcpStream::connect(addr).await.unwrap();
+        let mut len_buf = [0u8; 4];
+        sock.read_exact(&mut len_buf).await.unwrap();
+        let mut snap = vec![0u8; u32::from_le_bytes(len_buf) as usize];
+        sock.read_exact(&mut snap).await.unwrap();
+
+        // Wait for registration, then fan out three writes.
+        for _ in 0..50 {
+            if registry.count.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+        for i in 0..3 {
+            registry
+                .fan_out(format!("*1\r\n$4\r\nPING{i}\r\n").into_bytes())
+                .await;
+        }
+
+        let mut lag = 0;
+        for _ in 0..50 {
+            lag = registry.max_lag_frames().await;
+            if lag == 3 {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(lag, 3, "three unacknowledged frames must show as lag 3");
+
+        // Acknowledging two of them retires exactly two frames of lag.
+        sock.write_all(&2u64.to_le_bytes()).await.unwrap();
+        for _ in 0..50 {
+            lag = registry.max_lag_frames().await;
+            if lag == 1 {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(lag, 1, "after acking 2 of 3, one frame remains outstanding");
+
+        // A stale ack must not walk the high-water mark backwards.
+        sock.write_all(&1u64.to_le_bytes()).await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            registry.max_lag_frames().await,
+            1,
+            "a replayed lower ack must not increase reported lag"
         );
     }
 
@@ -4349,6 +5489,8 @@ mod tests {
             replicas: ReplHub::new(),
             is_replica: AtomicBool::new(false),
             dedup: std::sync::Mutex::new(HashMap::new()),
+            ephemeral: std::sync::Mutex::new(HashMap::new()),
+            dedup_dirty: std::sync::atomic::AtomicBool::new(false),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4466,6 +5608,8 @@ mod tests {
             replicas: ReplHub::new(),
             is_replica: AtomicBool::new(true),
             dedup: std::sync::Mutex::new(HashMap::new()),
+            ephemeral: std::sync::Mutex::new(HashMap::new()),
+            dedup_dirty: std::sync::atomic::AtomicBool::new(false),
         });
         let replica_store = Arc::new(KeyValueStore::new());
         let rs = Arc::clone(&replica_store);
@@ -4512,6 +5656,8 @@ mod tests {
             replicas: ReplHub::new(),
             is_replica: AtomicBool::new(false),
             dedup: std::sync::Mutex::new(HashMap::new()),
+            ephemeral: std::sync::Mutex::new(HashMap::new()),
+            dedup_dirty: std::sync::atomic::AtomicBool::new(false),
         });
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4567,6 +5713,33 @@ mod tests {
             }
             self.ws.send(Message::Text(req.into())).await.unwrap();
             self.next_reply().await
+        }
+
+        /// Send pre-encoded RESP bytes in a *binary* frame. Text frames must be
+        /// well-formed UTF-8 per the WebSocket spec, so this is the only way to
+        /// put arbitrary bytes on the wire.
+        async fn cmd_binary(&mut self, raw: Vec<u8>) -> Value {
+            self.ws.send(Message::Binary(raw.into())).await.unwrap();
+            self.next_reply().await
+        }
+
+        /// Wait up to `ms` for the next frame of any kind — RESP3 Push
+        /// broadcasts *and* plain arrays. `keychange` notifications are encoded
+        /// as arrays, so `recv_push` skips them entirely.
+        async fn recv_any(&mut self, ms: u64) -> Option<String> {
+            let fut = async {
+                loop {
+                    match self.ws.next().await {
+                        Some(Ok(Message::Text(t))) => return Some(t.to_string()),
+                        Some(Ok(_)) => continue,
+                        _ => return None,
+                    }
+                }
+            };
+            tokio::time::timeout(tokio::time::Duration::from_millis(ms), fut)
+                .await
+                .ok()
+                .flatten()
         }
 
         /// Wait up to `ms` for the next RESP3 Push broadcast frame, returning
@@ -4632,24 +5805,24 @@ mod tests {
         /// (RESP3 Push broadcasts and `keychange` observable-key pushes).
         async fn next_reply(&mut self) -> Value {
             loop {
-                match self.ws.next().await {
-                    Some(Ok(Message::Text(t))) => {
-                        let Ok((v, _)) = Value::parse(t.as_bytes()) else {
-                            continue;
-                        };
-                        if matches!(v, Value::Push(_)) {
-                            continue;
-                        }
-                        if let Value::Array(Some(items)) = &v
-                            && matches!(items.first(), Some(Value::BulkString(Some(k))) if k == b"keychange")
-                        {
-                            continue;
-                        }
-                        return v;
-                    }
+                let raw: Vec<u8> = match self.ws.next().await {
+                    Some(Ok(Message::Text(t))) => t.as_bytes().to_vec(),
+                    Some(Ok(Message::Binary(b))) => b.to_vec(),
                     Some(Ok(_)) => continue,
                     _ => panic!("ws closed unexpectedly"),
+                };
+                let Ok((v, _)) = Value::parse(&raw) else {
+                    continue;
+                };
+                if matches!(v, Value::Push(_)) {
+                    continue;
                 }
+                if let Value::Array(Some(items)) = &v
+                    && matches!(items.first(), Some(Value::BulkString(Some(k))) if k == b"keychange")
+                {
+                    continue;
+                }
+                return v;
             }
         }
     }
@@ -5043,6 +6216,7 @@ mod tests {
                 Expect::Keys(&["k"]),
             ),
             (Command::Get("k".into()), Expect::Keys(&["k"])),
+            (Command::ESet("k".into(), "v".into()), Expect::Keys(&["k"])),
             (Command::Del(vec!["k".into()]), Expect::Keys(&["k"])),
             (Command::Unlink(vec!["k".into()]), Expect::Keys(&["k"])),
             (
@@ -5289,6 +6463,54 @@ mod tests {
     }
 
     #[test]
+    fn every_key_writing_command_is_classified_as_a_write() {
+        // `is_write_command` is a `matches!` list, which — unlike a `match` —
+        // has no exhaustiveness check: a new variant silently defaults to "not
+        // a write" and is then never replicated, logged to AOF, or broadcast.
+        // `primary_keys` reports the keys a command *writes*, so anything it
+        // names must also be classified as a write. This cross-check is what
+        // makes the missing entry impossible to ship.
+        for (cmd, _) in all_commands() {
+            if !primary_keys(&cmd).is_empty() {
+                assert!(
+                    is_write_command(&cmd),
+                    "{cmd:?} writes keys but is_write_command() says otherwise — \
+                     it would never reach replicas, the AOF, or live queries"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn eset_is_a_write_and_reports_its_key() {
+        let cmd = Command::ESet("presence:1".into(), "on".into());
+        assert!(is_write_command(&cmd));
+        assert_eq!(primary_keys(&cmd), vec!["presence:1".to_string()]);
+        assert_eq!(command_name(&cmd), "eset");
+        // Scoped connections must not be able to write presence keys outside
+        // their grant.
+        assert!(matches!(command_scope(&cmd), CommandScope::Keys(_)));
+    }
+
+    #[test]
+    fn eset_replays_to_replicas_as_a_plain_set() {
+        // A replica has no connection to scope the lifetime to, so it stores an
+        // ordinary key; the owning server broadcasts the DEL on disconnect.
+        let frame = broadcast_for(
+            &Command::ESet("presence:1".into(), "on".into()),
+            &Value::SimpleString("OK".into()),
+        )
+        .expect("ESET must broadcast");
+        let frame = String::from_utf8_lossy(&frame).into_owned();
+        assert!(frame.contains("SET"), "{frame}");
+        assert!(frame.contains("presence:1"));
+        assert!(
+            !frame.contains("ESET"),
+            "replica should receive SET, not ESET"
+        );
+    }
+
+    #[test]
     fn every_command_has_a_metrics_label() {
         for (cmd, _) in all_commands() {
             let name = command_name(&cmd);
@@ -5404,11 +6626,14 @@ mod tests {
     // ── Wire encoding ─────────────────────────────────────────────────────────
 
     #[test]
-    fn pubsub_message_encodes_as_a_resp_push_frame() {
-        let bytes = encode_pubsub_msg(PubSubMsg::Message {
-            channel: "news".into(),
-            message: "hello".into(),
-        });
+    fn pubsub_message_encodes_as_a_resp3_push_frame() {
+        let bytes = encode_pubsub_msg(
+            PubSubMsg::Message {
+                channel: "news".into(),
+                message: "hello".into(),
+            },
+            3,
+        );
         let text = String::from_utf8_lossy(&bytes);
         assert!(
             text.starts_with('>'),
@@ -5420,18 +6645,120 @@ mod tests {
     }
 
     #[test]
+    fn pubsub_message_encodes_as_an_array_for_resp2() {
+        // RESP2 has no push type. Sending `>` to a RESP2 client — which is
+        // every client that has not sent HELLO 3 — is unparseable, so a
+        // subscribed connection would break outright.
+        let bytes = encode_pubsub_msg(
+            PubSubMsg::Message {
+                channel: "news".into(),
+                message: "hello".into(),
+            },
+            2,
+        );
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.starts_with("*3\r\n"),
+            "RESP2 delivery must be a 3-element array: {text:?}"
+        );
+        assert!(!text.contains('>'), "no push frame on RESP2: {text:?}");
+    }
+
+    #[test]
     fn pattern_message_carries_the_matching_pattern() {
         // A pmessage must name the pattern that matched, or a client
         // subscribed to several patterns cannot tell them apart.
-        let bytes = encode_pubsub_msg(PubSubMsg::PMessage {
-            pattern: "news.*".into(),
-            channel: "news.tech".into(),
-            message: "hi".into(),
-        });
+        for protover in [2u8, 3u8] {
+            let bytes = encode_pubsub_msg(
+                PubSubMsg::PMessage {
+                    pattern: "news.*".into(),
+                    channel: "news.tech".into(),
+                    message: "hi".into(),
+                },
+                protover,
+            );
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(text.contains("pmessage"), "protover {protover}");
+            assert!(text.contains("news.*"), "protover {protover}");
+            assert!(text.contains("news.tech"), "protover {protover}");
+        }
+    }
+
+    // ── HELLO / protocol negotiation ─────────────────────────────────────────
+
+    #[test]
+    fn hello_defaults_to_the_connections_current_version() {
+        // Bare HELLO reports, it does not change. A client using it purely to
+        // read server info must not be silently switched to another protocol.
+        let mut protover = 2u8;
+        let bytes = process_hello(None, &mut protover, true, false);
+        assert_eq!(protover, 2, "bare HELLO must not change the version");
         let text = String::from_utf8_lossy(&bytes);
-        assert!(text.contains("pmessage"));
-        assert!(text.contains("news.*"));
-        assert!(text.contains("news.tech"));
+        assert!(
+            text.starts_with('*'),
+            "RESP2 reply must be an array: {text:?}"
+        );
+        assert!(text.contains("recached"));
+        assert!(text.contains(":2\r\n"), "proto must report 2: {text:?}");
+    }
+
+    #[test]
+    fn hello_3_upgrades_and_replies_with_a_map() {
+        let mut protover = 2u8;
+        let bytes = process_hello(Some("3"), &mut protover, true, false);
+        assert_eq!(protover, 3);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.starts_with("%6\r\n"), "must be a 6-pair map: {text:?}");
+        assert!(text.contains(":3\r\n"), "proto must report 3: {text:?}");
+    }
+
+    #[test]
+    fn hello_3_then_2_downgrades_again() {
+        let mut protover = 2u8;
+        process_hello(Some("3"), &mut protover, true, false);
+        assert_eq!(protover, 3);
+        let bytes = process_hello(Some("2"), &mut protover, true, false);
+        assert_eq!(protover, 2, "HELLO 2 must downgrade");
+        assert!(String::from_utf8_lossy(&bytes).starts_with('*'));
+    }
+
+    #[test]
+    fn hello_rejects_unsupported_versions_without_changing_protocol() {
+        // A client probing for a version the server does not speak must get a
+        // clean NOPROTO and stay on what it had — not be left in a half-state.
+        for bad in ["4", "1", "0", "abc", "", "255", "-1", "3.0"] {
+            let mut protover = 2u8;
+            let bytes = process_hello(Some(bad), &mut protover, true, false);
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(
+                text.starts_with("-NOPROTO"),
+                "HELLO {bad:?} must be refused: {text:?}"
+            );
+            assert_eq!(protover, 2, "HELLO {bad:?} must not change the version");
+        }
+    }
+
+    #[test]
+    fn hello_does_not_leak_server_details_before_auth() {
+        let mut protover = 2u8;
+        let bytes = process_hello(Some("3"), &mut protover, false, false);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.starts_with("-NOAUTH"), "{text:?}");
+        assert!(
+            !text.contains("recached") && !text.contains(env!("CARGO_PKG_VERSION")),
+            "unauthenticated HELLO must not fingerprint the server: {text:?}"
+        );
+    }
+
+    #[test]
+    fn hello_reports_replica_role() {
+        let mut protover = 3u8;
+        let primary =
+            String::from_utf8_lossy(&process_hello(None, &mut protover, true, false)).into_owned();
+        let replica =
+            String::from_utf8_lossy(&process_hello(None, &mut protover, true, true)).into_owned();
+        assert!(primary.contains("master"), "{primary:?}");
+        assert!(replica.contains("replica"), "{replica:?}");
     }
 
     #[test]
@@ -5875,5 +7202,152 @@ mod tests {
         assert_eq!(writer.cmd(&["SET", "cart:42:item", "x"]).await, ok());
         let (key, _) = client.recv_keychange(1000).await.expect("scoped diff");
         assert_eq!(key, "cart:42:item");
+    }
+}
+
+#[cfg(test)]
+mod tls_loading_tests {
+    use super::*;
+
+    // A self-signed cert and its key, generated once with:
+    //   openssl req -x509 -newkey rsa:2048 -keyout k -out c -days 3650 -nodes \
+    //     -subj "/CN=recached-test"
+    // Embedded rather than generated at test time so the test needs no openssl
+    // on the runner and cannot fail for reasons unrelated to parsing.
+    const TEST_CERT: &str = "-----BEGIN CERTIFICATE-----\nMIIDETCCAfmgAwIBAgIUDpGtGZ5z4j/X0RMdVgiZt5TyukwwDQYJKoZIhvcNAQEL\nBQAwGDEWMBQGA1UEAwwNcmVjYWNoZWQtdGVzdDAeFw0yNjA3MTkxNDUyMDVaFw0z\nNjA3MTYxNDUyMDVaMBgxFjAUBgNVBAMMDXJlY2FjaGVkLXRlc3QwggEiMA0GCSqG\nSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDdi5zyxNocCEi6elQKsS0onYh9aOMW5Hjz\n7zAcWa6EPp1g4Zz1tLF2Nk92CBG/iWzF5OckDChuIYjM+MTRws5UOSXwwkbLplKR\nSMGEst1mP3rZPGHq57w52OmxO599kBR4BpeWhFMC4w5xGEO9Gp4P+QdCIYaUEBxz\nLeEyCwapimzamKRYKO0VoZWzF0bLhYUHxc9FD2QMbaPUmRZZGdcttg/0Gq4U/P5N\n6jhWo+ekIKu1kpLSAZPiHtYNAzGu1sk0lTPyVxdmmwqPueV9MLUgVIpDWA+QL80I\nXIjTfaQAOl4k31AeC+yglCyhB/yl/0ROQUAXGgozsFJnpxujLGMPAgMBAAGjUzBR\nMB0GA1UdDgQWBBSWbJJErt4zE9+u8lbBnAPXaRSI0TAfBgNVHSMEGDAWgBSWbJJE\nrt4zE9+u8lbBnAPXaRSI0TAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUA\nA4IBAQBGslzIW0Q46r7eQGK22fTEfNReSy4f7PZPGn/BZbj499LKSfRP1z8A3bbF\n2CdQKswbhVUbHfLUoaRwRfmJWhR/I/UxNkUfVlQ/jQBaUvg2ZCy1l/3kRM6N1t5K\ntkwg+dzai/6LwT7RHmbl8Dx32on3+x9vJMYtoxeBk4nfHZTQMIOd3zsaXp/+RWUY\nzuIWXX/rf862GerYhoHVCWzMcHMLnI/Mwzlm2tgVnfW1XpI/La3fxnTWYT4g4PIJ\nfXe3WrO9VyC1ZZ7PjE4Pq4unCRbJ2yZ5toybr4kcT4UGFrsXjnAsT+RyLY4By50D\nkaBPsvjq5ZvbiPBtEINXbmF3A7cq\n-----END CERTIFICATE-----";
+    const TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDdi5zyxNocCEi6\nelQKsS0onYh9aOMW5Hjz7zAcWa6EPp1g4Zz1tLF2Nk92CBG/iWzF5OckDChuIYjM\n+MTRws5UOSXwwkbLplKRSMGEst1mP3rZPGHq57w52OmxO599kBR4BpeWhFMC4w5x\nGEO9Gp4P+QdCIYaUEBxzLeEyCwapimzamKRYKO0VoZWzF0bLhYUHxc9FD2QMbaPU\nmRZZGdcttg/0Gq4U/P5N6jhWo+ekIKu1kpLSAZPiHtYNAzGu1sk0lTPyVxdmmwqP\nueV9MLUgVIpDWA+QL80IXIjTfaQAOl4k31AeC+yglCyhB/yl/0ROQUAXGgozsFJn\npxujLGMPAgMBAAECggEAQ4xj6ClZDx7/fcv6f+ARksalbQdj5gD3V/jfxGUbrrqg\npX9kqg3T5eUdSTGgp7Ow9I2cZANI+HtFCKn46LPq0QczqDqz9zfZCO8UAe+/TYOh\nY0bj3AmX/FNEvYMeV9xsQURRR9VEsiakqprpXGkXNGuLaQBr1g0rf3rHpMhz2ZEH\nw7QxoUfH3YL7fMIWwAvHanl6HwzE3TVh3felFGGGiqUaGg2Pll+/s5AiYnnZuq39\nW+t0RVH36rSFh037Su/ScCs44WZS+kGyqcuxyWLwvNwXEVXC3h42N62MHGgY8xQw\nP8wMSxGejEIr8IGpwhl86+oW+44nxarmrMBzMPRIcQKBgQD6VnpsIwxWV1zNC1LD\nbTVRQOoqJWDzxdXB47IB29ADHJnfBLbMr/6kIgIfuCu1Kf9wWTZGHwFUOKFhJDBC\ngLHpWFMWKSew4UmNyc0a16a9Pb7mdNyxnTY1oQucEbzS3pLMzda2dAdxYJE0Cuc6\nJ8Xp2Jo73LnRxY+NyEyl28frAwKBgQDijmtG0cDESNPMhxqJO/9KoRqRT3T+JqNf\noWaKlfSlQFaGecjdk9dNPZ1Aew4xI0v/C5YTwT6MUVDEXmoaSsa+S1atoDLNsojL\nuWqUno9mF6o3U23pi4vlEYh6c/V7Bd1VYde8ZQqVq0KxbCmYp1VE+DBeyNNT7Q5X\nN2lst0hEBQKBgQCXjds3tFA3xVQNXpmQboEk2+Pn+BEmA9NROoP91BGukJYnCjeQ\n28uRmnUmttzfJLncTmYpNYQcdNxebwY4fKk415wVgnzg/MMG7/EYGw566vKzmnQx\noze6Z/EbXzGth8nf643dj4kh/pBprWAnOQT8eYGGVC667Jvn/idJEjGJ+QKBgQCz\nGmgQio3cHr7huATwbO/7rbT1H12b9iu91DjeYoIPifddRDXZhaD1vTnt2dp0WjUg\nIaa5Y1HxV++D7ifvNSI9Gg4iIL1JBFVEyQZLC7bNvPOh3WDM+rbTlrLQK4/re81o\nTHtiwnZFsCh/XsTbm527coG6zQTUGln19SZw/cwxiQKBgA8dcEyBvPi6JgAqLy+5\n3Ev1uZEKkAeAQAkOV9jzqDN9NTi7GWOz3mtY2zopYjef7Wl0V4Qjkr7Jkxlx2wyn\nHboOuCEjComkRxn5vrHm6EBp0uTrdFIknLysxmQFgNamp9E8mX9p/q9rq7aZWzPu\nr+3jOYvwFyzAQ4j2tGzUm7Zd\n-----END PRIVATE KEY-----";
+
+    fn write(name: &str, body: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("recached_test_{name}_{}", std::process::id()));
+        std::fs::write(&path, body).expect("write pem");
+        path
+    }
+
+    #[test]
+    fn a_pem_certificate_and_key_load() {
+        // PEM parsing moved from the deprecated rustls-pemfile to
+        // rustls-pki-types. These two functions had no coverage at all, so the
+        // swap would have been verified only by the code compiling.
+        let cert_path = write("tls_load.crt", TEST_CERT);
+        let key_path = write("tls_load.key", TEST_KEY);
+
+        let certs = load_certs(cert_path.to_str().unwrap()).expect("cert must parse");
+        assert_eq!(certs.len(), 1, "one certificate in the chain");
+        assert!(!certs[0].as_ref().is_empty(), "DER body must be non-empty");
+
+        let key = load_private_key(key_path.to_str().unwrap()).expect("key must parse");
+        assert!(!key.secret_der().is_empty(), "key DER must be non-empty");
+
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+    }
+
+    #[test]
+    fn a_missing_file_is_an_error_not_a_panic() {
+        assert!(load_certs("/nonexistent/recached-test.crt").is_err());
+        assert!(load_private_key("/nonexistent/recached-test.key").is_err());
+    }
+
+    #[test]
+    fn a_file_with_no_pem_content_is_rejected() {
+        // Pointing RECACHED_TLS_CERT at the wrong file must fail loudly rather
+        // than yielding an empty chain that rustls would later reject with a
+        // much less obvious error.
+        let junk = write("tls_junk.crt", "this is not a PEM file\n");
+        assert!(
+            load_certs(junk.to_str().unwrap())
+                .map(|c| c.is_empty())
+                .unwrap_or(true),
+            "non-PEM input must not yield certificates"
+        );
+        let junk_key = write("tls_junk.key", "still not PEM\n");
+        assert!(load_private_key(junk_key.to_str().unwrap()).is_err());
+
+        let _ = std::fs::remove_file(&junk);
+        let _ = std::fs::remove_file(&junk_key);
+    }
+}
+
+#[cfg(test)]
+mod limit_config_tests {
+    use super::*;
+
+    /// Serialises the tests in this module.
+    ///
+    /// Environment variables are process-global and `cargo test` runs tests on
+    /// parallel threads, so a test that sets `RECACHED_MAX_*` races any test
+    /// reading the same variable — which is why `set_var` is `unsafe`. This
+    /// surfaced as `compiled_defaults_match_the_documented_values`
+    /// intermittently observing an override (`7`) instead of a default
+    /// (`10_000`): it passed locally and failed in CI purely on thread timing.
+    ///
+    /// Poisoning is ignored deliberately: one failing test must not cascade
+    /// into unrelated failures in the rest of the module.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn env_limit_falls_back_to_the_default() {
+        let _guard = env_guard();
+        // Unset, empty, non-numeric, and zero all mean "use the default" —
+        // a zero limit would disable the feature rather than tune it.
+        assert_eq!(env_limit("RECACHED_DEFINITELY_UNSET_VAR_XYZ", 64), 64);
+        for bad in ["", "  ", "abc", "0", "-5", "1.5"] {
+            unsafe { std::env::set_var("RECACHED_TEST_LIMIT", bad) };
+            assert_eq!(env_limit("RECACHED_TEST_LIMIT", 64), 64, "input {bad:?}");
+        }
+        unsafe { std::env::remove_var("RECACHED_TEST_LIMIT") };
+    }
+
+    #[test]
+    fn env_limit_accepts_a_positive_override() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("RECACHED_TEST_LIMIT_OK", " 256 ") };
+        assert_eq!(
+            env_limit("RECACHED_TEST_LIMIT_OK", 64),
+            256,
+            "whitespace tolerated"
+        );
+        unsafe { std::env::remove_var("RECACHED_TEST_LIMIT_OK") };
+    }
+
+    #[test]
+    fn overrides_are_read_from_the_documented_variable_names() {
+        let _guard = env_guard();
+        // A bulk rename once rewrote these string literals along with the
+        // function names, leaving variables like `RECACHED_max_watches_per_conn()`
+        // that no operator would ever set — the override silently did nothing.
+        // Assert the names the docs promise.
+        for (var, default) in [
+            ("RECACHED_MAX_MULTI_QUEUE", 10_000usize),
+            ("RECACHED_MAX_WATCHES_PER_CONN", 1_024),
+            ("RECACHED_MAX_LIVE_QUERIES", 64),
+            ("RECACHED_MAX_QSUB_INITIAL_KEYS", 10_000),
+            ("RECACHED_EVICTION_SAMPLE", 10),
+        ] {
+            assert!(
+                var.chars()
+                    .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit()),
+                "{var} is not a plausible environment variable name"
+            );
+            unsafe { std::env::set_var(var, "7") };
+            assert_eq!(env_limit(var, default), 7, "{var} override ignored");
+            unsafe { std::env::remove_var(var) };
+        }
+    }
+
+    #[test]
+    fn compiled_defaults_match_the_documented_values() {
+        let _guard = env_guard();
+        // These appear in docs/server/operations.md; drift would mislead
+        // operators sizing a deployment.
+        assert_eq!(max_multi_queue_len(), 10_000);
+        assert_eq!(max_watches_per_conn(), 1_024);
+        assert_eq!(max_qsubs_per_conn(), 64);
+        assert_eq!(max_qsub_initial_keys(), 10_000);
     }
 }

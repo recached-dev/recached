@@ -35,22 +35,42 @@ real.
 | `recached_keyspace_hits_total` | counter | — | Reads that found a live key. |
 | `recached_keyspace_misses_total` | counter | — | Reads that found nothing or an expired key. |
 
-### What is not exported yet
+### Capacity and sync
 
-Be aware of these before you build a dashboard expecting them:
+Sampled every 5 seconds, because these are levels rather than events.
 
-- **No memory metric.** Nothing reports bytes used or how close you are to `RECACHED_MAX_MEMORY`.
-  Monitor process RSS from your container runtime or node exporter instead.
-- **No key-count metric.** Nothing reports keyspace size against `RECACHED_MAX_KEYS`. `DBSIZE` gives
-  it on demand, but no scrape collects it.
-- **No eviction counter.** You cannot currently see whether eviction is running or how hard.
-- **No replication metrics.** No lag, no replica connection state, no failover events.
-- **No sync-layer metrics.** Live-query counts, outbox depth, and `DEDUP` duplicate rates are not
-  exported.
+| Metric | Type | Meaning |
+|---|---|---|
+| `recached_memory_bytes` | gauge | Approximate heap used by stored data. Compare against `RECACHED_MAX_MEMORY`. |
+| `recached_keys` | gauge | Live keys, excluding expired entries awaiting sweep. Compare against `RECACHED_MAX_KEYS`. |
+| `recached_evictions_total` | counter | Keys evicted since start. A rising rate means the cache is working at its cap. |
+| `recached_replicas_connected` | gauge | Replicas currently attached to this primary. |
+| `recached_live_queries` | gauge | Registered `QSUB` patterns across all connections. |
+| `recached_watched_keys` | gauge | Keys under `WATCH`. |
+| `recached_dedup_clients_tracked` | gauge | Clients with exactly-once bookkeeping in memory. |
+| `recached_replication_queue_depth` | gauge | Deepest replica send queue, in frames — work the primary has not yet put on the wire. |
+| `recached_replication_lag_frames` | gauge | Frames the furthest-behind replica has been sent but has not acknowledged applying. Zero means every replica is caught up. |
 
-The practical consequence: **Recached tells you about traffic, not about capacity or sync health.**
-Until those land, back the traffic metrics with process-level monitoring (RSS, CPU, FD count) and
-treat replication and sync as things you verify by probing, not by scraping.
+### Reading the two replication gauges
+
+They fail differently, which is why both exist:
+
+- **Queue depth high, lag high** — the primary cannot hand frames off fast enough. The replica's
+  channel is backing up, usually a slow or saturated network link. A replica whose queue fills is
+  disconnected outright so it resyncs from a snapshot rather than falling further behind.
+- **Queue depth zero, lag high** — everything was written to the socket and the replica is not
+  acknowledging it. The frames are in flight, or the replica is applying them slowly, or it is
+  wedged. This is the case queue depth alone cannot see, and it is the one worth alerting on.
+
+Lag is measured in frames, not bytes or seconds: one frame is one replicated write command.
+
+A replica running a build older than 0.2.2 never acknowledges, so its lag climbs without bound while
+replication works normally. Upgrade both ends together.
+
+### What is still not exported
+
+- **Client outbox depth.** That state lives in the browser — read it there with
+  `cache.pendingWrites()`.
 
 ## Useful queries
 
@@ -83,7 +103,10 @@ Thresholds are starting points — tune to your traffic.
 | Connection saturation | `recached_connections_active` > 80% of `RECACHED_MAX_CONNECTIONS` | New connections are rejected once the semaphore is exhausted — this fails hard, not gracefully. |
 | Hit ratio collapse | hit ratio drops sharply vs baseline | Keys expiring faster than expected, an eviction storm, or a cold restart. |
 | Traffic flatline | `rate(recached_commands_total[5m]) == 0` while clients are up | The process is alive enough to scrape but not serving. |
-| Process memory | RSS > 80% of the container limit | There is no built-in memory metric; this is your only capacity signal. |
+| Memory pressure | `recached_memory_bytes` > 80% of `RECACHED_MAX_MEMORY` | Eviction is about to start, or already has. |
+| Eviction churn | `rate(recached_evictions_total[5m])` climbing | The working set no longer fits; results will start missing. |
+| Replica lost | `recached_replicas_connected` drops | Failover risk — the standby is no longer following. |
+| Replica falling behind | `recached_replication_lag_frames` > 1000 for 5m | The standby is not keeping up; a failover now would lose those writes. |
 
 ## Health checking
 
@@ -115,17 +138,18 @@ healthy — they are separate listeners. Probe the cache port.
 Hard limits compiled into the server. Exceeding them produces errors rather than degradation, so it
 is worth knowing where the walls are:
 
-| Limit | Value | Configurable |
+| Limit | Default | Configurable |
 |---|---|---|
 | Max connections | 1024 | `RECACHED_MAX_CONNECTIONS` |
 | Consecutive auth failures before disconnect | 5 | No |
 | Read buffer per TCP connection | 64 MB | No |
-| Queued commands per `MULTI` | 10,000 | No |
-| `WATCH`ed keys per connection | 1,024 | No |
-| Live queries (`QSUB`) per connection | 64 | No |
-| Keys returned in a live query's initial state | 10,000 | No |
+| Queued commands per `MULTI` | 10,000 | `RECACHED_MAX_MULTI_QUEUE` |
+| `WATCH`ed keys per connection | 1,024 | `RECACHED_MAX_WATCHES_PER_CONN` |
+| Live queries (`QSUB`) per connection | 64 | `RECACHED_MAX_LIVE_QUERIES` |
+| Keys returned in a live query's initial state | 10,000 | `RECACHED_MAX_QSUB_INITIAL_KEYS` |
+| Keys sampled per eviction pass | 10 | `RECACHED_EVICTION_SAMPLE` |
 | Replication frame | 512 MB | No |
-| Client outbox (browser, offline writes) | 10,000 writes | No |
+| Client outbox (browser, offline writes) | 10,000 writes | via `sync-client` |
 
 The keyspace cap (`RECACHED_MAX_KEYS`) and memory cap (`RECACHED_MAX_MEMORY`) are configured rather
 than compiled — see [Configuration](/server/configuration#environment-variable-reference).
@@ -144,8 +168,12 @@ redis-cli -p 6379 LASTSAVE     # timestamp advances when the save lands
 cp /var/lib/recached/dump.msgpack /backups/dump-$(date +%F).msgpack
 ```
 
-To restore, stop the server, put the snapshot at `RECACHED_SAVE_PATH`, and start it — the snapshot
-loads at boot. There is **no import path from a Redis RDB file**; the formats are unrelated.
+A sidecar file sits next to the snapshot with a `.dedup` extension, holding exactly-once high-water
+marks. Back it up with the snapshot: without it a restarted server can re-apply a write a client
+replays. Losing it is not fatal — the server starts normally and rebuilds the marks.
+
+To restore, stop the server, put the snapshot (and its `.dedup` sidecar) at `RECACHED_SAVE_PATH`, and
+start it — both load at boot. There is **no import path from a Redis RDB file**; the formats are unrelated.
 
 If AOF is enabled, the AOF replays on top of the snapshot. Losing the AOF while keeping the snapshot
 costs you every write since the last save.

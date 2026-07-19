@@ -10,7 +10,7 @@ resolver = "2"
 # ── Single source of truth for all crate versions ────────────────────────────
 # Members inherit with:  version.workspace = true  /  edition.workspace = true
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["ThinkGrid Labs"]
@@ -37,7 +37,6 @@ tracing-subscriber           = { version = "0.3", features = ["env-filter"] }
 metrics                      = "0.24"
 metrics-exporter-prometheus  = { version = "0.16", features = ["http-listener"] }
 tokio-rustls                 = "0.26"
-rustls-pemfile               = "2"
 
 # serialization
 serde      = { version = "1", features = ["derive"] }

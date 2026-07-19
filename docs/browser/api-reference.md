@@ -109,6 +109,26 @@ cache.get('name')     // 'Alice'
 cache.get('missing')  // null
 ```
 
+::: warning Throws on binary values
+Values are byte-transparent, so a backend can write bytes that are not valid UTF-8 and they will sync
+into this cache. `get()` throws rather than returning a mangled string — use
+[`getBytes()`](#getbytes-key) when a value may not be text.
+:::
+
+#### `getBytes(key)`
+
+Returns the value for a key as raw bytes, or `null` if it does not exist or has expired. Works for
+any value; text values come back as their UTF-8 bytes.
+
+```typescript
+getBytes(key: string): Uint8Array | null
+```
+
+```typescript
+const bytes = cache.getBytes('thumb:42')
+if (bytes) img.src = URL.createObjectURL(new Blob([bytes]))
+```
+
 #### `getJSON<T>(key)`
 
 Returns a JSON-parsed value, or `null` if the key is missing, expired, or not valid JSON.
@@ -150,6 +170,19 @@ Sets a key to a string value. Overwrites any existing value and removes any exis
 
 ```typescript
 set(key: string, value: string): void
+```
+
+#### `setBytes(key, value)`
+
+Sets a key to raw bytes. Values are byte-transparent: the exact bytes are stored, synced to the
+server, replicated, and persisted — through the offline outbox and IndexedDB unchanged.
+
+```typescript
+setBytes(key: string, value: Uint8Array): void
+```
+
+```typescript
+cache.setBytes('thumb:42', new Uint8Array(await blob.arrayBuffer()))
 ```
 
 #### `setEx(key, value, seconds)`
@@ -349,7 +382,7 @@ handler only** — it does not leave the channel; call `unsubscribe(channel)` fo
 handlers can be registered on the same channel.
 
 ```typescript
-onMessage(channel: string, cb: (msg: string) => void): () => void
+onMessage(channel: string, cb: (msg: string | Uint8Array) => void): () => void
 ```
 
 ```typescript
@@ -378,6 +411,15 @@ Publish a message to a pub/sub channel. All server-side and browser-side subscri
 
 ```typescript
 publish(channel: string, message: string): void
+```
+
+#### `publishBytes(channel, message)`
+
+Publish raw bytes to a pub/sub channel. Subscribers receive a `Uint8Array` rather than a string when
+the payload is not valid UTF-8.
+
+```typescript
+publishBytes(channel: string, message: Uint8Array): void
 ```
 
 ---
@@ -413,6 +455,6 @@ Direct access to the underlying WASM instance (`RecachedCache` from wasm-bindgen
 get raw(): RawCache
 ```
 
-Available methods on `raw`: `set()`, `set_ex()`, `get()`, `del()`, `ttl()`, `exists()`, `subscribe()`, `unsubscribe()`, `publish()`, `connect()`, `auth()`, `broadcast()`, `enable_persistence()`, `clear_persistence()`, `set_mutation_callback()`, `free()`.
+Available methods on `raw`: `set()`, `setBytes()`, `set_ex()`, `get()`, `getBytes()`, `del()`, `ttl()`, `exists()`, `subscribe()`, `unsubscribe()`, `publish()`, `publishBytes()`, `connect()`, `auth()`, `broadcast()`, `enable_persistence()`, `clear_persistence()`, `set_mutation_callback()`, `free()`.
 
 > Writes through `cache.raw` bypass the `onMutation` notification bus. Use the typed `Cache` methods when possible.

@@ -67,8 +67,10 @@ interface RawCache {
   connect(url: string): void;
   auth(password: string): string;
   set(key: string, value: string): string;
+  setBytes(key: string, value: Uint8Array): string;
   set_ex(key: string, value: string, seconds: number): string;
   get(key: string): string | undefined;
+  getBytes(key: string): Uint8Array | undefined;
   del(key: string): number;
   incr_by(key: string, delta: number): number;
   disconnect(): void;
@@ -76,6 +78,7 @@ interface RawCache {
   ttl(key: string): number;
   exists(key: string): boolean;
   publish(channel: string, message: string): void;
+  publishBytes(channel: string, message: Uint8Array): void;
   subscribe(channel: string): void;
   unsubscribe(channel: string): void;
   jset(key: string, path: string, value: string): string;
@@ -85,8 +88,10 @@ interface RawCache {
   sync_scopes(patterns_csv: string): void;
   live_query(pattern: string): void;
   live_unquery(pattern?: string): void;
-  get_matching(pattern: string): Array<[string, string | null]>;
+  get_matching(pattern: string): Array<[string, string | Uint8Array | null]>;
   set_mutation_callback(cb: () => void): void;
+  set_outbox_full_callback(cb: (droppedId: number, pending: number) => void): void;
+  pending_writes(): number;
   set_message_callback(cb: (channel: string, message: string) => void): void;
   free(): void;
 }
@@ -129,7 +134,11 @@ export class Cache {
   readonly raw: RawCache;
 
   private readonly _mutationListeners = new Set<() => void>();
-  private readonly _messageListeners = new Map<string, Set<(msg: string) => void>>();
+  private readonly _messageListeners = new Map<
+    string,
+    Set<(msg: string | Uint8Array) => void>
+  >();
+  private readonly _outboxFullListeners = new Set<(droppedId: number, pending: number) => void>();
 
   /** @internal Arrow function so `this` is always bound when passed as a callback. */
   private readonly _notifyMutation = (): void => {
@@ -137,7 +146,15 @@ export class Cache {
   };
 
   /** @internal */
-  private readonly _notifyMessage = (channel: string, message: string): void => {
+  private readonly _notifyOutboxFull = (droppedId: number, pending: number): void => {
+    for (const cb of this._outboxFullListeners) cb(droppedId, pending);
+  };
+
+  /** @internal */
+  private readonly _notifyMessage = (
+    channel: string,
+    message: string | Uint8Array,
+  ): void => {
     const listeners = this._messageListeners.get(channel);
     if (listeners) {
       for (const cb of listeners) cb(message);
@@ -149,6 +166,7 @@ export class Cache {
     this.raw = raw;
     raw.set_mutation_callback(this._notifyMutation);
     raw.set_message_callback(this._notifyMessage);
+    raw.set_outbox_full_callback(this._notifyOutboxFull);
   }
 
   /**
@@ -172,6 +190,39 @@ export class Cache {
   }
 
   /**
+   * Called when the offline write queue overflows and the **oldest** queued
+   * write is discarded.
+   *
+   * The queue holds 10,000 writes. Past that, each new write evicts the oldest
+   * one — without this callback that is silent data loss: no error is thrown
+   * and the write is simply gone. If a client can plausibly be offline long
+   * enough to hit the cap, do not treat the outbox as the system of record;
+   * persist the mutation yourself and reconcile on reconnect.
+   *
+   * Returns an unsubscribe function.
+   *
+   * ```ts
+   * cache.onOutboxFull((droppedId, pending) => {
+   *   console.error(`dropped queued write ${droppedId}; ${pending} still pending`);
+   * });
+   * ```
+   */
+  onOutboxFull(cb: (droppedId: number, pending: number) => void): () => void {
+    this._outboxFullListeners.add(cb);
+    return () => this._outboxFullListeners.delete(cb);
+  }
+
+  /**
+   * Writes queued locally and not yet acknowledged by the server.
+   *
+   * Useful for a "syncing…" indicator, or to apply back-pressure before the
+   * queue reaches its 10,000-write cap.
+   */
+  pendingWrites(): number {
+    return this.raw.pending_writes();
+  }
+
+  /**
    * Subscribe to pub/sub messages on `channel`.
    *
    * Returns an unsubscribe function. Call it to stop receiving messages.
@@ -185,7 +236,10 @@ export class Cache {
    * cache.unsubscribe('notifications');
    * ```
    */
-  onMessage(channel: string, cb: (msg: string) => void): () => void {
+  onMessage(
+    channel: string,
+    cb: (msg: string | Uint8Array) => void,
+  ): () => void {
     let listeners = this._messageListeners.get(channel);
     if (!listeners) {
       listeners = new Set();
@@ -204,9 +258,33 @@ export class Cache {
    * Return the value for `key`, or `null` if the key does not exist or has expired.
    *
    * Always served from local WASM memory — zero network latency.
+   *
+   * @throws if the stored value is not valid UTF-8. Values are byte-transparent,
+   * so a backend can write binary that syncs into this cache; returning it as a
+   * mangled string would be worse than failing. Use {@link getBytes} for those.
    */
   get(key: string): string | null {
     return this.raw.get(key) ?? null;
+  }
+
+  /**
+   * Return the value for `key` as raw bytes, or `null` if it does not exist.
+   *
+   * Use this for values a backend wrote as binary — compressed payloads,
+   * protobuf, images — which cannot be represented as a JS string. Text values
+   * work here too, as their UTF-8 bytes.
+   *
+   * ```ts
+   * const bytes = cache.getBytes('thumb:42');
+   * if (bytes) img.src = URL.createObjectURL(new Blob([bytes]));
+   * ```
+   *
+   * Note: the browser SDK can *read* binary values but cannot yet *write* them
+   * — `set()` takes a string. Binary values originate from a backend writing
+   * over the RESP port.
+   */
+  getBytes(key: string): Uint8Array | null {
+    return this.raw.getBytes(key) ?? null;
   }
 
   /**
@@ -219,7 +297,14 @@ export class Cache {
    * ```
    */
   getJSON<T>(key: string): T | null {
-    const raw = this.get(key);
+    let raw: string | null;
+    try {
+      raw = this.get(key);
+    } catch {
+      // Binary value: not JSON by definition, so this is a miss rather than an
+      // error — getJSON is documented to return null for anything unparseable.
+      return null;
+    }
     if (raw === null) return null;
     try {
       return JSON.parse(raw) as T;
@@ -251,6 +336,21 @@ export class Cache {
     // raw.set fires the mutation callback registered in the constructor, so
     // listeners are already notified — no second _notifyMutation() here.
     this.raw.set(key, value);
+  }
+
+  /**
+   * Store raw bytes. Syncs to the server and other tabs when connected.
+   *
+   * Values are byte-transparent: the exact bytes given are stored, replicated,
+   * and persisted. Use this for compressed payloads, protobuf, or images —
+   * anything a JS string cannot hold. Read them back with {@link getBytes}.
+   *
+   * ```ts
+   * cache.setBytes('thumb:42', new Uint8Array(await blob.arrayBuffer()));
+   * ```
+   */
+  setBytes(key: string, value: Uint8Array): void {
+    this.raw.setBytes(key, value);
   }
 
   /**
@@ -391,6 +491,16 @@ export class Cache {
     this.raw.publish(channel, message);
   }
 
+  /**
+   * Publish raw bytes to a server pub/sub channel.
+   *
+   * Subscribers receive a `Uint8Array` rather than a string when the payload is
+   * not valid UTF-8 — see {@link onMessage}.
+   */
+  publishBytes(channel: string, message: Uint8Array): void {
+    this.raw.publishBytes(channel, message);
+  }
+
   // ── Sync scoping & live queries ───────────────────────────────────────────
 
   /**
@@ -452,12 +562,13 @@ export class Cache {
 
   /**
    * Snapshot of local keys matching a glob pattern, as `[key, value]` pairs.
-   * Values are strings; keys holding collection types come back as `null`
-   * (read those with typed accessors).
+   * Keys holding collection types come back as `null` (read those with typed
+   * accessors). A value that is not valid UTF-8 comes back as a `Uint8Array`
+   * rather than a mangled string, so narrow the type before treating it as text.
    *
    * Served entirely from local WASM memory — zero network latency.
    */
-  getMatching(pattern: string): Array<[string, string | null]> {
+  getMatching(pattern: string): Array<[string, string | Uint8Array | null]> {
     return this.raw.get_matching(pattern);
   }
 

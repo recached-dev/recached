@@ -103,13 +103,136 @@ fn in_score_range(score: f64, min: &ScoreBound, max: &ScoreBound) -> bool {
     above && below
 }
 
+// ── Byte payloads ─────────────────────────────────────────────────────────────
+
+/// A stored value's bytes.
+///
+/// Values are payloads and may be arbitrary bytes — compressed blobs, protobuf,
+/// images. *Identifiers* (keys, hash fields, set and sorted-set members) stay
+/// `String`: they are looked up, pattern-matched and scope-checked as text, and
+/// making them bytes would spread through the glob matcher, sync scopes and
+/// pub/sub routing for no practical gain.
+///
+/// The serde impls are hand-written for two reasons. `Vec<u8>` serializes as an
+/// array of integers under rmp-serde, which would roughly double snapshot size;
+/// `serialize_bytes` emits a compact msgpack `bin`. And deserialization accepts
+/// *either* a string or bytes, so snapshots written by 0.2.1 and earlier — where
+/// values were `String` — still load.
+#[derive(Clone, PartialEq, Eq, Hash, Default)]
+pub struct Blob(pub Vec<u8>);
+
+impl Blob {
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    pub fn into_vec(self) -> Vec<u8> {
+        self.0
+    }
+    /// Alias of `into_vec`, mirroring `String::into_bytes` at the many call
+    /// sites that build a RESP `BulkString` straight from a stored value.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+    /// Append bytes, for `APPEND`.
+    pub fn extend(&mut self, other: &[u8]) {
+        self.0.extend_from_slice(other);
+    }
+    /// Parse the payload as text, for the commands that require a number.
+    /// Non-UTF-8 fails the same way non-numeric text does.
+    pub fn parse_as<T: std::str::FromStr>(&self) -> Option<T> {
+        self.as_str()?.parse().ok()
+    }
+    /// Interpret the payload as text. Commands that need a number or a JSON
+    /// document (`INCR`, `JSET`, …) go through this and error when it fails,
+    /// rather than the storage layer refusing the write in the first place.
+    pub fn as_str(&self) -> Option<&str> {
+        std::str::from_utf8(&self.0).ok()
+    }
+}
+
+impl From<Vec<u8>> for Blob {
+    fn from(v: Vec<u8>) -> Self {
+        Blob(v)
+    }
+}
+impl From<&[u8]> for Blob {
+    fn from(v: &[u8]) -> Self {
+        Blob(v.to_vec())
+    }
+}
+impl From<String> for Blob {
+    fn from(v: String) -> Self {
+        Blob(v.into_bytes())
+    }
+}
+impl From<&str> for Blob {
+    fn from(v: &str) -> Self {
+        Blob(v.as_bytes().to_vec())
+    }
+}
+
+impl std::fmt::Debug for Blob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Text payloads dominate, so print them readably and fall back to hex.
+        match self.as_str() {
+            Some(t) => write!(f, "{t:?}"),
+            None => write!(f, "<{} bytes>", self.0.len()),
+        }
+    }
+}
+
+impl Serialize for Blob {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Blob {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Blob;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("bytes or a string")
+            }
+            // Pre-0.2.2 snapshots stored values as msgpack strings.
+            fn visit_str<E>(self, v: &str) -> Result<Blob, E> {
+                Ok(Blob(v.as_bytes().to_vec()))
+            }
+            fn visit_string<E>(self, v: String) -> Result<Blob, E> {
+                Ok(Blob(v.into_bytes()))
+            }
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Blob, E> {
+                Ok(Blob(v.to_vec()))
+            }
+            fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Blob, E> {
+                Ok(Blob(v))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Blob, A::Error> {
+                let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(b) = seq.next_element::<u8>()? {
+                    out.push(b);
+                }
+                Ok(Blob(out))
+            }
+        }
+        de.deserialize_any(V)
+    }
+}
+
 // ── Entry value type ──────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 enum EntryValue {
-    Str(String),
-    Hash(HashMap<String, String>),
-    List(VecDeque<String>),
+    Str(Blob),
+    Hash(HashMap<String, Blob>),
+    List(VecDeque<Blob>),
     // IndexSet rather than HashSet: SPOP / SRANDMEMBER need O(1) access to a
     // random member by index, which a hash table cannot provide.
     Set(IndexSet<String>),
@@ -267,15 +390,29 @@ fn json_approx_size(v: &serde_json::Value) -> usize {
 
 // ── Sliding-window rate limiter (RLSET / RLCHECK) ─────────────────────────────
 
+/// Buckets the sliding window is divided into. Memory per limiter is fixed at
+/// this many `(start, count)` pairs regardless of the configured limit.
+const RL_BUCKETS: u64 = 64;
+
 #[derive(Clone)]
 struct RateLimiterInner {
     limit: u64,
     window_ms: u64,
-    /// Timestamps (ms) of recorded attempts, oldest first. Attempts arrive in
-    /// monotonically non-decreasing time, so the deque stays sorted and window
-    /// pruning is O(pruned) pops from the front — no sorted-set machinery
-    /// needed. Length is bounded by `limit` (denied attempts are not recorded).
-    events: VecDeque<u64>,
+    /// `(bucket_start_ms, attempts)` for buckets inside the window, oldest
+    /// first.
+    ///
+    /// Storing one timestamp per attempt was exact but unbounded in practice:
+    /// a `RLSET key 100000 3600` limiter held 100 000 `u64`s — roughly 800 KB
+    /// for a single key, and token-cost limiting (roadmap #9) makes six-figure
+    /// limits ordinary. Counting into a fixed number of buckets caps a limiter
+    /// at ~1 KB whatever the limit.
+    ///
+    /// The cost is granularity: the window advances one bucket at a time, so a
+    /// limiter is exact to within `window_ms / RL_BUCKETS`. Attempts are never
+    /// under-counted — a bucket only leaves the window once it is entirely
+    /// outside it — so the limiter errs toward rejecting slightly early rather
+    /// than admitting over the limit.
+    buckets: VecDeque<(u64, u64)>,
 }
 
 impl RateLimiterInner {
@@ -283,28 +420,50 @@ impl RateLimiterInner {
         Self {
             limit,
             window_ms,
-            events: VecDeque::new(),
+            buckets: VecDeque::new(),
         }
+    }
+
+    /// Width of one bucket, at least 1 ms.
+    fn bucket_ms(&self) -> u64 {
+        (self.window_ms / RL_BUCKETS).max(1)
     }
 
     /// Record an attempt at `now`, returning `(allowed, remaining, retry_after_ms)`.
     /// Denied attempts are not recorded — a client hammering a full limiter
     /// does not push its own recovery further away.
     fn check(&mut self, now: u64) -> (i64, u64, u64) {
+        let width = self.bucket_ms();
         let cutoff = now.saturating_sub(self.window_ms);
-        while self.events.front().is_some_and(|&t| t <= cutoff) {
-            self.events.pop_front();
+        // A bucket leaves the window only once its whole span is behind the
+        // cutoff, so attempts are never dropped early.
+        while self
+            .buckets
+            .front()
+            .is_some_and(|&(start, _)| start + width <= cutoff)
+        {
+            self.buckets.pop_front();
         }
-        if (self.events.len() as u64) < self.limit {
-            self.events.push_back(now);
-            let remaining = self.limit - self.events.len() as u64;
-            (1, remaining, 0)
+
+        let used: u64 = self.buckets.iter().map(|&(_, c)| c).sum();
+        if used < self.limit {
+            let current = now - (now % width);
+            match self.buckets.back_mut() {
+                Some((start, count)) if *start == current => *count += 1,
+                _ => self.buckets.push_back((current, 1)),
+            }
+            (1, self.limit - used - 1, 0)
         } else {
+            // Recovery arrives when the oldest bucket falls out of the window.
             let retry_after = self
-                .events
+                .buckets
                 .front()
-                .map(|&t| (t + self.window_ms).saturating_sub(now))
-                .unwrap_or(0);
+                .map(|&(start, _)| (start + width + self.window_ms).saturating_sub(now))
+                .unwrap_or(0)
+                // A bucket spans forward from its start, so the raw figure can
+                // land a fraction past the window. The wait never legitimately
+                // exceeds one window.
+                .min(self.window_ms);
             (0, 0, retry_after)
         }
     }
@@ -332,17 +491,17 @@ impl Clone for Entry {
 }
 
 impl Entry {
-    fn new_str(value: String) -> Self {
+    fn new_str(value: impl Into<Blob>) -> Self {
         Self {
-            value: EntryValue::Str(value),
+            value: EntryValue::Str(value.into()),
             expires_at_ms: None,
             last_access_ms: AtomicU64::new(now_ms()),
         }
     }
 
-    fn new_str_ex(value: String, expires_at_ms: u64) -> Self {
+    fn new_str_ex(value: impl Into<Blob>, expires_at_ms: u64) -> Self {
         Self {
-            value: EntryValue::Str(value),
+            value: EntryValue::Str(value.into()),
             expires_at_ms: Some(expires_at_ms),
             last_access_ms: AtomicU64::new(now_ms()),
         }
@@ -480,9 +639,9 @@ pub enum EvictionPolicy {
 
 #[derive(Serialize, Deserialize)]
 pub enum SnapshotValue {
-    Str(String),
-    Hash(HashMap<String, String>),
-    List(Vec<String>),
+    Str(Blob),
+    Hash(HashMap<String, Blob>),
+    List(Vec<Blob>),
     Set(Vec<String>),
     ZSet(Vec<(String, f64)>),
     // Appended after the original variants: rmp-serde encodes variants by
@@ -510,6 +669,15 @@ pub struct KeyValueStore {
     max_memory_bytes: Option<usize>,
     eviction_policy: EvictionPolicy,
     dirty: Arc<AtomicU64>,
+    /// Keys sampled per eviction pass. Approximate-LRU quality rises with the
+    /// sample and so does the cost, so the right value is workload-dependent —
+    /// Redis exposes the same knob as `maxmemory-samples`. Configured rather
+    /// than read from the environment because this crate also runs in the
+    /// browser, where there is no environment to read.
+    eviction_sample: usize,
+    /// Total keys evicted since start. Exported as a metric: without it an
+    /// operator cannot tell a healthy cache from one thrashing at its cap.
+    evicted: Arc<AtomicU64>,
 }
 
 impl Default for KeyValueStore {
@@ -526,6 +694,8 @@ impl KeyValueStore {
             max_memory_bytes: None,
             eviction_policy: EvictionPolicy::NoEviction,
             dirty: Arc::new(AtomicU64::new(0)),
+            eviction_sample: 10,
+            evicted: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -536,6 +706,8 @@ impl KeyValueStore {
             max_memory_bytes: None,
             eviction_policy: EvictionPolicy::NoEviction,
             dirty: Arc::new(AtomicU64::new(0)),
+            eviction_sample: 10,
+            evicted: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -550,6 +722,8 @@ impl KeyValueStore {
             max_memory_bytes,
             eviction_policy,
             dirty: Arc::new(AtomicU64::new(0)),
+            eviction_sample: 10,
+            evicted: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -614,19 +788,73 @@ impl KeyValueStore {
     /// Strings are returned as bulk strings. Complex types return nil — the
     /// watcher must use a type-specific command (HGETALL, LRANGE, etc.) to
     /// fetch the full value. Deleted or expired keys also return nil.
+    /// The current value of `key`, as delivered to live-query subscribers.
+    ///
+    /// Strings come back as a bulk string and a missing or expired key as nil.
+    /// Collections come back **type-tagged**: an array whose first element names
+    /// the type, followed by its contents.
+    ///
+    /// ```text
+    /// hash  →  ["hash", field, value, ...]     (HGETALL order)
+    /// list  →  ["list", element, ...]          (head to tail)
+    /// set   →  ["set", member, ...]
+    /// zset  →  ["zset", member, score, ...]    (ascending score)
+    /// json  →  ["json", serialized-document]
+    /// ```
+    ///
+    /// The tag is what makes the payload unambiguous — a four-element array is
+    /// otherwise indistinguishable between a list of four items and a hash of
+    /// two pairs. Earlier versions sent only the type name, which forced every
+    /// subscriber into a follow-up `HGETALL`/`LRANGE` round-trip: exactly the
+    /// network hop local reads exist to avoid.
     pub fn get_current(&self, key: &str) -> Value {
+        fn tagged(tag: &str, mut items: Vec<Value>) -> Value {
+            let mut out = Vec::with_capacity(items.len() + 1);
+            out.push(Value::BulkString(Some(tag.as_bytes().to_vec())));
+            out.append(&mut items);
+            Value::Array(Some(out))
+        }
+        fn bulk(s: &str) -> Value {
+            Value::BulkString(Some(s.as_bytes().to_vec()))
+        }
+        fn blob(b: &Blob) -> Value {
+            Value::BulkString(Some(b.as_slice().to_vec()))
+        }
+
         let now = now_ms();
         match self.data.get(key) {
             None => Value::BulkString(None),
             Some(e) if e.is_expired(now) => Value::BulkString(None),
             Some(e) => match &e.value {
                 EntryValue::Str(s) => Value::BulkString(Some(s.clone().into_bytes())),
-                EntryValue::Hash(_) => Value::SimpleString("hash".to_string()),
-                EntryValue::List(_) => Value::SimpleString("list".to_string()),
-                EntryValue::Set(_) => Value::SimpleString("set".to_string()),
-                EntryValue::ZSet(_) => Value::SimpleString("zset".to_string()),
+                EntryValue::Hash(m) => {
+                    let mut fields: Vec<(&String, &Blob)> = m.iter().collect();
+                    fields.sort_by(|a, b| a.0.cmp(b.0));
+                    let items = fields
+                        .into_iter()
+                        .flat_map(|(f, v)| [bulk(f), blob(v)])
+                        .collect();
+                    tagged("hash", items)
+                }
+                EntryValue::List(l) => tagged("list", l.iter().map(blob).collect()),
+                EntryValue::Set(st) => tagged("set", st.iter().map(|m| bulk(m)).collect()),
+                EntryValue::ZSet(z) => {
+                    let mut pairs: Vec<(&String, &f64)> = z.scores.iter().collect();
+                    pairs.sort_by(|a, b| {
+                        a.1.partial_cmp(b.1)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| a.0.cmp(b.0))
+                    });
+                    let items = pairs
+                        .into_iter()
+                        .flat_map(|(m, sc)| [bulk(m), bulk(&format_score(*sc))])
+                        .collect();
+                    tagged("zset", items)
+                }
+                // Attempt state is transient and server-side; clients have no
+                // use for it and it must not leak into a browser replica.
                 EntryValue::RateLimiter(_) => Value::SimpleString("ratelimit".to_string()),
-                EntryValue::Json(_) => Value::SimpleString("json".to_string()),
+                EntryValue::Json(doc) => tagged("json", vec![bulk(&doc.to_string())]),
             },
         }
     }
@@ -663,8 +891,30 @@ impl KeyValueStore {
 
     /// Evict a single entry per the configured policy. Returns the number of
     /// bytes freed (`Some`), or `None` if nothing could be evicted.
+    /// Set how many keys each eviction pass samples (default 10, minimum 1).
+    ///
+    /// A larger sample approximates true LRU/TTL ordering more closely at the
+    /// cost of more work per eviction.
+    pub fn set_eviction_sample(&mut self, sample: usize) {
+        self.eviction_sample = sample.max(1);
+    }
+
+    /// Keys evicted since start.
+    pub fn evicted_count(&self) -> u64 {
+        self.evicted.load(Ordering::Relaxed)
+    }
+
+    /// Live key count, excluding expired entries awaiting sweep.
+    pub fn key_count(&self) -> usize {
+        let now = now_ms();
+        self.data
+            .iter()
+            .filter(|r| !r.value().is_expired(now))
+            .count()
+    }
+
     fn evict_one(&self, now: u64) -> Option<usize> {
-        const SAMPLE: usize = 10;
+        let sample = self.eviction_sample;
         let mut rng = rand::rng();
         let chosen: Option<String> = match self.eviction_policy {
             EvictionPolicy::NoEviction => None,
@@ -678,7 +928,7 @@ impl KeyValueStore {
                             r.value().last_access_ms.load(Ordering::Relaxed),
                         )
                     })
-                    .choose_multiple(&mut rng, SAMPLE);
+                    .choose_multiple(&mut rng, sample);
                 sample.into_iter().min_by_key(|(_, w)| *w).map(|(k, _)| k)
             }
             EvictionPolicy::AllKeysRandom => {
@@ -695,7 +945,7 @@ impl KeyValueStore {
                             r.value().last_access_ms.load(Ordering::Relaxed),
                         )
                     })
-                    .choose_multiple(&mut rng, SAMPLE);
+                    .choose_multiple(&mut rng, sample);
                 sample.into_iter().min_by_key(|(_, w)| *w).map(|(k, _)| k)
             }
             EvictionPolicy::VolatileTtl => {
@@ -710,7 +960,7 @@ impl KeyValueStore {
                             Some((r.key().clone(), exp))
                         }
                     })
-                    .choose_multiple(&mut rng, SAMPLE);
+                    .choose_multiple(&mut rng, sample);
                 sample
                     .into_iter()
                     .min_by_key(|(_, exp)| *exp)
@@ -720,11 +970,12 @@ impl KeyValueStore {
         let key = chosen?;
         // Treat a lost race (key already gone) as a successful eviction that
         // freed nothing, so callers don't spin.
-        Some(
-            self.data
-                .remove(&key)
-                .map_or(0, |(k, e)| entry_size(&k, &e)),
-        )
+        let freed = self
+            .data
+            .remove(&key)
+            .map_or(0, |(k, e)| entry_size(&k, &e));
+        self.evicted.fetch_add(1, Ordering::Relaxed);
+        Some(freed)
     }
 
     pub fn snapshot(&self) -> Vec<SnapshotEntry> {
@@ -741,10 +992,14 @@ impl KeyValueStore {
                     EntryValue::ZSet(z) => {
                         SnapshotValue::ZSet(z.scores.iter().map(|(k, &v)| (k.clone(), v)).collect())
                     }
+                    // Attempt counts are deliberately not persisted: they age
+                    // out within a single window, and a restart has already
+                    // interrupted that window. Only the configuration is
+                    // restored. The field remains for snapshot compatibility.
                     EntryValue::RateLimiter(rl) => SnapshotValue::RateLimiter {
                         limit: rl.limit,
                         window_ms: rl.window_ms,
-                        events: rl.events.iter().copied().collect(),
+                        events: Vec::new(),
                     },
                     EntryValue::Json(doc) => {
                         SnapshotValue::Json(serde_json::to_string(doc).unwrap_or_default())
@@ -779,11 +1034,14 @@ impl KeyValueStore {
                     limit,
                     window_ms,
                     events,
-                } => EntryValue::RateLimiter(RateLimiterInner {
-                    limit,
-                    window_ms,
-                    events: events.into(),
-                }),
+                } => {
+                    let _ = events; // older snapshots carried attempt timestamps
+                    EntryValue::RateLimiter(RateLimiterInner {
+                        limit,
+                        window_ms,
+                        buckets: VecDeque::new(),
+                    })
+                }
                 SnapshotValue::Json(s) => {
                     EntryValue::Json(serde_json::from_str(&s).unwrap_or(serde_json::Value::Null))
                 }
@@ -801,6 +1059,13 @@ impl KeyValueStore {
 
     pub fn execute(&self, cmd: Command) -> Value {
         match cmd {
+            // Ephemeral keys are ordinary strings to the engine — their lifetime
+            // is enforced by the server, which is the layer that knows about
+            // connections. Keeping the engine unaware keeps it I/O-free.
+            Command::ESet(key, value) => {
+                self.execute(Command::Set(key, value, crate::cmd::SetOptions::default()))
+            }
+
             // ── Core ─────────────────────────────────────────────────────────
             Command::Ping(msg) => match msg {
                 Some(m) => Value::BulkString(Some(m.into_bytes())),
@@ -808,6 +1073,9 @@ impl KeyValueStore {
             },
             Command::Auth(_) => Value::Error(
                 "ERR AUTH is handled by the connection layer, not the store".to_string(),
+            ),
+            Command::Hello(_) => Value::Error(
+                "ERR HELLO is handled by the connection layer, not the store".to_string(),
             ),
 
             // ── Strings ───────────────────────────────────────────────────────
@@ -870,7 +1138,7 @@ impl KeyValueStore {
                 self.data.insert(
                     key,
                     Entry {
-                        value: EntryValue::Str(val),
+                        value: EntryValue::Str(val.into()),
                         expires_at_ms,
                         last_access_ms: AtomicU64::new(now),
                     },
@@ -916,12 +1184,12 @@ impl KeyValueStore {
                     .entry(key)
                     .or_insert_with(|| Entry::new_str(String::new()));
                 if was_expired {
-                    entry.value = EntryValue::Str(String::new());
+                    entry.value = EntryValue::Str(Blob::default());
                     entry.expires_at_ms = None;
                 }
                 match &mut entry.value {
                     EntryValue::Str(s) => {
-                        s.push_str(&suffix);
+                        s.extend(&suffix);
                         Value::Integer(s.len() as i64)
                     }
                     _ => unreachable!(),
@@ -1219,7 +1487,7 @@ impl KeyValueStore {
                     .filter(|(f, _)| !h.contains_key(f.as_str()))
                     .count();
                 for (field, val) in pairs {
-                    h.insert(field, val);
+                    h.insert(field, val.into());
                 }
                 Value::Integer(new_count as i64)
             }
@@ -1249,15 +1517,15 @@ impl KeyValueStore {
                     Some(e) => match &e.value {
                         EntryValue::Hash(h) => {
                             e.touch(now);
-                            let mut pairs: Vec<(&str, &str)> =
-                                h.iter().map(|(f, v)| (f.as_str(), v.as_str())).collect();
+                            let mut pairs: Vec<(&str, &Blob)> =
+                                h.iter().map(|(f, v)| (f.as_str(), v)).collect();
                             pairs.sort_unstable_by_key(|(f, _)| *f);
                             let out = pairs
                                 .into_iter()
                                 .flat_map(|(f, v)| {
                                     [
                                         Value::BulkString(Some(f.as_bytes().to_vec())),
-                                        Value::BulkString(Some(v.as_bytes().to_vec())),
+                                        Value::BulkString(Some(v.as_slice().to_vec())),
                                     ]
                                 })
                                 .collect();
@@ -1311,13 +1579,13 @@ impl KeyValueStore {
                     Some(e) if e.is_expired(now) => Value::Array(Some(vec![])),
                     Some(e) => match &e.value {
                         EntryValue::Hash(h) => {
-                            let mut pairs: Vec<(&str, &str)> =
-                                h.iter().map(|(f, v)| (f.as_str(), v.as_str())).collect();
+                            let mut pairs: Vec<(&str, &Blob)> =
+                                h.iter().map(|(f, v)| (f.as_str(), v)).collect();
                             pairs.sort_unstable_by_key(|(f, _)| *f);
                             Value::Array(Some(
                                 pairs
                                     .into_iter()
-                                    .map(|(_, v)| Value::BulkString(Some(v.as_bytes().to_vec())))
+                                    .map(|(_, v)| Value::BulkString(Some(v.as_slice().to_vec())))
                                     .collect(),
                             ))
                         }
@@ -1375,7 +1643,7 @@ impl KeyValueStore {
                     _ => unreachable!(),
                 };
                 if let std::collections::hash_map::Entry::Vacant(e) = h.entry(field) {
-                    e.insert(val);
+                    e.insert(val.into());
                     Value::Integer(1)
                 } else {
                     Value::Integer(0)
@@ -1425,7 +1693,7 @@ impl KeyValueStore {
                     _ => unreachable!(),
                 };
                 for v in vals {
-                    list.push_front(v);
+                    list.push_front(v.into());
                 }
                 Value::Integer(list.len() as i64)
             }
@@ -1447,7 +1715,7 @@ impl KeyValueStore {
                     _ => unreachable!(),
                 };
                 for v in vals {
-                    list.push_back(v);
+                    list.push_back(v.into());
                 }
                 Value::Integer(list.len() as i64)
             }
@@ -1460,7 +1728,7 @@ impl KeyValueStore {
                     Some(mut e) => match &mut e.value {
                         EntryValue::List(list) => {
                             for v in vals {
-                                list.push_front(v);
+                                list.push_front(v.into());
                             }
                             Value::Integer(list.len() as i64)
                         }
@@ -1477,7 +1745,7 @@ impl KeyValueStore {
                     Some(mut e) => match &mut e.value {
                         EntryValue::List(list) => {
                             for v in vals {
-                                list.push_back(v);
+                                list.push_back(v.into());
                             }
                             Value::Integer(list.len() as i64)
                         }
@@ -1546,13 +1814,13 @@ impl KeyValueStore {
                     Some(e) => match &e.value {
                         EntryValue::List(list) => {
                             e.touch(now);
-                            let slice: Vec<&String> = list.iter().collect();
+                            let slice: Vec<&Blob> = list.iter().collect();
                             match resolve_range(start, stop, slice.len()) {
                                 None => Value::Array(Some(vec![])),
                                 Some((s, e)) => Value::Array(Some(
                                     slice[s..=e]
                                         .iter()
-                                        .map(|v| Value::BulkString(Some(v.as_bytes().to_vec())))
+                                        .map(|v| Value::BulkString(Some(v.as_slice().to_vec())))
                                         .collect(),
                                 )),
                             }
@@ -1581,9 +1849,9 @@ impl KeyValueStore {
                     Some(e) if e.is_expired(now) => Value::BulkString(None),
                     Some(e) => match &e.value {
                         EntryValue::List(list) => {
-                            let slice: Vec<&String> = list.iter().collect();
+                            let slice: Vec<&Blob> = list.iter().collect();
                             resolve_idx(idx, slice.len())
-                                .map(|i| Value::BulkString(Some(slice[i].as_bytes().to_vec())))
+                                .map(|i| Value::BulkString(Some(slice[i].as_slice().to_vec())))
                                 .unwrap_or(Value::BulkString(None))
                         }
                         _ => Value::Error(WRONGTYPE.to_string()),
@@ -1602,7 +1870,7 @@ impl KeyValueStore {
                             match resolve_idx(idx, len) {
                                 None => Value::Error("ERR index out of range".to_string()),
                                 Some(i) => {
-                                    list[i] = val;
+                                    list[i] = val.into();
                                     Value::SimpleString("OK".to_string())
                                 }
                             }
@@ -1624,7 +1892,7 @@ impl KeyValueStore {
                             if count >= 0 {
                                 let mut i = 0;
                                 while i < list.len() && (count == 0 || removed < abs as i64) {
-                                    if list[i] == element {
+                                    if list[i].as_slice() == element.as_slice() {
                                         list.remove(i);
                                         removed += 1;
                                     } else {
@@ -1635,7 +1903,7 @@ impl KeyValueStore {
                                 let mut i = list.len();
                                 while i > 0 && removed < abs as i64 {
                                     i -= 1;
-                                    if list[i] == element {
+                                    if list[i].as_slice() == element.as_slice() {
                                         list.remove(i);
                                         removed += 1;
                                     }
@@ -1659,7 +1927,7 @@ impl KeyValueStore {
                             match resolve_range(start, stop, len) {
                                 None => list.clear(),
                                 Some((s, e)) => {
-                                    let trimmed: VecDeque<String> = list.drain(s..=e).collect();
+                                    let trimmed: VecDeque<Blob> = list.drain(s..=e).collect();
                                     *list = trimmed;
                                 }
                             }
@@ -2453,7 +2721,7 @@ fn entry_size(key: &str, e: &Entry) -> usize {
         EntryValue::List(l) => l.iter().map(|s| s.len()).sum(),
         EntryValue::Set(s) => s.iter().map(|m| m.len()).sum::<usize>(),
         EntryValue::ZSet(z) => z.scores.keys().map(|m| m.len() + 8).sum(),
-        EntryValue::RateLimiter(rl) => rl.events.len() * 8 + 16,
+        EntryValue::RateLimiter(rl) => rl.buckets.len() * 16 + 16,
         EntryValue::Json(doc) => json_approx_size(doc),
     };
     key.len() + val_size + 64
@@ -2473,16 +2741,18 @@ fn incr_by(data: &DashMap<String, Entry>, key: String, delta: i64) -> Value {
         .entry(key)
         .or_insert_with(|| Entry::new_str("0".to_string()));
     if was_expired {
-        entry.value = EntryValue::Str("0".to_string());
+        entry.value = EntryValue::Str("0".into());
         entry.expires_at_ms = None;
     }
     match &mut entry.value {
-        EntryValue::Str(s) => match s.parse::<i64>() {
-            Err(_) => Value::Error("ERR value is not an integer or out of range".to_string()),
-            Ok(n) => match n.checked_add(delta) {
+        // A non-UTF-8 value fails here exactly as non-numeric text does: the
+        // bytes are stored faithfully, they are simply not a number.
+        EntryValue::Str(s) => match s.parse_as::<i64>() {
+            None => Value::Error("ERR value is not an integer or out of range".to_string()),
+            Some(n) => match n.checked_add(delta) {
                 None => Value::Error("ERR increment or decrement would overflow".to_string()),
                 Some(new) => {
-                    *s = new.to_string();
+                    *s = new.to_string().into();
                     Value::Integer(new)
                 }
             },
@@ -2671,11 +2941,11 @@ fn hash_incr_int(data: &DashMap<String, Entry>, key: String, field: String, delt
         EntryValue::Hash(h) => h,
         _ => unreachable!(),
     };
-    let cur: i64 = h.get(&field).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let cur: i64 = h.get(&field).and_then(|s| s.parse_as()).unwrap_or(0);
     match cur.checked_add(delta) {
         None => Value::Error("ERR increment or decrement would overflow".to_string()),
         Some(new) => {
-            h.insert(field, new.to_string());
+            h.insert(field, new.to_string().into());
             Value::Integer(new)
         }
     }
@@ -2704,13 +2974,13 @@ fn hash_incr_float(data: &DashMap<String, Entry>, key: String, field: String, de
         EntryValue::Hash(h) => h,
         _ => unreachable!(),
     };
-    let cur: f64 = h.get(&field).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let cur: f64 = h.get(&field).and_then(|s| s.parse_as()).unwrap_or(0.0);
     let new = cur + delta;
     if new.is_nan() || new.is_infinite() {
         return Value::Error("ERR increment would produce NaN or Infinity".to_string());
     }
     let new_str = format_score(new);
-    h.insert(field, new_str.clone());
+    h.insert(field, new_str.clone().into());
     Value::BulkString(Some(new_str.into_bytes()))
 }
 
@@ -4146,17 +4416,26 @@ mod tests {
     }
 
     #[test]
-    fn rl_snapshot_roundtrip_preserves_state() {
+    fn rl_snapshot_preserves_config_but_not_attempt_state() {
+        // Attempt counts are transient: they age out within one window, and a
+        // restart has already interrupted that window. Only the configuration
+        // is restored, so a limiter comes back enforcing the same policy with a
+        // clean slate rather than a stale partial count.
         let s = store();
-        s.execute(Command::RlSet("api".into(), 2, 60));
-        rl(s.execute(Command::RlCheck("api".into(), None)));
-        rl(s.execute(Command::RlCheck("api".into(), None)));
+        s.execute(Command::RlSet("api".into(), 3, 60));
+        s.execute(Command::RlCheck("api".into(), None));
+        s.execute(Command::RlCheck("api".into(), None));
 
-        let s2 = store();
-        s2.restore(s.snapshot());
-        let (allowed, remaining, retry) = rl(s2.execute(Command::RlCheck("api".into(), None)));
-        assert_eq!((allowed, remaining), (0, 0));
-        assert!(retry > 0);
+        let restored = store();
+        restored.restore(s.snapshot());
+
+        // Config survived: still a 3-per-60s limiter.
+        let (allowed, remaining, _) = rl(restored.execute(Command::RlCheck("api".into(), None)));
+        assert_eq!(allowed, 1);
+        assert_eq!(
+            remaining, 2,
+            "attempts reset on restore — the limiter enforces the same policy afresh"
+        );
     }
 
     // ── JSON (JSET / JGET / JMERGE) ───────────────────────────────────────────
@@ -4432,23 +4711,72 @@ mod capacity_tests {
     }
 
     #[test]
-    fn get_current_returns_type_markers_for_collections() {
+    fn get_current_returns_type_tagged_collection_values() {
+        // Live-query subscribers get the actual contents, tagged with the type
+        // so the payload is unambiguous. Previously only the type name was sent,
+        // which forced a follow-up HGETALL/LRANGE — a network round-trip in a
+        // system whose whole premise is local reads.
         let s = KeyValueStore::new();
         s.execute(Command::HSet("h".into(), vec![("f".into(), "v".into())]));
-        s.execute(Command::LPush("l".into(), vec!["a".into()]));
-        s.execute(Command::SAdd("st".into(), vec!["a".into()]));
+        s.execute(Command::RPush("l".into(), vec!["a".into(), "b".into()]));
+        s.execute(Command::SAdd("st".into(), vec!["m".into()]));
         s.execute(Command::ZAdd(
             "z".into(),
             Default::default(),
-            vec![(1.0, "a".into())],
+            vec![(1.5, "alice".into())],
         ));
         s.execute(Command::JSet("j".into(), "$".into(), "{\"a\":1}".into()));
 
-        assert_eq!(s.get_current("h"), Value::SimpleString("hash".into()));
-        assert_eq!(s.get_current("l"), Value::SimpleString("list".into()));
-        assert_eq!(s.get_current("st"), Value::SimpleString("set".into()));
-        assert_eq!(s.get_current("z"), Value::SimpleString("zset".into()));
-        assert_eq!(s.get_current("j"), Value::SimpleString("json".into()));
+        fn parts(v: Value) -> Vec<String> {
+            match v {
+                Value::Array(Some(items)) => items
+                    .iter()
+                    .map(|i| match i {
+                        Value::BulkString(Some(b)) => String::from_utf8_lossy(b).into_owned(),
+                        other => format!("{other:?}"),
+                    })
+                    .collect(),
+                other => panic!("expected a tagged array, got {other:?}"),
+            }
+        }
+
+        assert_eq!(parts(s.get_current("h")), vec!["hash", "f", "v"]);
+        assert_eq!(parts(s.get_current("l")), vec!["list", "a", "b"]);
+        assert_eq!(parts(s.get_current("st")), vec!["set", "m"]);
+        assert_eq!(parts(s.get_current("z")), vec!["zset", "alice", "1.5"]);
+        assert_eq!(parts(s.get_current("j")), vec!["json", "{\"a\":1}"]);
+    }
+
+    #[test]
+    fn get_current_orders_collections_deterministically() {
+        // Two clients receiving the same key must build identical local state,
+        // so ordering cannot depend on hash iteration order.
+        let s = KeyValueStore::new();
+        s.execute(Command::HSet(
+            "h".into(),
+            vec![("b".into(), "2".into()), ("a".into(), "1".into())],
+        ));
+        s.execute(Command::ZAdd(
+            "z".into(),
+            Default::default(),
+            vec![(9.0, "high".into()), (1.0, "low".into())],
+        ));
+        for _ in 0..5 {
+            match s.get_current("h") {
+                Value::Array(Some(items)) => {
+                    // Fields sorted: a before b.
+                    assert_eq!(items[1], Value::BulkString(Some(b"a".to_vec())));
+                }
+                other => panic!("{other:?}"),
+            }
+            match s.get_current("z") {
+                Value::Array(Some(items)) => {
+                    // Ascending score: low before high.
+                    assert_eq!(items[1], Value::BulkString(Some(b"low".to_vec())));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
     }
 
     // ── sweep_expired ─────────────────────────────────────────────────────────
@@ -4496,9 +4824,9 @@ mod capacity_tests {
         let base = s.approximate_memory_bytes();
         s.execute(Command::HSet(
             "h".into(),
-            vec![("f".into(), "v".repeat(500))],
+            vec![("f".into(), "v".repeat(500).into())],
         ));
-        s.execute(Command::LPush("l".into(), vec!["v".repeat(500)]));
+        s.execute(Command::LPush("l".into(), vec!["v".repeat(500).into()]));
         s.execute(Command::SAdd("st".into(), vec!["v".repeat(500)]));
         s.execute(Command::ZAdd(
             "z".into(),
@@ -4626,7 +4954,7 @@ mod capacity_tests {
         for (k, ttl) in [("keep", 600_000u64), ("drop", 1_000)] {
             s.execute(Command::Set(
                 k.into(),
-                "x".repeat(400),
+                "x".repeat(400).into(),
                 SetOptions {
                     expiry: Some(crate::cmd::SetExpiry::Px(ttl)),
                     ..Default::default()
@@ -5079,7 +5407,7 @@ mod critical_path_tests {
         let s = KeyValueStore::new();
         s.execute(Command::Set(
             "n".into(),
-            i64::MAX.to_string(),
+            i64::MAX.to_string().into(),
             SetOptions::default(),
         ));
         let r = s.execute(Command::Incr("n".into()));
@@ -5099,7 +5427,7 @@ mod critical_path_tests {
         let s = KeyValueStore::new();
         s.execute(Command::Set(
             "n".into(),
-            i64::MIN.to_string(),
+            i64::MIN.to_string().into(),
             SetOptions::default(),
         ));
         assert!(matches!(
@@ -5211,6 +5539,505 @@ mod critical_path_tests {
         assert!(
             matches!(restored.execute(Command::Ttl("k".into())), Value::Integer(n) if n > 0),
             "a restored key must keep its expiry, not become permanent"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ephemeral_tests {
+    use super::*;
+    use crate::cmd::Command;
+
+    #[test]
+    fn eset_stores_a_value_like_set() {
+        // To the engine an ephemeral key is an ordinary string — lifetime is
+        // enforced by the server, which is the layer that knows about
+        // connections. Keeping the engine unaware is what keeps it I/O-free
+        // and identical between native and wasm builds.
+        let s = KeyValueStore::new();
+        assert_eq!(
+            s.execute(Command::ESet("presence:1".into(), "online".into())),
+            Value::SimpleString("OK".into())
+        );
+        assert_eq!(
+            s.execute(Command::Get("presence:1".into())),
+            Value::BulkString(Some(b"online".to_vec()))
+        );
+        assert_eq!(
+            s.execute(Command::Type("presence:1".into())),
+            Value::SimpleString("string".into())
+        );
+        // No TTL — the engine must not invent one.
+        assert_eq!(
+            s.execute(Command::Ttl("presence:1".into())),
+            Value::Integer(-1)
+        );
+    }
+
+    #[test]
+    fn eset_overwrites_and_is_visible_to_reads_and_live_queries() {
+        let s = KeyValueStore::new();
+        s.execute(Command::ESet("presence:1".into(), "first".into()));
+        s.execute(Command::ESet("presence:1".into(), "second".into()));
+        assert_eq!(
+            s.get_current("presence:1"),
+            Value::BulkString(Some(b"second".to_vec()))
+        );
+        // Pattern matching picks it up like any other key.
+        let matched = s.matching_key_values("presence:*", 10);
+        assert_eq!(matched.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::*;
+    use crate::cmd::{Command, SetOptions};
+
+    #[test]
+    fn key_count_excludes_expired_entries() {
+        // The metric must report what a client can actually read, not what is
+        // still sitting in the map awaiting sweep — otherwise a dashboard shows
+        // a keyspace that is not there.
+        let s = KeyValueStore::new();
+        s.execute(Command::Set(
+            "live".into(),
+            "v".into(),
+            SetOptions::default(),
+        ));
+        s.execute(Command::Set(
+            "dead".into(),
+            "v".into(),
+            SetOptions {
+                expiry: Some(crate::cmd::SetExpiry::Px(1)),
+                ..Default::default()
+            },
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        assert_eq!(s.key_count(), 1);
+    }
+
+    #[test]
+    fn eviction_counter_starts_at_zero_and_counts_each_eviction() {
+        let s = KeyValueStore::with_config(Some(2), None, EvictionPolicy::AllKeysRandom);
+        assert_eq!(s.evicted_count(), 0);
+
+        for i in 0..5 {
+            s.execute(Command::Set(
+                format!("k{i}"),
+                "v".into(),
+                SetOptions::default(),
+            ));
+        }
+        // Cap of 2 with 5 inserts means 3 evictions were required.
+        assert_eq!(s.key_count(), 2);
+        assert_eq!(
+            s.evicted_count(),
+            3,
+            "eviction rate is the signal that a cache is thrashing at its cap"
+        );
+    }
+
+    #[test]
+    fn eviction_counter_stays_zero_without_pressure() {
+        let s = KeyValueStore::new();
+        for i in 0..10 {
+            s.execute(Command::Set(
+                format!("k{i}"),
+                "v".into(),
+                SetOptions::default(),
+            ));
+        }
+        assert_eq!(s.evicted_count(), 0, "no cap configured, nothing to evict");
+    }
+
+    #[test]
+    fn memory_estimate_tracks_the_stored_data() {
+        let s = KeyValueStore::new();
+        let empty = s.approximate_memory_bytes();
+        s.execute(Command::Set(
+            "k".into(),
+            "x".repeat(4096).into(),
+            SetOptions::default(),
+        ));
+        assert!(s.approximate_memory_bytes() >= empty + 4096);
+    }
+}
+
+#[cfg(test)]
+mod rate_limiter_memory_tests {
+    use super::*;
+    use crate::cmd::Command;
+
+    fn rl(v: Value) -> (i64, u64, u64) {
+        match v {
+            Value::Array(Some(items)) => match (&items[0], &items[1], &items[2]) {
+                (Value::Integer(a), Value::Integer(r), Value::Integer(w)) => {
+                    (*a, *r as u64, *w as u64)
+                }
+                _ => panic!("unexpected RLCHECK reply shape"),
+            },
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_is_bounded_regardless_of_limit() {
+        // The reason for bucketing: one timestamp per attempt meant ~800 KB for
+        // a single `RLSET key 100000 3600` limiter. Buckets cap it at ~1 KB.
+        let s = KeyValueStore::new();
+        s.execute(Command::RlSet("big".into(), 100_000, 3600));
+        for _ in 0..5_000 {
+            s.execute(Command::RlCheck("big".into(), None));
+        }
+        let bytes = s.approximate_memory_bytes();
+        assert!(
+            bytes < 4_096,
+            "5000 attempts against a 100k limiter should stay small, got {bytes} bytes"
+        );
+    }
+
+    #[test]
+    fn a_high_limit_still_admits_every_attempt_under_it() {
+        // Bounding memory must not bound throughput.
+        let s = KeyValueStore::new();
+        s.execute(Command::RlSet("api".into(), 10_000, 3600));
+        for i in 0..2_000 {
+            let (allowed, _, _) = rl(s.execute(Command::RlCheck("api".into(), None)));
+            assert_eq!(allowed, 1, "attempt {i} should be allowed");
+        }
+    }
+
+    #[test]
+    fn the_limit_is_still_enforced_exactly_at_the_boundary() {
+        // Bucketing approximates *when* attempts age out, never *how many* are
+        // counted inside the window.
+        let s = KeyValueStore::new();
+        s.execute(Command::RlSet("api".into(), 5, 60));
+        for expected in [4, 3, 2, 1, 0] {
+            let (allowed, remaining, retry) = rl(s.execute(Command::RlCheck("api".into(), None)));
+            assert_eq!(allowed, 1);
+            assert_eq!(remaining, expected);
+            assert_eq!(retry, 0);
+        }
+        let (allowed, remaining, retry) = rl(s.execute(Command::RlCheck("api".into(), None)));
+        assert_eq!(allowed, 0, "the 6th attempt against a limit of 5 is denied");
+        assert_eq!(remaining, 0);
+        assert!(retry > 0, "a denied attempt must say when to retry");
+    }
+
+    #[test]
+    fn retry_after_never_exceeds_the_window() {
+        // Retry-After is handed straight to HTTP clients; a value past the
+        // window would park them longer than the policy requires.
+        let s = KeyValueStore::new();
+        s.execute(Command::RlSet("api".into(), 1, 60));
+        s.execute(Command::RlCheck("api".into(), None));
+        let (_, _, retry) = rl(s.execute(Command::RlCheck("api".into(), None)));
+        assert!(
+            retry > 0 && retry <= 60_000,
+            "retry_after_ms = {retry}, window is 60000"
+        );
+    }
+
+    #[test]
+    fn the_shortest_window_recovers_after_it_elapses() {
+        // RLSET takes the window in *seconds*, so one second is the floor. At
+        // that width each bucket is ~15 ms; the bucket-width floor of 1 ms
+        // exists so an even shorter window could never divide to zero.
+        let s = KeyValueStore::new();
+        s.execute(Command::RlSet("fast".into(), 2, 1));
+        assert_eq!(rl(s.execute(Command::RlCheck("fast".into(), None))).0, 1);
+        assert_eq!(rl(s.execute(Command::RlCheck("fast".into(), None))).0, 1);
+        assert_eq!(
+            rl(s.execute(Command::RlCheck("fast".into(), None))).0,
+            0,
+            "third attempt against a limit of 2 is denied"
+        );
+
+        // Past the window the limiter admits traffic again.
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        assert_eq!(
+            rl(s.execute(Command::RlCheck("fast".into(), None))).0,
+            1,
+            "buckets older than the window must age out"
+        );
+    }
+}
+
+// ── Byte transparency ─────────────────────────────────────────────────────────
+//
+// Values are byte-transparent; identifiers are text. A stored value may be
+// arbitrary bytes — compressed blobs, protobuf, images — and must come back
+// exactly as it went in. Keys, hash fields, set and sorted-set members and glob
+// patterns are looked up and matched as text, so a non-UTF-8 one is refused
+// rather than lossily converted.
+//
+// These live in-crate rather than in `tests/`: a separate integration binary
+// links its own copy of every function into the coverage map, and the copies it
+// does not exercise drag the measured figure down without changing what is
+// actually tested.
+#[cfg(test)]
+mod byte_transparency_tests {
+    use super::*;
+    use crate::cmd::Command;
+    use crate::resp::Value;
+
+    /// Invalid UTF-8 in any position: a lone continuation byte and a truncated
+    /// sequence, plus an embedded NUL and a byte that is legal only inside one.
+    const BINARY: &[u8] = &[0xff, 0xfe, 0x00, 0x41, 0x80, 0xc3];
+
+    fn parse(raw: &[u8]) -> Result<Command, String> {
+        let (v, _) = Value::parse(raw).unwrap();
+        Command::from_value(v)
+    }
+
+    /// Build a RESP array frame from raw byte arguments.
+    fn frame(args: &[&[u8]]) -> Vec<u8> {
+        let mut out = format!("*{}\r\n", args.len()).into_bytes();
+        for a in args {
+            out.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+            out.extend_from_slice(a);
+            out.extend_from_slice(b"\r\n");
+        }
+        out
+    }
+
+    #[test]
+    fn a_binary_value_round_trips_byte_for_byte() {
+        let store = KeyValueStore::new();
+        store.execute(parse(&frame(&[b"SET", b"k", BINARY])).unwrap());
+
+        let Value::BulkString(Some(got)) = store.execute(Command::Get("k".into())) else {
+            panic!("key missing after SET");
+        };
+        assert_eq!(got, BINARY, "value must survive unchanged");
+    }
+
+    #[test]
+    fn binary_values_work_in_lists_and_hashes() {
+        let store = KeyValueStore::new();
+
+        store.execute(parse(&frame(&[b"RPUSH", b"l", BINARY, b"plain"])).unwrap());
+        let Value::Array(Some(items)) = store.execute(Command::LRange("l".into(), 0, -1)) else {
+            panic!("list missing");
+        };
+        assert_eq!(items[0], Value::BulkString(Some(BINARY.to_vec())));
+
+        store.execute(parse(&frame(&[b"HSET", b"h", b"f", BINARY])).unwrap());
+        assert_eq!(
+            store.execute(Command::HGet("h".into(), "f".into())),
+            Value::BulkString(Some(BINARY.to_vec()))
+        );
+    }
+
+    #[test]
+    fn append_concatenates_bytes_rather_than_text() {
+        let store = KeyValueStore::new();
+        store.execute(parse(&frame(&[b"SET", b"k", BINARY])).unwrap());
+        store.execute(parse(&frame(&[b"APPEND", b"k", BINARY])).unwrap());
+
+        let Value::BulkString(Some(got)) = store.execute(Command::Get("k".into())) else {
+            panic!("key missing");
+        };
+        assert_eq!(got.len(), BINARY.len() * 2);
+        assert_eq!(&got[..BINARY.len()], BINARY);
+        assert_eq!(&got[BINARY.len()..], BINARY);
+    }
+
+    #[test]
+    fn strlen_counts_bytes_not_characters() {
+        let store = KeyValueStore::new();
+        store.execute(parse(&frame(&[b"SET", b"k", BINARY])).unwrap());
+        assert_eq!(
+            store.execute(Command::Strlen("k".into())),
+            Value::Integer(BINARY.len() as i64)
+        );
+    }
+
+    #[test]
+    fn incr_on_a_binary_value_errors_like_any_non_numeric_value() {
+        // The bytes are stored faithfully; they are simply not a number. This must
+        // read as a type error, not as corruption.
+        let store = KeyValueStore::new();
+        store.execute(parse(&frame(&[b"SET", b"k", BINARY])).unwrap());
+        let Value::Error(e) = store.execute(Command::Incr("k".into())) else {
+            panic!("INCR on binary must error");
+        };
+        assert!(e.contains("not an integer"), "got {e:?}");
+    }
+
+    #[test]
+    fn a_binary_key_is_rejected() {
+        // Keys are matched by glob and checked against sync scopes as text, so a
+        // corrupted key would be silently unretrievable.
+        let err = parse(&frame(&[b"SET", BINARY, b"v"])).expect_err("binary key must be refused");
+        assert!(err.starts_with("ERR "), "{err:?}");
+        assert!(err.contains("must be text"), "{err:?}");
+    }
+
+    #[test]
+    fn binary_fields_and_members_are_rejected() {
+        for args in [
+            vec![b"HSET".as_slice(), b"h", BINARY, b"v"], // hash field
+            vec![b"SADD".as_slice(), b"s", BINARY],       // set member
+            vec![b"ZADD".as_slice(), b"z", b"1", BINARY], // zset member
+            vec![b"KEYS".as_slice(), BINARY],             // glob pattern
+        ] {
+            let err = parse(&frame(&args)).expect_err("identifier must be refused");
+            assert!(err.contains("must be text"), "{:?} -> {err:?}", args[0]);
+        }
+    }
+
+    #[test]
+    fn the_error_names_which_argument_was_bad() {
+        // MSET k1 v1 <binary-key> v2 — index 3 is a key, so it is refused.
+        let err =
+            parse(&frame(&[b"MSET", b"k1", b"v1", BINARY, b"v2"])).expect_err("must be refused");
+        assert!(err.contains("argument 3"), "got {err:?}");
+    }
+
+    #[test]
+    fn a_rejected_command_stores_nothing() {
+        let store = KeyValueStore::new();
+        assert!(parse(&frame(&[b"SET", BINARY, b"v"])).is_err());
+        assert_eq!(store.execute(Command::DbSize), Value::Integer(0));
+    }
+
+    #[test]
+    fn utf8_values_survive_unchanged() {
+        let store = KeyValueStore::new();
+        for value in ["héllo ✓", "日本語", "\u{1F600}", "", "plain"] {
+            store.execute(Command::Set("k".into(), value.into(), Default::default()));
+            let Value::BulkString(Some(got)) = store.execute(Command::Get("k".into())) else {
+                panic!("key missing after SET of {value:?}");
+            };
+            assert_eq!(String::from_utf8(got).unwrap(), value);
+        }
+    }
+}
+
+// ── Snapshot compatibility ────────────────────────────────────────────────────
+//
+// `SnapshotValue` held `String` up to 0.2.1 and holds `Blob` from 0.2.2.
+// rmp-serde encodes those differently — msgpack `str` versus `bin` — so `Blob`'s
+// deserializer accepts either. Without that, upgrading a server would silently
+// start from an empty cache, or fail to boot.
+#[cfg(test)]
+mod snapshot_compat_tests {
+    // `super::*` already brings Command, Value and the snapshot types into
+    // scope from the store module's own imports.
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Mirror of the pre-0.2.2 `SnapshotValue`, used to produce a genuine old-format
+    /// payload rather than a hand-rolled byte string. Variant order matters:
+    /// rmp-serde encodes variants by index.
+    #[derive(Serialize)]
+    #[allow(dead_code)] // variants exist to fix the discriminant order, not to be built
+    enum LegacySnapshotValue {
+        Str(String),
+        Hash(HashMap<String, String>),
+        List(Vec<String>),
+        Set(Vec<String>),
+        ZSet(Vec<(String, f64)>),
+        RateLimiter {
+            limit: u64,
+            window_ms: u64,
+            events: Vec<u64>,
+        },
+        Json(String),
+    }
+
+    #[derive(Serialize)]
+    struct LegacyEntry {
+        key: String,
+        value: LegacySnapshotValue,
+        expires_at_ms: Option<u64>,
+    }
+
+    #[test]
+    fn a_pre_0_2_2_snapshot_still_restores() {
+        let legacy = vec![
+            LegacyEntry {
+                key: "s".into(),
+                value: LegacySnapshotValue::Str("hello".into()),
+                expires_at_ms: None,
+            },
+            LegacyEntry {
+                key: "l".into(),
+                value: LegacySnapshotValue::List(vec!["a".into(), "b".into()]),
+                expires_at_ms: None,
+            },
+            LegacyEntry {
+                key: "h".into(),
+                value: LegacySnapshotValue::Hash(HashMap::from([(
+                    "f".to_string(),
+                    "v".to_string(),
+                )])),
+                expires_at_ms: None,
+            },
+        ];
+        let bytes = rmp_serde::to_vec(&legacy).expect("legacy snapshot must encode");
+
+        // Decode with the *current* types — this is what a restarted server does.
+        let entries: Vec<SnapshotEntry> =
+            rmp_serde::from_slice(&bytes).expect("a pre-0.2.2 snapshot must still decode");
+
+        let store = KeyValueStore::new();
+        store.restore(entries);
+
+        use crate::{cmd::Command, resp::Value};
+        assert_eq!(
+            store.execute(Command::Get("s".into())),
+            Value::BulkString(Some(b"hello".to_vec()))
+        );
+        assert_eq!(
+            store.execute(Command::HGet("h".into(), "f".into())),
+            Value::BulkString(Some(b"v".to_vec()))
+        );
+        assert_eq!(store.execute(Command::LLen("l".into())), Value::Integer(2));
+    }
+
+    #[test]
+    fn binary_values_survive_a_snapshot_round_trip() {
+        let binary = vec![0xff, 0xfe, 0x00, 0x41, 0x80];
+        let store = KeyValueStore::new();
+        store.restore(vec![SnapshotEntry {
+            key: "b".into(),
+            value: SnapshotValue::Str(binary.clone().into()),
+            expires_at_ms: None,
+        }]);
+
+        let bytes = rmp_serde::to_vec(&store.snapshot()).unwrap();
+        let entries: Vec<SnapshotEntry> = rmp_serde::from_slice(&bytes).unwrap();
+
+        let restored = KeyValueStore::new();
+        restored.restore(entries);
+
+        use crate::{cmd::Command, resp::Value};
+        assert_eq!(
+            restored.execute(Command::Get("b".into())),
+            Value::BulkString(Some(binary)),
+            "binary must survive snapshot and restore"
+        );
+    }
+
+    #[test]
+    fn a_binary_value_encodes_as_msgpack_bin_not_an_int_array() {
+        // Vec<u8> serializes as an array of integers by default, which would roughly
+        // double snapshot size for binary payloads. Blob emits a compact `bin`.
+        let store = KeyValueStore::new();
+        store.restore(vec![SnapshotEntry {
+            key: "b".into(),
+            value: SnapshotValue::Str(vec![0xffu8; 1000].into()),
+            expires_at_ms: None,
+        }]);
+        let bytes = rmp_serde::to_vec(&store.snapshot()).unwrap();
+        assert!(
+            bytes.len() < 1200,
+            "1000 bytes encoded to {} — likely an int array, not msgpack bin",
+            bytes.len()
         );
     }
 }

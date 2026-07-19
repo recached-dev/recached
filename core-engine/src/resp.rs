@@ -13,6 +13,12 @@ pub enum Value {
     /// RESP3 Push frame (`>N\r\n...`). Used for server-initiated out-of-band messages
     /// (mutation fan-out, pub/sub) on the WebSocket channel. Never sent as a command response.
     Push(Vec<Value>),
+    /// RESP3 Map (`%N\r\n` followed by `N` key/value pairs).
+    ///
+    /// Only `HELLO 3` replies with one today. A RESP2 connection must never be
+    /// sent a map — the type does not exist in RESP2 and the client will fail
+    /// to parse it — so the caller picks the shape from the negotiated version.
+    Map(Vec<(Value, Value)>),
 }
 
 impl Value {
@@ -65,6 +71,15 @@ impl Value {
                     v.serialize_into(out);
                 }
             }
+            Value::Map(pairs) => {
+                // The header counts *pairs*, not elements, so a 3-entry map is
+                // `%3` followed by six values.
+                let _ = write!(out, "%{}\r\n", pairs.len());
+                for (k, v) in pairs {
+                    k.serialize_into(out);
+                    v.serialize_into(out);
+                }
+            }
         }
     }
 
@@ -84,6 +99,7 @@ impl Value {
             b'$' => Self::parse_bulk_string(buffer),
             b'*' => Self::parse_array(buffer, depth),
             b'>' => Self::parse_push(buffer, depth),
+            b'%' => Self::parse_map(buffer, depth),
             _ => Err("Invalid RESP type".to_string()),
         }
     }
@@ -190,6 +206,39 @@ impl Value {
                     }
                 }
                 Ok((Value::Push(arr), offset))
+            }
+            None => Err("Incomplete".to_string()),
+        }
+    }
+
+    fn parse_map(buffer: &[u8], depth: usize) -> Result<(Value, usize), String> {
+        if depth >= MAX_ARRAY_DEPTH {
+            return Err("ERR max nesting depth exceeded".to_string());
+        }
+        match Self::read_until_crlf(buffer) {
+            Some((data, mut offset)) => {
+                let s = String::from_utf8_lossy(data);
+                let count: u64 = s.parse().map_err(|_| "Invalid map length".to_string())?;
+                // Each pair is two values, so the element budget is halved.
+                if count as usize > MAX_ARRAY_ELEMENTS / 2 {
+                    return Err(format!(
+                        "ERR map too large ({} > {} pairs)",
+                        count,
+                        MAX_ARRAY_ELEMENTS / 2
+                    ));
+                }
+                let mut pairs = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    let (k, klen) = Self::parse_inner(&buffer[offset..], depth + 1)?;
+                    offset += klen;
+                    let (v, vlen) = Self::parse_inner(&buffer[offset..], depth + 1)?;
+                    offset += vlen;
+                    pairs.push((k, v));
+                    if offset > MAX_TOTAL_MESSAGE_BYTES {
+                        return Err("ERR message too large".to_string());
+                    }
+                }
+                Ok((Value::Map(pairs), offset))
             }
             None => Err("Incomplete".to_string()),
         }
@@ -341,6 +390,21 @@ mod tests {
 
     #[test]
     fn push_round_trip() {
+        round_trip(&Value::Map(vec![]));
+        round_trip(&Value::Map(vec![(
+            Value::BulkString(Some(b"proto".to_vec())),
+            Value::Integer(3),
+        )]));
+        round_trip(&Value::Map(vec![
+            (
+                Value::BulkString(Some(b"server".to_vec())),
+                Value::BulkString(Some(b"recached".to_vec())),
+            ),
+            (
+                Value::BulkString(Some(b"modules".to_vec())),
+                Value::Array(Some(vec![])),
+            ),
+        ]));
         round_trip(&Value::Push(vec![]));
         round_trip(&Value::Push(vec![
             Value::BulkString(Some(b"SET".to_vec())),
@@ -352,6 +416,48 @@ mod tests {
             Value::BulkString(Some(b"alerts".to_vec())),
             Value::BulkString(Some(b"hello".to_vec())),
         ]));
+    }
+
+    #[test]
+    fn map_header_counts_pairs_not_elements() {
+        // `%N` means N key/value *pairs* — 2N values follow. Emitting the
+        // element count instead would desynchronise every downstream parser.
+        let m = Value::Map(vec![
+            (Value::BulkString(Some(b"a".to_vec())), Value::Integer(1)),
+            (Value::BulkString(Some(b"b".to_vec())), Value::Integer(2)),
+        ]);
+        let bytes = m.serialize();
+        assert!(
+            bytes.starts_with(b"%2\r\n"),
+            "got {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let (parsed, n) = Value::parse(&bytes).unwrap();
+        assert_eq!(parsed, m);
+        assert_eq!(n, bytes.len(), "must consume exactly the frame");
+    }
+
+    #[test]
+    fn map_rejects_a_malformed_length() {
+        assert!(Value::parse(b"%x\r\n").is_err());
+        assert!(Value::parse(b"%-1\r\n").is_err());
+    }
+
+    #[test]
+    fn truncated_map_is_incomplete_not_an_error() {
+        // A partial frame must be retried once more bytes arrive, not rejected.
+        let full = Value::Map(vec![(
+            Value::BulkString(Some(b"k".to_vec())),
+            Value::Integer(7),
+        )])
+        .serialize();
+        for cut in 1..full.len() {
+            assert_eq!(
+                Value::parse(&full[..cut]),
+                Err("Incomplete".to_string()),
+                "prefix of length {cut} should be incomplete"
+            );
+        }
     }
 
     #[test]

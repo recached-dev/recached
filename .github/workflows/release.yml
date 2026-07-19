@@ -1,4 +1,13 @@
-name: Release Binaries
+name: Release
+
+# One workflow for everything a tag ships: GitHub Release binaries, the
+# multi-arch container image, and the three npm packages.
+#
+# These were three separate workflows on the same `v*` trigger, which produced
+# three entries per tag in the Actions list and, more importantly, three
+# independent runs — npm could publish while the binaries failed, leaving a
+# half-released version. An npm publish cannot be undone after 72 hours, so
+# nothing publishes until the full CI suite and the tag checks have passed.
 
 on:
   push:
@@ -7,10 +16,62 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+# Two tags pushed close together must not publish over each other.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build-and-upload:
+  # ── Gates ───────────────────────────────────────────────────────────────────
+  #
+  # The full CI suite: fmt, clippy, tests, both coverage floors, browser tests,
+  # and the React/Vue typechecks. Reused rather than restated so the release
+  # gate cannot drift from what CI actually enforces on the branch.
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
+  tag-checks:
+    name: Verify tag
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # The npm job rewrites each package version from the tag, so a tag that
+      # disagrees with Cargo.toml would publish artifacts labelled with a
+      # version the source never claimed. Catch it before anything ships.
+      - name: Check tag matches workspace version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          echo "tag=$TAG_VERSION cargo=$CARGO_VERSION"
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $CARGO_VERSION"
+            exit 1
+          fi
+
+      # A release whose notes were never written is a release nobody can read.
+      - name: Check CHANGELOG has an entry for this version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if ! grep -qE "^## \[?${TAG_VERSION}\]?" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$TAG_VERSION]' section"
+            exit 1
+          fi
+          if grep -qE "^## \[?${TAG_VERSION}\]?.*Unreleased" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md still marks $TAG_VERSION as Unreleased"
+            exit 1
+          fi
+
+  # ── Binaries ────────────────────────────────────────────────────────────────
+  binaries:
     name: Build (${{ matrix.target }})
+    needs: [ci, tag-checks]
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: write
@@ -65,3 +126,142 @@ jobs:
           asset_name: ${{ matrix.artifact }}
           tag: ${{ github.ref }}
           overwrite: true
+
+  # ── Container image ─────────────────────────────────────────────────────────
+  docker:
+    name: Build and push multi-arch image
+    needs: [ci, tag-checks]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      # Required for multi-platform builds (linux/amd64 + linux/arm64)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── npm packages ────────────────────────────────────────────────────────────
+  #
+  # The framework SDKs depend on recached-edge, so it publishes first.
+  npm-wasm:
+    name: Publish recached-edge to NPM
+    needs: [ci, tag-checks]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "recached-wasm-cache"
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Build Wasm package
+        run: wasm-pack build wasm-edge --target web --release --out-name recached-edge
+
+      - name: Copy LICENSE + NOTICE into package
+        run: cp LICENSE.md NOTICE wasm-edge/pkg/
+
+      - name: Set package name and version
+        # wasm-pack derives the npm name and version from the crate — patch both so the
+        # published package always matches the git tag (e.g. v0.1.5 → 0.1.5).
+        run: |
+          node -e "
+            const fs = require('fs');
+            const path = 'wasm-edge/pkg/package.json';
+            const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
+            pkg.name = 'recached-edge';
+            pkg.version = process.env.TAG_VERSION.replace(/^v/, '');
+            fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+            console.log('Package:', pkg.name, pkg.version);
+          "
+        env:
+          TAG_VERSION: ${{ github.ref_name }}
+
+      - name: Publish to NPM
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: cd wasm-edge/pkg && npm publish --access public
+
+  npm-sdks:
+    name: Publish @recached/${{ matrix.package }} to NPM
+    needs: npm-wasm
+    runs-on: ubuntu-latest
+
+    strategy:
+      # One SDK failing must not stop the other from publishing: they are
+      # independent packages, and finishing a partial release is easier than
+      # unpicking one.
+      fail-fast: false
+      matrix:
+        package: [react, vue]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        run: cd sdks/recached-${{ matrix.package }} && npm install --legacy-peer-deps
+
+      - name: Typecheck
+        run: cd sdks/recached-${{ matrix.package }} && npm run typecheck
+
+      - name: Build
+        run: cd sdks/recached-${{ matrix.package }} && npm run build
+
+      - name: Copy LICENSE + NOTICE into package
+        run: cp LICENSE.md NOTICE sdks/recached-${{ matrix.package }}/
+
+      - name: Publish to NPM
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: cd sdks/recached-${{ matrix.package }} && npm publish --access public

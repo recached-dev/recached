@@ -5,6 +5,9 @@ on:
     branches: ["main", "dev"]
   pull_request:
     branches: ["main", "dev"]
+  # Callable so the release workflow gates on the *same* checks rather than a
+  # re-declared subset that can drift out of step with this file.
+  workflow_call:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
