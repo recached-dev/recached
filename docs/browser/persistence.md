@@ -1,5 +1,11 @@
 # Persistence
 
+::: warning Requires recached-edge 0.2.1 or later
+On 0.1.1 – 0.2.0, write-ahead-log compaction cleared the WAL and then panicked before writing the
+replacement snapshot, destroying the persisted cache. See
+[Getting Started](/browser/getting-started) for the full detail.
+:::
+
 By default, the `recached-edge` cache lives in WASM memory and is lost on page refresh. Enabling persistence writes a WAL (write-ahead log) to IndexedDB, so the cache is hydrated immediately on the next page load — before any network request completes.
 
 ## How the IndexedDB WAL works

@@ -31,6 +31,11 @@ features = [
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.3", features = ["wasm_js"] }
 
+# Browser-only tests: the IndexedDB persistence paths cannot run on a native
+# target. Run with `wasm-pack test --headless --chrome wasm-edge`.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
 # Recent Rust toolchains emit newer wasm features (bulk-memory, nontrapping
 # float-to-int, …) that the older `wasm-opt` wasm-pack downloads rejects during
 # validation. Disabling wasm-opt avoids the version mismatch entirely; the

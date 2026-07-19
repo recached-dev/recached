@@ -10,3 +10,8 @@ indexmap.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+# `SystemTime::now()` is unsupported on wasm32-unknown-unknown and panics. This
+# crate is compiled into the browser SDK, so it needs the platform clock there.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys.workspace = true

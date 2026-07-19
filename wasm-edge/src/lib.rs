@@ -139,15 +139,31 @@ fn to_resp_owned(parts: &[String]) -> String {
 /// snapshot commands so the next replay is fast regardless of write history.
 const WAL_COMPACT_THRESHOLD: u32 = 1000;
 
+/// Milliseconds since the Unix epoch, from whichever clock the target has.
+#[cfg(target_arch = "wasm32")]
+fn wall_clock_ms() -> u64 {
+    js_sys::Date::now() as u64
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn wall_clock_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 /// Convert snapshot entries into minimal RESP command strings suitable for
 /// storing in the WAL. Each entry produces one command; entries with a TTL on
 /// collection types produce an extra PEXPIREAT command.
 fn snapshot_to_resp_cmds(entries: &[SnapshotEntry]) -> Vec<String> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    // `SystemTime::now()` is unsupported on wasm32-unknown-unknown and panics
+    // outright. This runs inside WAL compaction, immediately after the WAL has
+    // been cleared — a panic here therefore destroys the entire persisted cache
+    // rather than merely failing. Use the platform clock the rest of this crate
+    // already uses in the browser.
+    let now_ms = wall_clock_ms();
 
     let mut out = Vec::new();
     for e in entries {
@@ -289,8 +305,11 @@ struct WsShared {
     /// reconnects over the live socket.
     generation: Rc<Cell<u64>>,
     /// Keeps the pending reconnect timer's callback alive until it fires.
-    reconnect_cb: Rc<RefCell<Option<Closure<dyn FnMut()>>>>,
+    reconnect_cb: ReconnectCallback,
 }
+
+/// Handle to the pending reconnect timer's callback, kept alive until it fires.
+type ReconnectCallback = Rc<RefCell<Option<Closure<dyn FnMut()>>>>;
 
 /// Delete an acknowledged (or evicted) outbox row from durable storage.
 fn outbox_delete(sh: &WsShared, id: u64) {
@@ -356,7 +375,7 @@ fn queue_write(sh: &WsShared, encoded: &str, dedup: bool) {
         .enqueue_write(encoded, dedup, connected);
     if let Some(old) = e.dropped {
         outbox_delete(sh, old);
-        let _ = web_sys::console::warn_1(&JsValue::from_str(
+        web_sys::console::warn_1(&JsValue::from_str(
             "recached: offline write queue full — dropped the oldest queued write",
         ));
     }
@@ -623,7 +642,11 @@ impl RecachedCache {
                         restored.push((id, cmd));
                     }
                 }
-                for (old_id, new_id, frame) in core.borrow_mut().restore_outbox(restored) {
+                // Collect before awaiting: holding the `RefCell` borrow across an
+                // await lets an incoming WebSocket frame re-enter and panic on a
+                // double borrow, killing the client mid-hydration.
+                let renumbered = core.borrow_mut().restore_outbox(restored);
+                for (old_id, new_id, frame) in renumbered {
                     if new_id != old_id {
                         let _ = JsFuture::from(idb_outbox_delete_js(&db, old_id as f64)).await;
                         let _ = JsFuture::from(idb_outbox_put_js(&db, new_id as f64, &frame)).await;
@@ -788,7 +811,7 @@ impl RecachedCache {
     /// asynchronously via onmessage.
     pub fn auth(&self, password: &str) -> String {
         if self.ws_is_plaintext {
-            let _ = web_sys::console::warn_1(&JsValue::from_str(
+            web_sys::console::warn_1(&JsValue::from_str(
                 "recached: AUTH over unencrypted ws:// exposes the password in plaintext; use wss://",
             ));
         }
@@ -1050,5 +1073,574 @@ impl RecachedCache {
     /// Unsubscribe from a channel on the server.
     pub fn unsubscribe(&self, channel: &str) {
         self.ws_enqueue_nodedup(&to_resp(&["UNSUBSCRIBE", channel]));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+//
+// Only the parts of this crate that do not touch `web_sys`/`js_sys` can run on
+// a native target. That is the WAL encoding and the frame builders — the
+// correctness-critical, browser-independent logic. The socket, IndexedDB, and
+// `Closure` plumbing needs `wasm-bindgen-test` in a headless browser and is
+// covered end-to-end by the JS SDK suite instead.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn entry(key: &str, value: SnapshotValue, expires_at_ms: Option<u64>) -> SnapshotEntry {
+        SnapshotEntry {
+            key: key.to_string(),
+            value,
+            expires_at_ms,
+        }
+    }
+
+    fn now_ms() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
+    /// Join the emitted RESP frames for substring assertions.
+    fn joined(entries: &[SnapshotEntry]) -> String {
+        snapshot_to_resp_cmds(entries).join("")
+    }
+
+    // ── WAL encoding: every value type must survive a page reload ─────────────
+
+    #[test]
+    fn strings_persist_as_set() {
+        let out = snapshot_to_resp_cmds(&[entry("k", SnapshotValue::Str("v".into()), None)]);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains("SET") && out[0].contains("k") && out[0].contains("v"));
+    }
+
+    #[test]
+    fn hashes_persist_every_field() {
+        let mut m = HashMap::new();
+        m.insert("f1".to_string(), "v1".to_string());
+        m.insert("f2".to_string(), "v2".to_string());
+        let s = joined(&[entry("h", SnapshotValue::Hash(m), None)]);
+        assert!(s.contains("HSET"));
+        for part in ["f1", "v1", "f2", "v2"] {
+            assert!(s.contains(part), "field {part} lost from WAL: {s}");
+        }
+    }
+
+    #[test]
+    fn lists_persist_in_order_with_rpush() {
+        // RPUSH (not LPUSH) — replaying with LPUSH would reverse the list.
+        let s = joined(&[entry(
+            "l",
+            SnapshotValue::List(vec!["a".into(), "b".into(), "c".into()]),
+            None,
+        )]);
+        assert!(s.contains("RPUSH"), "{s}");
+        let (ia, ib, ic) = (
+            s.find("\r\na\r\n").unwrap(),
+            s.find("\r\nb\r\n").unwrap(),
+            s.find("\r\nc\r\n").unwrap(),
+        );
+        assert!(ia < ib && ib < ic, "list order not preserved: {s}");
+    }
+
+    #[test]
+    fn sets_and_zsets_persist_with_their_members() {
+        let s = joined(&[entry(
+            "st",
+            SnapshotValue::Set(vec!["m1".into(), "m2".into()]),
+            None,
+        )]);
+        assert!(s.contains("SADD") && s.contains("m1") && s.contains("m2"));
+
+        let z = joined(&[entry(
+            "z",
+            SnapshotValue::ZSet(vec![("alice".into(), 1.5), ("bob".into(), 2.0)]),
+            None,
+        )]);
+        assert!(z.contains("ZADD"), "{z}");
+        // ZADD takes score before member.
+        assert!(
+            z.find("1.5").unwrap() < z.find("alice").unwrap(),
+            "score must precede member: {z}"
+        );
+        // Whole scores serialize without a trailing .0, matching the server.
+        assert!(z.contains("\r\n2\r\n"), "expected bare '2' score: {z}");
+    }
+
+    #[test]
+    fn json_documents_persist_as_a_root_jset() {
+        let s = joined(&[entry("j", SnapshotValue::Json("{\"a\":1}".into()), None)]);
+        assert!(
+            s.contains("JSET") && s.contains("$") && s.contains("{\"a\":1}"),
+            "{s}"
+        );
+    }
+
+    // ── TTL handling ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn already_expired_entries_are_dropped_not_resurrected() {
+        // Replaying an expired key would bring deleted data back on reload.
+        let out = snapshot_to_resp_cmds(&[
+            entry("dead", SnapshotValue::Str("v".into()), Some(1)),
+            entry("live", SnapshotValue::Str("v".into()), None),
+        ]);
+        let s = out.join("");
+        assert!(!s.contains("dead"), "expired key resurrected: {s}");
+        assert!(s.contains("live"));
+    }
+
+    #[test]
+    fn strings_with_a_ttl_carry_remaining_time_not_absolute() {
+        // PX is relative: persisting an absolute timestamp here would set a TTL
+        // decades in the future.
+        let exp = now_ms() + 60_000;
+        let s = joined(&[entry("k", SnapshotValue::Str("v".into()), Some(exp))]);
+        assert!(s.contains("PX"), "{s}");
+        assert!(
+            !s.contains(&exp.to_string()),
+            "absolute expiry leaked into a relative PX: {s}"
+        );
+    }
+
+    #[test]
+    fn collections_with_a_ttl_get_a_separate_pexpireat() {
+        // Collection commands cannot carry an inline TTL, so the expiry rides
+        // in a second command — as an absolute timestamp this time.
+        let exp = now_ms() + 60_000;
+        let out =
+            snapshot_to_resp_cmds(&[entry("l", SnapshotValue::List(vec!["a".into()]), Some(exp))]);
+        assert_eq!(out.len(), 2, "expected RPUSH + PEXPIREAT: {out:?}");
+        assert!(out[1].contains("PEXPIREAT") && out[1].contains(&exp.to_string()));
+    }
+
+    #[test]
+    fn a_string_with_a_ttl_emits_only_one_command() {
+        let exp = now_ms() + 60_000;
+        let out = snapshot_to_resp_cmds(&[entry("k", SnapshotValue::Str("v".into()), Some(exp))]);
+        assert_eq!(out.len(), 1, "SET carries PX inline: {out:?}");
+    }
+
+    // ── Entries that must not be written ──────────────────────────────────────
+
+    #[test]
+    fn empty_collections_emit_nothing() {
+        // `RPUSH key` with no members is a syntax error on replay, which would
+        // abort WAL hydration part-way through.
+        let out = snapshot_to_resp_cmds(&[
+            entry("h", SnapshotValue::Hash(HashMap::new()), None),
+            entry("l", SnapshotValue::List(vec![]), None),
+            entry("s", SnapshotValue::Set(vec![]), None),
+            entry("z", SnapshotValue::ZSet(vec![]), None),
+        ]);
+        assert!(out.is_empty(), "empty collections must be skipped: {out:?}");
+    }
+
+    #[test]
+    fn rate_limiter_state_is_not_persisted_in_the_browser() {
+        // Attempt state is server-side and transient; replaying it locally
+        // would let a client fabricate its own rate-limit history.
+        let out = snapshot_to_resp_cmds(&[entry(
+            "rl",
+            SnapshotValue::RateLimiter {
+                limit: 10,
+                window_ms: 1000,
+                events: vec![1, 2, 3],
+            },
+            None,
+        )]);
+        assert!(
+            out.is_empty(),
+            "rate-limiter state leaked into the WAL: {out:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_snapshot_produces_no_commands() {
+        assert!(snapshot_to_resp_cmds(&[]).is_empty());
+    }
+
+    #[test]
+    fn every_emitted_command_is_a_well_formed_resp_array() {
+        let mut m = HashMap::new();
+        m.insert("f".to_string(), "v".to_string());
+        let out = snapshot_to_resp_cmds(&[
+            entry("s", SnapshotValue::Str("v".into()), None),
+            entry("h", SnapshotValue::Hash(m), None),
+            entry("l", SnapshotValue::List(vec!["a".into()]), None),
+            entry("z", SnapshotValue::ZSet(vec![("m".into(), 1.0)]), None),
+        ]);
+        assert_eq!(out.len(), 4);
+        for frame in &out {
+            assert!(frame.starts_with('*'), "not a RESP array: {frame}");
+            assert!(frame.ends_with("\r\n"), "unterminated frame: {frame}");
+            // A parseable frame is the only guarantee that replay will work.
+            assert!(
+                core_engine::resp::Value::parse(frame.as_bytes()).is_ok(),
+                "WAL frame does not parse: {frame}"
+            );
+        }
+    }
+
+    #[test]
+    fn wal_round_trips_through_the_real_engine() {
+        // The strongest check: encode a snapshot, replay it into a fresh store
+        // exactly as hydration does, and confirm the data comes back.
+        use core_engine::cmd::Command;
+        use core_engine::store::KeyValueStore;
+
+        let mut m = HashMap::new();
+        m.insert("f".to_string(), "v".to_string());
+        let cmds = snapshot_to_resp_cmds(&[
+            entry("str", SnapshotValue::Str("hello".into()), None),
+            entry("h", SnapshotValue::Hash(m), None),
+            entry("l", SnapshotValue::List(vec!["a".into(), "b".into()]), None),
+            entry("st", SnapshotValue::Set(vec!["m".into()]), None),
+            entry("z", SnapshotValue::ZSet(vec![("alice".into(), 1.5)]), None),
+        ]);
+
+        let store = KeyValueStore::new();
+        for frame in &cmds {
+            let (value, _) = core_engine::resp::Value::parse(frame.as_bytes()).unwrap();
+            store.execute(Command::from_value(value).unwrap());
+        }
+
+        assert_eq!(
+            store.execute(Command::Get("str".into())),
+            core_engine::resp::Value::BulkString(Some(b"hello".to_vec()))
+        );
+        assert_eq!(
+            store.execute(Command::HGet("h".into(), "f".into())),
+            core_engine::resp::Value::BulkString(Some(b"v".to_vec()))
+        );
+        assert_eq!(
+            store.execute(Command::LLen("l".into())),
+            core_engine::resp::Value::Integer(2)
+        );
+        assert_eq!(
+            store.execute(Command::SIsMember("st".into(), "m".into())),
+            core_engine::resp::Value::Integer(1)
+        );
+        assert_eq!(
+            store.execute(Command::ZScore("z".into(), "alice".into())),
+            core_engine::resp::Value::BulkString(Some(b"1.5".to_vec()))
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Browser tests
+//
+// These exercise the IndexedDB persistence layer, which cannot run on a native
+// target — `wasm_bindgen_test_configure!(run_in_browser)` puts them in a real
+// browser with a real IndexedDB.
+//
+//     wasm-pack test --headless --chrome wasm-edge
+//
+// Scope: durable storage only (WAL, outbox, meta). The WebSocket and reconnect
+// paths need a live server alongside the browser and are not covered here.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod browser_tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    async fn open_db() -> JsValue {
+        JsFuture::from(open_recached_db())
+            .await
+            .expect("IndexedDB should open")
+    }
+
+    /// Start every test from an empty database — IndexedDB persists across
+    /// tests in the same browser session, so leftover rows would make results
+    /// depend on execution order.
+    async fn fresh_db() -> JsValue {
+        let db = open_db().await;
+        JsFuture::from(idb_clear_js(&db)).await.expect("clear");
+        db
+    }
+
+    /// `(keys, values)` from a `readAll`-shaped JS result.
+    fn split_pairs(res: &JsValue) -> (Vec<f64>, Vec<String>) {
+        let arr = js_sys::Array::from(res);
+        let keys = js_sys::Array::from(&arr.get(0));
+        let vals = js_sys::Array::from(&arr.get(1));
+        (
+            keys.iter().map(|k| k.as_f64().unwrap_or(-1.0)).collect(),
+            vals.iter()
+                .map(|v| v.as_string().unwrap_or_default())
+                .collect(),
+        )
+    }
+
+    async fn wal_rows(db: &JsValue) -> (Vec<f64>, Vec<String>) {
+        let res = JsFuture::from(idb_read_all(db)).await.expect("wal read");
+        split_pairs(&res)
+    }
+
+    async fn outbox_rows(db: &JsValue) -> (Vec<f64>, Vec<String>) {
+        let res = JsFuture::from(idb_outbox_read_all(db))
+            .await
+            .expect("outbox read");
+        split_pairs(&res)
+    }
+
+    // ── Engine smoke test ─────────────────────────────────────────────────────
+
+    #[wasm_bindgen_test]
+    fn core_engine_operates_in_the_browser() {
+        // Regression guard. `core-engine` reads a clock on essentially every
+        // operation (TTL checks, LRU recency), and `SystemTime::now()` panics
+        // on wasm32-unknown-unknown — which made every store write abort in the
+        // browser. Native tests cannot catch this; only a real wasm target can.
+        use core_engine::cmd::{Command, SetOptions};
+        use core_engine::store::KeyValueStore;
+
+        let store = KeyValueStore::new();
+        assert_eq!(
+            store.execute(Command::Set("k".into(), "v".into(), SetOptions::default())),
+            core_engine::resp::Value::SimpleString("OK".into())
+        );
+        assert_eq!(
+            store.execute(Command::Get("k".into())),
+            core_engine::resp::Value::BulkString(Some(b"v".to_vec()))
+        );
+        // TTL paths read the clock twice — set and check.
+        store.execute(Command::Set(
+            "ttl".into(),
+            "v".into(),
+            SetOptions {
+                expiry: Some(core_engine::cmd::SetExpiry::Ex(60)),
+                ..Default::default()
+            },
+        ));
+        match store.execute(Command::Ttl("ttl".into())) {
+            core_engine::resp::Value::Integer(n) => assert!(n > 0, "expected a live TTL, got {n}"),
+            other => panic!("unexpected TTL reply: {other:?}"),
+        }
+    }
+
+    // ── Schema ────────────────────────────────────────────────────────────────
+
+    #[wasm_bindgen_test]
+    async fn database_opens_with_all_three_stores() {
+        // A missing store means an upgrade path was skipped and every write to
+        // it throws at runtime.
+        let db = open_db().await;
+        let names = js_sys::Reflect::get(&db, &JsValue::from_str("objectStoreNames"))
+            .expect("objectStoreNames");
+        let contains =
+            js_sys::Reflect::get(&names, &JsValue::from_str("contains")).expect("contains fn");
+        let f = js_sys::Function::from(contains);
+        for store in ["wal", "outbox", "meta"] {
+            let has = f
+                .call1(&names, &JsValue::from_str(store))
+                .expect("call contains");
+            assert!(
+                has.as_bool().unwrap_or(false),
+                "missing object store: {store}"
+            );
+        }
+    }
+
+    // ── WAL ───────────────────────────────────────────────────────────────────
+
+    #[wasm_bindgen_test]
+    async fn wal_appends_are_read_back_in_sequence_order() {
+        // Replay order is the whole point of the WAL: applying writes out of
+        // order reconstructs the wrong state on reload.
+        let db = fresh_db().await;
+        for (seq, cmd) in [(1.0, "SET a 1"), (2.0, "SET b 2"), (3.0, "SET a 3")] {
+            JsFuture::from(idb_append_js(&db, seq, cmd))
+                .await
+                .expect("append");
+        }
+        let (keys, vals) = wal_rows(&db).await;
+        assert_eq!(keys, vec![1.0, 2.0, 3.0], "IndexedDB returns keys sorted");
+        assert_eq!(vals[2], "SET a 3", "last write for a key must come last");
+    }
+
+    #[wasm_bindgen_test]
+    async fn wal_clear_leaves_the_outbox_intact() {
+        // Compaction clears the WAL only. Wiping the outbox here would discard
+        // writes the server has not acknowledged yet — silent data loss.
+        let db = fresh_db().await;
+        JsFuture::from(idb_append_js(&db, 1.0, "SET a 1"))
+            .await
+            .expect("append");
+        JsFuture::from(idb_outbox_put_js(&db, 10.0, "PENDING WRITE"))
+            .await
+            .expect("outbox put");
+
+        JsFuture::from(idb_wal_clear_js(&db))
+            .await
+            .expect("wal clear");
+
+        assert!(wal_rows(&db).await.0.is_empty(), "WAL should be empty");
+        let (ids, _) = outbox_rows(&db).await;
+        assert_eq!(ids, vec![10.0], "pending write must survive WAL compaction");
+    }
+
+    #[wasm_bindgen_test]
+    async fn full_clear_empties_every_store() {
+        let db = open_db().await;
+        JsFuture::from(idb_append_js(&db, 1.0, "SET a 1"))
+            .await
+            .unwrap();
+        JsFuture::from(idb_outbox_put_js(&db, 1.0, "SET b 2"))
+            .await
+            .unwrap();
+
+        JsFuture::from(idb_clear_js(&db)).await.expect("clear");
+
+        assert!(wal_rows(&db).await.0.is_empty());
+        assert!(outbox_rows(&db).await.0.is_empty());
+    }
+
+    // ── Outbox ────────────────────────────────────────────────────────────────
+
+    #[wasm_bindgen_test]
+    async fn outbox_rows_survive_a_reopen() {
+        // The durability guarantee: a write made offline must still be there
+        // after the page is reloaded and the database reopened.
+        let db = fresh_db().await;
+        JsFuture::from(idb_outbox_put_js(&db, 7.0, "SET offline 1"))
+            .await
+            .expect("put");
+        drop(db);
+
+        let db2 = open_db().await;
+        let (ids, vals) = outbox_rows(&db2).await;
+        assert_eq!(ids, vec![7.0]);
+        assert_eq!(vals[0], "SET offline 1");
+    }
+
+    #[wasm_bindgen_test]
+    async fn deleting_an_acknowledged_row_leaves_the_others() {
+        let db = fresh_db().await;
+        for (id, cmd) in [(1.0, "SET a 1"), (2.0, "SET b 2"), (3.0, "SET c 3")] {
+            JsFuture::from(idb_outbox_put_js(&db, id, cmd))
+                .await
+                .unwrap();
+        }
+        JsFuture::from(idb_outbox_delete_js(&db, 2.0))
+            .await
+            .expect("delete");
+
+        let (ids, _) = outbox_rows(&db).await;
+        assert_eq!(ids, vec![1.0, 3.0], "only the acknowledged row is retired");
+    }
+
+    #[wasm_bindgen_test]
+    async fn putting_the_same_id_replaces_rather_than_duplicates() {
+        // Renumbering on restore re-puts rows; duplicates would replay a write
+        // twice.
+        let db = fresh_db().await;
+        JsFuture::from(idb_outbox_put_js(&db, 5.0, "FIRST"))
+            .await
+            .unwrap();
+        JsFuture::from(idb_outbox_put_js(&db, 5.0, "SECOND"))
+            .await
+            .unwrap();
+
+        let (ids, vals) = outbox_rows(&db).await;
+        assert_eq!(ids.len(), 1, "same key must overwrite");
+        assert_eq!(vals[0], "SECOND");
+    }
+
+    #[wasm_bindgen_test]
+    async fn deleting_a_missing_row_is_not_an_error() {
+        // Acknowledgements can race a restore; a delete for an already-retired
+        // id must not reject and abort the hydration loop.
+        let db = fresh_db().await;
+        JsFuture::from(idb_outbox_delete_js(&db, 999.0))
+            .await
+            .expect("deleting a missing row should resolve");
+    }
+
+    // ── Meta (client identity + epoch) ────────────────────────────────────────
+
+    #[wasm_bindgen_test]
+    async fn meta_round_trips_the_client_identity() {
+        // The client id and epoch are what make delivery exactly-once across
+        // reloads; losing them re-issues ids the server has already seen.
+        let db = fresh_db().await;
+        JsFuture::from(idb_meta_put(
+            &db,
+            "client_id",
+            &JsValue::from_str("abc-123"),
+        ))
+        .await
+        .expect("meta put");
+        let got = JsFuture::from(idb_meta_get(&db, "client_id"))
+            .await
+            .expect("meta get");
+        assert_eq!(got.as_string().as_deref(), Some("abc-123"));
+    }
+
+    #[wasm_bindgen_test]
+    async fn meta_stores_a_numeric_epoch() {
+        let db = fresh_db().await;
+        JsFuture::from(idb_meta_put(&db, "epoch", &JsValue::from_f64(4.0)))
+            .await
+            .expect("meta put");
+        let got = JsFuture::from(idb_meta_get(&db, "epoch"))
+            .await
+            .expect("get");
+        assert_eq!(got.as_f64(), Some(4.0));
+    }
+
+    #[wasm_bindgen_test]
+    async fn missing_meta_reads_as_undefined_not_an_error() {
+        // First run on a new browser: absence must be a normal value the caller
+        // can branch on, not a rejected promise.
+        let db = fresh_db().await;
+        let got = JsFuture::from(idb_meta_get(&db, "never_written"))
+            .await
+            .expect("missing key should resolve");
+        assert!(got.is_undefined() || got.is_null(), "got {got:?}");
+    }
+
+    // ── WAL + outbox interaction ──────────────────────────────────────────────
+
+    #[wasm_bindgen_test]
+    async fn a_snapshot_written_to_the_wal_replays_into_a_store() {
+        // End-to-end for the hydration path: encode a snapshot the way
+        // compaction does, persist it, read it back, and rebuild the cache.
+        use core_engine::cmd::Command;
+        use core_engine::store::KeyValueStore;
+
+        let db = fresh_db().await;
+        let cmds = snapshot_to_resp_cmds(&[SnapshotEntry {
+            key: "hydrated".into(),
+            value: SnapshotValue::Str("value".into()),
+            expires_at_ms: None,
+        }]);
+        for (i, cmd) in cmds.iter().enumerate() {
+            JsFuture::from(idb_append_js(&db, i as f64, cmd))
+                .await
+                .expect("append");
+        }
+
+        let (_, vals) = wal_rows(&db).await;
+        let store = KeyValueStore::new();
+        for frame in &vals {
+            let (value, _) = core_engine::resp::Value::parse(frame.as_bytes()).unwrap();
+            store.execute(Command::from_value(value).unwrap());
+        }
+        assert_eq!(
+            store.execute(Command::Get("hydrated".into())),
+            core_engine::resp::Value::BulkString(Some(b"value".to_vec()))
+        );
     }
 }

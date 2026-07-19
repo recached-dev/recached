@@ -1,5 +1,16 @@
 # Getting Started (Browser)
 
+::: danger recached-edge 0.1.1 – 0.2.0 are broken in the browser
+`core-engine` read the clock via `std::time::SystemTime::now()`, which **panics** on
+`wasm32-unknown-unknown`. The clock is read on nearly every operation, so **no store write
+completes** on those versions — and a client whose write-ahead log passed the compaction threshold
+erased its own persisted cache before the replacement snapshot was written.
+
+Fixed in **0.2.1**. Install `recached-edge@^0.2.1` or later.
+
+The Recached **server is unaffected**: it runs on a native target where the clock works normally.
+:::
+
 The `recached-edge` package is the TypeScript SDK for the browser WASM client. It gives you a `Cache` class backed by the same `core-engine` as the server, with optional WebSocket sync to a Recached server instance.
 
 ## Install

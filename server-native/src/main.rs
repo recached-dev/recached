@@ -26,7 +26,7 @@ use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 // ── metrics ───────────────────────────────────────────────────────────────────
 
@@ -278,11 +278,49 @@ fn load_private_key(path: &str) -> std::io::Result<PrivateKeyDer<'static>> {
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no private key found"))
 }
 
-/// Returns a `TlsAcceptor` if both `RECACHED_TLS_CERT` and `RECACHED_TLS_KEY`
-/// are set. Falls back to plain TCP when either is absent.
+/// Decides what a (cert, key) environment pair means, without touching the
+/// filesystem — split out from `load_tls_acceptor` so the security-relevant
+/// rule is unit-testable.
+///
+/// Setting only one half is treated as a fatal misconfiguration rather than a
+/// fallback to plaintext: an operator who set `RECACHED_TLS_CERT` intends TLS,
+/// and silently serving unencrypted traffic on both ports because the key
+/// variable was misspelled is a failure they would not detect until traffic had
+/// already been exposed.
+fn resolve_tls_paths(
+    cert: Option<String>,
+    key: Option<String>,
+) -> Result<Option<(String, String)>, String> {
+    match (cert, key) {
+        (None, None) => Ok(None),
+        (Some(c), Some(k)) => Ok(Some((c, k))),
+        (Some(_), None) => Err(
+            "RECACHED_TLS_CERT is set but RECACHED_TLS_KEY is not — refusing to start rather than \
+             silently serving plaintext. Set both, or neither."
+                .to_string(),
+        ),
+        (None, Some(_)) => Err(
+            "RECACHED_TLS_KEY is set but RECACHED_TLS_CERT is not — refusing to start rather than \
+             silently serving plaintext. Set both, or neither."
+                .to_string(),
+        ),
+    }
+}
+
+/// Returns a `TlsAcceptor` when both `RECACHED_TLS_CERT` and `RECACHED_TLS_KEY`
+/// are set, `None` when neither is. Exits if exactly one is set.
 fn load_tls_acceptor() -> Option<TlsAcceptor> {
-    let cert_path = std::env::var("RECACHED_TLS_CERT").ok()?;
-    let key_path = std::env::var("RECACHED_TLS_KEY").ok()?;
+    let (cert_path, key_path) = match resolve_tls_paths(
+        std::env::var("RECACHED_TLS_CERT").ok(),
+        std::env::var("RECACHED_TLS_KEY").ok(),
+    ) {
+        Ok(None) => return None,
+        Ok(Some(pair)) => pair,
+        Err(msg) => {
+            error!("{msg}");
+            std::process::exit(1);
+        }
+    };
 
     let cert_coll = load_certs(&cert_path).unwrap_or_else(|e| panic!("TLS cert {cert_path}: {e}"));
     let key = load_private_key(&key_path).unwrap_or_else(|e| panic!("TLS key {key_path}: {e}"));
@@ -326,6 +364,42 @@ fn now_unix_secs() -> i64 {
 
 /// Parse a human-readable memory size string (e.g. "512mb", "1gb", "262144")
 /// into a byte count. Returns None on parse failure.
+/// Parse `RECACHED_ALLOW_IPS` into exact addresses.
+///
+/// Every entry must parse. The previous behaviour logged and dropped invalid
+/// entries, which quietly narrowed a security control: a mistyped CIDR range
+/// like `10.0.0.0/8` produced an allowlist that did not include the hosts the
+/// operator wrote, and an entirely invalid list produced an empty one — which
+/// rejects *every* connection while the server still reports itself healthy.
+/// Refusing to start makes the misconfiguration impossible to miss.
+fn parse_allow_ips(raw: &str) -> Result<Vec<IpAddr>, String> {
+    let mut ips = Vec::new();
+    for entry in raw.split(',') {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match IpAddr::from_str(trimmed) {
+            Ok(ip) => ips.push(ip),
+            Err(_) => {
+                return Err(format!(
+                    "RECACHED_ALLOW_IPS: '{trimmed}' is not a valid IP address. Exact addresses \
+                     only — CIDR ranges and hostnames are not supported. Refusing to start rather \
+                     than applying a narrower allowlist than configured."
+                ));
+            }
+        }
+    }
+    if ips.is_empty() {
+        return Err(
+            "RECACHED_ALLOW_IPS is set but contains no valid addresses — this would reject every \
+             connection. Unset it to accept all connections."
+                .to_string(),
+        );
+    }
+    Ok(ips)
+}
+
 fn parse_memory_bytes(s: &str) -> Option<usize> {
     let s = s.trim().to_lowercase();
     if let Some(n) = s.strip_suffix("gb") {
@@ -1036,6 +1110,7 @@ fn verify_sync_token(secret: &str, token: &str) -> Result<Vec<String>, &'static 
 
 /// What a command touches, for scope enforcement on token-scoped WebSocket
 /// connections.
+#[derive(Debug)]
 enum CommandScope {
     /// No key access (PING, AUTH, MULTI, SYNC, pub/sub) — always allowed.
     KeyLess,
@@ -1326,7 +1401,7 @@ impl PubSubHub {
         let pattern_txs: Vec<(String, PubSubSender)> = self
             .pattern_subs
             .iter()
-            .filter(|(p, _, _)| glob_match(p, channel))
+            .filter(|(p, _, _)| core_engine::store::glob_match(p, channel))
             .map(|(p, _, tx)| (p.clone(), tx.clone()))
             .collect();
         for (pattern, tx) in pattern_txs {
@@ -1619,24 +1694,6 @@ fn resp_subscribe_ack(kind: &str, channel: &str, count: usize) -> Vec<u8> {
         Value::Integer(count as i64),
     ]))
     .serialize()
-}
-
-fn glob_match(pattern: &str, s: &str) -> bool {
-    glob_helper(pattern.as_bytes(), s.as_bytes())
-}
-
-fn glob_helper(pat: &[u8], s: &[u8]) -> bool {
-    match (pat.first(), s.first()) {
-        (None, None) => true,
-        (None, Some(_)) => false,
-        (Some(b'*'), _) => {
-            glob_helper(&pat[1..], s) || (!s.is_empty() && glob_helper(pat, &s[1..]))
-        }
-        (Some(b'?'), Some(_)) => glob_helper(&pat[1..], &s[1..]),
-        (Some(b'?'), None) | (Some(_), None) => false,
-        (Some(p), Some(c)) if p == c => glob_helper(&pat[1..], &s[1..]),
-        _ => false,
-    }
 }
 
 /// Encodes a list of string parts as a RESP3 Push frame for WebSocket fan-out.
@@ -2121,22 +2178,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── IP allowlist ──────────────────────────────────────────────────────
-    let allowed_ips: Option<Arc<Vec<IpAddr>>> = std::env::var("RECACHED_ALLOW_IPS").ok().map(|s| {
-        let ips: Vec<IpAddr> = s
-            .split(',')
-            .filter_map(|raw| {
-                let trimmed = raw.trim();
-                match IpAddr::from_str(trimmed) {
-                    Ok(ip) => Some(ip),
-                    Err(_) => {
-                        warn!("RECACHED_ALLOW_IPS: ignoring invalid entry '{}'", trimmed);
-                        None
-                    }
-                }
-            })
-            .collect();
-        Arc::new(ips)
-    });
+    let allowed_ips: Option<Arc<Vec<IpAddr>>> = match std::env::var("RECACHED_ALLOW_IPS").ok() {
+        None => None,
+        Some(raw) => match parse_allow_ips(&raw) {
+            Ok(ips) => Some(Arc::new(ips)),
+            Err(msg) => {
+                error!("{msg}");
+                std::process::exit(1);
+            }
+        },
+    };
 
     if let Some(ips) = &allowed_ips {
         info!("IP allowlist ENABLED: {:?}", ips);
@@ -4794,6 +4845,796 @@ mod tests {
                 assert!(k.contains(&"dst".to_string()) && k.contains(&"a".to_string()))
             }
             _ => panic!("SINTERSTORE should be key-scoped"),
+        }
+    }
+
+    // ── Scope enforcement: the authorization surface ──────────────────────────
+    //
+    // `command_scope` decides whether a command is checked against the
+    // connection's grants at all. A key-touching command misclassified as
+    // `KeyLess` skips the check entirely, so every family is pinned here.
+    // The match in `command_scope` is exhaustive over `Command` with no
+    // catch-all — a new variant fails to compile until classified — and these
+    // tests guard against the remaining risk: classifying one wrongly.
+
+    fn scoped_keys(cmd: Command) -> Vec<String> {
+        match command_scope(&cmd) {
+            CommandScope::Keys(k) => k,
+            other => panic!("{cmd:?} should be key-scoped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_single_key_command_family_is_key_scoped() {
+        let cases: Vec<(Command, &str)> = vec![
+            (Command::Get("k".into()), "k"),
+            (
+                Command::Set("k".into(), "v".into(), SetOptions::default()),
+                "k",
+            ),
+            (Command::Append("k".into(), "v".into()), "k"),
+            (Command::Incr("k".into()), "k"),
+            (Command::Decr("k".into()), "k"),
+            (Command::Ttl("k".into()), "k"),
+            (Command::Persist("k".into()), "k"),
+            (Command::Expire("k".into(), 1), "k"),
+            (Command::Type("k".into()), "k"),
+            (Command::HGet("k".into(), "f".into()), "k"),
+            (Command::HGetAll("k".into()), "k"),
+            (Command::LPush("k".into(), vec!["v".into()]), "k"),
+            (Command::LRange("k".into(), 0, -1), "k"),
+            (Command::SAdd("k".into(), vec!["m".into()]), "k"),
+            (Command::SMembers("k".into()), "k"),
+            (
+                Command::ZAdd("k".into(), ZAddOptions::default(), vec![(1.0, "m".into())]),
+                "k",
+            ),
+            (Command::ZScore("k".into(), "m".into()), "k"),
+            (Command::JGet("k".into(), None), "k"),
+            (Command::JSet("k".into(), "$".into(), "1".into()), "k"),
+            (Command::RlCheck("k".into(), None), "k"),
+        ];
+        for (cmd, expected) in cases {
+            let keys = scoped_keys(cmd.clone());
+            assert!(
+                keys.contains(&expected.to_string()),
+                "{cmd:?} must report key '{expected}', got {keys:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_key_commands_report_every_key_they_touch() {
+        // A key omitted here is a key that never gets scope-checked, because
+        // `scopes_match` only inspects the keys it is handed.
+        let rename = scoped_keys(Command::Rename("src".into(), "dst".into()));
+        assert!(
+            rename.contains(&"src".to_string()) && rename.contains(&"dst".to_string()),
+            "RENAME touches both keys, got {rename:?}"
+        );
+
+        let smove = scoped_keys(Command::SMove("src".into(), "dst".into(), "m".into()));
+        assert!(
+            smove.contains(&"src".to_string()) && smove.contains(&"dst".to_string()),
+            "SMOVE touches both sets, got {smove:?}"
+        );
+
+        let mset = scoped_keys(Command::MSet(vec![
+            ("a".into(), "1".into()),
+            ("b".into(), "2".into()),
+        ]));
+        assert!(
+            mset.contains(&"a".to_string()) && mset.contains(&"b".to_string()),
+            "MSET touches every key, got {mset:?}"
+        );
+
+        let mget = scoped_keys(Command::MGet(vec!["a".into(), "b".into()]));
+        assert!(mget.contains(&"a".to_string()) && mget.contains(&"b".to_string()));
+
+        let del = scoped_keys(Command::Del(vec!["a".into(), "b".into()]));
+        assert!(del.contains(&"a".to_string()) && del.contains(&"b".to_string()));
+
+        let exists = scoped_keys(Command::Exists(vec!["a".into(), "b".into()]));
+        assert!(exists.contains(&"a".to_string()) && exists.contains(&"b".to_string()));
+
+        let sunion = scoped_keys(Command::SUnionStore(
+            "dst".into(),
+            vec!["a".into(), "b".into()],
+        ));
+        for k in ["dst", "a", "b"] {
+            assert!(sunion.contains(&k.to_string()), "SUNIONSTORE missed {k}");
+        }
+    }
+
+    #[test]
+    fn administrative_commands_are_denied_not_merely_unscoped() {
+        // These would read or destroy data outside any grant, so they must map
+        // to Admin (refused) rather than KeyLess (silently allowed).
+        for cmd in [
+            Command::Keys("*".into()),
+            Command::Scan(0, None, None),
+            Command::DbSize,
+            Command::FlushDb,
+            Command::Save,
+            Command::BgSave,
+            Command::LastSave,
+            Command::ReplicaOfNoOne,
+        ] {
+            assert!(
+                matches!(command_scope(&cmd), CommandScope::Admin),
+                "{cmd:?} must be Admin-classified"
+            );
+        }
+    }
+
+    #[test]
+    fn keyless_commands_touch_no_keys() {
+        for cmd in [
+            Command::Ping(None),
+            Command::Auth("pw".into()),
+            Command::Multi,
+            Command::Exec,
+            Command::Discard,
+            Command::Subscribe(vec!["ch".into()]),
+            Command::Publish("ch".into(), "m".into()),
+            Command::Sync(vec![]),
+        ] {
+            assert!(
+                matches!(command_scope(&cmd), CommandScope::KeyLess),
+                "{cmd:?} should be KeyLess"
+            );
+        }
+    }
+
+    #[test]
+    fn dedup_envelope_inherits_the_inner_command_scope() {
+        // DEDUP wraps a real write. If the wrapper were treated as KeyLess, an
+        // attacker could smuggle any command past scope enforcement.
+        let inner = Command::Set("secret:1".into(), "v".into(), SetOptions::default());
+        let wrapped = Command::Dedup("client".into(), 1, Box::new(inner));
+        match command_scope(&wrapped) {
+            CommandScope::Keys(k) => assert_eq!(k, vec!["secret:1".to_string()]),
+            other => panic!("DEDUP must inherit inner scope, got {other:?}"),
+        }
+
+        // The same must hold for an admin inner command.
+        let wrapped_admin = Command::Dedup("client".into(), 2, Box::new(Command::FlushDb));
+        assert!(matches!(command_scope(&wrapped_admin), CommandScope::Admin));
+    }
+
+    #[test]
+    fn scopes_match_allows_when_there_are_no_keys_to_check() {
+        // Documented consequence of the design: an empty key list is allowed.
+        // That is only safe because `command_scope` returns `Keys(..)` for every
+        // key-touching command — the test above is what keeps it safe.
+        assert!(scopes_match(&["cart:*".to_string()], &[]));
+    }
+
+    #[test]
+    fn scopes_match_requires_every_key_to_match() {
+        let scopes = vec!["cart:42:*".to_string()];
+        assert!(scopes_match(&scopes, &["cart:42:a".to_string()]));
+        // One in-scope key does not license an out-of-scope sibling.
+        assert!(!scopes_match(&scopes, &["cart:99:a".to_string()]));
+    }
+
+    // ── Metrics labels ────────────────────────────────────────────────────────
+
+    // ── Exhaustive command classification ─────────────────────────────────────
+    //
+    // One instance of every `Command` variant, run through the three functions
+    // that decide scope enforcement and metrics. `command_scope` has no
+    // catch-all arm, so a new variant cannot compile without being classified —
+    // but nothing stops it being classified *wrongly*, and a key-touching
+    // command marked `KeyLess` silently bypasses scope checks entirely.
+
+    enum Expect {
+        KeyLess,
+        Admin,
+        Keys(&'static [&'static str]),
+    }
+
+    fn all_commands() -> Vec<(Command, Expect)> {
+        vec![
+            (Command::Ping(None), Expect::KeyLess),
+            (Command::Auth("pw".into()), Expect::KeyLess),
+            (
+                Command::Set("k".into(), "v".into(), SetOptions::default()),
+                Expect::Keys(&["k"]),
+            ),
+            (Command::Get("k".into()), Expect::Keys(&["k"])),
+            (Command::Del(vec!["k".into()]), Expect::Keys(&["k"])),
+            (Command::Unlink(vec!["k".into()]), Expect::Keys(&["k"])),
+            (
+                Command::Append("k".into(), "v".into()),
+                Expect::Keys(&["k"]),
+            ),
+            (Command::Strlen("k".into()), Expect::Keys(&["k"])),
+            (
+                Command::GetSet("k".into(), "v".into()),
+                Expect::Keys(&["k"]),
+            ),
+            (Command::MGet(vec!["k".into()]), Expect::Keys(&["k"])),
+            (Command::SetNx("k".into(), "v".into()), Expect::Keys(&["k"])),
+            (
+                Command::SetEx("k".into(), 1, "v".into()),
+                Expect::Keys(&["k"]),
+            ),
+            (
+                Command::PSetEx("k".into(), 1, "v".into()),
+                Expect::Keys(&["k"]),
+            ),
+            (
+                Command::MSet(vec![("k".into(), "v".into())]),
+                Expect::Keys(&["k"]),
+            ),
+            (Command::Incr("k".into()), Expect::Keys(&["k"])),
+            (Command::Decr("k".into()), Expect::Keys(&["k"])),
+            (Command::IncrBy("k".into(), 1), Expect::Keys(&["k"])),
+            (Command::DecrBy("k".into(), 1), Expect::Keys(&["k"])),
+            (Command::Expire("k".into(), 1), Expect::Keys(&["k"])),
+            (Command::PExpire("k".into(), 1), Expect::Keys(&["k"])),
+            (Command::ExpireAt("k".into(), 1), Expect::Keys(&["k"])),
+            (Command::PExpireAt("k".into(), 1), Expect::Keys(&["k"])),
+            (Command::Ttl("k".into()), Expect::Keys(&["k"])),
+            (Command::PTtl("k".into()), Expect::Keys(&["k"])),
+            (Command::Persist("k".into()), Expect::Keys(&["k"])),
+            (Command::Exists(vec!["k".into()]), Expect::Keys(&["k"])),
+            (Command::Keys("*".into()), Expect::Admin),
+            (Command::Scan(0, None, None), Expect::Admin),
+            (Command::DbSize, Expect::Admin),
+            (Command::FlushDb, Expect::Admin),
+            (
+                Command::Rename("k".into(), "d".into()),
+                Expect::Keys(&["k", "d"]),
+            ),
+            (Command::Type("k".into()), Expect::Keys(&["k"])),
+            (
+                Command::HSet("k".into(), vec![("f".into(), "v".into())]),
+                Expect::Keys(&["k"]),
+            ),
+            (Command::HGet("k".into(), "f".into()), Expect::Keys(&["k"])),
+            (Command::HGetAll("k".into()), Expect::Keys(&["k"])),
+            (
+                Command::HDel("k".into(), vec!["f".into()]),
+                Expect::Keys(&["k"]),
+            ),
+            (Command::HKeys("k".into()), Expect::Keys(&["k"])),
+            (Command::HVals("k".into()), Expect::Keys(&["k"])),
+            (Command::HLen("k".into()), Expect::Keys(&["k"])),
+            (
+                Command::HIncrBy("k".into(), "f".into(), 1),
+                Expect::Keys(&["k"]),
+            ),
+            (
+                Command::HIncrByFloat("k".into(), "f".into(), 1.0),
+                Expect::Keys(&["k"]),
+            ),
+            (
+                Command::HExists("k".into(), "f".into()),
+                Expect::Keys(&["k"]),
+            ),
+            (
+                Command::HSetNx("k".into(), "f".into(), "v".into()),
+                Expect::Keys(&["k"]),
+            ),
+            (
+                Command::HMGet("k".into(), vec!["f".into()]),
+                Expect::Keys(&["k"]),
+            ),
+            (
+                Command::LPush("k".into(), vec!["v".into()]),
+                Expect::Keys(&["k"]),
+            ),
+            (
+                Command::RPush("k".into(), vec!["v".into()]),
+                Expect::Keys(&["k"]),
+            ),
+            (
+                Command::LPushX("k".into(), vec!["v".into()]),
+                Expect::Keys(&["k"]),
+            ),
+            (
+                Command::RPushX("k".into(), vec!["v".into()]),
+                Expect::Keys(&["k"]),
+            ),
+            (Command::LPop("k".into(), None), Expect::Keys(&["k"])),
+            (Command::RPop("k".into(), None), Expect::Keys(&["k"])),
+            (Command::LRange("k".into(), 0, -1), Expect::Keys(&["k"])),
+            (Command::LLen("k".into()), Expect::Keys(&["k"])),
+            (Command::LIndex("k".into(), 0), Expect::Keys(&["k"])),
+            (
+                Command::LSet("k".into(), 0, "v".into()),
+                Expect::Keys(&["k"]),
+            ),
+            (
+                Command::LRem("k".into(), 0, "v".into()),
+                Expect::Keys(&["k"]),
+            ),
+            (Command::LTrim("k".into(), 0, -1), Expect::Keys(&["k"])),
+            (
+                Command::SAdd("k".into(), vec!["m".into()]),
+                Expect::Keys(&["k"]),
+            ),
+            (Command::SMembers("k".into()), Expect::Keys(&["k"])),
+            (
+                Command::SRem("k".into(), vec!["m".into()]),
+                Expect::Keys(&["k"]),
+            ),
+            (Command::SCard("k".into()), Expect::Keys(&["k"])),
+            (
+                Command::SIsMember("k".into(), "m".into()),
+                Expect::Keys(&["k"]),
+            ),
+            (
+                Command::SMIsMember("k".into(), vec!["m".into()]),
+                Expect::Keys(&["k"]),
+            ),
+            (Command::SInter(vec!["k".into()]), Expect::Keys(&["k"])),
+            (
+                Command::SInterStore("d".into(), vec!["k".into()]),
+                Expect::Keys(&["k", "d"]),
+            ),
+            (Command::SUnion(vec!["k".into()]), Expect::Keys(&["k"])),
+            (
+                Command::SUnionStore("d".into(), vec!["k".into()]),
+                Expect::Keys(&["k", "d"]),
+            ),
+            (Command::SDiff(vec!["k".into()]), Expect::Keys(&["k"])),
+            (
+                Command::SDiffStore("d".into(), vec!["k".into()]),
+                Expect::Keys(&["k", "d"]),
+            ),
+            (Command::SPop("k".into(), None), Expect::Keys(&["k"])),
+            (Command::SRandMember("k".into(), None), Expect::Keys(&["k"])),
+            (
+                Command::SMove("k".into(), "d".into(), "m".into()),
+                Expect::Keys(&["k", "d"]),
+            ),
+            (
+                Command::ZAdd("k".into(), ZAddOptions::default(), vec![(1.0, "m".into())]),
+                Expect::Keys(&["k"]),
+            ),
+            (
+                Command::ZRange("k".into(), 0, -1, false),
+                Expect::Keys(&["k"]),
+            ),
+            (
+                Command::ZRevRange("k".into(), 0, -1, false),
+                Expect::Keys(&["k"]),
+            ),
+            (
+                Command::ZRangeByScore("k".into(), "0".into(), "1".into(), false, None),
+                Expect::Keys(&["k"]),
+            ),
+            (
+                Command::ZRevRangeByScore("k".into(), "1".into(), "0".into(), false, None),
+                Expect::Keys(&["k"]),
+            ),
+            (
+                Command::ZScore("k".into(), "m".into()),
+                Expect::Keys(&["k"]),
+            ),
+            (
+                Command::ZMScore("k".into(), vec!["m".into()]),
+                Expect::Keys(&["k"]),
+            ),
+            (Command::ZRank("k".into(), "m".into()), Expect::Keys(&["k"])),
+            (
+                Command::ZRevRank("k".into(), "m".into()),
+                Expect::Keys(&["k"]),
+            ),
+            (
+                Command::ZRem("k".into(), vec!["m".into()]),
+                Expect::Keys(&["k"]),
+            ),
+            (Command::ZCard("k".into()), Expect::Keys(&["k"])),
+            (
+                Command::ZIncrBy("k".into(), 1.0, "m".into()),
+                Expect::Keys(&["k"]),
+            ),
+            (
+                Command::ZCount("k".into(), "0".into(), "1".into()),
+                Expect::Keys(&["k"]),
+            ),
+            (
+                Command::JSet("k".into(), "$".into(), "1".into()),
+                Expect::Keys(&["k"]),
+            ),
+            (Command::JGet("k".into(), None), Expect::Keys(&["k"])),
+            (
+                Command::JMerge("k".into(), "{}".into()),
+                Expect::Keys(&["k"]),
+            ),
+            (Command::RlSet("k".into(), 1, 1), Expect::Keys(&["k"])),
+            (Command::RlCheck("k".into(), None), Expect::Keys(&["k"])),
+            (Command::Multi, Expect::KeyLess),
+            (Command::Exec, Expect::KeyLess),
+            (Command::Discard, Expect::KeyLess),
+            (Command::Subscribe(vec!["ch".into()]), Expect::KeyLess),
+            (Command::Unsubscribe(vec!["ch".into()]), Expect::KeyLess),
+            (Command::PSubscribe(vec!["ch".into()]), Expect::KeyLess),
+            (Command::PUnsubscribe(vec!["ch".into()]), Expect::KeyLess),
+            (Command::Publish("ch".into(), "m".into()), Expect::KeyLess),
+            (Command::Watch(vec!["k".into()]), Expect::Keys(&["k"])),
+            (Command::Unwatch(vec!["k".into()]), Expect::Keys(&["k"])),
+            (Command::Sync(vec![]), Expect::KeyLess),
+            (Command::QSub("p:*".into()), Expect::KeyLess),
+            (Command::QUnsub(None), Expect::KeyLess),
+            (Command::Save, Expect::Admin),
+            (Command::BgSave, Expect::Admin),
+            (Command::LastSave, Expect::Admin),
+            (Command::ReplicaOfNoOne, Expect::Admin),
+            (Command::Unknown("X".into()), Expect::KeyLess),
+        ]
+    }
+
+    #[test]
+    fn every_command_is_classified_for_scope_enforcement() {
+        for (cmd, expect) in all_commands() {
+            match (command_scope(&cmd), &expect) {
+                (CommandScope::KeyLess, Expect::KeyLess) => {}
+                (CommandScope::Admin, Expect::Admin) => {}
+                (CommandScope::Keys(got), Expect::Keys(want)) => {
+                    for k in *want {
+                        assert!(
+                            got.contains(&k.to_string()),
+                            "{cmd:?} must scope-check key '{k}', reported {got:?}"
+                        );
+                    }
+                }
+                (got, _) => panic!("{cmd:?} classified as {got:?}, which is not what it touches"),
+            }
+        }
+    }
+
+    #[test]
+    fn every_command_has_a_metrics_label() {
+        for (cmd, _) in all_commands() {
+            let name = command_name(&cmd);
+            assert!(!name.is_empty(), "{cmd:?} has an empty metrics label");
+            assert_eq!(
+                name,
+                name.to_lowercase(),
+                "{cmd:?} label '{name}' must be lowercase for Prometheus"
+            );
+        }
+    }
+
+    #[test]
+    fn primary_keys_reports_writes_only() {
+        // `primary_keys` answers "what did this command *write*", for
+        // replication and push targeting — it is deliberately NOT the
+        // authorization function (that is `command_scope`). Reads report
+        // nothing because there is no mutation to broadcast.
+        for cmd in [
+            Command::Get("k".into()),
+            Command::Exists(vec!["k".into()]),
+            Command::Ttl("k".into()),
+            Command::LRange("k".into(), 0, -1),
+            Command::SMembers("k".into()),
+            Command::HGetAll("k".into()),
+        ] {
+            assert!(
+                primary_keys(&cmd).is_empty(),
+                "{cmd:?} is a read and must not be broadcast as a mutation"
+            );
+        }
+
+        // Writes must report every key they touch, or a replica or subscribed
+        // browser silently misses the change.
+        let writes: Vec<(Command, &[&str])> = vec![
+            (
+                Command::Set("k".into(), "v".into(), SetOptions::default()),
+                &["k"],
+            ),
+            (Command::Del(vec!["a".into(), "b".into()]), &["a", "b"]),
+            (Command::Incr("k".into()), &["k"]),
+            (Command::Rename("src".into(), "dst".into()), &["src", "dst"]),
+            (
+                Command::SMove("src".into(), "dst".into(), "m".into()),
+                &["src", "dst"],
+            ),
+            (
+                Command::MSet(vec![("a".into(), "1".into()), ("b".into(), "2".into())]),
+                &["a", "b"],
+            ),
+            (
+                Command::SInterStore("dst".into(), vec!["a".into()]),
+                &["dst"],
+            ),
+            (Command::LPush("k".into(), vec!["v".into()]), &["k"]),
+            (
+                Command::HSet("k".into(), vec![("f".into(), "v".into())]),
+                &["k"],
+            ),
+            (Command::JMerge("k".into(), "{}".into()), &["k"]),
+        ];
+        for (cmd, want) in writes {
+            let got = primary_keys(&cmd);
+            for k in want {
+                assert!(
+                    got.contains(&k.to_string()),
+                    "{cmd:?}: primary_keys missed written key '{k}', got {got:?}"
+                );
+            }
+        }
+    }
+
+    // ── Pub/Sub pattern matching ──────────────────────────────────────────────
+
+    #[test]
+    fn psubscribe_pattern_matching_is_not_exponential() {
+        // PSUBSCRIBE patterns are attacker-controlled, and every PUBLISH is
+        // matched against every registered pattern. This file previously used a
+        // recursive matcher that backtracked exponentially: a 10-wildcard
+        // pattern against a 36-character channel took ~7 s, so one subscriber
+        // could stall pub/sub for everyone. It now shares core-engine's DP
+        // matcher (verified equivalent). This test fails loudly if that
+        // regresses.
+        let pattern = "*a*a*a*a*a*a*a*a*a*a*b";
+        let channel = "a".repeat(200);
+        let start = std::time::Instant::now();
+        assert!(!core_engine::store::glob_match(pattern, &channel));
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(500),
+            "pattern matching took {:?} — exponential backtracking is back",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn pubsub_patterns_match_the_expected_channels() {
+        for (pat, ch, want) in [
+            ("news.*", "news.tech", true),
+            ("news.*", "news.", true),
+            ("news.*", "sports.tech", false),
+            ("*", "anything", true),
+            ("user.?", "user.1", true),
+            ("user.?", "user.42", false),
+        ] {
+            assert_eq!(
+                core_engine::store::glob_match(pat, ch),
+                want,
+                "pattern {pat:?} vs channel {ch:?}"
+            );
+        }
+    }
+
+    // ── Wire encoding ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn pubsub_message_encodes_as_a_resp_push_frame() {
+        let bytes = encode_pubsub_msg(PubSubMsg::Message {
+            channel: "news".into(),
+            message: "hello".into(),
+        });
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.starts_with('>'),
+            "must be a RESP3 Push frame: {text:?}"
+        );
+        assert!(text.contains("message"));
+        assert!(text.contains("news"));
+        assert!(text.contains("hello"));
+    }
+
+    #[test]
+    fn pattern_message_carries_the_matching_pattern() {
+        // A pmessage must name the pattern that matched, or a client
+        // subscribed to several patterns cannot tell them apart.
+        let bytes = encode_pubsub_msg(PubSubMsg::PMessage {
+            pattern: "news.*".into(),
+            channel: "news.tech".into(),
+            message: "hi".into(),
+        });
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("pmessage"));
+        assert!(text.contains("news.*"));
+        assert!(text.contains("news.tech"));
+    }
+
+    #[test]
+    fn subscribe_ack_reports_the_running_subscription_count() {
+        let bytes = resp_subscribe_ack("subscribe", "news", 3);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("subscribe"));
+        assert!(text.contains("news"));
+        assert!(
+            text.contains(":3"),
+            "count must be a RESP integer: {text:?}"
+        );
+    }
+
+    // ── Score formatting ──────────────────────────────────────────────────────
+
+    #[test]
+    fn scores_format_without_trailing_decimals() {
+        // Redis returns "1" not "1.0" — clients parse these as integers.
+        assert_eq!(format_f64_score(1.0), "1");
+        assert_eq!(format_f64_score(-5.0), "-5");
+        assert_eq!(format_f64_score(0.0), "0");
+        assert_eq!(format_f64_score(1.5), "1.5");
+        assert_eq!(format_f64_score(-0.25), "-0.25");
+    }
+
+    #[test]
+    fn scores_format_infinities_as_redis_does() {
+        assert_eq!(format_f64_score(f64::INFINITY), "inf");
+        assert_eq!(format_f64_score(f64::NEG_INFINITY), "-inf");
+    }
+
+    #[test]
+    fn very_large_scores_do_not_lose_their_exponent() {
+        // Past 1e15 the integer shortcut is skipped, because casting to i64
+        // would silently truncate.
+        let big = 1e16_f64;
+        let s = format_f64_score(big);
+        assert!(
+            s.contains('e') || s.len() > 15,
+            "unexpected formatting: {s}"
+        );
+    }
+
+    // ── Save conditions ───────────────────────────────────────────────────────
+
+    #[test]
+    fn save_conditions_parse_as_seconds_colon_changes() {
+        let c = parse_save_conditions("900:1,300:10,60:10000");
+        assert_eq!(c.len(), 3);
+        assert_eq!(c[0].secs, 900);
+        assert_eq!(c[0].changes, 1);
+        assert_eq!(c[2].secs, 60);
+        assert_eq!(c[2].changes, 10000);
+    }
+
+    #[test]
+    fn save_conditions_tolerate_whitespace() {
+        let c = parse_save_conditions(" 900 : 1 , 300 : 10 ");
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0].secs, 900);
+        assert_eq!(c[1].changes, 10);
+    }
+
+    #[test]
+    fn malformed_save_conditions_are_skipped_not_fatal() {
+        // A bad pair is dropped so one typo cannot disable autosave entirely —
+        // but a wholly invalid string yields no conditions, which the caller
+        // treats as "autosave off".
+        let c = parse_save_conditions("900:1,garbage,300:10");
+        assert_eq!(c.len(), 2, "valid pairs survive a bad one");
+        assert!(parse_save_conditions("").is_empty());
+        assert!(parse_save_conditions("nonsense").is_empty());
+        assert!(
+            parse_save_conditions("900").is_empty(),
+            "missing ':changes'"
+        );
+    }
+
+    // ── TLS configuration ─────────────────────────────────────────────────────
+
+    #[test]
+    fn tls_requires_both_cert_and_key() {
+        assert_eq!(
+            resolve_tls_paths(None, None).unwrap(),
+            None,
+            "neither set → plaintext"
+        );
+        assert_eq!(
+            resolve_tls_paths(Some("c.pem".into()), Some("k.pem".into())).unwrap(),
+            Some(("c.pem".to_string(), "k.pem".to_string()))
+        );
+    }
+
+    #[test]
+    fn tls_half_configured_is_refused_not_downgraded() {
+        // The dangerous case: an operator sets the cert, mistypes the key
+        // variable, and the server used to serve plaintext on both ports while
+        // reporting itself healthy. Traffic believed encrypted was not.
+        let cert_only = resolve_tls_paths(Some("c.pem".into()), None).unwrap_err();
+        assert!(cert_only.contains("RECACHED_TLS_KEY"), "got {cert_only}");
+        assert!(
+            cert_only.contains("plaintext"),
+            "must explain the risk: {cert_only}"
+        );
+
+        let key_only = resolve_tls_paths(None, Some("k.pem".into())).unwrap_err();
+        assert!(key_only.contains("RECACHED_TLS_CERT"), "got {key_only}");
+    }
+
+    // ── IP allowlist ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn allow_ips_parses_exact_addresses() {
+        let ips = parse_allow_ips("10.0.1.5, 10.0.1.6").unwrap();
+        assert_eq!(ips.len(), 2);
+        assert!(ips.contains(&IpAddr::from_str("10.0.1.5").unwrap()));
+        // IPv6 literals are accepted too.
+        let v6 = parse_allow_ips("::1").unwrap();
+        assert_eq!(v6, vec![IpAddr::from_str("::1").unwrap()]);
+    }
+
+    #[test]
+    fn allow_ips_rejects_cidr_instead_of_silently_narrowing() {
+        // A CIDR range used to be dropped with only a warning, leaving an
+        // allowlist that excluded every host the operator meant to admit.
+        let err = parse_allow_ips("10.0.0.0/8").unwrap_err();
+        assert!(err.contains("10.0.0.0/8"), "must name the bad entry: {err}");
+        assert!(err.contains("CIDR"), "must explain why: {err}");
+    }
+
+    #[test]
+    fn allow_ips_rejects_a_partially_valid_list() {
+        // One good entry must not mask a typo in another — the result would be
+        // a narrower allowlist than configured.
+        assert!(parse_allow_ips("10.0.1.5,not-an-ip").is_err());
+        assert!(
+            parse_allow_ips("localhost").is_err(),
+            "hostnames unsupported"
+        );
+    }
+
+    #[test]
+    fn allow_ips_rejects_an_empty_result_that_would_block_everything() {
+        // An all-invalid list previously produced an empty allowlist, and an
+        // empty allowlist rejects every connection while the process still
+        // starts and passes health checks.
+        let err = parse_allow_ips("   ").unwrap_err();
+        assert!(err.contains("reject every connection"), "got {err}");
+        assert!(parse_allow_ips(",,,").is_err());
+    }
+
+    #[test]
+    fn allow_ips_tolerates_incidental_whitespace_and_trailing_commas() {
+        let ips = parse_allow_ips(" 127.0.0.1 , 10.0.0.1 ,").unwrap();
+        assert_eq!(ips.len(), 2);
+    }
+
+    #[test]
+    fn command_name_is_stable_and_lowercase() {
+        // These strings become Prometheus label values; renaming one silently
+        // breaks existing dashboards and alerts.
+        let cases = [
+            (Command::Get("k".into()), "get"),
+            (
+                Command::Set("k".into(), "v".into(), SetOptions::default()),
+                "set",
+            ),
+            (Command::Del(vec!["k".into()]), "del"),
+            (Command::Incr("k".into()), "incr"),
+            (Command::HGetAll("k".into()), "hgetall"),
+            (Command::LPush("k".into(), vec!["v".into()]), "lpush"),
+            (Command::SAdd("k".into(), vec!["m".into()]), "sadd"),
+            (Command::Ping(None), "ping"),
+        ];
+        for (cmd, expected) in cases {
+            assert_eq!(command_name(&cmd), expected, "label drift for {cmd:?}");
+        }
+    }
+
+    // ── Config parsing ────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_memory_bytes_accepts_units_and_bare_numbers() {
+        assert_eq!(parse_memory_bytes("1024"), Some(1024));
+        assert_eq!(parse_memory_bytes("1kb"), Some(1024));
+        assert_eq!(parse_memory_bytes("2mb"), Some(2 * 1024 * 1024));
+        assert_eq!(parse_memory_bytes("1gb"), Some(1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn parse_memory_bytes_is_case_and_whitespace_tolerant() {
+        assert_eq!(parse_memory_bytes("  2MB "), Some(2 * 1024 * 1024));
+        assert_eq!(parse_memory_bytes("2 mb"), Some(2 * 1024 * 1024));
+        assert_eq!(parse_memory_bytes("1Gb"), Some(1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn parse_memory_bytes_rejects_nonsense_rather_than_defaulting() {
+        // Returning None lets the caller fall back explicitly; silently
+        // parsing "10 bananas" as 10 bytes would cap memory at nothing.
+        for bad in ["", "abc", "10 bananas", "-5", "1.5mb", "mb"] {
+            assert_eq!(parse_memory_bytes(bad), None, "{bad:?} should not parse");
         }
     }
 

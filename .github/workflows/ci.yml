@@ -32,12 +32,14 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        # wasm-edge requires the wasm32 target to compile — exclude it from native CI.
-        # It is validated separately in the npm workflow when wasm-pack builds it.
-        run: cargo clippy --workspace --exclude wasm-edge --all-targets -- -D warnings
+        # wasm-edge builds natively, so its pure logic is linted and unit-tested
+        # here. Its browser-bound paths (WebSocket, IndexedDB, Closure plumbing)
+        # are NOT covered by any automated test yet — the npm workflow only
+        # builds the wasm package. See the roadmap for wasm-bindgen-test.
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace --exclude wasm-edge
+        run: cargo test --workspace
 
       # core-engine is the shared state machine: the same code evaluates commands
       # on the server and inside the browser via WASM, so a bug here reaches every
@@ -47,6 +49,55 @@ jobs:
 
       - name: Enforce core-engine coverage floor (90%)
         run: cargo llvm-cov -p core-engine --summary-only --fail-under-lines 90
+
+      # server-native is mostly async I/O drivers — accept loops, TLS handshakes,
+      # replication streams — which are exercised by the socket-driven tests
+      # rather than unit tests. The floor is set to protect the pure decision
+      # functions (scope classification, wire encoding, config parsing), not to
+      # chase a number the I/O layer cannot reach.
+      - name: Enforce server-native coverage floor (65%)
+        run: cargo llvm-cov -p server-native --summary-only --fail-under-lines 65 -- --include-ignored
+
+  # ---------------------------------------------------------------------------
+  # Browser tests — the IndexedDB persistence layer and the engine's behaviour
+  # on a real wasm32 target. Native tests cannot cover either: `wasm-pack test`
+  # runs them in headless Chrome with a real IndexedDB.
+  #
+  # This job exists because a native-only suite missed that `SystemTime::now()`
+  # panics on wasm32-unknown-unknown, which made every browser store write abort.
+  # ---------------------------------------------------------------------------
+  browser-tests:
+    name: Browser Tests (wasm)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "recached-wasm-cache"
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+
+      # The runner ships Chrome and a matching chromedriver on PATH. Letting
+      # wasm-pack download its own risks a version mismatch with the installed
+      # browser, which fails as an opaque driver crash.
+      - name: Use the runner's chromedriver
+        run: |
+          echo "CHROMEDRIVER=$(which chromedriver)" >> "$GITHUB_ENV"
+          chromedriver --version
+          google-chrome --version
+
+      - name: Run browser tests
+        run: wasm-pack test --headless --chrome wasm-edge
 
   integration-load-chaos:
     name: Load & Chaos Tests
