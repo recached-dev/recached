@@ -2,24 +2,16 @@
 
 Recached competes on **where the data can live** — the same engine on the server and in the browser, with sync in between. The [benchmarks](/guide/benchmarks) show this costs nothing in raw speed.
 
-Numbered items are stable identifiers, not an ordering — code and changelog entries reference them
-(e.g. "roadmap #6"), so they are never renumbered. **Near-term priorities** are called out below.
-
-Items 1–5 and 13 have shipped: rate-limiting commands, scoped sync with per-client auth, live queries, the native JSON type, and offline-first writes with merge semantics. Their numbering is retained below so existing references stay valid — see the [changelog](https://github.com/thinkgrid-labs/recached/blob/main/CHANGELOG.md) for what landed in each.
-
 ## Near-term
 
-The three items previously listed here shipped in **0.2.2**: reconnect backoff jitter, presence via
-connection-scoped keys (`ESET`), and live queries carrying complete collection values. See the
-[changelog](https://github.com/thinkgrid-labs/recached/blob/main/CHANGELOG.md).
+The next three things worth doing, in order:
 
-Next up, in order:
-
-1. **[Exactly-once across a server restart](#reliability)** — the last documented caveat on the
-   delivery guarantee.
-2. **[Atomic WAL compaction](#reliability)** — removes a browser-side data-loss window.
-3. **[Capacity and sync metrics](#operability)** — operators currently cannot see memory, key count,
-   eviction rate, or replication lag.
+1. **[Byte-slice command arguments](#performance)** — the main remaining lever on unpipelined
+   latency, and the likeliest explanation for `HSET` trailing Redis.
+2. **[Surface outbox overflow](#reliability)** — the client silently drops the oldest write past
+   10 000; applications get no signal.
+3. **[Live queries carry `FLUSHDB` diffs](#live-queries)** — subscribers currently miss a mass
+   deletion entirely.
 ---
 
 ## 6. Mobile SDKs — React Native, Flutter, Kotlin, Swift
@@ -83,15 +75,6 @@ independent — pick them off in any order.
 
 ### Reliability
 
-**Exactly-once across a server restart.** `DEDUP` high-water marks live in server memory and are
-swept after 24 h idle, so a restart inside the acknowledgement window can admit one duplicate — a
-caveat currently documented rather than fixed. Persisting the marks alongside the snapshot would make
-the exactly-once guarantee unconditional.
-
-**Atomic WAL compaction.** Browser-side compaction clears the write-ahead log and then writes the
-replacement snapshot. An interruption between the two loses the persisted cache. Writing to a new key
-range and swapping removes the window entirely.
-
 **Surface outbox overflow.** The client outbox holds 10 000 writes and silently evicts the oldest
 past that. An `onOutboxFull` callback, or a `pendingWrites()` accessor, lets an application degrade
 deliberately instead of losing writes without a signal.
@@ -113,10 +96,8 @@ Redis while *beating* it pipelined.
 
 ### Operability
 
-**Capacity and sync metrics.** Six series are exported today, all traffic. Nothing reports memory
-use, key count, eviction rate, replication lag, or outbox depth — so an operator cannot answer "am I
-near the cap?" or "is my replica behind?" from a dashboard. See
-[Operations](/server/operations#what-is-not-exported-yet).
+**Replication lag.** The number of connected replicas is exported, but not how far behind each one
+is — the signal that actually matters before a failover.
 
 **Make the compiled-in limits configurable.** The 10 000-write outbox, 64 live queries per
 connection, and eviction's fixed 10-key sample are all constants. Redis exposes `maxmemory-samples`

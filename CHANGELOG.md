@@ -19,6 +19,13 @@ All notable changes to Recached are documented here.
   offline. Replicas receive the write as a plain `SET` — they have no connection to scope a lifetime
   to, and the owning server broadcasts the deletion.
 
+- **Capacity and sync metrics.** Seven new series, sampled every 5 seconds because capacity is a
+  level rather than an event: `recached_memory_bytes`, `recached_keys`, `recached_evictions_total`,
+  `recached_replicas_connected`, `recached_live_queries`, `recached_watched_keys`, and
+  `recached_dedup_clients_tracked`. Previously only traffic was exported, so an operator could not
+  answer "am I near the cap?" or "is eviction thrashing?" from a dashboard. Replication *lag* and
+  browser outbox depth remain unexported — see [Operations](docs/server/operations.md).
+
 ### Changed
 
 - **Live queries now carry collection values.** `qstate` and `keychange` previously delivered only a
@@ -52,6 +59,23 @@ All notable changes to Recached are documented here.
   stays dependency-free and I/O-free and the sequence remains reproducible in tests.
 
 ### Fixed
+
+- **Exactly-once delivery now survives a server restart.** Dedup high-water marks were held only in
+  memory, so a restart inside the acknowledgement window let a client's replayed write apply twice —
+  the last standing caveat on the guarantee. Marks are now persisted to a `.dedup` sidecar beside the
+  snapshot, written atomically and only when a mark advances, and restored before the server accepts
+  connections.
+
+  The map is one `u64` per client, so it is flushed on a 1-second timer as well as with each
+  snapshot: the residual window on an unclean shutdown is bounded by that interval rather than by the
+  snapshot cadence. A missing or corrupt sidecar is logged and ignored rather than being fatal —
+  losing the bookkeeping is bad, refusing to boot is worse.
+
+- **WAL compaction could destroy the browser's persisted cache.** Compaction cleared the write-ahead
+  log in one IndexedDB transaction and wrote the replacement snapshot in later ones, so an
+  interruption between them left an empty WAL and no snapshot. The existing code comment anticipated
+  this window; it is now closed by doing the clear and the rewrite in a **single transaction**, which
+  IndexedDB commits or rolls back as a unit.
 
 - **`ESET` would not have replicated.** `is_write_command` is a `matches!` list, which — unlike a
   `match` — has no exhaustiveness check, so a newly added command silently defaults to "not a write"

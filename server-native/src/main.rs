@@ -613,6 +613,8 @@ struct ServerState {
     /// owner, so the first tab closing does not mark the user offline. Only the
     /// owning connection's close deletes the key.
     ephemeral: std::sync::Mutex<HashMap<String, u64>>,
+    /// Set when a dedup high-water mark advances; cleared once persisted.
+    dedup_dirty: std::sync::atomic::AtomicBool,
 }
 
 impl ServerState {
@@ -682,11 +684,13 @@ impl ServerState {
                     true
                 } else {
                     *hwm = id;
+                    self.dedup_dirty.store(true, Ordering::Relaxed);
                     false
                 }
             }
             None => {
                 map.insert(client.to_string(), (id, now));
+                self.dedup_dirty.store(true, Ordering::Relaxed);
                 false
             }
         }
@@ -715,8 +719,66 @@ impl ServerState {
         self.replicas.count.store(reg.len(), Ordering::Relaxed);
     }
 
+    /// Path of the dedup sidecar, alongside the snapshot.
+    fn dedup_path(&self) -> std::path::PathBuf {
+        self.snap.path.with_extension("dedup")
+    }
+
+    /// Persist dedup high-water marks so exactly-once delivery survives a
+    /// restart. Written atomically (temp + rename) and only when a mark has
+    /// advanced. The map is one `u64` per client, so this stays small enough to
+    /// flush far more often than the snapshot.
+    async fn persist_dedup(&self) {
+        if !self.dedup_dirty.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        let marks: Vec<(String, u64)> = match self.dedup.lock() {
+            Ok(map) => map.iter().map(|(c, (hwm, _))| (c.clone(), *hwm)).collect(),
+            Err(_) => return,
+        };
+        let path = self.dedup_path();
+        let tmp = path.with_extension("dedup.tmp");
+        match rmp_serde::to_vec(&marks) {
+            Err(e) => warn!("Dedup serialize failed: {}", e),
+            Ok(bytes) => match tokio::fs::write(&tmp, &bytes).await {
+                Err(e) => warn!("Dedup write failed: {}", e),
+                Ok(()) => {
+                    if let Err(e) = tokio::fs::rename(&tmp, &path).await {
+                        warn!("Dedup rename failed: {}", e);
+                    }
+                }
+            },
+        }
+    }
+
+    /// Restore dedup marks at boot. `seen` timestamps are not persisted — they
+    /// only drive idle sweeping, so restored entries start their idle clock now.
+    async fn load_dedup(&self) {
+        let path = self.dedup_path();
+        let Ok(bytes) = tokio::fs::read(&path).await else {
+            return;
+        };
+        match rmp_serde::from_slice::<Vec<(String, u64)>>(&bytes) {
+            Err(e) => warn!("Dedup sidecar unreadable ({}), ignoring: {:?}", e, path),
+            Ok(marks) => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                if let Ok(mut map) = self.dedup.lock() {
+                    let count = marks.len();
+                    for (client, hwm) in marks {
+                        map.insert(client, (hwm, now));
+                    }
+                    info!("Restored {} dedup high-water mark(s)", count);
+                }
+            }
+        }
+    }
+
     /// Save snapshot, reset the dirty counter, then truncate AOF (snapshot subsumes the log).
     async fn save(&self, store: &KeyValueStore) {
+        self.persist_dedup().await;
         save_snapshot(store, &self.snap).await;
         store.reset_dirty();
         if let Some(aof) = &self.aof {
@@ -2385,7 +2447,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         is_replica: std::sync::atomic::AtomicBool::new(is_replica_start),
         dedup: std::sync::Mutex::new(HashMap::new()),
         ephemeral: std::sync::Mutex::new(HashMap::new()),
+        dedup_dirty: std::sync::atomic::AtomicBool::new(false),
     });
+
+    // Restore exactly-once bookkeeping before accepting connections, so a
+    // client replaying an unacknowledged write after a restart is recognised
+    // rather than applied twice.
+    state.load_dedup().await;
+
+    // ── Dedup flush ───────────────────────────────────────────────────────
+    // The map is one u64 per client, so it can be persisted far more often than
+    // the snapshot. This bounds the duplicate window on an unclean shutdown to
+    // roughly this interval rather than to the snapshot cadence.
+    {
+        let state_dedup = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(1));
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                state_dedup.persist_dedup().await;
+            }
+        });
+    }
 
     // ── autosave ──────────────────────────────────────────────────────────
     if !save_conditions.is_empty() {
@@ -2477,6 +2561,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── watch registry ────────────────────────────────────────────────────
     let watch_registry: WatchRegistry = WatchHub::new();
+
+    // ── Capacity & sync metrics ───────────────────────────────────────────
+    // Traffic counters are event-driven, but capacity is a level, not an event:
+    // memory, key count and eviction rate have to be sampled. Without these an
+    // operator cannot answer "am I near the cap?" or "is eviction thrashing?"
+    // from a dashboard — see docs/server/operations.md.
+    {
+        let store_m = Arc::clone(&store);
+        let state_m = Arc::clone(&state);
+        let registry_m = watch_registry.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(5));
+            loop {
+                ticker.tick().await;
+                gauge!("recached_memory_bytes").set(store_m.approximate_memory_bytes() as f64);
+                gauge!("recached_keys").set(store_m.key_count() as f64);
+                counter!("recached_evictions_total").absolute(store_m.evicted_count());
+                gauge!("recached_replicas_connected")
+                    .set(state_m.replicas.count.load(Ordering::Relaxed) as f64);
+                gauge!("recached_live_queries")
+                    .set(registry_m.watched_patterns.load(Ordering::Relaxed) as f64);
+                gauge!("recached_watched_keys")
+                    .set(registry_m.watched_keys.load(Ordering::Relaxed) as f64);
+                gauge!("recached_dedup_clients_tracked")
+                    .set(state_m.dedup.lock().map(|m| m.len()).unwrap_or(0) as f64);
+            }
+        });
+    }
 
     // ── connection limiter ────────────────────────────────────────────────
     let max_connections = std::env::var("RECACHED_MAX_CONNECTIONS")
@@ -3677,6 +3789,7 @@ mod tests {
             is_replica: AtomicBool::new(start_as_replica),
             dedup: std::sync::Mutex::new(HashMap::new()),
             ephemeral: std::sync::Mutex::new(HashMap::new()),
+            dedup_dirty: std::sync::atomic::AtomicBool::new(false),
         });
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4174,6 +4287,7 @@ mod tests {
             is_replica: AtomicBool::new(false),
             dedup: std::sync::Mutex::new(HashMap::new()),
             ephemeral: std::sync::Mutex::new(HashMap::new()),
+            dedup_dirty: std::sync::atomic::AtomicBool::new(false),
         });
 
         // Simulate writes captured by AOF
@@ -4246,6 +4360,103 @@ mod tests {
         assert_eq!(c.cmd(&["SET", "k", "v"]).await, ok());
         assert_eq!(c.cmd(&["GET", "k"]).await, bulk("v"));
         assert!(!srv.state.is_replica());
+    }
+
+    // ── Exactly-once across a restart ─────────────────────────────────────────
+
+    /// Build a `ServerState` whose snapshot path (and therefore dedup sidecar)
+    /// is `path` — the same file a restarted process would find.
+    fn state_with_snapshot_path(path: PathBuf) -> Arc<ServerState> {
+        Arc::new(ServerState {
+            snap: Arc::new(SnapshotConfig {
+                path,
+                last_save: AtomicI64::new(now_unix_secs()),
+            }),
+            aof: None,
+            replicas: ReplHub::new(),
+            is_replica: AtomicBool::new(false),
+            dedup: std::sync::Mutex::new(HashMap::new()),
+            ephemeral: std::sync::Mutex::new(HashMap::new()),
+            dedup_dirty: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    #[tokio::test]
+    async fn dedup_marks_survive_a_restart() {
+        let snap = tmp_path("dedup_restart.rdb");
+        let _ = std::fs::remove_file(snap.with_extension("dedup"));
+
+        // First run: the client's writes are accepted once each.
+        let first = state_with_snapshot_path(snap.clone());
+        assert!(!first.dedup_seen("client-a", 1));
+        assert!(!first.dedup_seen("client-a", 2));
+        assert!(
+            first.dedup_seen("client-a", 2),
+            "same id twice within a run"
+        );
+        first.persist_dedup().await;
+
+        // Restart: fresh process, same snapshot path.
+        let second = state_with_snapshot_path(snap.clone());
+        assert!(
+            !second.dedup_seen("client-a", 3),
+            "a genuinely new id must still be accepted"
+        );
+
+        let third = state_with_snapshot_path(snap.clone());
+        third.load_dedup().await;
+        assert!(
+            third.dedup_seen("client-a", 2),
+            "a replayed write must be recognised after a restart — this is the \
+             caveat the sidecar exists to close"
+        );
+        assert!(!third.dedup_seen("client-a", 99), "higher ids still apply");
+
+        let _ = std::fs::remove_file(snap.with_extension("dedup"));
+    }
+
+    #[tokio::test]
+    async fn persist_dedup_is_a_no_op_when_nothing_advanced() {
+        // The flusher runs every second; it must not rewrite the file when no
+        // mark moved.
+        let snap = tmp_path("dedup_noop.rdb");
+        let side = snap.with_extension("dedup");
+        let _ = std::fs::remove_file(&side);
+
+        let state = state_with_snapshot_path(snap.clone());
+        state.dedup_seen("c", 1);
+        state.persist_dedup().await;
+        assert!(side.exists(), "first flush should write");
+
+        let before = std::fs::metadata(&side).unwrap().modified().unwrap();
+        state.persist_dedup().await; // nothing changed since
+        let after = std::fs::metadata(&side).unwrap().modified().unwrap();
+        assert_eq!(before, after, "unchanged marks must not rewrite the file");
+
+        let _ = std::fs::remove_file(&side);
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_dedup_sidecar_is_ignored_not_fatal() {
+        // Losing exactly-once bookkeeping is bad; refusing to boot is worse.
+        let snap = tmp_path("dedup_corrupt.rdb");
+        let side = snap.with_extension("dedup");
+        std::fs::write(&side, b"not messagepack").unwrap();
+
+        let state = state_with_snapshot_path(snap.clone());
+        state.load_dedup().await; // must not panic
+        assert!(!state.dedup_seen("client-a", 1), "server still functions");
+
+        let _ = std::fs::remove_file(&side);
+    }
+
+    #[tokio::test]
+    async fn a_missing_dedup_sidecar_is_a_clean_first_boot() {
+        let snap = tmp_path("dedup_absent.rdb");
+        let _ = std::fs::remove_file(snap.with_extension("dedup"));
+        let state = state_with_snapshot_path(snap);
+        state.load_dedup().await;
+        assert!(!state.dedup_seen("fresh", 1));
     }
 
     // ── Presence: connection-scoped keys ──────────────────────────────────────
@@ -4405,6 +4616,7 @@ mod tests {
                 is_replica: AtomicBool::new(false),
                 dedup: std::sync::Mutex::new(HashMap::new()),
                 ephemeral: std::sync::Mutex::new(HashMap::new()),
+                dedup_dirty: std::sync::atomic::AtomicBool::new(false),
             });
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -4453,6 +4665,7 @@ mod tests {
             is_replica: AtomicBool::new(true),
             dedup: std::sync::Mutex::new(HashMap::new()),
             ephemeral: std::sync::Mutex::new(HashMap::new()),
+            dedup_dirty: std::sync::atomic::AtomicBool::new(false),
         });
         let rs = Arc::clone(&replica_store);
         let rst = Arc::clone(&replica_state);
@@ -4526,6 +4739,7 @@ mod tests {
             is_replica: AtomicBool::new(false),
             dedup: std::sync::Mutex::new(HashMap::new()),
             ephemeral: std::sync::Mutex::new(HashMap::new()),
+            dedup_dirty: std::sync::atomic::AtomicBool::new(false),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4644,6 +4858,7 @@ mod tests {
             is_replica: AtomicBool::new(true),
             dedup: std::sync::Mutex::new(HashMap::new()),
             ephemeral: std::sync::Mutex::new(HashMap::new()),
+            dedup_dirty: std::sync::atomic::AtomicBool::new(false),
         });
         let replica_store = Arc::new(KeyValueStore::new());
         let rs = Arc::clone(&replica_store);
@@ -4691,6 +4906,7 @@ mod tests {
             is_replica: AtomicBool::new(false),
             dedup: std::sync::Mutex::new(HashMap::new()),
             ephemeral: std::sync::Mutex::new(HashMap::new()),
+            dedup_dirty: std::sync::atomic::AtomicBool::new(false),
         });
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

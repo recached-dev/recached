@@ -69,6 +69,21 @@ export function idbOutboxDelete(db, id) {
         req.onerror   = (e) => reject(e.target.error);
     });
 }
+export function idbWalReplace(db, cmds) {
+    return new Promise((resolve, reject) => {
+        // One transaction: the clear and the rewrite commit together or not at
+        // all. Clearing in a separate transaction (as this used to) leaves the
+        // WAL empty if the tab closes before the snapshot is written, losing the
+        // entire persisted cache.
+        const tx    = db.transaction('wal', 'readwrite');
+        const store = tx.objectStore('wal');
+        store.clear();
+        for (let i = 0; i < cmds.length; i++) store.put(cmds[i], i);
+        tx.oncomplete = () => resolve(undefined);
+        tx.onerror    = (e) => reject(e.target.error);
+        tx.onabort    = (e) => reject(e.target.error);
+    });
+}
 export function idbWalClear(db) {
     return new Promise((resolve, reject) => {
         const tx  = db.transaction('wal', 'readwrite');
@@ -118,6 +133,8 @@ extern "C" {
     fn idb_outbox_delete_js(db: &JsValue, id: f64) -> Promise;
     #[wasm_bindgen(js_name = "idbWalClear")]
     fn idb_wal_clear_js(db: &JsValue) -> Promise;
+    #[wasm_bindgen(js_name = "idbWalReplace")]
+    fn idb_wal_replace_js(db: &JsValue, cmds: &JsValue) -> Promise;
     #[wasm_bindgen(js_name = "idbMetaGet")]
     fn idb_meta_get(db: &JsValue, key: &str) -> Promise;
     #[wasm_bindgen(js_name = "idbMetaPut")]
@@ -683,14 +700,17 @@ impl RecachedCache {
             let next_seq = if entry_count > WAL_COMPACT_THRESHOLD {
                 // WAL only — the outbox holds writes still awaiting server
                 // acknowledgment and must survive compaction.
-                JsFuture::from(idb_wal_clear_js(&db)).await?;
+                // Atomic: the old log is only dropped if the replacement
+                // commits with it. Previously this cleared first and wrote
+                // after, so an interruption in between left an empty WAL and
+                // the persisted cache was gone.
                 let cmds = snapshot_to_resp_cmds(&store.snapshot());
-                let mut seq: u64 = 0;
+                let arr = js_sys::Array::new();
                 for cmd_str in &cmds {
-                    let _ = JsFuture::from(idb_append_js(&db, seq as f64, cmd_str)).await;
-                    seq += 1;
+                    arr.push(&JsValue::from_str(cmd_str));
                 }
-                seq
+                JsFuture::from(idb_wal_replace_js(&db, &arr)).await?;
+                cmds.len() as u64
             } else if entry_count == 0 {
                 0
             } else {
@@ -1566,6 +1586,102 @@ mod browser_tests {
         JsFuture::from(idb_outbox_delete_js(&db, 999.0))
             .await
             .expect("deleting a missing row should resolve");
+    }
+
+    // ── Atomic WAL compaction ─────────────────────────────────────────────────
+
+    #[wasm_bindgen_test]
+    async fn wal_replace_swaps_contents_in_one_transaction() {
+        let db = fresh_db().await;
+        for (seq, cmd) in [(0.0, "SET a 1"), (1.0, "SET b 2"), (2.0, "SET c 3")] {
+            JsFuture::from(idb_append_js(&db, seq, cmd)).await.unwrap();
+        }
+
+        let arr = js_sys::Array::new();
+        arr.push(&JsValue::from_str("SET compacted 1"));
+        JsFuture::from(idb_wal_replace_js(&db, &arr))
+            .await
+            .expect("replace");
+
+        let (keys, vals) = wal_rows(&db).await;
+        assert_eq!(keys, vec![0.0], "old entries must be gone");
+        assert_eq!(vals, vec!["SET compacted 1".to_string()]);
+    }
+
+    #[wasm_bindgen_test]
+    async fn wal_replace_with_an_empty_snapshot_empties_the_log() {
+        // An empty store compacts to zero commands; the WAL should end empty
+        // rather than retaining stale entries.
+        let db = fresh_db().await;
+        JsFuture::from(idb_append_js(&db, 0.0, "SET a 1"))
+            .await
+            .unwrap();
+
+        let empty = js_sys::Array::new();
+        JsFuture::from(idb_wal_replace_js(&db, &empty))
+            .await
+            .expect("replace");
+
+        assert!(wal_rows(&db).await.0.is_empty());
+    }
+
+    #[wasm_bindgen_test]
+    async fn wal_replace_leaves_the_outbox_untouched() {
+        // Compaction must never drop writes still awaiting acknowledgement.
+        let db = fresh_db().await;
+        JsFuture::from(idb_append_js(&db, 0.0, "SET a 1"))
+            .await
+            .unwrap();
+        JsFuture::from(idb_outbox_put_js(&db, 5.0, "PENDING"))
+            .await
+            .unwrap();
+
+        let arr = js_sys::Array::new();
+        arr.push(&JsValue::from_str("SET compacted 1"));
+        JsFuture::from(idb_wal_replace_js(&db, &arr)).await.unwrap();
+
+        let (ids, vals) = outbox_rows(&db).await;
+        assert_eq!(ids, vec![5.0]);
+        assert_eq!(vals[0], "PENDING");
+    }
+
+    #[wasm_bindgen_test]
+    async fn compacted_wal_replays_to_the_same_state() {
+        // End to end: snapshot a store, compact through the atomic path, read
+        // back, and rebuild — the persisted cache must be intact.
+        use core_engine::cmd::Command;
+        use core_engine::store::KeyValueStore;
+
+        let db = fresh_db().await;
+        let source = KeyValueStore::new();
+        source.execute(Command::Set(
+            "k".into(),
+            "v".into(),
+            core_engine::cmd::SetOptions::default(),
+        ));
+        source.execute(Command::RPush("l".into(), vec!["a".into(), "b".into()]));
+
+        let cmds = snapshot_to_resp_cmds(&source.snapshot());
+        let arr = js_sys::Array::new();
+        for c in &cmds {
+            arr.push(&JsValue::from_str(c));
+        }
+        JsFuture::from(idb_wal_replace_js(&db, &arr)).await.unwrap();
+
+        let (_, vals) = wal_rows(&db).await;
+        let restored = KeyValueStore::new();
+        for frame in &vals {
+            let (value, _) = core_engine::resp::Value::parse(frame.as_bytes()).unwrap();
+            restored.execute(Command::from_value(value).unwrap());
+        }
+        assert_eq!(
+            restored.execute(Command::Get("k".into())),
+            core_engine::resp::Value::BulkString(Some(b"v".to_vec()))
+        );
+        assert_eq!(
+            restored.execute(Command::LLen("l".into())),
+            core_engine::resp::Value::Integer(2)
+        );
     }
 
     // ── Meta (client identity + epoch) ────────────────────────────────────────

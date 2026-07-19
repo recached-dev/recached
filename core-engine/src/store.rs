@@ -510,6 +510,9 @@ pub struct KeyValueStore {
     max_memory_bytes: Option<usize>,
     eviction_policy: EvictionPolicy,
     dirty: Arc<AtomicU64>,
+    /// Total keys evicted since start. Exported as a metric: without it an
+    /// operator cannot tell a healthy cache from one thrashing at its cap.
+    evicted: Arc<AtomicU64>,
 }
 
 impl Default for KeyValueStore {
@@ -526,6 +529,7 @@ impl KeyValueStore {
             max_memory_bytes: None,
             eviction_policy: EvictionPolicy::NoEviction,
             dirty: Arc::new(AtomicU64::new(0)),
+            evicted: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -536,6 +540,7 @@ impl KeyValueStore {
             max_memory_bytes: None,
             eviction_policy: EvictionPolicy::NoEviction,
             dirty: Arc::new(AtomicU64::new(0)),
+            evicted: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -550,6 +555,7 @@ impl KeyValueStore {
             max_memory_bytes,
             eviction_policy,
             dirty: Arc::new(AtomicU64::new(0)),
+            evicted: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -714,6 +720,20 @@ impl KeyValueStore {
 
     /// Evict a single entry per the configured policy. Returns the number of
     /// bytes freed (`Some`), or `None` if nothing could be evicted.
+    /// Keys evicted since start.
+    pub fn evicted_count(&self) -> u64 {
+        self.evicted.load(Ordering::Relaxed)
+    }
+
+    /// Live key count, excluding expired entries awaiting sweep.
+    pub fn key_count(&self) -> usize {
+        let now = now_ms();
+        self.data
+            .iter()
+            .filter(|r| !r.value().is_expired(now))
+            .count()
+    }
+
     fn evict_one(&self, now: u64) -> Option<usize> {
         const SAMPLE: usize = 10;
         let mut rng = rand::rng();
@@ -771,11 +791,12 @@ impl KeyValueStore {
         let key = chosen?;
         // Treat a lost race (key already gone) as a successful eviction that
         // freed nothing, so callers don't spin.
-        Some(
-            self.data
-                .remove(&key)
-                .map_or(0, |(k, e)| entry_size(&k, &e)),
-        )
+        let freed = self
+            .data
+            .remove(&key)
+            .map_or(0, |(k, e)| entry_size(&k, &e));
+        self.evicted.fetch_add(1, Ordering::Relaxed);
+        Some(freed)
     }
 
     pub fn snapshot(&self) -> Vec<SnapshotEntry> {
@@ -5365,5 +5386,80 @@ mod ephemeral_tests {
         // Pattern matching picks it up like any other key.
         let matched = s.matching_key_values("presence:*", 10);
         assert_eq!(matched.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::*;
+    use crate::cmd::{Command, SetOptions};
+
+    #[test]
+    fn key_count_excludes_expired_entries() {
+        // The metric must report what a client can actually read, not what is
+        // still sitting in the map awaiting sweep — otherwise a dashboard shows
+        // a keyspace that is not there.
+        let s = KeyValueStore::new();
+        s.execute(Command::Set(
+            "live".into(),
+            "v".into(),
+            SetOptions::default(),
+        ));
+        s.execute(Command::Set(
+            "dead".into(),
+            "v".into(),
+            SetOptions {
+                expiry: Some(crate::cmd::SetExpiry::Px(1)),
+                ..Default::default()
+            },
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        assert_eq!(s.key_count(), 1);
+    }
+
+    #[test]
+    fn eviction_counter_starts_at_zero_and_counts_each_eviction() {
+        let s = KeyValueStore::with_config(Some(2), None, EvictionPolicy::AllKeysRandom);
+        assert_eq!(s.evicted_count(), 0);
+
+        for i in 0..5 {
+            s.execute(Command::Set(
+                format!("k{i}"),
+                "v".into(),
+                SetOptions::default(),
+            ));
+        }
+        // Cap of 2 with 5 inserts means 3 evictions were required.
+        assert_eq!(s.key_count(), 2);
+        assert_eq!(
+            s.evicted_count(),
+            3,
+            "eviction rate is the signal that a cache is thrashing at its cap"
+        );
+    }
+
+    #[test]
+    fn eviction_counter_stays_zero_without_pressure() {
+        let s = KeyValueStore::new();
+        for i in 0..10 {
+            s.execute(Command::Set(
+                format!("k{i}"),
+                "v".into(),
+                SetOptions::default(),
+            ));
+        }
+        assert_eq!(s.evicted_count(), 0, "no cap configured, nothing to evict");
+    }
+
+    #[test]
+    fn memory_estimate_tracks_the_stored_data() {
+        let s = KeyValueStore::new();
+        let empty = s.approximate_memory_bytes();
+        s.execute(Command::Set(
+            "k".into(),
+            "x".repeat(4096),
+            SetOptions::default(),
+        ));
+        assert!(s.approximate_memory_bytes() >= empty + 4096);
     }
 }
