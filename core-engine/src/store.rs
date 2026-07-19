@@ -4344,3 +4344,860 @@ mod tests {
         assert!(matches!(&r, Value::Error(e) if e.contains("no rate limit configured")));
     }
 }
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+    use crate::cmd::{Command, SetOptions};
+
+    fn bulk(s: &str) -> Value {
+        Value::BulkString(Some(s.as_bytes().to_vec()))
+    }
+
+    fn set(s: &KeyValueStore, k: &str, v: &str) -> Value {
+        s.execute(Command::Set(k.into(), v.into(), SetOptions::default()))
+    }
+
+    /// Fill `n` keys named `k0..k{n-1}` with a fixed-size value.
+    fn fill(s: &KeyValueStore, n: usize) {
+        for i in 0..n {
+            set(s, &format!("k{i}"), "0123456789");
+        }
+    }
+
+    // ── Dirty counter ─────────────────────────────────────────────────────────
+    // Drives the autosave loop: it skips a snapshot when nothing changed, so an
+    // off-by-one here means either wasted saves or a missed one.
+
+    #[test]
+    fn dirty_counter_starts_at_zero_and_increments() {
+        let s = KeyValueStore::new();
+        assert_eq!(s.dirty_count(), 0);
+        s.mark_dirty();
+        s.mark_dirty();
+        assert_eq!(s.dirty_count(), 2);
+    }
+
+    #[test]
+    fn reset_dirty_clears_the_counter() {
+        let s = KeyValueStore::new();
+        s.mark_dirty();
+        s.reset_dirty();
+        assert_eq!(s.dirty_count(), 0);
+        // Still usable after a reset — the counter is not consumed.
+        s.mark_dirty();
+        assert_eq!(s.dirty_count(), 1);
+    }
+
+    // ── get_current ───────────────────────────────────────────────────────────
+    // The live-query read path. Strings return their value; every collection
+    // type returns a type marker instead, which clients use to decide whether a
+    // typed re-read is needed.
+
+    #[test]
+    fn get_current_returns_value_for_strings() {
+        let s = KeyValueStore::new();
+        set(&s, "k", "v");
+        assert_eq!(s.get_current("k"), bulk("v"));
+    }
+
+    #[test]
+    fn get_current_returns_nil_for_missing_and_expired() {
+        let s = KeyValueStore::new();
+        assert_eq!(s.get_current("nope"), Value::BulkString(None));
+
+        s.execute(Command::Set(
+            "gone".into(),
+            "v".into(),
+            SetOptions {
+                expiry: Some(crate::cmd::SetExpiry::Px(1)),
+                ..Default::default()
+            },
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        assert_eq!(s.get_current("gone"), Value::BulkString(None));
+    }
+
+    #[test]
+    fn get_current_returns_type_markers_for_collections() {
+        let s = KeyValueStore::new();
+        s.execute(Command::HSet("h".into(), vec![("f".into(), "v".into())]));
+        s.execute(Command::LPush("l".into(), vec!["a".into()]));
+        s.execute(Command::SAdd("st".into(), vec!["a".into()]));
+        s.execute(Command::ZAdd(
+            "z".into(),
+            Default::default(),
+            vec![(1.0, "a".into())],
+        ));
+        s.execute(Command::JSet("j".into(), "$".into(), "{\"a\":1}".into()));
+
+        assert_eq!(s.get_current("h"), Value::SimpleString("hash".into()));
+        assert_eq!(s.get_current("l"), Value::SimpleString("list".into()));
+        assert_eq!(s.get_current("st"), Value::SimpleString("set".into()));
+        assert_eq!(s.get_current("z"), Value::SimpleString("zset".into()));
+        assert_eq!(s.get_current("j"), Value::SimpleString("json".into()));
+    }
+
+    // ── sweep_expired ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn sweep_expired_drops_only_expired_keys() {
+        let s = KeyValueStore::new();
+        set(&s, "live", "v");
+        s.execute(Command::Set(
+            "dead".into(),
+            "v".into(),
+            SetOptions {
+                expiry: Some(crate::cmd::SetExpiry::Px(1)),
+                ..Default::default()
+            },
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(15));
+
+        // Before the sweep the expired key still occupies memory — expiry is
+        // lazy on read, so the sweep is what actually reclaims it.
+        s.sweep_expired();
+
+        assert_eq!(s.get_current("live"), bulk("v"));
+        assert_eq!(s.get_current("dead"), Value::BulkString(None));
+        assert_eq!(s.execute(Command::DbSize), Value::Integer(1));
+    }
+
+    // ── Memory accounting ─────────────────────────────────────────────────────
+
+    #[test]
+    fn approximate_memory_grows_with_stored_data() {
+        let s = KeyValueStore::new();
+        let empty = s.approximate_memory_bytes();
+        set(&s, "k", &"x".repeat(1000));
+        let filled = s.approximate_memory_bytes();
+        assert!(
+            filled > empty + 1000,
+            "1 KB value should add at least its own size: {empty} -> {filled}"
+        );
+    }
+
+    #[test]
+    fn approximate_memory_counts_every_value_type() {
+        let s = KeyValueStore::new();
+        let base = s.approximate_memory_bytes();
+        s.execute(Command::HSet(
+            "h".into(),
+            vec![("f".into(), "v".repeat(500))],
+        ));
+        s.execute(Command::LPush("l".into(), vec!["v".repeat(500)]));
+        s.execute(Command::SAdd("st".into(), vec!["v".repeat(500)]));
+        s.execute(Command::ZAdd(
+            "z".into(),
+            Default::default(),
+            vec![(1.0, "v".repeat(500))],
+        ));
+        s.execute(Command::JSet(
+            "j".into(),
+            "$".into(),
+            format!("{{\"a\":\"{}\"}}", "v".repeat(500)),
+        ));
+        assert!(
+            s.approximate_memory_bytes() > base + 2500,
+            "collections must contribute to the memory estimate"
+        );
+    }
+
+    // ── max_keys ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn max_keys_rejects_new_keys_without_an_eviction_policy() {
+        let s = KeyValueStore::with_max_keys(2);
+        set(&s, "a", "1");
+        set(&s, "b", "2");
+        // NoEviction is the default: the write is refused rather than making room.
+        assert!(matches!(set(&s, "c", "3"), Value::Error(_)));
+        assert_eq!(s.execute(Command::DbSize), Value::Integer(2));
+        // Overwriting an existing key is still fine — it adds no key.
+        assert_eq!(set(&s, "a", "updated"), Value::SimpleString("OK".into()));
+    }
+
+    #[test]
+    fn max_keys_evicts_instead_of_failing_when_a_policy_is_set() {
+        let s = KeyValueStore::with_config(Some(3), None, EvictionPolicy::AllKeysRandom);
+        fill(&s, 3);
+        assert_eq!(s.execute(Command::DbSize), Value::Integer(3));
+
+        // The write succeeds; something older is evicted to make room.
+        assert_eq!(set(&s, "new", "v"), Value::SimpleString("OK".into()));
+        assert_eq!(s.execute(Command::DbSize), Value::Integer(3));
+        assert_eq!(s.get_current("new"), bulk("v"));
+    }
+
+    #[test]
+    fn mset_evicts_enough_room_for_every_new_key() {
+        let s = KeyValueStore::with_config(Some(4), None, EvictionPolicy::AllKeysRandom);
+        fill(&s, 4);
+        // Three new keys against a full store — eviction must run per key, not once.
+        s.execute(Command::MSet(vec![
+            ("n1".into(), "v".into()),
+            ("n2".into(), "v".into()),
+            ("n3".into(), "v".into()),
+        ]));
+        assert_eq!(s.execute(Command::DbSize), Value::Integer(4));
+        for k in ["n1", "n2", "n3"] {
+            assert_eq!(s.get_current(k), bulk("v"), "{k} should have been written");
+        }
+    }
+
+    #[test]
+    fn mset_is_refused_when_it_cannot_make_room() {
+        let s = KeyValueStore::with_max_keys(2); // NoEviction
+        fill(&s, 2);
+        let r = s.execute(Command::MSet(vec![
+            ("n1".into(), "v".into()),
+            ("n2".into(), "v".into()),
+        ]));
+        assert!(matches!(r, Value::Error(_)), "got {r:?}");
+        assert_eq!(s.execute(Command::DbSize), Value::Integer(2));
+    }
+
+    // ── Memory-driven eviction ────────────────────────────────────────────────
+
+    #[test]
+    fn try_evict_is_a_noop_without_a_memory_limit() {
+        let s = KeyValueStore::new();
+        fill(&s, 5);
+        assert!(s.try_evict_for_memory(), "no limit configured -> always ok");
+        assert_eq!(s.execute(Command::DbSize), Value::Integer(5));
+    }
+
+    #[test]
+    fn try_evict_reports_failure_when_policy_cannot_free_memory() {
+        // A tiny limit with NoEviction: nothing can be freed, so the call must
+        // report failure rather than silently exceeding the cap.
+        let s = KeyValueStore::with_config(None, Some(64), EvictionPolicy::NoEviction);
+        fill(&s, 20);
+        assert!(!s.try_evict_for_memory());
+    }
+
+    #[test]
+    fn try_evict_frees_until_under_the_limit() {
+        let s = KeyValueStore::with_config(None, Some(4096), EvictionPolicy::AllKeysRandom);
+        for i in 0..60 {
+            set(&s, &format!("k{i}"), &"x".repeat(200));
+        }
+        assert!(s.try_evict_for_memory());
+        assert!(
+            s.approximate_memory_bytes() <= 4096,
+            "still over the limit: {}",
+            s.approximate_memory_bytes()
+        );
+    }
+
+    #[test]
+    fn volatile_policies_only_evict_keys_that_have_a_ttl() {
+        for policy in [EvictionPolicy::VolatileLru, EvictionPolicy::VolatileTtl] {
+            let s = KeyValueStore::with_config(None, Some(256), policy.clone());
+            // Persistent keys only — a volatile policy has nothing it may touch.
+            for i in 0..30 {
+                set(&s, &format!("p{i}"), &"x".repeat(100));
+            }
+            assert!(
+                !s.try_evict_for_memory(),
+                "{policy:?} must not evict keys without a TTL"
+            );
+            assert_eq!(s.execute(Command::DbSize), Value::Integer(30));
+        }
+    }
+
+    #[test]
+    fn volatile_ttl_evicts_the_soonest_to_expire_first() {
+        let s = KeyValueStore::with_config(None, Some(512), EvictionPolicy::VolatileTtl);
+        // Long TTL first so it is not simply insertion order deciding.
+        for (k, ttl) in [("keep", 600_000u64), ("drop", 1_000)] {
+            s.execute(Command::Set(
+                k.into(),
+                "x".repeat(400),
+                SetOptions {
+                    expiry: Some(crate::cmd::SetExpiry::Px(ttl)),
+                    ..Default::default()
+                },
+            ));
+        }
+        s.try_evict_for_memory();
+        assert_eq!(
+            s.get_current("drop"),
+            Value::BulkString(None),
+            "soonest-to-expire key should go first"
+        );
+    }
+
+    #[test]
+    fn all_keys_lru_evicts_the_least_recently_used() {
+        // Two 400-byte values cost ~936 bytes (entry_size = key + value + 64),
+        // so a 600-byte cap forces exactly one eviction.
+        let s = KeyValueStore::with_config(None, Some(600), EvictionPolicy::AllKeysLru);
+        set(&s, "cold", &"x".repeat(400));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        set(&s, "warm", &"x".repeat(400));
+
+        // Read through `execute` — that is the path that refreshes recency.
+        // `get_current` deliberately does not touch the entry, so using it here
+        // would leave both keys with their write-time timestamps.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_ne!(
+            s.execute(Command::Get("warm".into())),
+            Value::BulkString(None)
+        );
+
+        assert!(s.try_evict_for_memory());
+        assert_eq!(
+            s.get_current("cold"),
+            Value::BulkString(None),
+            "least-recently-used key should be evicted first"
+        );
+        assert_ne!(s.get_current("warm"), Value::BulkString(None));
+    }
+}
+
+#[cfg(test)]
+mod semantics_tests {
+    use super::*;
+    use crate::cmd::{Command, SetExpiry, SetOptions, ZAddOptions};
+
+    fn bulk(s: &str) -> Value {
+        Value::BulkString(Some(s.as_bytes().to_vec()))
+    }
+
+    fn zadd(s: &KeyValueStore, key: &str, opts: ZAddOptions, members: Vec<(f64, String)>) -> Value {
+        s.execute(Command::ZAdd(key.into(), opts, members))
+    }
+
+    fn score(s: &KeyValueStore, key: &str, member: &str) -> Option<String> {
+        match s.execute(Command::ZScore(key.into(), member.into())) {
+            Value::BulkString(Some(b)) => Some(String::from_utf8(b).unwrap()),
+            _ => None,
+        }
+    }
+
+    // ── ZADD GT / LT ──────────────────────────────────────────────────────────
+    // Only move a score in one direction. Getting these inverted silently
+    // corrupts leaderboards, which is the headline use case for sorted sets.
+
+    #[test]
+    fn zadd_gt_only_raises_scores() {
+        let s = KeyValueStore::new();
+        zadd(&s, "lb", ZAddOptions::default(), vec![(100.0, "p".into())]);
+
+        let gt = ZAddOptions {
+            gt: true,
+            ..Default::default()
+        };
+        zadd(&s, "lb", gt.clone(), vec![(50.0, "p".into())]);
+        assert_eq!(
+            score(&s, "lb", "p").as_deref(),
+            Some("100"),
+            "GT must not lower"
+        );
+
+        zadd(&s, "lb", gt, vec![(150.0, "p".into())]);
+        assert_eq!(
+            score(&s, "lb", "p").as_deref(),
+            Some("150"),
+            "GT must raise"
+        );
+    }
+
+    #[test]
+    fn zadd_lt_only_lowers_scores() {
+        let s = KeyValueStore::new();
+        zadd(&s, "lb", ZAddOptions::default(), vec![(100.0, "p".into())]);
+
+        let lt = ZAddOptions {
+            lt: true,
+            ..Default::default()
+        };
+        zadd(&s, "lb", lt.clone(), vec![(150.0, "p".into())]);
+        assert_eq!(
+            score(&s, "lb", "p").as_deref(),
+            Some("100"),
+            "LT must not raise"
+        );
+
+        zadd(&s, "lb", lt, vec![(50.0, "p".into())]);
+        assert_eq!(score(&s, "lb", "p").as_deref(), Some("50"), "LT must lower");
+    }
+
+    #[test]
+    fn zadd_ch_counts_changed_not_just_added() {
+        let s = KeyValueStore::new();
+        zadd(&s, "z", ZAddOptions::default(), vec![(1.0, "a".into())]);
+        let ch = ZAddOptions {
+            ch: true,
+            ..Default::default()
+        };
+        // Without CH this returns 0 (nothing *added*); with CH it counts the update.
+        assert_eq!(
+            zadd(&s, "z", ch, vec![(2.0, "a".into())]),
+            Value::Integer(1)
+        );
+    }
+
+    // ── ZINCRBY ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn zincrby_accumulates_and_creates() {
+        let s = KeyValueStore::new();
+        assert_eq!(
+            s.execute(Command::ZIncrBy("z".into(), 5.0, "m".into())),
+            bulk("5")
+        );
+        assert_eq!(
+            s.execute(Command::ZIncrBy("z".into(), 2.5, "m".into())),
+            bulk("7.5")
+        );
+        // Negative deltas subtract.
+        assert_eq!(
+            s.execute(Command::ZIncrBy("z".into(), -7.5, "m".into())),
+            bulk("0")
+        );
+    }
+
+    // ── TTL overflow guards ───────────────────────────────────────────────────
+
+    #[test]
+    fn set_rejects_ttl_that_would_overflow_milliseconds() {
+        let s = KeyValueStore::new();
+        let r = s.execute(Command::Set(
+            "k".into(),
+            "v".into(),
+            SetOptions {
+                expiry: Some(SetExpiry::Ex(u64::MAX / 1000 + 1)),
+                ..Default::default()
+            },
+        ));
+        assert!(matches!(r, Value::Error(_)), "got {r:?}");
+    }
+
+    #[test]
+    fn keepttl_preserves_the_existing_expiry() {
+        let s = KeyValueStore::new();
+        s.execute(Command::Set(
+            "k".into(),
+            "v1".into(),
+            SetOptions {
+                expiry: Some(SetExpiry::Ex(600)),
+                ..Default::default()
+            },
+        ));
+        s.execute(Command::Set(
+            "k".into(),
+            "v2".into(),
+            SetOptions {
+                expiry: Some(SetExpiry::KeepTtl),
+                ..Default::default()
+            },
+        ));
+        assert_eq!(s.execute(Command::Get("k".into())), bulk("v2"));
+        // A TTL still exists — the rewrite did not clear it.
+        assert!(
+            matches!(s.execute(Command::Ttl("k".into())), Value::Integer(n) if n > 0),
+            "KEEPTTL should retain the expiry"
+        );
+    }
+
+    #[test]
+    fn plain_set_clears_an_existing_expiry() {
+        let s = KeyValueStore::new();
+        s.execute(Command::Set(
+            "k".into(),
+            "v1".into(),
+            SetOptions {
+                expiry: Some(SetExpiry::Ex(600)),
+                ..Default::default()
+            },
+        ));
+        s.execute(Command::Set("k".into(), "v2".into(), SetOptions::default()));
+        // -1 means "exists, no expiry".
+        assert_eq!(s.execute(Command::Ttl("k".into())), Value::Integer(-1));
+    }
+
+    // ── SMOVE ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn smove_transfers_a_member_between_sets() {
+        let s = KeyValueStore::new();
+        s.execute(Command::SAdd("src".into(), vec!["a".into(), "b".into()]));
+        s.execute(Command::SAdd("dst".into(), vec!["z".into()]));
+
+        assert_eq!(
+            s.execute(Command::SMove("src".into(), "dst".into(), "a".into())),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            s.execute(Command::SIsMember("src".into(), "a".into())),
+            Value::Integer(0)
+        );
+        assert_eq!(
+            s.execute(Command::SIsMember("dst".into(), "a".into())),
+            Value::Integer(1)
+        );
+    }
+
+    #[test]
+    fn smove_is_a_noop_when_the_member_is_absent() {
+        let s = KeyValueStore::new();
+        s.execute(Command::SAdd("src".into(), vec!["a".into()]));
+        assert_eq!(
+            s.execute(Command::SMove("src".into(), "dst".into(), "missing".into())),
+            Value::Integer(0)
+        );
+        // Destination must not be created as a side effect of a failed move.
+        assert_eq!(
+            s.execute(Command::Exists(vec!["dst".into()])),
+            Value::Integer(0)
+        );
+    }
+
+    // ── Commands the engine deliberately refuses ──────────────────────────────
+    // These are server-layer concerns; the pure engine must reject rather than
+    // half-implement them, so a WASM build can never silently "succeed".
+
+    #[test]
+    fn engine_refuses_server_layer_commands() {
+        let s = KeyValueStore::new();
+        for cmd in [
+            Command::Save,
+            Command::BgSave,
+            Command::LastSave,
+            Command::ReplicaOfNoOne,
+            Command::Watch(vec!["k".into()]),
+            Command::Unwatch(vec![]),
+        ] {
+            assert!(
+                matches!(s.execute(cmd.clone()), Value::Error(_)),
+                "{cmd:?} should be refused by the engine"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_command_names_itself_in_the_error() {
+        let s = KeyValueStore::new();
+        match s.execute(Command::Unknown("FLERB".into())) {
+            Value::Error(e) => assert!(e.contains("FLERB"), "got {e}"),
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod critical_path_tests {
+    use super::*;
+    use crate::cmd::{Command, SetExpiry, SetOptions};
+
+    fn bulk(s: &str) -> Value {
+        Value::BulkString(Some(s.as_bytes().to_vec()))
+    }
+
+    // ── glob_match ────────────────────────────────────────────────────────────
+    //
+    // This is not just the KEYS/SCAN matcher. `server-native` uses it as the
+    // sync-scope authorization primitive: a connection may touch a key only if
+    // some granted pattern glob_matches it. A false positive here is a
+    // cross-tenant data leak, so the security-relevant cases are pinned
+    // explicitly rather than left to the callers' tests.
+
+    #[test]
+    fn glob_literal_matches_exactly() {
+        assert!(glob_match("key", "key"));
+        assert!(!glob_match("key", "keys"));
+        assert!(!glob_match("keys", "key"));
+        assert!(!glob_match("key", "Key"), "matching is case-sensitive");
+    }
+
+    #[test]
+    fn glob_star_matches_any_run_including_empty() {
+        assert!(glob_match("*", ""));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("a*", "a"), "trailing * may match nothing");
+        assert!(glob_match("a*c", "ac"), "interior * may match nothing");
+        assert!(glob_match("a*c", "abbbc"));
+        assert!(glob_match("*c", "abc"));
+        assert!(glob_match("*b*", "abc"));
+        assert!(glob_match("a*b*c", "axxbyyc"));
+    }
+
+    #[test]
+    fn glob_question_matches_exactly_one_byte() {
+        assert!(glob_match("a?c", "abc"));
+        assert!(!glob_match("a?c", "ac"), "? must not match empty");
+        assert!(!glob_match("a?c", "abbc"), "? must not match two");
+        assert!(glob_match("???", "abc"));
+        assert!(!glob_match("???", "ab"));
+    }
+
+    #[test]
+    fn glob_empty_pattern_matches_only_empty_string() {
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "x"));
+    }
+
+    #[test]
+    fn glob_scope_prefix_grants_do_not_leak_across_siblings() {
+        // The documented model: `cart:*` covers everything under `cart:`.
+        assert!(glob_match("cart:*", "cart:42"));
+        assert!(glob_match("cart:*", "cart:42:item:9"));
+
+        // But a narrower grant must not reach a sibling tenant's keys. If any
+        // of these flip to true, scoped connections can read other users' data.
+        assert!(!glob_match("cart:42:*", "cart:99:item:1"));
+        assert!(!glob_match("user:1:*", "user:2:secret"));
+        assert!(!glob_match("cart:*", "carts:42"), "':' is a real boundary");
+        assert!(
+            !glob_match("cart:*", "xcart:42"),
+            "no implicit leading wildcard"
+        );
+    }
+
+    #[test]
+    fn glob_prefix_confusion_between_similar_keys() {
+        // `user:1*` legitimately covers user:1, user:10, user:19 — a caller
+        // granting it is granting all of them. Pinned so the behaviour is a
+        // documented decision rather than an accident.
+        assert!(glob_match("user:1*", "user:1"));
+        assert!(glob_match("user:1*", "user:10"));
+        assert!(glob_match("user:1*", "user:1:private"));
+        assert!(!glob_match("user:1*", "user:2"));
+    }
+
+    #[test]
+    fn glob_star_crosses_separators() {
+        // Unlike shell globbing, `*` spans ':' — this is what makes a single
+        // `tenant:7:*` grant cover the whole subtree.
+        assert!(glob_match("tenant:7:*", "tenant:7:orders:2024:11"));
+        assert!(glob_match("*:secret", "a:b:c:secret"));
+    }
+
+    #[test]
+    fn glob_consecutive_stars_behave_as_one() {
+        assert!(glob_match("**", "abc"));
+        assert!(glob_match("a**c", "abc"));
+        assert!(glob_match("a**c", "ac"));
+    }
+
+    #[test]
+    fn glob_pathological_pattern_terminates_quickly() {
+        // The implementation replaced a recursive matcher with exponential
+        // backtracking on inputs of exactly this shape. A regression would hang
+        // the server, so this asserts on wall-clock, not just correctness.
+        let text = "a".repeat(2_000);
+        let pattern = "*a*a*a*a*a*a*a*a*a*b";
+        let start = std::time::Instant::now();
+        assert!(!glob_match(pattern, &text));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "glob_match took {:?} — exponential backtracking has returned",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn glob_operates_on_bytes_so_multibyte_chars_span_several_positions() {
+        // Documented consequence of byte-wise matching: '?' matches one *byte*,
+        // and 'é' is two bytes in UTF-8. Callers building scopes from user input
+        // need to know this.
+        assert!(!glob_match("?", "é"));
+        assert!(glob_match("??", "é"));
+        assert!(glob_match("*", "héllo"));
+        assert!(glob_match("h*o", "héllo"));
+    }
+
+    // ── Expiry ────────────────────────────────────────────────────────────────
+    // Returning an expired value is a correctness bug with security weight —
+    // revoked sessions and flags are exactly what people put in a cache.
+
+    #[test]
+    fn expired_keys_are_invisible_to_every_read_path() {
+        let s = KeyValueStore::new();
+        s.execute(Command::Set(
+            "k".into(),
+            "v".into(),
+            SetOptions {
+                expiry: Some(SetExpiry::Px(1)),
+                ..Default::default()
+            },
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(15));
+
+        assert_eq!(s.execute(Command::Get("k".into())), Value::BulkString(None));
+        assert_eq!(
+            s.execute(Command::Exists(vec!["k".into()])),
+            Value::Integer(0)
+        );
+        assert_eq!(s.get_current("k"), Value::BulkString(None));
+        assert_eq!(s.execute(Command::Ttl("k".into())), Value::Integer(-2));
+        // KEYS and live-query matching must not surface it either.
+        assert_eq!(
+            s.execute(Command::Keys("*".into())),
+            Value::Array(Some(vec![]))
+        );
+        assert!(s.matching_key_values("*", 100).is_empty());
+    }
+
+    #[test]
+    fn ttl_distinguishes_missing_from_persistent() {
+        let s = KeyValueStore::new();
+        // -2 = no such key, -1 = exists but never expires.
+        assert_eq!(s.execute(Command::Ttl("nope".into())), Value::Integer(-2));
+        s.execute(Command::Set("k".into(), "v".into(), SetOptions::default()));
+        assert_eq!(s.execute(Command::Ttl("k".into())), Value::Integer(-1));
+    }
+
+    #[test]
+    fn expiry_in_the_past_deletes_immediately() {
+        let s = KeyValueStore::new();
+        s.execute(Command::Set("k".into(), "v".into(), SetOptions::default()));
+        // EXAT with a timestamp already behind us.
+        s.execute(Command::ExpireAt("k".into(), 1_000));
+        assert_eq!(s.execute(Command::Get("k".into())), Value::BulkString(None));
+    }
+
+    // ── Numeric edges ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn incr_refuses_to_overflow() {
+        let s = KeyValueStore::new();
+        s.execute(Command::Set(
+            "n".into(),
+            i64::MAX.to_string(),
+            SetOptions::default(),
+        ));
+        let r = s.execute(Command::Incr("n".into()));
+        assert!(
+            matches!(r, Value::Error(_)),
+            "i64::MAX + 1 must error, got {r:?}"
+        );
+        // The stored value must be untouched after a refused increment.
+        assert_eq!(
+            s.execute(Command::Get("n".into())),
+            bulk(&i64::MAX.to_string())
+        );
+    }
+
+    #[test]
+    fn decr_refuses_to_underflow() {
+        let s = KeyValueStore::new();
+        s.execute(Command::Set(
+            "n".into(),
+            i64::MIN.to_string(),
+            SetOptions::default(),
+        ));
+        assert!(matches!(
+            s.execute(Command::Decr("n".into())),
+            Value::Error(_)
+        ));
+    }
+
+    #[test]
+    fn incr_rejects_non_numeric_values() {
+        let s = KeyValueStore::new();
+        s.execute(Command::Set(
+            "k".into(),
+            "abc".into(),
+            SetOptions::default(),
+        ));
+        match s.execute(Command::Incr("k".into())) {
+            Value::Error(e) => assert!(e.contains("not an integer"), "got {e}"),
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    // ── Type safety ───────────────────────────────────────────────────────────
+    // A string command against a hash must error, not coerce or silently
+    // clobber the existing value.
+
+    #[test]
+    fn wrong_type_operations_error_and_preserve_the_value() {
+        let s = KeyValueStore::new();
+        s.execute(Command::HSet("h".into(), vec![("f".into(), "v".into())]));
+
+        for cmd in [
+            Command::Get("h".into()),
+            Command::Incr("h".into()),
+            Command::Append("h".into(), "x".into()),
+            Command::LPush("h".into(), vec!["x".into()]),
+            Command::SAdd("h".into(), vec!["x".into()]),
+        ] {
+            assert!(
+                matches!(s.execute(cmd.clone()), Value::Error(_)),
+                "{cmd:?} against a hash should error"
+            );
+        }
+        // The hash survived every attempt intact.
+        assert_eq!(s.execute(Command::HGet("h".into(), "f".into())), bulk("v"));
+    }
+
+    // ── Snapshot round-trip ───────────────────────────────────────────────────
+    // Restore is the data-loss path: anything that fails to round-trip is gone
+    // after a restart.
+
+    #[test]
+    fn snapshot_restores_every_value_type() {
+        let s = KeyValueStore::new();
+        s.execute(Command::Set(
+            "str".into(),
+            "v".into(),
+            SetOptions::default(),
+        ));
+        s.execute(Command::HSet("h".into(), vec![("f".into(), "v".into())]));
+        s.execute(Command::RPush("l".into(), vec!["a".into(), "b".into()]));
+        s.execute(Command::SAdd("st".into(), vec!["m".into()]));
+        s.execute(Command::ZAdd(
+            "z".into(),
+            Default::default(),
+            vec![(1.5, "m".into())],
+        ));
+        s.execute(Command::JSet("j".into(), "$".into(), "{\"a\":1}".into()));
+
+        let restored = KeyValueStore::new();
+        restored.restore(s.snapshot());
+
+        assert_eq!(restored.execute(Command::Get("str".into())), bulk("v"));
+        assert_eq!(
+            restored.execute(Command::HGet("h".into(), "f".into())),
+            bulk("v")
+        );
+        assert_eq!(
+            restored.execute(Command::LLen("l".into())),
+            Value::Integer(2)
+        );
+        assert_eq!(
+            restored.execute(Command::SIsMember("st".into(), "m".into())),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            restored.execute(Command::ZScore("z".into(), "m".into())),
+            bulk("1.5")
+        );
+        assert_eq!(
+            restored.execute(Command::JGet("j".into(), None)),
+            bulk("{\"a\":1}")
+        );
+    }
+
+    #[test]
+    fn snapshot_preserves_ttls_rather_than_making_keys_permanent() {
+        let s = KeyValueStore::new();
+        s.execute(Command::Set(
+            "k".into(),
+            "v".into(),
+            SetOptions {
+                expiry: Some(SetExpiry::Ex(600)),
+                ..Default::default()
+            },
+        ));
+        let restored = KeyValueStore::new();
+        restored.restore(s.snapshot());
+        assert!(
+            matches!(restored.execute(Command::Ttl("k".into())), Value::Integer(n) if n > 0),
+            "a restored key must keep its expiry, not become permanent"
+        );
+    }
+}

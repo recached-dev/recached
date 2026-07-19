@@ -205,4 +205,4 @@ cache.setEx('session', userId, 1800);
 
 ## License
 
-MIT
+Apache-2.0

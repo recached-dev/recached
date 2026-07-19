@@ -128,3 +128,36 @@
   background-color: #0f1620;
   border-top-color: #1a2535;
 }
+
+/* ── Theme-swapped figures ───────────────────────────────────────────────────
+   VitePress toggles dark mode with a class on <html>, so a `prefers-color-scheme`
+   media query inside an image cannot follow the site's theme switch — it tracks
+   the OS instead. Ship both variants and swap them on the same class VitePress
+   uses, so the diagram always matches the page. */
+
+html.dark .light-only {
+  display: none;
+}
+
+html:not(.dark) .dark-only {
+  display: none;
+}
+
+figure {
+  margin: 1.5rem 0;
+}
+
+figure img {
+  width: 100%;
+  max-width: 880px;
+  height: auto;
+  display: block;
+  margin: 0 auto;
+}
+
+figcaption {
+  text-align: center;
+  color: var(--vp-c-text-2);
+  font-size: 0.85rem;
+  margin-top: 0.75rem;
+}

@@ -7,7 +7,7 @@
   <a href="https://www.npmjs.com/package/recached-edge"><img src="https://img.shields.io/npm/v/recached-edge?label=npm" alt="npm"></a>
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Language-Rust-orange.svg?logo=rust" alt="Rust"></a>
   <a href="https://webassembly.org"><img src="https://img.shields.io/badge/Ecosystem-WebAssembly-yellow.svg" alt="Wasm"></a>
-  <a href="LICENSE.md"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="MIT"></a>
+  <a href="LICENSE.md"><img src="https://img.shields.io/badge/License-Apache_2.0-green.svg" alt="Apache 2.0"></a>
 </div>
 
 ---
@@ -45,19 +45,12 @@ npm install recached-edge
 
 ## How it works
 
-```
-┌─────────────────┐        RESP (port 6379)        ┌──────────────────┐
-│   Your backend  │ ──────────────────────────────► │  Recached Server │
-└─────────────────┘                                 │  (server-native) │
-                                                    └────────┬─────────┘
-                                                             │ WebSocket
-                                                             │ sync (6380)
-                                                    ┌────────▼─────────┐
-                                                    │  Browser / Edge  │
-                                                    │  (wasm-edge)     │
-                                                    │  local reads: 0ms│
-                                                    └──────────────────┘
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/architecture-dark.svg">
+    <img src="assets/architecture-light.svg" width="880" alt="Your backend writes to the Recached server over RESP on port 6379. The server syncs over a WebSocket on port 6380 to the browser or edge runtime, where reads are served from local WebAssembly memory. Writes flow back the same way.">
+  </picture>
+</p>
 
 Any mutation on the server is pushed to all connected browser instances automatically. Any write from the browser is pushed to the server and fanned out to other clients. Reads always come from local WASM memory — no network hop.
 
@@ -146,4 +139,4 @@ Recached is free and open-source, maintained by one person. If it saves you infr
 
 ## License
 
-MIT — © 2026 ThinkGrid Labs
+Apache License 2.0 — © 2026 ThinkGrid Labs

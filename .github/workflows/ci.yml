@@ -39,6 +39,15 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --exclude wasm-edge
 
+      # core-engine is the shared state machine: the same code evaluates commands
+      # on the server and inside the browser via WASM, so a bug here reaches every
+      # platform at once. Its coverage is gated rather than merely reported.
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Enforce core-engine coverage floor (90%)
+        run: cargo llvm-cov -p core-engine --summary-only --fail-under-lines 90
+
   integration-load-chaos:
     name: Load & Chaos Tests
     runs-on: ubuntu-latest

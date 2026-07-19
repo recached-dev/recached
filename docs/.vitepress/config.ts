@@ -43,6 +43,7 @@ export default defineConfig({
           items: [
             { text: 'Introduction', link: '/guide/introduction' },
             { text: 'Quick Start', link: '/guide/quick-start' },
+            { text: 'Use Cases', link: '/guide/use-cases' },
             { text: 'How It Works', link: '/guide/how-it-works' },
             { text: 'Benchmarks', link: '/guide/benchmarks' },
           ],
@@ -56,6 +57,9 @@ export default defineConfig({
             { text: 'Configuration', link: '/server/configuration' },
             { text: 'Commands', link: '/server/commands' },
             { text: 'Sync Scopes', link: '/server/sync-scopes' },
+            { text: 'Security', link: '/server/security' },
+            { text: 'Operations', link: '/server/operations' },
+            { text: 'Troubleshooting', link: '/server/troubleshooting' },
             { text: 'Wire Protocol', link: '/server/protocol' },
           ],
         },
@@ -96,7 +100,7 @@ export default defineConfig({
     ],
 
     footer: {
-      message: 'Released under the MIT License.',
+      message: 'Released under the Apache License 2.0.',
       copyright: 'Copyright © 2026 ThinkGrid Labs',
     },
 

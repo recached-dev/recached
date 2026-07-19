@@ -2,8 +2,12 @@
 
 How the Recached server compares to Redis 7.2.5 and Valkey 9.1.0 under `redis-benchmark`, measured July 2026 on Recached v0.1.8.
 
+::: warning Measured on v0.1.8
+These numbers predate v0.2.0, which added the exactly-once `DEDUP` envelope on every store write and extracted the sync client. Server-side command paths were not the target of those changes, but the suite has not been re-run since — treat the table as v0.1.8 evidence, not a current measurement. Redis 7.2.5 was also current when this ran; newer Redis releases may perform differently.
+:::
+
 ::: tip TL;DR
-Pipelined (`-P 16`), Recached sustains **408k–546k requests/sec** — ahead of Redis on 6 of 7 commands and ahead of Valkey on all 7, on the same 4-core machine. Unpipelined — one command per round-trip, the traffic shape of typical application cache calls — Recached runs at 46–96% of Redis with **sub-millisecond p50 latency** on every common command.
+Pipelined (`-P 16`), Recached sustains **408k–546k requests/sec** — ahead of Redis on 6 of 7 commands and ahead of Valkey on all 7, on the same 4-core machine. Unpipelined — one command per round-trip, the traffic shape of typical application cache calls — Recached runs at 46–96% of Redis with **sub-millisecond p50 latency on every single-key command** (multi-element `LRANGE` reads are the exception, at 1.96–3.58 ms p50).
 :::
 
 Recached's design goal is not to beat Redis at raw server throughput — it is to remove the network round-trip entirely for browser reads, which no server-side cache can do. These numbers cover the server half (`server-native`) so you know what to expect when you point existing Redis clients at it.
@@ -67,7 +71,7 @@ Requests per second; p50/p99 latency in milliseconds.
 | LRANGE_500 | 3,457 | 3.43 / 8.87 | 4,393 | 3.70 / 6.81 | 4,417 | 3.70 / 6.63 |
 | LRANGE_600 | 3,172 | 3.58 / 8.22 | 3,737 | 4.37 / 8.19 | 3,805 | 4.30 / 8.05 |
 
-Unpipelined, the localhost round-trip dominates and single-command latency decides the table: strings, counters, lists and sets run at 74–96% of Redis; HSET, SPOP and ZADD trail at 46–58%. Everything stays under 0.75 ms at p50.
+Unpipelined, the localhost round-trip dominates and single-command latency decides the table: single-key strings, counters, lists and sets run at 73–96% of Redis; HSET, SPOP and ZADD trail at 46–58%; multi-element `LRANGE` reads land at 63–85%. Single-key commands stay at or under 0.74 ms p50; the `LRANGE` range reads are the exception at 1.96–3.58 ms p50, since the reply grows with the number of elements returned.
 
 ::: info SPOP on large sets — fixed in v0.1.8
 In v0.1.7, SPOP selected random members by iterating and cloning the entire set — O(n) per pop — which collapsed to **823 rps** against the ~100k-member set this suite builds. v0.1.8 backs sets with an index-addressable structure (`IndexSet`), making SPOP/SRANDMEMBER O(1) per member: the same large-set workload now runs at **~22,000 rps**, in line with the other set commands.

@@ -338,4 +338,4 @@ Requires WebAssembly support (all modern browsers) and the WebSocket API for ser
 
 ## License
 
-MIT
+Apache-2.0

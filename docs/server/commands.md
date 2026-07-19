@@ -343,6 +343,18 @@ await pub.publish('events:orders', JSON.stringify({ id: 123, status: 'shipped' }
 
 ---
 
+## Replication
+
+Replication topology is set at startup with [`RECACHED_REPLICAOF`](/server/configuration#environment-variable-reference). One runtime command exists, for promoting a replica during failover.
+
+| Command | Description |
+|---|---|
+| `REPLICAOF NO ONE` | Promotes this replica to a primary: it stops following its upstream and begins accepting writes. This is the **only** accepted form — pointing a running server at a new primary (`REPLICAOF host port`) is rejected with an error. To re-point a server, restart it with a different `RECACHED_REPLICAOF`. |
+
+Automatic promotion on primary failure is configured with `RECACHED_FAILOVER_TIMEOUT`; `REPLICAOF NO ONE` is the manual equivalent. Note that promotion is not coordinated between replicas — see [when Recached is not the right fit](/guide/introduction#when-recached-is-not-the-right-fit) for the split-brain caveat.
+
+---
+
 ## Persistence
 
 Snapshot commands write the in-memory store to disk in MessagePack format. The snapshot path and autosave interval are controlled by [`RECACHED_SAVE_PATH` and `RECACHED_SAVE_INTERVAL`](/server/configuration#environment-variable-reference).

@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 236" width="880" height="236" role="img" aria-label="Your backend writes to the Recached server over RESP on port 6379. The server syncs over a WebSocket on port 6380 to the browser or edge runtime, where reads are served from local WebAssembly memory. Writes flow back the same way.">
+<style>
+  .wire { fill:none; stroke:#d6dae0; stroke-width:2; stroke-dasharray:5 6; }
+  .node rect { fill:#f6f8fa; stroke:#d6dae0; stroke-width:1.5; }
+  .server > rect { stroke:#E8542A; }
+  .pill { fill:#ffffff; stroke:#d6dae0; stroke-width:1; }
+  .pill-accent { fill:#fdeee9; stroke:#f3b9a5; stroke-width:1; }
+  .title { fill:#1f2328; font:700 15px system-ui,-apple-system,'Segoe UI',Roboto,sans-serif; text-anchor:middle; }
+  .sub { fill:#656d76; font:11.5px system-ui,-apple-system,'Segoe UI',Roboto,sans-serif; text-anchor:middle; }
+  .pill-text { fill:#1f2328; font:600 11px ui-monospace,SFMono-Regular,'SF Mono',Menlo,monospace; text-anchor:middle; }
+  .edge { fill:#8c959f; font:600 11px ui-monospace,SFMono-Regular,'SF Mono',Menlo,monospace; text-anchor:middle; }
+  .w-in { fill:#5B8DEF; }
+  .w-out { fill:#8DD4CC; }
+  .w-back { fill:#E8542A; }
+  .flash { fill:#8DD4CC; opacity:0; animation:arrive 4.4s linear infinite; }
+  @keyframes arrive { 0%,52% {opacity:0;} 57% {opacity:.20;} 66%,100% {opacity:0;} }
+  /* Honour a reduced-motion preference: keep the diagram, drop the movement. */
+  @media (prefers-reduced-motion: reduce) {
+    .packet { display:none; }
+    .flash { animation:none; }
+  }
+</style>
+<path class="wire" d="M196,134 L344,134"/>
+<path class="wire" d="M540,112 L688,112"/>
+<path class="wire" d="M688,156 L540,156"/>
+<g class="node"><rect x="24" y="96" width="172" height="76" rx="14"/><text x="110" y="128" class="title">Your backend</text><text x="110" y="149" class="sub">any Redis client</text></g>
+<g class="node server"><rect x="344" y="72" width="196" height="124" rx="16"/><text x="442" y="102" class="title">Recached Server</text><rect x="362" y="116" width="160" height="26" rx="7" class="pill-accent"/><text x="442" y="134" class="pill-text">server-native</text><rect x="362" y="150" width="160" height="26" rx="7" class="pill"/><text x="442" y="168" class="pill-text">core-engine</text></g>
+<g class="node"><rect x="688" y="84" width="168" height="100" rx="14"/><rect class="flash" x="688" y="84" width="168" height="100" rx="14"/><text x="772" y="114" class="title">Browser / Edge</text><rect x="704" y="126" width="136" height="26" rx="7" class="pill"/><text x="772" y="144" class="pill-text">wasm-edge</text><text x="772" y="170" class="sub">local reads · 0 ms</text></g>
+<text x="270" y="124" class="edge">RESP · :6379</text>
+<text x="614" y="100" class="edge">WebSocket · :6380</text>
+<text x="614" y="176" class="edge">writes sync back</text>
+<circle class="packet w-in" r="5"><animateMotion dur="4.4s" repeatCount="indefinite" keyTimes="0;0.30;1" keyPoints="0;1;1" calcMode="linear" path="M196,134 L344,134"/><animate attributeName="opacity" dur="4.4s" repeatCount="indefinite" keyTimes="0;0.02;0.28;0.31;1" values="0;1;1;0;0"/></circle>
+<circle class="packet w-out" r="5"><animateMotion dur="4.4s" repeatCount="indefinite" keyTimes="0;0.34;0.58;1" keyPoints="0;0;1;1" calcMode="linear" path="M540,112 L688,112"/><animate attributeName="opacity" dur="4.4s" repeatCount="indefinite" keyTimes="0;0.34;0.36;0.56;0.59;1" values="0;0;1;1;0;0"/></circle>
+<circle class="packet w-back" r="5"><animateMotion dur="4.4s" repeatCount="indefinite" keyTimes="0;0.68;0.94;1" keyPoints="0;0;1;1" calcMode="linear" path="M688,156 L540,156"/><animate attributeName="opacity" dur="4.4s" repeatCount="indefinite" keyTimes="0;0.68;0.70;0.92;0.95;1" values="0;0;1;1;0;0"/></circle>
+</svg>
