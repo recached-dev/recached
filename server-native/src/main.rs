@@ -773,7 +773,10 @@ fn origin_allowed(allowed: Option<&[String]>, origin: Option<&str>) -> bool {
 fn handshake_timeout() -> Duration {
     static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     Duration::from_secs(*V.get_or_init(|| {
-        env_limit("RECACHED_HANDSHAKE_TIMEOUT", DEFAULT_HANDSHAKE_TIMEOUT_SECS as usize) as u64
+        env_limit(
+            "RECACHED_HANDSHAKE_TIMEOUT",
+            DEFAULT_HANDSHAKE_TIMEOUT_SECS as usize,
+        ) as u64
     }))
 }
 
@@ -4046,16 +4049,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let thr_r = ReplAuthThrottle::new();
         tokio::spawn(async move {
             run_repl_server(
-                host_r,
-                repl_port,
-                store_r,
-                snap_r,
-                reg_r,
-                pwd_r,
-                cap_r,
-                allowed_r,
-                sem_r,
-                thr_r,
+                host_r, repl_port, store_r, snap_r, reg_r, pwd_r, cap_r, allowed_r, sem_r, thr_r,
             )
             .await;
         });
@@ -4219,11 +4213,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // Bounded: the permit is already held, so a peer
                                 // that opens a socket and never negotiates would
                                 // otherwise occupy a slot indefinitely.
-                                match tokio::time::timeout(
-                                    handshake_timeout(),
-                                    acc.accept(socket),
-                                )
-                                .await
+                                match tokio::time::timeout(handshake_timeout(), acc.accept(socket))
+                                    .await
                                 {
                                     Ok(Ok(tls_stream)) => {
                                         handle_tcp(
@@ -4822,6 +4813,11 @@ async fn handle_tcp<S>(
 ///
 /// Split out from `handle_ws` so both the origin decision and the timeout are
 /// reachable from a test without standing up a listener.
+///
+/// `result_large_err`: the error type is tungstenite's `ErrorResponse`, which is
+/// an `http::Response` — its size is the handshake callback's signature, not
+/// ours, and boxing it would not satisfy the trait.
+#[allow(clippy::result_large_err)]
 async fn ws_handshake<S>(
     socket: S,
     allowed_origins: Option<&[String]>,
@@ -6752,6 +6748,8 @@ mod tests {
                     r,
                     None,
                     DEFAULT_REPL_CHANNEL_CAPACITY,
+                    IpAddr::from([127, 0, 0, 1]),
+                    ReplAuthThrottle::new(),
                 ));
             }
         });
@@ -6954,8 +6952,17 @@ mod tests {
             );
             tokio::spawn(async move {
                 if let Ok((socket, _)) = listener.accept().await {
-                    let _ =
-                        handle_replica(socket, s, sc, r, None, DEFAULT_REPL_CHANNEL_CAPACITY).await;
+                    let _ = handle_replica(
+                        socket,
+                        s,
+                        sc,
+                        r,
+                        None,
+                        DEFAULT_REPL_CHANNEL_CAPACITY,
+                        IpAddr::from([127, 0, 0, 1]),
+                        ReplAuthThrottle::new(),
+                    )
+                    .await;
                 }
             });
         }
@@ -7215,6 +7222,87 @@ mod tests {
 
     /// Like `spawn_ws_server`, with an optional sync-scope secret (strict mode).
     async fn spawn_ws_server_cfg(sync_secret: Option<String>) -> TestServer {
+        spawn_ws_server_full(sync_secret, None).await
+    }
+
+    /// Like `spawn_ws_server`, with an origin allowlist in force.
+    async fn spawn_ws_server_origins(origins: Vec<String>) -> TestServer {
+        spawn_ws_server_full(None, Some(origins)).await
+    }
+
+    /// Open a WebSocket to `addr`, optionally sending an `Origin` header, and
+    /// report whether the handshake completed.
+    async fn ws_connect_with_origin(
+        addr: std::net::SocketAddr,
+        origin: Option<&str>,
+    ) -> Result<(), String> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut req = format!("ws://{addr}").into_client_request().unwrap();
+        if let Some(o) = origin {
+            req.headers_mut().insert("origin", o.parse().unwrap());
+        }
+        tokio_tungstenite::connect_async(req)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    #[tokio::test]
+    async fn ws_refuses_a_cross_origin_handshake() {
+        // Browsers apply neither CORS nor a preflight to WebSockets, so before
+        // this check any page a user visited could open a socket to port 6380
+        // and read or write the whole keyspace with that user's network
+        // position. On ws://localhost:6380 that is every site in every tab.
+        let srv = spawn_ws_server_origins(vec!["https://app.example.com".to_string()]).await;
+
+        let err = ws_connect_with_origin(srv.tcp_addr, Some("https://evil.example"))
+            .await
+            .expect_err("a foreign Origin must not complete the handshake");
+        assert!(
+            err.contains("403") || err.to_lowercase().contains("forbidden"),
+            "expected a 403, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_admits_an_allowlisted_origin_and_serves_commands() {
+        // The rejection is worthless if it also breaks the deployed app, so
+        // assert the permitted path all the way through to a working command.
+        let srv = spawn_ws_server_origins(vec!["https://app.example.com".to_string()]).await;
+        ws_connect_with_origin(srv.tcp_addr, Some("https://app.example.com"))
+            .await
+            .expect("an allowlisted Origin must connect");
+
+        let mut c = WsClient::connect(srv.tcp_addr).await;
+        assert_eq!(c.cmd(&["SET", "k", "v"]).await, ok());
+        assert_eq!(c.cmd(&["GET", "k"]).await, bulk("v"));
+    }
+
+    #[tokio::test]
+    async fn ws_admits_a_client_that_sends_no_origin() {
+        // Native clients omit the header, and an attacker with a raw socket can
+        // forge it — refusing here would break real clients while stopping
+        // nobody. `WsClient::connect` is exactly such a client.
+        let srv = spawn_ws_server_origins(vec!["https://app.example.com".to_string()]).await;
+        ws_connect_with_origin(srv.tcp_addr, None)
+            .await
+            .expect("a client with no Origin must connect");
+    }
+
+    #[tokio::test]
+    async fn ws_without_an_allowlist_accepts_any_origin() {
+        // Unset means allow, matching RECACHED_PASSWORD. The startup warning is
+        // what keeps this from being a silent default.
+        let srv = spawn_ws_server().await;
+        ws_connect_with_origin(srv.tcp_addr, Some("https://anything.example"))
+            .await
+            .expect("no allowlist means no origin restriction");
+    }
+
+    async fn spawn_ws_server_full(
+        sync_secret: Option<String>,
+        allowed_origins: Option<Vec<String>>,
+    ) -> TestServer {
         let store = Arc::new(KeyValueStore::new());
         let (tx, _rx) = broadcast::channel::<SyncMsg>(256);
         let pubsub: SharedPubSub = Arc::new(tokio::sync::Mutex::new(PubSubHub::new()));
@@ -7238,19 +7326,21 @@ mod tests {
         let store2 = Arc::clone(&store);
         let state2 = Arc::clone(&state);
         let secret = Arc::new(sync_secret);
+        let origins = Arc::new(allowed_origins);
 
         let task = tokio::spawn(async move {
             loop {
                 let Ok((socket, _)) = listener.accept().await else {
                     return;
                 };
-                let (s, t, ps, wr, st, ss) = (
+                let (s, t, ps, wr, st, ss, ao) = (
                     Arc::clone(&store2),
                     tx.clone(),
                     Arc::clone(&pubsub),
                     Arc::clone(&watch_registry),
                     Arc::clone(&state2),
                     Arc::clone(&secret),
+                    Arc::clone(&origins),
                 );
                 let id = next_conn_id();
                 let peer = socket
@@ -7258,7 +7348,7 @@ mod tests {
                     .map(|a| a.to_string())
                     .unwrap_or_default();
                 tokio::spawn(async move {
-                    handle_ws(socket, s, t, Arc::new(None), id, ps, wr, st, ss, peer).await;
+                    handle_ws(socket, s, t, Arc::new(None), id, ps, wr, st, ss, ao, peer).await;
                 });
             }
         });
@@ -9576,5 +9666,415 @@ mod limit_config_tests {
         assert_eq!(max_watches_per_conn(), 1_024);
         assert_eq!(max_qsubs_per_conn(), 64);
         assert_eq!(max_qsub_initial_keys(), 10_000);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Hardening: the network-exposure fixes and their decision functions.
+//
+// Every check here guards a boundary that was open in 0.2.4 or earlier. The
+// pure-function shape is deliberate: the replication gate and the origin
+// allowlist are decisions, and a decision can be asserted without standing up a
+// listener or mutating process-global environment state.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    // ── replication listener gate ─────────────────────────────────────────────
+
+    #[test]
+    fn the_replication_port_stays_closed_unless_asked_for() {
+        // The default. Before this gate existed the listener bound
+        // 0.0.0.0:6381 on every node and, with no password, served the entire
+        // keyspace to anyone who connected — so an operator who set
+        // RECACHED_PASSWORD was protecting nothing.
+        assert_eq!(resolve_repl_listen(None, "0.0.0.0", None), Ok(false));
+        assert_eq!(resolve_repl_listen(None, "0.0.0.0", Some("pw")), Ok(false));
+        // An empty value is "unset", not "true".
+        assert_eq!(
+            resolve_repl_listen(Some(String::new()), "0.0.0.0", None),
+            Ok(false)
+        );
+        assert_eq!(
+            resolve_repl_listen(Some("  ".to_string()), "0.0.0.0", None),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn enabling_it_on_a_public_interface_without_a_password_refuses_to_start() {
+        let err = resolve_repl_listen(Some("1".into()), "0.0.0.0", None)
+            .expect_err("public + no password must not be allowed");
+        // The message has to name both variables — an operator reading a log
+        // line needs to know what to set, not merely that something is wrong.
+        assert!(err.contains("RECACHED_REPL_PASSWORD"), "{err}");
+        assert!(err.contains("RECACHED_REPL_ENABLE"), "{err}");
+        assert!(err.contains("0.0.0.0"), "{err}");
+
+        // A specific LAN address is just as reachable as 0.0.0.0.
+        assert!(resolve_repl_listen(Some("1".into()), "10.0.1.5", None).is_err());
+        // So is a hostname we cannot resolve to a loopback address: the
+        // conservative reading is the one that demands a password.
+        assert!(resolve_repl_listen(Some("1".into()), "cache.internal", None).is_err());
+        // An empty password is not a password.
+        assert!(resolve_repl_listen(Some("1".into()), "0.0.0.0", Some("")).is_err());
+    }
+
+    #[test]
+    fn enabling_it_is_allowed_on_loopback_or_with_a_password() {
+        // Loopback without a password is a development setup, not an exposure.
+        assert_eq!(
+            resolve_repl_listen(Some("1".into()), "127.0.0.1", None),
+            Ok(true)
+        );
+        assert_eq!(
+            resolve_repl_listen(Some("yes".into()), "::1", None),
+            Ok(true)
+        );
+        assert_eq!(
+            resolve_repl_listen(Some("on".into()), "localhost", None),
+            Ok(true)
+        );
+        // Public is fine once authenticated — this is the multi-tier
+        // replication path, which must keep working.
+        assert_eq!(
+            resolve_repl_listen(Some("true".into()), "0.0.0.0", Some("pw")),
+            Ok(true)
+        );
+        assert_eq!(
+            resolve_repl_listen(Some("1".into()), "10.0.1.5", Some("pw")),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_enable_value_refuses_to_start() {
+        // Treating `please` as false would leave an operator believing
+        // replication was on; treating it as true would open a port nobody
+        // asked for. Neither is acceptable for a variable gating a boundary.
+        let err = resolve_repl_listen(Some("please".into()), "127.0.0.1", None).unwrap_err();
+        assert!(err.contains("RECACHED_REPL_ENABLE"), "{err}");
+        assert!(err.contains("not a boolean"), "{err}");
+    }
+
+    #[test]
+    fn boolean_env_values_cover_the_conventional_spellings() {
+        for yes in ["1", "true", "TRUE", "yes", "On", " on "] {
+            assert_eq!(parse_env_bool("V", yes), Ok(true), "{yes:?}");
+        }
+        for no in ["0", "false", "FALSE", "no", "Off", " off "] {
+            assert_eq!(parse_env_bool("V", no), Ok(false), "{no:?}");
+        }
+        assert!(parse_env_bool("V", "maybe").is_err());
+    }
+
+    #[test]
+    fn loopback_detection_treats_unparseable_hosts_as_public() {
+        assert!(bind_is_loopback("127.0.0.1"));
+        assert!(bind_is_loopback("127.0.0.53"));
+        assert!(bind_is_loopback("::1"));
+        assert!(bind_is_loopback("localhost"));
+        assert!(bind_is_loopback("LOCALHOST"));
+        assert!(!bind_is_loopback("0.0.0.0"));
+        assert!(!bind_is_loopback("10.0.1.5"));
+        assert!(!bind_is_loopback("::"));
+        assert!(!bind_is_loopback("cache.internal"));
+        assert!(!bind_is_loopback(""));
+    }
+
+    // ── replication auth: throttle and handshake ─────────────────────────────
+
+    #[test]
+    fn repeated_bad_replication_passwords_block_the_peer() {
+        // The RESP port drops a connection after five guesses, but the
+        // replication handshake is one-shot: reconnecting used to reset the
+        // count, so the port offered unlimited guesses at a secret that yields
+        // the whole keyspace. The throttle is keyed by address for that reason.
+        let throttle = ReplAuthThrottle::new();
+        let ip = IpAddr::from([203, 0, 113, 7]);
+        assert!(!throttle.is_blocked(ip));
+        for _ in 0..MAX_AUTH_FAILURES {
+            assert!(!throttle.is_blocked(ip), "must not block before the cap");
+            throttle.record_failure(ip);
+        }
+        assert!(throttle.is_blocked(ip), "cap reached, peer must be refused");
+
+        // Other peers are unaffected — one attacker must not lock out a fleet.
+        assert!(!throttle.is_blocked(IpAddr::from([203, 0, 113, 8])));
+
+        // A successful handshake clears the record.
+        throttle.record_success(ip);
+        assert!(!throttle.is_blocked(ip));
+    }
+
+    #[test]
+    fn the_throttle_does_not_grow_without_bound() {
+        // A spray from many source addresses must not be a memory-growth
+        // vector; the map sweeps once it crosses the threshold.
+        let throttle = ReplAuthThrottle::new();
+        for i in 0..(REPL_AUTH_SWEEP_THRESHOLD + 64) {
+            let ip = IpAddr::from([
+                10,
+                ((i >> 16) & 0xff) as u8,
+                ((i >> 8) & 0xff) as u8,
+                (i & 0xff) as u8,
+            ]);
+            throttle.record_failure(ip);
+        }
+        let len = throttle.failures.lock().unwrap().len();
+        // Entries are all fresh so none are swept, but the sweep must have run
+        // without panicking and the map must stay proportional to the input
+        // rather than duplicating it.
+        assert!(len <= REPL_AUTH_SWEEP_THRESHOLD + 64, "{len}");
+    }
+
+    #[tokio::test]
+    async fn the_auth_line_is_read_to_its_terminator_not_to_the_password_length() {
+        // Reading exactly `password.len() + 1` bytes made the number of bytes
+        // the server waited for *be* the password length, recoverable by
+        // drip-feeding one byte at a time.
+        let (mut client, mut server) = tokio::io::duplex(256);
+        client.write_all(b"hunter2\n").await.unwrap();
+        let line = read_repl_auth_line(&mut server).await.unwrap();
+        assert_eq!(line, b"hunter2");
+    }
+
+    #[tokio::test]
+    async fn an_auth_line_without_a_terminator_is_refused_at_the_cap() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let flood = vec![b'x'; MAX_REPL_AUTH_LINE + 16];
+        // Write concurrently: the reader gives up mid-stream, so the writer
+        // must not block on a full pipe.
+        tokio::spawn(async move {
+            let _ = client.write_all(&flood).await;
+        });
+        let err = read_repl_auth_line(&mut server)
+            .await
+            .expect_err("an unterminated line must not be read forever");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn a_short_auth_line_still_compares_unequal() {
+        // The comparison is constant-time and length-checked, so a truncated
+        // guess fails rather than matching a prefix.
+        let (mut client, mut server) = tokio::io::duplex(256);
+        client.write_all(b"hunt\n").await.unwrap();
+        let line = read_repl_auth_line(&mut server).await.unwrap();
+        assert!(!ct_eq_bytes(&line, b"hunter2"));
+    }
+
+    // ── WebSocket origin allowlist ──────────────────────────────────────────
+
+    #[test]
+    fn an_unset_origin_allowlist_permits_everything() {
+        // Matches how an unset RECACHED_PASSWORD behaves. The project ships
+        // insecure-by-default deliberately and says so; what it must not do is
+        // ship a *silent* default, hence the startup warning.
+        assert!(origin_allowed(None, Some("https://evil.example")));
+        assert!(origin_allowed(None, None));
+    }
+
+    #[test]
+    fn a_foreign_origin_is_refused_when_the_allowlist_is_set() {
+        // The finding this closes: browsers apply neither CORS nor a preflight
+        // to WebSockets, so without this check any page a user visits could
+        // open a socket to ws://localhost:6380 and read or write every key.
+        let allow = vec!["https://app.example.com".to_string()];
+        assert!(origin_allowed(
+            Some(&allow),
+            Some("https://app.example.com")
+        ));
+        assert!(!origin_allowed(Some(&allow), Some("https://evil.example")));
+        // A different scheme or port is a different origin.
+        assert!(!origin_allowed(
+            Some(&allow),
+            Some("http://app.example.com")
+        ));
+        assert!(!origin_allowed(
+            Some(&allow),
+            Some("https://app.example.com:8443")
+        ));
+        // Substring matching would be a hole: `app.example.com.evil.test`
+        // contains an allowlisted origin as a prefix.
+        assert!(!origin_allowed(
+            Some(&allow),
+            Some("https://app.example.com.evil.test")
+        ));
+    }
+
+    #[test]
+    fn an_absent_origin_is_permitted_because_only_browsers_send_one() {
+        // A native client omits the header and an attacker with a socket can
+        // forge it, so refusing here would break legitimate clients while
+        // stopping nobody. The control exists to separate "the app I deployed"
+        // from "another page in the same browser".
+        let allow = vec!["https://app.example.com".to_string()];
+        assert!(origin_allowed(Some(&allow), None));
+    }
+
+    #[test]
+    fn origin_comparison_ignores_case_and_a_trailing_slash() {
+        let allow = parse_allowed_origins("https://App.Example.com/").unwrap();
+        assert!(origin_allowed(
+            Some(&allow),
+            Some("https://app.example.com")
+        ));
+        assert!(origin_allowed(
+            Some(&allow),
+            Some("HTTPS://APP.EXAMPLE.COM/")
+        ));
+    }
+
+    #[test]
+    fn the_origin_allowlist_parses_a_list_and_admits_null() {
+        let list = parse_allowed_origins(
+            "https://app.example.com, http://localhost:3000 ,https://admin.example.com:8443",
+        )
+        .unwrap();
+        assert_eq!(
+            list,
+            vec![
+                "https://app.example.com",
+                "http://localhost:3000",
+                "https://admin.example.com:8443",
+            ]
+        );
+        // Sandboxed iframes and file:// documents send the literal `null`.
+        assert_eq!(parse_allowed_origins("null").unwrap(), vec!["null"]);
+        assert!(origin_allowed(
+            Some(&parse_allowed_origins("null").unwrap()),
+            Some("null")
+        ));
+    }
+
+    #[test]
+    fn the_origin_allowlist_rejects_entries_that_could_never_match() {
+        // Each of these would parse into something a browser never sends, so
+        // the allowlist would silently reject every connection. Failing at
+        // startup is the only way an operator finds out.
+        for bad in [
+            "app.example.com",
+            "https://app.example.com/dashboard",
+            "://nohost",
+            "https://",
+        ] {
+            assert!(
+                parse_allowed_origins(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+        // Set-but-empty would reject every browser; unset is how you allow all.
+        let err = parse_allowed_origins(" , ").unwrap_err();
+        assert!(err.contains("Unset it"), "{err}");
+    }
+
+    // ── handshake deadline ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_stalled_websocket_handshake_gives_up_and_releases_the_socket() {
+        // The connection permit is acquired *before* the handshake runs, so
+        // without this deadline `RECACHED_MAX_CONNECTIONS` sockets that connect
+        // and then say nothing — costing an attacker nothing — hold every slot
+        // indefinitely and the server stops accepting real clients.
+        let (_client, server) = tokio::io::duplex(1024);
+        let start = std::time::Instant::now();
+        let out = ws_handshake(server, None, Duration::from_millis(150), 1).await;
+        assert!(out.is_none(), "a silent peer must not produce a stream");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "gave up after {:?} — the deadline did not apply",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn the_handshake_deadline_has_a_documented_default() {
+        assert_eq!(DEFAULT_HANDSHAKE_TIMEOUT_SECS, 10);
+    }
+
+    // ── persistence file permissions ────────────────────────────────────────
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn snapshot_and_sidecar_files_are_not_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("recached_perm_{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("perm-test.rdb");
+
+        write_private(&path, b"payload").await.unwrap();
+        let mode = tokio::fs::metadata(&path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "snapshots are plaintext dumps of the keyspace; 0644 lets any local user read the cache"
+        );
+
+        // A file left behind 0644 by an earlier version must be tightened on
+        // the next write, not keep its old mode forever.
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .await
+            .unwrap();
+        write_private(&path, b"payload2").await.unwrap();
+        let mode = tokio::fs::metadata(&path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "an existing loose mode must be fixed");
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"payload2");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn the_aof_is_not_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("recached_aofperm_{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("perm-test.aof");
+
+        // Pre-create it loose, as an upgrade from an earlier version would.
+        tokio::fs::write(&path, b"").await.unwrap();
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .await
+            .unwrap();
+
+        let writer = AofWriter::open(path.clone(), AofSync::No).await.unwrap();
+        writer.append(b"*1\r\n$4\r\nPING\r\n").await;
+        let mode = tokio::fs::metadata(&path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn temp_files_do_not_collide_between_processes() {
+        // A fixed `.tmp` name meant two servers sharing a data directory would
+        // clobber each other's half-written snapshot.
+        let a = temp_sibling(std::path::Path::new("/data/recached.rdb"), "snap");
+        assert!(
+            a.to_string_lossy()
+                .contains(&std::process::id().to_string()),
+            "{a:?}"
+        );
+        assert!(a.to_string_lossy().ends_with(".tmp"), "{a:?}");
+        assert_ne!(
+            a,
+            temp_sibling(std::path::Path::new("/data/recached.rdb"), "dedup")
+        );
     }
 }

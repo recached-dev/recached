@@ -15,12 +15,17 @@ run `FLUSHDB`. This is the single most common way self-hosted caches get comprom
 - [ ] **Bind to a private interface** — `RECACHED_BIND=127.0.0.1` or a VPC address, never `0.0.0.0`
       on a public host.
 - [ ] **Enable TLS** (`RECACHED_TLS_CERT` + `RECACHED_TLS_KEY`) if traffic crosses any network you do
-      not control.
-- [ ] **Firewall the metrics port** — it has no authentication of its own.
+      not control. Note this covers the RESP and WebSocket ports only — see
+      [Replication](#replication).
+- [ ] **Firewall the metrics port** — it has no authentication of its own, and
+      `RECACHED_ALLOW_IPS` does not apply to it.
 - [ ] **Set `RECACHED_SYNC_SECRET`** before any browser connects to a multi-tenant deployment.
+- [ ] **Set `RECACHED_ALLOWED_ORIGINS`** to the origins your application is served from, so that
+      other pages in a user's browser cannot open the sync socket.
 - [ ] **Set `RECACHED_MAX_MEMORY` and/or `RECACHED_MAX_KEYS`** so an unbounded keyspace cannot
       exhaust the host.
-- [ ] **Set `RECACHED_REPL_PASSWORD`** if you run replication.
+- [ ] **Set `RECACHED_REPL_PASSWORD`** if you enable the replication listener. The server refuses to
+      start without it on any interface other than loopback.
 - [ ] Review [what is still beta](/guide/introduction#maturity) before putting the sync layer in
       front of untrusted users.
 
@@ -46,8 +51,9 @@ Two properties worth knowing:
 RECACHED_TLS_CERT=./cert.pem RECACHED_TLS_KEY=./key.pem recached-server
 ```
 
-TLS applies to **both** ports when enabled: clients use `rediss://` for RESP and `wss://` for the
-browser sync socket.
+TLS applies to **both client ports** when enabled: clients use `rediss://` for RESP and `wss://` for
+the browser sync socket. It does not apply to the replication port or the metrics port, which are
+always plaintext.
 
 ::: tip TLS is all-or-nothing, and fails loudly
 Set both variables or neither. If exactly one is present the server **refuses to start** with an
@@ -92,6 +98,28 @@ full data breach.
 RECACHED_SYNC_SECRET="$(openssl rand -base64 32)" recached-server
 ```
 
+### Restrict which pages may connect
+
+Browsers apply neither CORS nor a preflight to WebSockets. That makes this port different from every
+HTTP endpoint you have secured before: **any page a user visits can open a socket to any Recached
+that page's browser can reach**, and the request carries the user's network position. On a developer
+machine running `ws://localhost:6380`, that is every site in every tab.
+
+```bash
+RECACHED_ALLOWED_ORIGINS="https://app.example.com,https://admin.example.com" recached-server
+```
+
+A handshake from any other origin is refused with `403` before a single frame is exchanged. Three
+things to understand about the limits of this control:
+
+- **It only defends against browsers.** A native client omits `Origin`, and an attacker with a raw
+  socket can send whatever they like — so a client that sends no `Origin` is admitted. What the
+  allowlist separates is *the application you deployed* from *another page in the same browser*,
+  which is the threat that is otherwise unaddressed.
+- **It is not a substitute for `RECACHED_SYNC_SECRET`.** Origin says which page connected; a scope
+  token says which keys that page may touch. A multi-tenant deployment needs both.
+- **Unset means allow-all**, with a warning at startup. Set it before exposing 6380 to a browser.
+
 With the secret set, connections present an HMAC-signed token minted by your backend, and **every
 command — reads included — is checked against the granted patterns**. Keyspace-wide and
 administrative commands (`KEYS`, `SCAN`, `DBSIZE`, `FLUSHDB`, `SAVE`, `BGSAVE`, `REPLICAOF`) are
@@ -115,8 +143,42 @@ If a token leaks, it grants its scopes until it expires — scope narrowly and k
 
 ## Replication
 
-Set `RECACHED_REPL_PASSWORD` so an attacker cannot attach a rogue replica and stream your entire
-keyspace. Replication traffic is covered by TLS when TLS is enabled.
+::: danger The replication port bypassed authentication entirely before 0.2.4
+Every release up to and including 0.2.3 bound `${RECACHED_BIND}:6381` — default `0.0.0.0` —
+**unconditionally on every node**, whether or not replication was configured, and skipped the
+handshake completely when `RECACHED_REPL_PASSWORD` was unset, which was also the default. Any peer
+that connected received a full dump of the keyspace followed by a live stream of every subsequent
+write, regardless of `RECACHED_PASSWORD`. If you are on an earlier version, upgrade or firewall
+6381 now.
+:::
+
+The listener is opt-in from 0.2.4 onward:
+
+```bash
+RECACHED_REPL_ENABLE=1 \
+RECACHED_REPL_PASSWORD="$(openssl rand -base64 32)" \
+recached-server
+```
+
+- **It binds only when `RECACHED_REPL_ENABLE` is set** — on the primary, and on any replica that
+  serves sub-replicas. A replica that merely consumes replication does not need it.
+- **Enabling it off-loopback without a password refuses to start.** The port serves the whole
+  keyspace to whoever connects, so it is not a thing to leave unauthenticated on a reachable
+  interface.
+- **`RECACHED_ALLOW_IPS` and `RECACHED_MAX_CONNECTIONS` apply to it**, which they did not before.
+- **Failed auth is throttled per source address.** The handshake is one-shot, so before this a wrong
+  guess cost an attacker only a reconnect.
+
+::: warning Replication traffic is never encrypted
+TLS covers the RESP and WebSocket ports. It does **not** cover port 6381 — both the listener and the
+replica's outbound connection are plain TCP, so the password and the entire keyspace cross the
+network in the clear. Earlier versions of this page claimed otherwise; that was wrong. Run
+replication over a private network or a tunnel (WireGuard, an SSH tunnel, a service mesh), and treat
+the replication password as protecting against a rogue replica rather than against an observer.
+
+The replica also does not verify the primary's identity, so a DNS hijack or an on-path attacker can
+feed it an arbitrary keyspace. The same mitigation applies.
+:::
 
 Note the failover model: single-replica automatic promotion only. In a multi-replica topology,
 designate one replica for auto-failover and keep the rest passive, or you risk split-brain — see
@@ -140,18 +202,30 @@ compiled in and cannot be configured.
 What Recached defends against today:
 
 - Unauthenticated access (password, constant-time comparison)
-- Network eavesdropping (TLS on both ports)
+- Network eavesdropping on the RESP and WebSocket ports (TLS)
 - Browser clients reading data they should not (sync scopes, signed tokens)
-- Brute-force password guessing (connection dropped after 5 failures)
-- Rogue replicas (replication password)
+- Cross-origin WebSocket hijacking (`RECACHED_ALLOWED_ORIGINS`)
+- Brute-force password guessing (connection dropped after 5 failures; replication auth throttled
+  per source address)
+- Rogue replicas (replication password, and an opt-in listener that will not run unauthenticated
+  off-loopback)
+- Connection-slot exhaustion by half-open sockets (handshake deadline)
+- Local users reading the cache off disk (snapshot, AOF and dedup files created `0600`)
 
 What it does **not** defend against, and you should not assume:
 
 - **No per-command ACLs.** Unlike Redis 6+ ACLs, authentication is all-or-nothing on the RESP port —
   any authenticated client can run any command. Scoping exists only on the WebSocket sync path.
 - **No audit log.** There is no record of who read or wrote what.
-- **No encryption at rest.** Snapshots and AOF files are plaintext MessagePack; protect them with
-  filesystem permissions and disk encryption.
+- **No encryption in transit for replication.** Port 6381 is always plaintext. See
+  [Replication](#replication).
+- **No encryption at rest.** Snapshots and AOF files are plaintext MessagePack. They are created
+  `0600` so other local users cannot read them, but anyone who can read them as the server's user,
+  or who obtains the disk, has the whole keyspace. Use disk encryption.
+- **`always` and `everysec` do not fsync yet.** `RECACHED_AOF_SYNC` currently flushes to the
+  operating system rather than to the storage device, so acknowledged writes survive a process crash
+  but not a power loss or kernel panic. This is a known gap being closed; do not rely on the AOF as
+  a durability boundary against hardware failure.
 - **No rate limiting on the RESP port.** `RLSET`/`RLCHECK` are commands you can use for *your*
   application's rate limiting; they do not throttle clients of the cache itself.
 - **No third-party security review.** The sync layer in particular is young. See

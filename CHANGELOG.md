@@ -83,6 +83,69 @@ client that sends it treats the error as "not supported here" and carries on.
   ordering survives that. A cursor pointing past the end of a collection that shrank returns an
   empty final page rather than an error.
 
+### Security
+
+::: danger Breaking: the replication port no longer opens by default
+If you run replication, add `RECACHED_REPL_ENABLE=1` to every node that serves replicas —
+including a replica that serves sub-replicas. Without it, port 6381 is not bound and replicas
+cannot attach.
+:::
+
+- **The replication port is now opt-in, and refuses to run unauthenticated on a public interface.**
+  It previously bound `${RECACHED_BIND}:6381` — default `0.0.0.0` — unconditionally on **every**
+  node, whether or not replication was configured. With `RECACHED_REPL_PASSWORD` unset, which was
+  also the default, the handshake was skipped entirely and any peer that connected received a full
+  MessagePack dump of the keyspace followed by a live stream of every subsequent write. An operator
+  who set `RECACHED_PASSWORD` had every reason to believe the data was behind authentication, and
+  it was not: the port bypassed it completely.
+
+  Two rules now apply. The listener binds only when `RECACHED_REPL_ENABLE` is set, and enabling it
+  on any interface other than loopback without `RECACHED_REPL_PASSWORD` **refuses to start** rather
+  than serving the keyspace unauthenticated. Multi-tier replication is unaffected in capability —
+  a node that serves sub-replicas sets the variable — but it is now a decision rather than a
+  default. All earlier 0.1.x and 0.2.x releases are affected; upgrading is the fix.
+
+  The same listener now also honours `RECACHED_ALLOW_IPS` and counts against
+  `RECACHED_MAX_CONNECTIONS`. Neither applied to it before, so the one port that streams the entire
+  keyspace was the one port with no allowlist and no connection limit.
+
+- **Failed replication auth is throttled per source address.** The RESP port drops a connection
+  after five wrong passwords, but the replication handshake is one-shot: a wrong guess cost an
+  attacker a single TCP connection, so reconnecting gave unlimited attempts at a secret that yields
+  the whole keyspace. Failures are now counted per peer over a rolling window and further attempts
+  are refused before the handshake is read.
+
+- **The replication handshake no longer leaks the password length.** It read exactly
+  `password.len() + 1` bytes, so the number of bytes the server waited for *was* the length —
+  recoverable by feeding one byte at a time and watching when the server replied. It now reads to
+  the line terminator, with a length cap and a deadline.
+
+- **`RECACHED_ALLOWED_ORIGINS` restricts which web pages may open the browser sync socket.**
+  Browsers apply neither CORS nor a preflight to WebSockets, so any page a user visited could open
+  a socket to a reachable Recached and read or write the keyspace with that user's network
+  position — on the common `ws://localhost:6380` development setup, every site in every tab. Set it
+  to a comma-separated list of exact origins (`https://app.example.com,http://localhost:3000`;
+  `null` admits sandboxed iframes and `file://` documents) and a handshake from anywhere else is
+  refused with a 403.
+
+  Unset means allow-all with a startup warning, matching how `RECACHED_PASSWORD` behaves — the
+  project ships insecure by default and says so, but it should not do it silently. A client that
+  sends no `Origin` header at all is admitted: native clients omit it and an attacker with a raw
+  socket can forge it, so refusing would break real clients while stopping nobody. The control
+  separates *the application you deployed* from *another page in the same browser*, which is the
+  threat this port actually faces.
+
+- **TLS and WebSocket handshakes are now bounded by a deadline** (`RECACHED_HANDSHAKE_TIMEOUT`,
+  default 10s). The connection permit is taken before the handshake runs, so a client that opened a
+  socket and then said nothing held one of `RECACHED_MAX_CONNECTIONS` slots indefinitely. A
+  thousand such sockets cost an attacker nothing and stopped the server accepting real clients.
+
+- **Snapshots, the AOF and the dedup sidecar are created `0600`.** They were created with the
+  process umask — `0644` on a typical host — so any local user could read plaintext MessagePack
+  dumps of the entire keyspace. Files left `0644` by an earlier version are tightened on the next
+  write. Snapshot and dedup temp files also carry the process id, so two servers sharing a data
+  directory can no longer clobber each other's half-written file.
+
 ### Changed
 
 - **`SCAN` now rejects `COUNT 0` and negative counts** with `ERR syntax error`, as Redis does.
