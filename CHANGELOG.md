@@ -4,6 +4,241 @@ All notable changes to Recached are documented here.
 
 ---
 
+## [0.2.4] — Unreleased
+
+### Added
+
+- **`QUIT`.** Every client library closes a connection by sending `QUIT` and reading `+OK`.
+  Recached answered `ERR unknown command`, and node-redis surfaced that as a thrown error from
+  `.quit()` — a clean shutdown reported as a failure. It now replies `+OK` and closes. Answered
+  before the authentication gate and before the subscribe-mode gate, as Redis does: a client that
+  cannot authenticate, or is parked in subscribe mode, still deserves a clean close rather than a
+  dropped socket. The subscribe-mode error already claimed `QUIT` was allowed there; now it is.
+
+- **`CLIENT ID | INFO | LIST | GETNAME | SETNAME | SETINFO`.** node-redis, ioredis, redis-py and
+  go-redis all send `CLIENT SETINFO LIB-NAME` and `LIB-VER` immediately after `HELLO`. All four
+  tolerate the error, so nothing broke — but every connection from every modern client logged two
+  or three `unknown command` errors before doing any work, and the server could not say which
+  library was on the other end of a connection. `CLIENT LIST` and `CLIENT INFO` report in Redis's
+  `key=value` line format, carrying the fields Recached can answer truthfully — id, addresses,
+  name, age, subscription counts, protocol, library — and omitting the buffer sizes, file
+  descriptors and event masks it cannot. A plausible invented `omem` is worse than an absent one,
+  because nothing downstream can tell the difference. `CLIENT KILL`, `NO-EVICT` and `UNPAUSE`
+  return "unknown subcommand" rather than `+OK`: answering OK without doing the thing would leave
+  a caller believing a connection had been closed or eviction disabled.
+
+- **`CONFIG GET`.** Reports `maxmemory`, `maxmemory-policy`, `maxclients`, `port`, `tls-port`,
+  `appendonly`, `databases`, `requirepass`, `proto-max-bulk-len`, `timeout` and `save`, resolved
+  from the values actually in force rather than a table of defaults — the eviction policy comes
+  from the store, the ports and limits from the same startup facts `INFO` reads. Glob patterns and
+  multiple names work as in Redis. `requirepass` is masked to `*`: whether a password exists is not
+  a secret, its value is. **`CONFIG SET` is refused with an explanatory error.** Recached reads its
+  configuration from the environment at startup and holds it for the life of the process, so there
+  is nothing a runtime SET could change; returning `+OK` would leave an operator to discover much
+  later that the limit they set never applied.
+
+- **`COMMAND`, `COMMAND COUNT`, `COMMAND LIST`, `COMMAND INFO`, `COMMAND DOCS`.** Backed by a new
+  `core-engine::catalog` module holding one row per command. Arity, flags and key positions are
+  transcribed from a real `redis-server` 7.2.5's own `COMMAND INFO` rather than written from
+  memory: cluster-aware clients and proxies route on `first_key`/`step`, and a wrong arity makes a
+  client reject a call the server would have accepted. Summaries come from
+  `docs/server/commands.md`, so the text a client sees is the text that was reviewed and published.
+  The catalog cannot drift from the parser: one test asserts every catalog row names a command the
+  parser accepts, and another walks the exhaustive `Command` variant table asserting every command
+  has a row.
+
+  Worth recording, since it contradicts a guess made while planning this work: **no client library
+  sends `COMMAND DOCS` or `CONFIG GET` during connect.** Tapping the wire for node-redis 6.2.0,
+  ioredis 6.0.0, redis-py 8.1.0 and go-redis 9.21.0 showed all four opening with `HELLO 3`,
+  `CLIENT SETINFO` ×2 and `CLIENT MAINT_NOTIFICATIONS`, and nothing else. `COMMAND DOCS` is used
+  interactively by `redis-cli`, and `CONFIG GET maxmemory-policy` by background-job frameworks —
+  both worth having, neither on the connect path.
+
+`CLIENT MAINT_NOTIFICATIONS` is still refused. It asks the server to push notifications before a
+maintenance event moves the connection elsewhere; Recached has no such event to announce, and every
+client that sends it treats the error as "not supported here" and carries on.
+
+- **Bounded reads: `GETRANGE`, `HSCAN`, `SSCAN`, `ZSCAN`.** Until now the only way to read a hash,
+  a set or a sorted set was `HGETALL` / `SMEMBERS` / `ZRANGE`, and the only way to read a string was
+  `GET`. Each of those is unbounded: the reply is as large as the value, and building it clones the
+  whole collection while holding the shard guard for that key — so one oversized key delays every
+  other key that hashes to the same shard. The cursor variants bound both the reply and the time
+  the guard is held, and `GETRANGE` reads a byte window of a large value without transferring it
+  whole. Tools that browse a keyspace they did not write — `redis-cli --scan`, TUI browsers such as
+  keylens, admin dashboards — need exactly these four to stay bounded; without them they must
+  measure with `STRLEN` / `HLEN` / `SCARD` and refuse to display anything big.
+
+  ```bash
+  GETRANGE log:2026-08 0 4095            # first 4 KB of a large value
+  HSCAN session:42 0 COUNT 100           # → [cursor, [field, value, …]]
+  HSCAN session:42 0 NOVALUES            # field names only (Redis 7.4)
+  SSCAN tags:hot 0 MATCH "eu:*"
+  ZSCAN leaderboard 0 COUNT 50           # → [cursor, [member, score, …]]
+  ```
+
+  The cursor is an offset into the collection's name-ordered element list, the same scheme keyspace
+  `SCAN` already used, so the same caveat applies: elements added or removed mid-iteration may be
+  missed or returned twice, and `MATCH` must stay the same across an iteration. `ZSCAN` orders by
+  **member**, not by score — a score can change under an in-flight cursor, and only the member
+  ordering survives that. A cursor pointing past the end of a collection that shrank returns an
+  empty final page rather than an error.
+
+### Security
+
+::: danger Breaking: the replication port no longer opens by default
+If you run replication, add `RECACHED_REPL_ENABLE=1` to every node that serves replicas —
+including a replica that serves sub-replicas. Without it, port 6381 is not bound and replicas
+cannot attach.
+:::
+
+- **The replication port is now opt-in, and refuses to run unauthenticated on a public interface.**
+  It previously bound `${RECACHED_BIND}:6381` — default `0.0.0.0` — unconditionally on **every**
+  node, whether or not replication was configured. With `RECACHED_REPL_PASSWORD` unset, which was
+  also the default, the handshake was skipped entirely and any peer that connected received a full
+  MessagePack dump of the keyspace followed by a live stream of every subsequent write. An operator
+  who set `RECACHED_PASSWORD` had every reason to believe the data was behind authentication, and
+  it was not: the port bypassed it completely.
+
+  Two rules now apply. The listener binds only when `RECACHED_REPL_ENABLE` is set, and enabling it
+  on any interface other than loopback without `RECACHED_REPL_PASSWORD` **refuses to start** rather
+  than serving the keyspace unauthenticated. Multi-tier replication is unaffected in capability —
+  a node that serves sub-replicas sets the variable — but it is now a decision rather than a
+  default. All earlier 0.1.x and 0.2.x releases are affected; upgrading is the fix.
+
+  The same listener now also honours `RECACHED_ALLOW_IPS` and counts against
+  `RECACHED_MAX_CONNECTIONS`. Neither applied to it before, so the one port that streams the entire
+  keyspace was the one port with no allowlist and no connection limit.
+
+- **Failed replication auth is throttled per source address.** The RESP port drops a connection
+  after five wrong passwords, but the replication handshake is one-shot: a wrong guess cost an
+  attacker a single TCP connection, so reconnecting gave unlimited attempts at a secret that yields
+  the whole keyspace. Failures are now counted per peer over a rolling window and further attempts
+  are refused before the handshake is read.
+
+- **The replication handshake no longer leaks the password length.** It read exactly
+  `password.len() + 1` bytes, so the number of bytes the server waited for *was* the length —
+  recoverable by feeding one byte at a time and watching when the server replied. It now reads to
+  the line terminator, with a length cap and a deadline.
+
+- **`RECACHED_ALLOWED_ORIGINS` restricts which web pages may open the browser sync socket.**
+  Browsers apply neither CORS nor a preflight to WebSockets, so any page a user visited could open
+  a socket to a reachable Recached and read or write the keyspace with that user's network
+  position — on the common `ws://localhost:6380` development setup, every site in every tab. Set it
+  to a comma-separated list of exact origins (`https://app.example.com,http://localhost:3000`;
+  `null` admits sandboxed iframes and `file://` documents) and a handshake from anywhere else is
+  refused with a 403.
+
+  Unset means allow-all with a startup warning, matching how `RECACHED_PASSWORD` behaves — the
+  project ships insecure by default and says so, but it should not do it silently. A client that
+  sends no `Origin` header at all is admitted: native clients omit it and an attacker with a raw
+  socket can forge it, so refusing would break real clients while stopping nobody. The control
+  separates *the application you deployed* from *another page in the same browser*, which is the
+  threat this port actually faces.
+
+- **TLS and WebSocket handshakes are now bounded by a deadline** (`RECACHED_HANDSHAKE_TIMEOUT`,
+  default 10s). The connection permit is taken before the handshake runs, so a client that opened a
+  socket and then said nothing held one of `RECACHED_MAX_CONNECTIONS` slots indefinitely. A
+  thousand such sockets cost an attacker nothing and stopped the server accepting real clients.
+
+- **Snapshots, the AOF and the dedup sidecar are created `0600`.** They were created with the
+  process umask — `0644` on a typical host — so any local user could read plaintext MessagePack
+  dumps of the entire keyspace. Files left `0644` by an earlier version are tightened on the next
+  write. Snapshot and dedup temp files also carry the process id, so two servers sharing a data
+  directory can no longer clobber each other's half-written file.
+
+- **The RESP parser no longer reserves memory for a count it has not received.** An aggregate header
+  declares how many elements follow and arrives before any of them, and the parser reserved capacity
+  for the declared count. Nine bytes — `*1000000\r\n` — reserved 32 MB, and nesting that to the depth
+  limit made 160 bytes of input request **512 MB**. Because an incomplete frame is re-parsed from the
+  start whenever more bytes arrive, a client dripping one byte per packet repeated the reservation on
+  every packet, and none of it counted against `RECACHED_MAX_MEMORY`, which tracks stored data only.
+
+  Reservations are now capped at 1,024 elements, so allocation is proportional to bytes *received*
+  rather than bytes *claimed*: the same two inputs now cost 32 KB and 512 KB. The cap is a floor and
+  not a limit — aggregates larger than 1,024 elements still parse in full, and `proto-max-bulk-len`
+  and the million-element ceiling are unchanged.
+
+- **Replication can now be encrypted and the primary's identity verified.** Both ends of port 6381
+  were plain TCP, so the replication password and then the entire keyspace crossed the network in the
+  clear. Worse than the eavesdropping: a replica had no way to check *who* it was following, so a DNS
+  hijack or an on-path attacker could feed it an arbitrary keyspace and it would load it.
+
+  The listener now reuses `RECACHED_TLS_CERT`/`RECACHED_TLS_KEY` — enabling TLS covers the RESP,
+  WebSocket **and** replication listeners. Replicas opt in with `RECACHED_REPL_TLS_CA`, pointing at
+  the primary's certificate or the CA that issued it, with `RECACHED_REPL_TLS_SERVERNAME` to override
+  the verified name when `RECACHED_REPLICAOF` names an IP but the certificate names a host.
+
+  The trust anchor is a file rather than the system root store deliberately: replication links two
+  hosts one operator runs, so trusting one private CA is both simpler and tighter than trusting every
+  public CA to vouch for a host that streams the whole dataset. A public bundle still works if the
+  primary's certificate is publicly issued. There is no encrypt-without-verify mode, because
+  verification is the half that stops a rogue primary.
+
+  Note that this needs a genuine **two-certificate chain** — a CA plus a leaf it signed. A single
+  self-signed certificate, which is what the common `openssl req -x509` one-liner produces, is marked
+  `CA:TRUE` and is refused as a server certificate (`CaUsedAsEndEntity`). OpenSSL-based clients like
+  `redis-cli --cacert` accept such a certificate, so the same file can work for `rediss://` and fail
+  for replication. The security docs carry the `openssl` recipe.
+
+  Replication remains **plaintext unless configured**, and a replica following a primary without TLS
+  now says so at startup. A replica without `RECACHED_REPL_TLS_CA` cannot talk to a TLS-enabled
+  primary; that handshake failure names the variable to set.
+
+- **Glob patterns are capped at 1,024 bytes** for `KEYS`, `SCAN`/`HSCAN`/`SSCAN`/`ZSCAN MATCH`,
+  `QSUB`, `PSUBSCRIBE`, `SYNC` scopes and signed sync tokens, reported as
+  `ERR pattern is too long`. Matching costs O(pattern × text) and runs once per key for `KEYS`, once
+  per key per write for sync scopes, and once per published message per subscriber for `PSUBSCRIBE`;
+  pattern length was previously bounded only by `proto-max-bulk-len` at 64 MB, so a single command
+  could occupy the process for an unbounded time. No legitimate pattern is near the cap.
+
+### Fixed
+
+- **`RECACHED_AOF_SYNC` now actually fsyncs.** `always` and `everysec` called `flush()`, which pushes
+  the buffer into a `write` syscall and leaves the bytes in the page cache — so acknowledged writes
+  survived a process crash but *not* a power loss or kernel panic, which is the case `always` exists
+  to cover. Both now `fsync`. The AOF truncation that follows a snapshot is fsynced too, so a crash
+  cannot resurrect a log the snapshot has already subsumed.
+
+  Snapshots gained the same treatment: the temp file is fsynced before the rename, and the containing
+  **directory** is fsynced after it. Without the second step the file contents were durable but the
+  directory entry naming them was not, so a crash could leave the previous snapshot or none at all.
+
+  ::: danger `always` is now roughly 400× more expensive per write
+  It was never doing the work, so it never cost anything. Measured on macOS/APFS: `no` and `everysec`
+  both run ~40–50 µs per append, `always` runs **~20 ms** — tens of writes per second rather than tens
+  of thousands, because the fsync is held inside the AOF lock and every writer queues behind it. The
+  server now logs a warning at startup when `always` is selected.
+
+  If you benchmarked `always` on an earlier version and found it acceptable, re-measure: that number
+  was the cost of a `write` syscall, not of durability. `everysec` remains the default and costs
+  nothing measurable. See [Configuration](/server/configuration#what-each-sync-mode-costs).
+  :::
+
+- **`glob_match` no longer allocates.** It ran an O(pattern × text) dynamic program that allocated two
+  `Vec<bool>` of `text.len() + 1` on **every call**, so one 64 MB value made `KEYS *` request 128 MB
+  on a path that runs once per key. Replaced with two-pointer greedy matching: same worst-case time
+  bound, zero allocation. Semantics are unchanged, verified by differential testing against the
+  previous implementation over every pattern of up to 5 bytes drawn from `{a, b, *, ?}` against every
+  text of up to 4 bytes drawn from `{a, b}`.
+
+- **Documentation: glob character classes were never supported.** `commands.md`, `sync-scopes.md` and
+  the `glob_match` doc comment all described `[abc]` as a character class. It has never been
+  implemented — brackets match literally, so `[ab]` matches the four-byte string `[ab]` and not `a`.
+  This matters most for sync scopes: a scope written `user:[12]:*` grants access to keys starting with
+  the literal text `user:[12]:` and matches nothing a normal application writes. It fails closed, so
+  no data was over-exposed, but a scope written that way never granted what its author intended.
+  Enumerate prefixes instead — `user:1:*,user:2:*`.
+
+### Changed
+
+- **`SCAN` now rejects `COUNT 0` and negative counts** with `ERR syntax error`, as Redis does.
+  They were previously cast to `usize`, where `-1` wrapped to a count of 18 quintillion and was
+  then silently clamped back to a normal page. The cursor argument reports `ERR invalid cursor`
+  rather than `ERR value is not an integer or out of range`, which is both Redis's wording and
+  what the whole SCAN family now shares.
+
+---
+
 ## [0.2.3] — 2026-08-01
 
 ### Added

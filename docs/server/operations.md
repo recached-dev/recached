@@ -162,6 +162,8 @@ is worth knowing where the walls are:
 | Keys returned in a live query's initial state | 10,000 | `RECACHED_MAX_QSUB_INITIAL_KEYS` |
 | Keys sampled per eviction pass | 10 | `RECACHED_EVICTION_SAMPLE` |
 | Replication frame | 512 MB | No |
+| Glob pattern length (`KEYS`, `SCAN MATCH`, `PSUBSCRIBE`, sync scopes) | 1,024 bytes | No |
+| Elements reserved up front for an aggregate | 1,024 | No |
 | Client outbox (browser, offline writes) | 10,000 writes | via `sync-client` |
 
 The keyspace cap (`RECACHED_MAX_KEYS`) and memory cap (`RECACHED_MAX_MEMORY`) are configured rather

@@ -1129,6 +1129,18 @@ impl KeyValueStore {
             Command::Info(_) => Value::Error(
                 "ERR INFO is handled by the connection layer, not the store".to_string(),
             ),
+            Command::Quit => Value::Error(
+                "ERR QUIT is handled by the connection layer, not the store".to_string(),
+            ),
+            Command::Client(_) => Value::Error(
+                "ERR CLIENT is handled by the connection layer, not the store".to_string(),
+            ),
+            Command::Config(_) => Value::Error(
+                "ERR CONFIG is handled by the connection layer, not the store".to_string(),
+            ),
+            Command::CommandQuery(_) => Value::Error(
+                "ERR COMMAND is handled by the connection layer, not the store".to_string(),
+            ),
 
             // ── Strings ───────────────────────────────────────────────────────
             Command::Set(key, val, opts) => {
@@ -1256,6 +1268,22 @@ impl KeyValueStore {
                         _ => Value::Error(WRONGTYPE.to_string()),
                     },
                     _ => Value::Integer(0),
+                }
+            }
+
+            Command::GetRange(key, start, end) => {
+                let now = now_ms();
+                match self.data.get(&key) {
+                    Some(e) if !e.is_expired(now) => match &e.value {
+                        EntryValue::Str(s) => {
+                            e.touch(now);
+                            Value::BulkString(Some(byte_range(s.as_slice(), start, end).to_vec()))
+                        }
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                    // A missing key is an empty string, so every range of it is
+                    // empty — an empty bulk, not a nil.
+                    _ => Value::BulkString(Some(Vec::new())),
                 }
             }
 
@@ -1618,6 +1646,40 @@ impl KeyValueStore {
                                     .map(|k| Value::BulkString(Some(k.as_bytes().to_vec())))
                                     .collect(),
                             ))
+                        }
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::HScan(key, args) => {
+                let now = now_ms();
+                match self.data.get(&key) {
+                    None => empty_scan(),
+                    Some(e) if e.is_expired(now) => empty_scan(),
+                    Some(e) => match &e.value {
+                        EntryValue::Hash(h) => {
+                            e.touch(now);
+                            let pat = args.pattern.as_deref().unwrap_or("*");
+                            let mut fields: Vec<(&str, &Blob)> = h
+                                .iter()
+                                .filter(|(f, _)| glob_match(pat, f))
+                                .map(|(f, v)| (f.as_str(), v))
+                                .collect();
+                            fields.sort_unstable_by_key(|(f, _)| *f);
+                            let (page, next) = scan_page(&fields, args.cursor, args.count);
+                            let out = page
+                                .iter()
+                                .flat_map(|(f, v)| {
+                                    let field = Value::BulkString(Some(f.as_bytes().to_vec()));
+                                    if args.novalues {
+                                        vec![field]
+                                    } else {
+                                        vec![field, Value::BulkString(Some(v.as_slice().to_vec()))]
+                                    }
+                                })
+                                .collect();
+                            scan_reply(next, out)
                         }
                         _ => Value::Error(WRONGTYPE.to_string()),
                     },
@@ -2030,6 +2092,33 @@ impl KeyValueStore {
                                     .map(|m| Value::BulkString(Some(m.as_bytes().to_vec())))
                                     .collect(),
                             ))
+                        }
+                        _ => Value::Error(WRONGTYPE.to_string()),
+                    },
+                }
+            }
+
+            Command::SScan(key, args) => {
+                let now = now_ms();
+                match self.data.get(&key) {
+                    None => empty_scan(),
+                    Some(e) if e.is_expired(now) => empty_scan(),
+                    Some(e) => match &e.value {
+                        EntryValue::Set(s) => {
+                            e.touch(now);
+                            let pat = args.pattern.as_deref().unwrap_or("*");
+                            let mut members: Vec<&str> = s
+                                .iter()
+                                .map(|m| m.as_str())
+                                .filter(|m| glob_match(pat, m))
+                                .collect();
+                            members.sort_unstable();
+                            let (page, next) = scan_page(&members, args.cursor, args.count);
+                            let out = page
+                                .iter()
+                                .map(|m| Value::BulkString(Some(m.as_bytes().to_vec())))
+                                .collect();
+                            scan_reply(next, out)
                         }
                         _ => Value::Error(WRONGTYPE.to_string()),
                     },
@@ -2544,6 +2633,28 @@ impl KeyValueStore {
                 Ok(Value::Integer(count as i64))
             }),
 
+            Command::ZScan(key, args) => zset_read(&self.data, &key, |zset| {
+                let pat = args.pattern.as_deref().unwrap_or("*");
+                let mut members: Vec<(&str, f64)> = zset
+                    .scores
+                    .iter()
+                    .filter(|(m, _)| glob_match(pat, m))
+                    .map(|(m, &s)| (m.as_str(), s))
+                    .collect();
+                members.sort_unstable_by_key(|(m, _)| *m);
+                let (page, next) = scan_page(&members, args.cursor, args.count);
+                let out = page
+                    .iter()
+                    .flat_map(|(m, s)| {
+                        [
+                            Value::BulkString(Some(m.as_bytes().to_vec())),
+                            Value::BulkString(Some(format_score(*s).into_bytes())),
+                        ]
+                    })
+                    .collect();
+                Ok(scan_reply(next, out))
+            }),
+
             // ── JSON ──────────────────────────────────────────────────────────
             Command::JSet(key, path, value) => {
                 let now = now_ms();
@@ -2825,36 +2936,71 @@ fn set_expiry(data: &DashMap<String, Entry>, key: String, ts_ms: u64) -> Value {
     }
 }
 
-/// Glob match with `*`, `?`, and `[abc]` classes — iterative DP, O(m × n),
-/// immune to backtracking blowup. Used by KEYS/SCAN and exported for the
-/// server layer's sync-scope filtering.
+/// Longest glob pattern accepted from a client, in bytes.
+///
+/// Matching is O(pattern × text) in the worst case and runs once per key for
+/// `KEYS`/`SCAN MATCH`, once per key per write for sync-scope filtering, and
+/// once per published message per subscriber for `PSUBSCRIBE`. Pattern length
+/// was previously bounded only by `proto-max-bulk-len` (64 MB), so a single
+/// `KEYS <very long pattern>` against a large keyspace could occupy the process
+/// for an unbounded time. No legitimate pattern is anywhere near this cap.
+pub const MAX_PATTERN_BYTES: usize = 1024;
+
+/// Glob match with `*` and `?` against raw bytes.
+///
+/// Two-pointer greedy matching with a single backtrack point: worst case
+/// O(pattern × text) time, and **no allocation at all**.
+///
+/// This is the third implementation. The first was recursive and backtracked
+/// exponentially on patterns like `*a*a*a*b`; the second fixed the time bound
+/// with an iterative DP but allocated two `Vec<bool>` of `text.len() + 1` on
+/// *every call*, so a single 64 MB value made `KEYS *` allocate 128 MB — on a
+/// path that runs once per key. The greedy form keeps the DP's time bound and
+/// needs no memory, which is why it replaced it.
+///
+/// Supports `*` (any run of bytes, including empty) and `?` (exactly one byte).
+/// **Character classes like `[abc]` are not supported** — brackets match
+/// literally, so `[ab]` matches the four-byte string `[ab]` and not `a`. An
+/// earlier version of this comment claimed class support; it was never
+/// implemented. Matching is byte-wise, so `?` matches one *byte* and a
+/// multi-byte UTF-8 character spans several positions.
 pub fn glob_match(pattern: &str, s: &str) -> bool {
     let pat = pattern.as_bytes();
     let text = s.as_bytes();
     let (m, n) = (pat.len(), text.len());
 
-    // Iterative DP: prev[j] = pat[..i] matches text[..j].
-    // This replaces a recursive matcher that had exponential worst-case
-    // backtracking on patterns like "*.*.*x" against long non-matching strings.
-    let mut prev = vec![false; n + 1];
-    let mut curr = vec![false; n + 1];
-    prev[0] = true;
+    let mut i = 0usize; // position in text
+    let mut j = 0usize; // position in pattern
+    // The most recent `*` and the text position it was first allowed to stop at.
+    // Only the latest `*` needs remembering: any backtracking an earlier one
+    // could do, the latest one can do too.
+    let mut star: Option<usize> = None;
+    let mut resume = 0usize;
 
-    for i in 1..=m {
-        curr[0] = pat[i - 1] == b'*' && prev[0];
-        for j in 1..=n {
-            curr[j] = if pat[i - 1] == b'*' {
-                prev[j] || curr[j - 1]
-            } else if pat[i - 1] == b'?' || pat[i - 1] == text[j - 1] {
-                prev[j - 1]
-            } else {
-                false
-            };
+    while i < n {
+        if j < m && (pat[j] == b'?' || pat[j] == text[i]) {
+            i += 1;
+            j += 1;
+        } else if j < m && pat[j] == b'*' {
+            star = Some(j);
+            j += 1;
+            resume = i;
+        } else if let Some(star_at) = star {
+            // The last `*` consumed too little — give it one more byte and
+            // retry. `resume` only ever advances, which is what bounds this.
+            j = star_at + 1;
+            resume += 1;
+            i = resume;
+        } else {
+            return false;
         }
-        std::mem::swap(&mut prev, &mut curr);
     }
 
-    prev[n]
+    // Any `*` left over matches the empty remainder; anything else does not.
+    while j < m && pat[j] == b'*' {
+        j += 1;
+    }
+    j == m
 }
 
 fn no_list_response(count: Option<u64>) -> Value {
@@ -3036,6 +3182,75 @@ fn hash_incr_float(data: &DashMap<String, Entry>, key: String, field: String, de
     Value::BulkString(Some(new_str.into_bytes()))
 }
 
+/// Resolve `GETRANGE`'s inclusive bounds against a value of `data.len()` bytes.
+///
+/// Redis clamps the two ends asymmetrically and the difference matters: `end`
+/// is pulled back to the last byte, but `start` is left alone, so a `start`
+/// past the end of the value inverts the range and yields nothing instead of
+/// the final byte.
+fn byte_range(data: &[u8], start: i64, end: i64) -> &[u8] {
+    let len = data.len() as i64;
+    if len == 0 {
+        return &[];
+    }
+    let mut s = if start < 0 {
+        start.saturating_add(len)
+    } else {
+        start
+    };
+    let mut e = if end < 0 {
+        end.saturating_add(len)
+    } else {
+        end
+    };
+    if s < 0 {
+        s = 0;
+    }
+    if e < 0 {
+        e = 0;
+    }
+    if e >= len {
+        e = len - 1;
+    }
+    if s > e {
+        return &[];
+    }
+    // `s <= e < len` here, so both casts are in range.
+    &data[s as usize..=e as usize]
+}
+
+/// Take one page out of an ordered element list for the collection scans.
+///
+/// The cursor is an offset rather than Redis's reverse-binary bucket index:
+/// there is no incremental rehashing to survive here, and keyspace `SCAN`
+/// already established the convention. The ordering must be stable across
+/// calls for the offset to mean anything, which is why every caller sorts by
+/// field or member name. A cursor past the end returns an empty final page
+/// rather than erroring, matching what Redis does with a stale cursor.
+fn scan_page<T>(items: &[T], cursor: u64, count: Option<usize>) -> (&[T], u64) {
+    let batch = count.unwrap_or(10).max(1);
+    let start = (cursor as usize).min(items.len());
+    let end = start.saturating_add(batch).min(items.len());
+    let next = if end >= items.len() { 0 } else { end as u64 };
+    (&items[start..end], next)
+}
+
+/// `[cursor, [elements…]]` — the two-element reply every SCAN family member
+/// returns. The cursor is a bulk string, as in Redis, because it may exceed
+/// what a RESP integer promises.
+fn scan_reply(next: u64, items: Vec<Value>) -> Value {
+    Value::Array(Some(vec![
+        Value::BulkString(Some(next.to_string().into_bytes())),
+        Value::Array(Some(items)),
+    ]))
+}
+
+/// The reply for scanning a key that does not exist: a completed iteration
+/// over nothing, which is also what Redis answers.
+fn empty_scan() -> Value {
+    scan_reply(0, vec![])
+}
+
 fn zset_read<F>(data: &DashMap<String, Entry>, key: &str, f: F) -> Value
 where
     F: FnOnce(&ZSetInner) -> Result<Value, Value>,
@@ -3145,7 +3360,7 @@ fn zadd_exec(zset: &mut ZSetInner, opts: ZAddOptions, pairs: Vec<(f64, String)>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::{Command, SetOptions, ZAddOptions};
+    use crate::cmd::{Command, ScanArgs, SetOptions, ZAddOptions};
 
     fn store() -> KeyValueStore {
         KeyValueStore::new()
@@ -3696,6 +3911,76 @@ mod tests {
     }
 
     #[test]
+    fn getrange_slices_with_inclusive_bounds() {
+        let s = store();
+        s.execute(Command::Set(
+            "k".into(),
+            "This is a string".into(),
+            SetOptions::default(),
+        ));
+        assert_eq!(s.execute(Command::GetRange("k".into(), 0, 3)), bulk("This"));
+        assert_eq!(
+            s.execute(Command::GetRange("k".into(), -3, -1)),
+            bulk("ing")
+        );
+        assert_eq!(
+            s.execute(Command::GetRange("k".into(), 0, -1)),
+            bulk("This is a string")
+        );
+        assert_eq!(
+            s.execute(Command::GetRange("k".into(), 10, 100)),
+            bulk("string"),
+            "an end past the value clamps to the last byte"
+        );
+    }
+
+    #[test]
+    fn getrange_empty_cases() {
+        let s = store();
+        s.execute(Command::Set(
+            "k".into(),
+            "hello".into(),
+            SetOptions::default(),
+        ));
+        // A start past the end inverts the range — Redis clamps `end` but not
+        // `start`, so this is empty rather than the final byte.
+        assert_eq!(s.execute(Command::GetRange("k".into(), 10, 20)), bulk(""));
+        assert_eq!(s.execute(Command::GetRange("k".into(), 3, 1)), bulk(""));
+        // A missing key is an empty string, and an empty bulk — not a nil.
+        assert_eq!(
+            s.execute(Command::GetRange("ghost".into(), 0, -1)),
+            bulk("")
+        );
+        // Offsets far below zero clamp to the start rather than wrapping.
+        assert_eq!(
+            s.execute(Command::GetRange("k".into(), -100, 1)),
+            bulk("he")
+        );
+        assert_eq!(
+            s.execute(Command::GetRange("k".into(), i64::MIN, i64::MAX)),
+            bulk("hello")
+        );
+    }
+
+    #[test]
+    fn getrange_is_binary_safe_and_type_checked() {
+        let s = store();
+        s.execute(Command::Set(
+            "b".into(),
+            vec![0xff, 0x00, 0xfe],
+            SetOptions::default(),
+        ));
+        assert_eq!(
+            s.execute(Command::GetRange("b".into(), 0, 1)),
+            Value::BulkString(Some(vec![0xff, 0x00]))
+        );
+        s.execute(Command::HSet("h".into(), vec![("f".into(), "v".into())]));
+        assert!(
+            matches!(s.execute(Command::GetRange("h".into(), 0, -1)), Value::Error(e) if e.starts_with("WRONGTYPE"))
+        );
+    }
+
+    #[test]
     fn string_getset() {
         let s = store();
         s.execute(Command::Set(
@@ -3972,6 +4257,188 @@ mod tests {
         }
         seen.sort();
         assert_eq!(seen, vec!["k0", "k1", "k2", "k3", "k4"]);
+    }
+
+    // ── Collection scans ──────────────────────────────────────────────────────
+
+    /// Unpack a `[cursor, [elements…]]` reply into the pair it represents.
+    fn scan_parts(v: &Value) -> (u64, Vec<String>) {
+        let Value::Array(Some(parts)) = v else {
+            panic!("scan reply must be an array, got {v:?}")
+        };
+        assert_eq!(parts.len(), 2, "scan reply is [cursor, elements]");
+        let Value::BulkString(Some(c)) = &parts[0] else {
+            panic!("cursor must be a bulk string")
+        };
+        let cursor: u64 = String::from_utf8_lossy(c).parse().expect("numeric cursor");
+        let Value::Array(Some(items)) = &parts[1] else {
+            panic!("elements must be an array")
+        };
+        let items = items
+            .iter()
+            .map(|i| match i {
+                Value::BulkString(Some(d)) => String::from_utf8_lossy(d).into_owned(),
+                other => panic!("element must be a bulk string, got {other:?}"),
+            })
+            .collect();
+        (cursor, items)
+    }
+
+    /// Walk a scan to completion in pages of `count`, returning every element
+    /// in the order the cursor produced them. Panics rather than looping
+    /// forever if the cursor fails to terminate.
+    fn drain_scan(
+        s: &KeyValueStore,
+        cmd: impl Fn(ScanArgs) -> Command,
+        count: usize,
+        per_element: usize,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cursor = 0u64;
+        for _ in 0..100 {
+            let (next, items) = scan_parts(&s.execute(cmd(ScanArgs {
+                cursor,
+                count: Some(count),
+                ..Default::default()
+            })));
+            assert!(
+                items.len() <= count * per_element,
+                "page of {} exceeds COUNT {count}",
+                items.len()
+            );
+            out.extend(items);
+            cursor = next;
+            if cursor == 0 {
+                return out;
+            }
+        }
+        panic!("cursor did not terminate");
+    }
+
+    #[test]
+    fn hscan_visits_every_field_exactly_once() {
+        let s = store();
+        let fields: Vec<(String, Vec<u8>)> = (0..7)
+            .map(|i| (format!("f{i}"), format!("v{i}").into_bytes()))
+            .collect();
+        s.execute(Command::HSet("h".into(), fields));
+        let seen = drain_scan(&s, |a| Command::HScan("h".into(), a), 2, 2);
+        assert_eq!(seen.len(), 14, "7 fields as field/value pairs");
+        let names: Vec<&String> = seen.iter().step_by(2).collect();
+        assert_eq!(names, vec!["f0", "f1", "f2", "f3", "f4", "f5", "f6"]);
+        assert_eq!(seen[1], "v0");
+    }
+
+    #[test]
+    fn hscan_novalues_returns_field_names_only() {
+        let s = store();
+        s.execute(Command::HSet(
+            "h".into(),
+            vec![("a".into(), "1".into()), ("b".into(), "2".into())],
+        ));
+        let (cursor, items) = scan_parts(&s.execute(Command::HScan(
+            "h".into(),
+            ScanArgs {
+                novalues: true,
+                ..Default::default()
+            },
+        )));
+        assert_eq!(cursor, 0);
+        assert_eq!(items, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn hscan_match_filters_field_names() {
+        let s = store();
+        s.execute(Command::HSet(
+            "h".into(),
+            vec![
+                ("user:1".into(), "a".into()),
+                ("user:2".into(), "b".into()),
+                ("other".into(), "c".into()),
+            ],
+        ));
+        let (_, items) = scan_parts(&s.execute(Command::HScan(
+            "h".into(),
+            ScanArgs {
+                pattern: Some("user:*".into()),
+                ..Default::default()
+            },
+        )));
+        assert_eq!(items, vec!["user:1", "a", "user:2", "b"]);
+    }
+
+    #[test]
+    fn collection_scans_on_missing_key_complete_empty() {
+        let s = store();
+        for cmd in [
+            Command::HScan("ghost".into(), ScanArgs::default()),
+            Command::SScan("ghost".into(), ScanArgs::default()),
+            Command::ZScan("ghost".into(), ScanArgs::default()),
+        ] {
+            let (cursor, items) = scan_parts(&s.execute(cmd));
+            assert_eq!(cursor, 0);
+            assert!(items.is_empty());
+        }
+    }
+
+    #[test]
+    fn collection_scans_reject_the_wrong_type() {
+        let s = store();
+        s.execute(Command::Set(
+            "str".into(),
+            "v".into(),
+            SetOptions::default(),
+        ));
+        for cmd in [
+            Command::HScan("str".into(), ScanArgs::default()),
+            Command::SScan("str".into(), ScanArgs::default()),
+            Command::ZScan("str".into(), ScanArgs::default()),
+        ] {
+            assert!(matches!(s.execute(cmd), Value::Error(e) if e.starts_with("WRONGTYPE")));
+        }
+    }
+
+    #[test]
+    fn scan_cursor_past_the_end_completes_without_panicking() {
+        // A client resuming a cursor into a collection that shrank underneath
+        // it must get an empty final page, not an out-of-bounds slice.
+        let s = store();
+        s.execute(Command::SAdd("st".into(), vec!["a".into()]));
+        let (cursor, items) = scan_parts(&s.execute(Command::SScan(
+            "st".into(),
+            ScanArgs {
+                cursor: 9_999,
+                ..Default::default()
+            },
+        )));
+        assert_eq!(cursor, 0);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn sscan_visits_every_member_exactly_once() {
+        let s = store();
+        s.execute(Command::SAdd(
+            "st".into(),
+            (0..5).map(|i| format!("m{i}")).collect(),
+        ));
+        let seen = drain_scan(&s, |a| Command::SScan("st".into(), a), 2, 1);
+        assert_eq!(seen, vec!["m0", "m1", "m2", "m3", "m4"]);
+    }
+
+    #[test]
+    fn zscan_pages_members_with_scores() {
+        let s = store();
+        s.execute(Command::ZAdd(
+            "z".into(),
+            ZAddOptions::default(),
+            vec![(2.0, "bob".into()), (1.5, "amy".into())],
+        ));
+        // Ordered by member, not by score: the offset cursor has to survive a
+        // score being updated mid-iteration.
+        let seen = drain_scan(&s, |a| Command::ZScan("z".into(), a), 1, 2);
+        assert_eq!(seen, vec!["amy", "1.5", "bob", "2"]);
     }
 
     // ── Expiry ────────────────────────────────────────────────────────────────
@@ -5455,6 +5922,128 @@ mod critical_path_tests {
             "glob_match took {:?} — exponential backtracking has returned",
             start.elapsed()
         );
+    }
+
+    /// The DP implementation this replaced, kept as a reference oracle.
+    ///
+    /// `glob_match` is not just a `KEYS` helper — it decides sync-scope access,
+    /// so a rewrite that changed semantics anywhere would be a silent
+    /// authorisation change. Comparing against the previous implementation is
+    /// the only way to make "behaviour is unchanged" an assertion rather than a
+    /// claim.
+    fn glob_match_dp_reference(pattern: &str, s: &str) -> bool {
+        let pat = pattern.as_bytes();
+        let text = s.as_bytes();
+        let (m, n) = (pat.len(), text.len());
+        let mut prev = vec![false; n + 1];
+        let mut curr = vec![false; n + 1];
+        prev[0] = true;
+        for i in 1..=m {
+            curr[0] = pat[i - 1] == b'*' && prev[0];
+            for j in 1..=n {
+                curr[j] = if pat[i - 1] == b'*' {
+                    prev[j] || curr[j - 1]
+                } else if pat[i - 1] == b'?' || pat[i - 1] == text[j - 1] {
+                    prev[j - 1]
+                } else {
+                    false
+                };
+            }
+            std::mem::swap(&mut prev, &mut curr);
+        }
+        prev[n]
+    }
+
+    #[test]
+    fn glob_match_agrees_with_the_dp_reference_on_every_small_input() {
+        // Exhaustive rather than random: every pattern over {a, b, *, ?} up to
+        // length 5 against every text over {a, b} up to length 4. That is the
+        // whole space where `*` interacts with `?` and with literals, which is
+        // where a greedy matcher would differ from the DP if it were wrong.
+        let pat_alphabet = *b"ab*?";
+        let txt_alphabet = *b"ab";
+
+        fn all_strings(alphabet: &[u8], max_len: usize) -> Vec<String> {
+            let mut out = vec![String::new()];
+            let mut frontier = vec![String::new()];
+            for _ in 0..max_len {
+                let mut next = Vec::new();
+                for s in &frontier {
+                    for &c in alphabet {
+                        let mut t = s.clone();
+                        t.push(c as char);
+                        next.push(t);
+                    }
+                }
+                out.extend(next.iter().cloned());
+                frontier = next;
+            }
+            out
+        }
+
+        let patterns = all_strings(&pat_alphabet, 5);
+        let texts = all_strings(&txt_alphabet, 4);
+        let mut compared = 0usize;
+        for p in &patterns {
+            for t in &texts {
+                let got = glob_match(p, t);
+                let want = glob_match_dp_reference(p, t);
+                assert_eq!(got, want, "glob_match({p:?}, {t:?}) disagrees with the DP");
+                compared += 1;
+            }
+        }
+        // Guard against the loops silently collapsing to nothing.
+        assert!(compared > 20_000, "only compared {compared} pairs");
+    }
+
+    #[test]
+    fn glob_match_agrees_with_the_dp_reference_on_realistic_key_shapes() {
+        // The exhaustive sweep uses a two-letter alphabet, so it never produces
+        // a `:`-delimited key or a repeated-literal run — the shapes real
+        // patterns and real keys actually have.
+        let cases = [
+            ("cart:*", "cart:42:item:9"),
+            ("cart:42:*", "cart:99:item:1"),
+            ("*:secret", "a:b:c:secret"),
+            ("user:1*", "user:1:private"),
+            ("tenant:7:*", "tenant:7:orders:2024:11"),
+            ("*a*a*a*a*b", "aaaaaaaaaaaaaaaaaaaa"),
+            ("a*b*c*d", "axxbyyczzd"),
+            ("a*b*c*d", "axxbyyczz"),
+            ("?????", "abcde"),
+            ("*?", ""),
+            ("?*", "x"),
+            ("**?**", "xy"),
+            ("session:*:token", "session:abc:token"),
+            ("session:*:token", "session::token"),
+            ("[ab]", "a"),
+            ("[ab]", "[ab]"),
+        ];
+        for (p, t) in cases {
+            assert_eq!(
+                glob_match(p, t),
+                glob_match_dp_reference(p, t),
+                "glob_match({p:?}, {t:?}) disagrees with the DP"
+            );
+        }
+    }
+
+    #[test]
+    fn glob_match_does_not_allocate_per_call() {
+        // The DP allocated two Vec<bool> of text.len() + 1 on every call, so one
+        // 64 MB value made `KEYS *` request 128 MB — on a path that runs once
+        // per key. A long text must now cost nothing but time.
+        let long = "k".repeat(4 * 1024 * 1024);
+        assert!(glob_match("*", &long));
+        assert!(glob_match("k*k", &long));
+        assert!(!glob_match("*z", &long));
+    }
+
+    #[test]
+    fn glob_pattern_cap_is_generous_but_finite() {
+        // Enforced where patterns are parsed, not here — this pins the value so
+        // it cannot drift without someone noticing.
+        assert_eq!(MAX_PATTERN_BYTES, 1024);
     }
 
     #[test]

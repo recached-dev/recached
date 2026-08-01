@@ -1,6 +1,28 @@
 const MAX_ARRAY_DEPTH: usize = 16;
 const MAX_ARRAY_ELEMENTS: usize = 1_000_000;
-const MAX_BULK_STRING_BYTES: usize = 64 * 1024 * 1024; // 64 MB
+/// Elements reserved up front for an aggregate, however many its header claims.
+///
+/// The header is attacker-controlled and arrives before any of the elements do,
+/// so reserving `count` capacity let a tiny input demand a large allocation:
+/// `*1000000\r\n` is nine bytes and used to reserve a million `Value`s, and
+/// nesting that to `MAX_ARRAY_DEPTH` multiplied it. Worse, an incomplete frame
+/// is re-parsed from the start each time more bytes arrive, so a one-byte-per-
+/// packet drip repeated the reservation on every packet — none of it counted
+/// against `RECACHED_MAX_MEMORY`, which only tracks stored data.
+///
+/// Reserving a fixed floor instead makes allocation proportional to bytes
+/// *received* rather than bytes *claimed*; the vector still grows as real
+/// elements are parsed, and `MAX_ARRAY_ELEMENTS` still rejects absurd headers.
+const PREALLOC_ELEMENTS: usize = 1024;
+
+/// Capacity to reserve for an aggregate whose header declares `declared`.
+fn prealloc_for(declared: usize) -> usize {
+    declared.min(PREALLOC_ELEMENTS)
+}
+/// Largest bulk string the parser will accept, in bytes. Public because
+/// `CONFIG GET proto-max-bulk-len` has to report the limit actually enforced
+/// rather than a second copy of the number.
+pub const MAX_BULK_STRING_BYTES: usize = 64 * 1024 * 1024; // 64 MB
 const MAX_TOTAL_MESSAGE_BYTES: usize = 64 * 1024 * 1024; // 64 MB total per message
 
 #[derive(Debug, Clone, PartialEq)]
@@ -196,7 +218,7 @@ impl Value {
                         count, MAX_ARRAY_ELEMENTS
                     ));
                 }
-                let mut arr = Vec::with_capacity(count as usize);
+                let mut arr = Vec::with_capacity(prealloc_for(count as usize));
                 for _ in 0..count {
                     let (val, len) = Self::parse_inner(&buffer[offset..], depth + 1)?;
                     arr.push(val);
@@ -227,7 +249,7 @@ impl Value {
                         MAX_ARRAY_ELEMENTS / 2
                     ));
                 }
-                let mut pairs = Vec::with_capacity(count as usize);
+                let mut pairs = Vec::with_capacity(prealloc_for(count as usize));
                 for _ in 0..count {
                     let (k, klen) = Self::parse_inner(&buffer[offset..], depth + 1)?;
                     offset += klen;
@@ -267,7 +289,7 @@ impl Value {
                     ));
                 }
 
-                let mut arr = Vec::with_capacity(count as usize);
+                let mut arr = Vec::with_capacity(prealloc_for(count as usize));
                 for _ in 0..count {
                     let (val, len) = Self::parse_inner(&buffer[offset..], depth + 1)?;
                     arr.push(val);

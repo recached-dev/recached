@@ -4,28 +4,35 @@
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+use core_engine::catalog;
 use core_engine::cmd::{Command, SetExpiry, ZAddCondition};
-use core_engine::resp::Value;
-use core_engine::store::{EvictionPolicy, KeyValueStore, KeyspaceSample, SnapshotEntry};
+use core_engine::resp::{MAX_BULK_STRING_BYTES, Value};
+use core_engine::store::{
+    EvictionPolicy, KeyValueStore, KeyspaceSample, SnapshotEntry, glob_match,
+};
 use futures_util::{SinkExt, StreamExt};
 use metrics::{counter, gauge};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::ErrorKind;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, broadcast, mpsc};
-use tokio_rustls::TlsAcceptor;
-use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio_tungstenite::accept_async;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::handshake::server::{
+    ErrorResponse, Request as HandshakeRequest, Response as HandshakeResponse,
+};
+use tokio_tungstenite::tungstenite::http::StatusCode;
 use tracing::{debug, error, info, warn};
 
 // ── metrics ───────────────────────────────────────────────────────────────────
@@ -43,24 +50,21 @@ static STAT_KEYSPACE_HITS: AtomicU64 = AtomicU64::new(0);
 static STAT_KEYSPACE_MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// RAII guard that tracks an active connection. Increments on creation,
-/// decrements when dropped (i.e. when the handler future completes).
-struct ConnectionGuard;
+/// decrements when dropped (i.e. when the handler future completes), and
+/// keeps the `CLIENT LIST` registry in step with both.
+struct ConnectionGuard {
+    id: u64,
+}
 
 impl ConnectionGuard {
-    fn tcp() -> Self {
-        counter!("recached_connections_total", "type" => "tcp").increment(1);
+    fn new(kind: &'static str, meta: ClientMeta) -> Self {
+        counter!("recached_connections_total", "type" => kind).increment(1);
         gauge!("recached_connections_active").increment(1.0);
         STAT_CONNECTIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
         STAT_CONNECTIONS_ACTIVE.fetch_add(1, Ordering::Relaxed);
-        Self
-    }
-
-    fn ws() -> Self {
-        counter!("recached_connections_total", "type" => "ws").increment(1);
-        gauge!("recached_connections_active").increment(1.0);
-        STAT_CONNECTIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
-        STAT_CONNECTIONS_ACTIVE.fetch_add(1, Ordering::Relaxed);
-        Self
+        let id = meta.id;
+        publish_client(meta);
+        Self { id }
     }
 }
 
@@ -68,7 +72,100 @@ impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         gauge!("recached_connections_active").decrement(1.0);
         STAT_CONNECTIONS_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+        CLIENTS
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
     }
+}
+
+// ── Client registry ───────────────────────────────────────────────────────────
+
+/// What `CLIENT INFO` and `CLIENT LIST` report about one live connection.
+///
+/// The connection task owns the authoritative copy and republishes it whenever
+/// a field changes — a name is set, a library identifies itself, the protocol
+/// is renegotiated. Publishing on change rather than per command keeps the
+/// registry's write lock off the hot path: these events happen a handful of
+/// times per connection, commands happen millions of times.
+#[derive(Clone, Debug)]
+struct ClientMeta {
+    id: u64,
+    /// Peer address, or empty when the listener could not report one.
+    addr: String,
+    laddr: String,
+    name: String,
+    lib_name: String,
+    lib_ver: String,
+    since: SystemTime,
+    resp: u8,
+    sub: usize,
+    psub: usize,
+}
+
+impl ClientMeta {
+    fn new(id: u64, addr: String, laddr: String) -> Self {
+        Self {
+            id,
+            addr,
+            laddr,
+            name: String::new(),
+            lib_name: String::new(),
+            lib_ver: String::new(),
+            since: SystemTime::now(),
+            resp: 2,
+            sub: 0,
+            psub: 0,
+        }
+    }
+
+    /// One line in Redis's `CLIENT LIST` format: space-separated `key=value`.
+    ///
+    /// Only fields Recached can answer truthfully are emitted. Redis also
+    /// reports buffer sizes, file descriptors and an event mask; inventing
+    /// plausible numbers for those would be worse than leaving them out,
+    /// because a client cannot tell a made-up `omem` from a real one. Parsers
+    /// read this format key by key and skip what they do not recognise, so a
+    /// shorter line is a supported line.
+    fn render(&self) -> String {
+        let age = self.since.elapsed().unwrap_or_default().as_secs();
+        format!(
+            "id={} addr={} laddr={} name={} age={} idle=0 flags=N db=0 \
+             sub={} psub={} multi=-1 resp={} lib-name={} lib-ver={}",
+            self.id,
+            self.addr,
+            self.laddr,
+            self.name,
+            age,
+            self.sub,
+            self.psub,
+            self.resp,
+            self.lib_name,
+            self.lib_ver,
+        )
+    }
+}
+
+/// Live connections, keyed by id. A `BTreeMap` so `CLIENT LIST` comes out in
+/// connection order rather than an arbitrary one that shuffles between calls.
+static CLIENTS: std::sync::LazyLock<std::sync::RwLock<BTreeMap<u64, ClientMeta>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn publish_client(meta: ClientMeta) {
+    CLIENTS
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(meta.id, meta);
+}
+
+fn client_list_lines() -> String {
+    let clients = CLIENTS.read().unwrap_or_else(|e| e.into_inner());
+    let mut out = String::new();
+    for meta in clients.values() {
+        out.push_str(&meta.render());
+        out.push('\n');
+    }
+    out
 }
 
 fn command_name(cmd: &Command) -> &'static str {
@@ -77,6 +174,10 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::Auth(_) => "auth",
         Command::Hello(_) => "hello",
         Command::Info(_) => "info",
+        Command::Quit => "quit",
+        Command::Client(_) => "client",
+        Command::Config(_) => "config",
+        Command::CommandQuery(_) => "command",
         Command::Get(_) => "get",
         Command::ESet(_, _) => "eset",
         Command::Set(_, _, _) => "set",
@@ -84,6 +185,7 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::Unlink(_) => "unlink",
         Command::Append(_, _) => "append",
         Command::Strlen(_) => "strlen",
+        Command::GetRange(_, _, _) => "getrange",
         Command::GetSet(_, _) => "getset",
         Command::MGet(_) => "mget",
         Command::MSet(_) => "mset",
@@ -120,6 +222,7 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::HExists(_, _) => "hexists",
         Command::HSetNx(_, _, _) => "hsetnx",
         Command::HMGet(_, _) => "hmget",
+        Command::HScan(_, _) => "hscan",
         Command::LPush(_, _) => "lpush",
         Command::RPush(_, _) => "rpush",
         Command::LPushX(_, _) => "lpushx",
@@ -147,6 +250,7 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::SPop(_, _) => "spop",
         Command::SRandMember(_, _) => "srandmember",
         Command::SMove(_, _, _) => "smove",
+        Command::SScan(_, _) => "sscan",
         Command::ZAdd(_, _, _) => "zadd",
         Command::ZRange(_, _, _, _) => "zrange",
         Command::ZRevRange(_, _, _, _) => "zrevrange",
@@ -160,6 +264,7 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::ZCard(_) => "zcard",
         Command::ZIncrBy(_, _, _) => "zincrby",
         Command::ZCount(_, _, _) => "zcount",
+        Command::ZScan(_, _) => "zscan",
         Command::Multi => "multi",
         Command::Exec => "exec",
         Command::Discard => "discard",
@@ -336,6 +441,61 @@ fn resolve_tls_paths(
     }
 }
 
+/// The name a replica verifies the primary's certificate against.
+///
+/// Defaults to the host portion of `RECACHED_REPLICAOF`, which is what an
+/// operator means by "connect to this primary". It is overridable because the
+/// address is frequently an IP while the certificate names a host: a cert issued
+/// for `primary.internal` does not validate against `10.0.1.5` unless it also
+/// carries that IP as a SAN, and pointing at the IP is the common deployment.
+fn repl_tls_servername(primary_addr: &str, override_name: Option<String>) -> String {
+    if let Some(name) = override_name.map(|n| n.trim().to_string())
+        && !name.is_empty()
+    {
+        return name;
+    }
+    // `host:port`, or a bare host. An IPv6 literal is bracketed, so splitting on
+    // the last colon would cut inside the address.
+    match primary_addr.rsplit_once(':') {
+        Some((host, _)) if !host.is_empty() && !host.contains(':') => host.to_string(),
+        _ => primary_addr
+            .trim_start_matches('[')
+            .split(']')
+            .next()
+            .unwrap_or(primary_addr)
+            .to_string(),
+    }
+}
+
+/// Build the TLS connector a replica uses to reach its primary.
+///
+/// The trust anchor is an explicit file rather than the system root store, and
+/// that is deliberate. Replication is a link between two machines the same
+/// operator runs, so the right model is pinning the certificate (or the private
+/// CA that issued it) — not trusting every public CA on earth to vouch for a
+/// host that streams the entire keyspace. Pointing this at a system bundle still
+/// works if the primary genuinely uses a publicly-issued certificate.
+fn load_repl_tls_connector(ca_path: &str) -> Result<TlsConnector, String> {
+    let certs =
+        load_certs(ca_path).map_err(|e| format!("RECACHED_REPL_TLS_CA '{ca_path}': {e}"))?;
+    if certs.is_empty() {
+        return Err(format!(
+            "RECACHED_REPL_TLS_CA '{ca_path}' contains no certificates — replication TLS would \
+             trust nothing and every connection would fail."
+        ));
+    }
+    let mut roots = RootCertStore::empty();
+    for cert in certs {
+        roots
+            .add(cert)
+            .map_err(|e| format!("RECACHED_REPL_TLS_CA '{ca_path}': {e}"))?;
+    }
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(TlsConnector::from(Arc::new(config)))
+}
+
 /// Returns a `TlsAcceptor` when both `RECACHED_TLS_CERT` and `RECACHED_TLS_KEY`
 /// are set, `None` when neither is. Exits if exactly one is set.
 fn load_tls_acceptor() -> Option<TlsAcceptor> {
@@ -406,6 +566,101 @@ const BROADCAST_CHANNEL_CAPACITY: usize = 512;
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 const MAX_AUTH_FAILURES: u32 = 5;
 const EVICTION_INTERVAL_SECS: u64 = 1;
+const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+/// Longest replication auth line accepted, in bytes.
+const MAX_REPL_AUTH_LINE: usize = 512;
+/// Window over which failed replication auth attempts are counted per peer.
+const REPL_AUTH_WINDOW: Duration = Duration::from_secs(60);
+/// Peers tracked before the throttle sweeps expired entries.
+const REPL_AUTH_SWEEP_THRESHOLD: usize = 1024;
+
+// ── private file writes ───────────────────────────────────────────────────────
+
+/// Write `bytes` to `path`, creating it readable only by this user.
+///
+/// Snapshots, the AOF, and the dedup sidecar are plaintext MessagePack dumps of
+/// the keyspace. `fs::write` creates with the process umask — `0644` on a
+/// typical host — so any local user could read the entire cache. The
+/// documentation told operators to protect these files with filesystem
+/// permissions; the server should never have been relying on that.
+///
+/// Permissions are also set explicitly after opening, so a file left behind
+/// `0644` by an earlier version is tightened on the next write rather than
+/// keeping its old mode forever.
+/// Writes are fsynced before returning. Every caller is writing state that has
+/// to survive a crash — a snapshot about to be renamed into place, or the dedup
+/// high-water marks that stop a replayed write being applied twice — so the
+/// barrier belongs here rather than at each call site.
+async fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let mut f = opts.open(path).await?;
+    #[cfg(unix)]
+    restrict_permissions(&f).await;
+    f.write_all(bytes).await?;
+    f.flush().await?;
+    // `sync_all`, not `sync_data`: this file was just created, so its metadata
+    // is part of what has to reach the device.
+    f.sync_all().await?;
+    Ok(())
+}
+
+/// fsync the directory holding `path`, making a `rename` into it durable.
+///
+/// Renaming a fsynced temp file over the target is atomic with respect to
+/// readers, but the *directory entry* is itself just a write: without this, a
+/// crash can leave the old file, or no file, despite the new contents being
+/// safely on disk. Only meaningful on unix — Windows has no directory handle to
+/// sync — so the call is compiled out elsewhere.
+#[cfg(unix)]
+async fn sync_parent_dir(path: &std::path::Path) {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    // An empty parent means the path was relative with no directory component.
+    let dir = if dir.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        dir
+    };
+    match tokio::fs::File::open(dir).await {
+        Ok(f) => {
+            if let Err(e) = f.sync_all().await {
+                warn!("Directory fsync failed for {:?}: {}", dir, e);
+            }
+        }
+        Err(e) => warn!("Could not open {:?} to fsync: {}", dir, e),
+    }
+}
+
+#[cfg(not(unix))]
+async fn sync_parent_dir(_path: &std::path::Path) {}
+
+/// Tighten an already-open file to `0600`, ignoring failure.
+///
+/// Best-effort by design: on a filesystem that cannot represent unix modes this
+/// is not something to fail a write over, and the caller has already created the
+/// file with the right mode where the platform allows it.
+#[cfg(unix)]
+async fn restrict_permissions(f: &tokio::fs::File) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = f
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .await;
+}
+
+/// Path for a temp file alongside `path`, distinct per process.
+///
+/// The previous fixed `.tmp` name meant two servers sharing a directory would
+/// clobber each other's half-written snapshot, and made the target predictable
+/// to anyone who could already write to that directory. Residual: this is not
+/// unguessable, so it is a defence against collision rather than against an
+/// attacker who already controls the data directory.
+fn temp_sibling(path: &std::path::Path, tag: &str) -> PathBuf {
+    path.with_extension(format!("{tag}.{}.tmp", std::process::id()))
+}
 
 // ── snapshot persistence ──────────────────────────────────────────────────────
 
@@ -459,6 +714,174 @@ fn parse_allow_ips(raw: &str) -> Result<Vec<IpAddr>, String> {
     Ok(ips)
 }
 
+/// Parse a boolean environment variable, rejecting anything ambiguous.
+///
+/// Silently treating `RECACHED_REPL_ENABLE=please` as false would leave an
+/// operator believing replication was on when it was not; treating it as true
+/// would open a port they never asked for. Neither is acceptable for a variable
+/// that gates a security boundary, so an unrecognised value refuses to start.
+fn parse_env_bool(var: &str, raw: &str) -> Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(format!(
+            "{var}: '{other}' is not a boolean. Use 1/true/yes/on or 0/false/no/off."
+        )),
+    }
+}
+
+/// True when `bind_host` can only be reached from this machine.
+///
+/// A hostname that does not parse as an address is treated as public: the
+/// conservative answer is the one that demands a password.
+fn bind_is_loopback(bind_host: &str) -> bool {
+    if bind_host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // An IPv6 bind address has to be written bracketed — `[::1]` — because the
+    // listeners format it as `{host}:{port}`, and `::1:6379` does not parse.
+    // Without stripping them, `[::1]` fails to parse as an address and would be
+    // classified as public, demanding a replication password on what is in fact
+    // loopback.
+    let host = bind_host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(bind_host);
+    IpAddr::from_str(host)
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// Whether to bind the replication listener, given the environment.
+///
+/// This listener used to start unconditionally on every node. The stated reason
+/// was multi-tier replication — a replica must be able to serve sub-replicas —
+/// but the cost was that *every* default deployment opened a port carrying the
+/// entire keyspace to anyone who connected: with no `RECACHED_REPL_PASSWORD`,
+/// `handle_replica` skips the handshake and sends a full snapshot followed by a
+/// live stream of every subsequent write. An operator who set
+/// `RECACHED_PASSWORD` had every reason to believe the data was behind
+/// authentication, and it was not.
+///
+/// Two rules now apply. The port is closed unless `RECACHED_REPL_ENABLE` says
+/// otherwise, and enabling it on an interface other than loopback without a
+/// password refuses to start rather than serving the keyspace unauthenticated.
+/// Multi-tier replication still works — a node that serves sub-replicas sets
+/// the variable, which is the point: it is now a decision rather than a default.
+fn resolve_repl_listen(
+    enable: Option<String>,
+    bind_host: &str,
+    password: Option<&str>,
+) -> Result<bool, String> {
+    let enabled = match enable.as_deref().map(str::trim) {
+        None | Some("") => false,
+        Some(v) => parse_env_bool("RECACHED_REPL_ENABLE", v)?,
+    };
+    if !enabled {
+        return Ok(false);
+    }
+    let has_password = password.is_some_and(|p| !p.is_empty());
+    if !has_password && !bind_is_loopback(bind_host) {
+        return Err(format!(
+            "RECACHED_REPL_ENABLE is set and RECACHED_BIND is '{bind_host}', but \
+             RECACHED_REPL_PASSWORD is unset — refusing to start. The replication port serves the \
+             entire keyspace to whoever connects, so on any interface reachable from the network \
+             it must be authenticated. Set RECACHED_REPL_PASSWORD, or bind to 127.0.0.1."
+        ));
+    }
+    Ok(true)
+}
+
+/// Parse `RECACHED_ALLOWED_ORIGINS` into exact origins.
+///
+/// An origin is scheme + host + optional port and nothing else, so an entry
+/// carrying a path is a misunderstanding of what will be compared against — and
+/// one that would silently never match. Reject it at startup, in the same
+/// spirit as `parse_allow_ips`.
+fn parse_allowed_origins(raw: &str) -> Result<Vec<String>, String> {
+    let mut origins = Vec::new();
+    for entry in raw.split(',') {
+        let trimmed = entry.trim().trim_end_matches('/');
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Sandboxed iframes and `file://` documents send the literal `null`.
+        // An operator may legitimately need to admit them.
+        if trimmed.eq_ignore_ascii_case("null") {
+            origins.push("null".to_string());
+            continue;
+        }
+        let Some((scheme, authority)) = trimmed.split_once("://") else {
+            return Err(format!(
+                "RECACHED_ALLOWED_ORIGINS: '{trimmed}' is not an origin — it needs a scheme, e.g. \
+                 https://app.example.com."
+            ));
+        };
+        if scheme.is_empty() || authority.is_empty() {
+            return Err(format!(
+                "RECACHED_ALLOWED_ORIGINS: '{trimmed}' is not an origin — expected \
+                 scheme://host[:port]."
+            ));
+        }
+        if authority.contains('/') {
+            return Err(format!(
+                "RECACHED_ALLOWED_ORIGINS: '{trimmed}' contains a path. An origin is \
+                 scheme://host[:port] only, and a browser will never send a path — this entry \
+                 could never match."
+            ));
+        }
+        origins.push(trimmed.to_ascii_lowercase());
+    }
+    if origins.is_empty() {
+        return Err(
+            "RECACHED_ALLOWED_ORIGINS is set but lists no origins — this would reject every \
+             browser. Unset it to accept all origins."
+                .to_string(),
+        );
+    }
+    Ok(origins)
+}
+
+/// Whether a WebSocket handshake carrying `origin` may proceed.
+///
+/// Browsers apply neither CORS nor a preflight to WebSockets, so without this
+/// check any page a user visits can open a socket to a reachable Recached and
+/// act with that user's network position. On the common `ws://localhost:6380`
+/// development setup that means every site in every tab.
+///
+/// `Origin` is not a boundary against a native client, which simply omits the
+/// header — and that is why an absent origin is allowed. What it does
+/// distinguish is "the application I deployed" from "some other page in the same
+/// browser", which is precisely the threat this port faces. An unset allowlist
+/// permits everything, matching how an unset `RECACHED_PASSWORD` behaves.
+fn origin_allowed(allowed: Option<&[String]>, origin: Option<&str>) -> bool {
+    let Some(list) = allowed else {
+        return true;
+    };
+    let Some(origin) = origin else {
+        return true;
+    };
+    let origin = origin.trim().trim_end_matches('/');
+    list.iter().any(|a| a.eq_ignore_ascii_case(origin))
+}
+
+/// How long a connection may take to complete its TLS and/or WebSocket
+/// handshake. Override: `RECACHED_HANDSHAKE_TIMEOUT` (seconds).
+///
+/// The connection permit is taken before the handshake runs, so without a
+/// deadline a client that opens a socket and then says nothing holds one of
+/// `RECACHED_MAX_CONNECTIONS` slots indefinitely. A thousand such sockets cost
+/// an attacker nothing and stop the server accepting real clients.
+fn handshake_timeout() -> Duration {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    Duration::from_secs(*V.get_or_init(|| {
+        env_limit(
+            "RECACHED_HANDSHAKE_TIMEOUT",
+            DEFAULT_HANDSHAKE_TIMEOUT_SECS as usize,
+        ) as u64
+    }))
+}
+
 fn parse_memory_bytes(s: &str) -> Option<usize> {
     let s = s.trim().to_lowercase();
     if let Some(n) = s.strip_suffix("gb") {
@@ -478,14 +901,15 @@ fn parse_memory_bytes(s: &str) -> Option<usize> {
 async fn save_snapshot(store: &KeyValueStore, cfg: &SnapshotConfig) {
     let entries = store.snapshot();
     let count = entries.len();
-    let tmp = cfg.path.with_extension("tmp");
+    let tmp = temp_sibling(&cfg.path, "snap");
     match rmp_serde::to_vec(&entries) {
         Err(e) => warn!("Snapshot serialize failed: {}", e),
-        Ok(bytes) => match tokio::fs::write(&tmp, &bytes).await {
+        Ok(bytes) => match write_private(&tmp, &bytes).await {
             Err(e) => warn!("Snapshot write failed: {}", e),
             Ok(()) => match tokio::fs::rename(&tmp, &cfg.path).await {
                 Err(e) => warn!("Snapshot rename failed: {}", e),
                 Ok(()) => {
+                    sync_parent_dir(&cfg.path).await;
                     cfg.last_save.store(now_unix_secs(), Ordering::Relaxed);
                     info!("Snapshot saved: {} entries → {:?}", count, cfg.path);
                 }
@@ -537,11 +961,15 @@ struct AofWriter {
 
 impl AofWriter {
     async fn open(path: PathBuf, sync: AofSync) -> std::io::Result<Self> {
-        let file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .await?;
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let file = opts.open(&path).await?;
+        // An AOF written by an earlier version is likely to be 0644 — tighten it
+        // on open, since `mode()` only applies to files this call creates.
+        #[cfg(unix)]
+        restrict_permissions(&file).await;
         Ok(Self {
             path,
             file: tokio::sync::Mutex::new(file),
@@ -556,17 +984,44 @@ impl AofWriter {
             return;
         }
         if self.sync == AofSync::Always {
-            let _ = f.flush().await;
+            // `flush()` alone only pushes tokio's buffer into a `write` syscall,
+            // which leaves the bytes in the page cache — surviving a process
+            // crash but not a power loss or kernel panic. `always` exists
+            // precisely to survive the latter, so it has to reach the device.
+            if let Err(e) = f.flush().await {
+                warn!("AOF flush failed: {}", e);
+                return;
+            }
+            if let Err(e) = f.sync_data().await {
+                warn!("AOF fsync failed: {}", e);
+            }
         }
     }
 
+    /// Flush and fsync. Called on the `everysec` ticker and before shutdown.
+    ///
+    /// `sync_data` rather than `sync_all`: the AOF is append-only, so its
+    /// metadata beyond the length carries nothing worth an extra barrier.
     async fn flush(&self) {
-        let _ = self.file.lock().await.flush().await;
+        let mut f = self.file.lock().await;
+        if let Err(e) = f.flush().await {
+            warn!("AOF flush failed: {}", e);
+            return;
+        }
+        if let Err(e) = f.sync_data().await {
+            warn!("AOF fsync failed: {}", e);
+        }
     }
 
     async fn truncate(&self) {
-        match self.file.lock().await.set_len(0).await {
-            Ok(()) => info!("AOF truncated after snapshot save"),
+        let f = self.file.lock().await;
+        match f.set_len(0).await {
+            // The truncation itself must be durable, or a crash can resurrect a
+            // log the snapshot has already subsumed and replay it on top.
+            Ok(()) => match f.sync_all().await {
+                Ok(()) => info!("AOF truncated after snapshot save"),
+                Err(e) => warn!("AOF truncate fsync failed: {}", e),
+            },
             Err(e) => warn!("AOF truncate failed: {}", e),
         }
     }
@@ -853,16 +1308,15 @@ impl ServerState {
             Err(_) => return,
         };
         let path = self.dedup_path();
-        let tmp = path.with_extension("dedup.tmp");
+        let tmp = temp_sibling(&path, "dedup");
         match rmp_serde::to_vec(&marks) {
             Err(e) => warn!("Dedup serialize failed: {}", e),
-            Ok(bytes) => match tokio::fs::write(&tmp, &bytes).await {
+            Ok(bytes) => match write_private(&tmp, &bytes).await {
                 Err(e) => warn!("Dedup write failed: {}", e),
-                Ok(()) => {
-                    if let Err(e) = tokio::fs::rename(&tmp, &path).await {
-                        warn!("Dedup rename failed: {}", e);
-                    }
-                }
+                Ok(()) => match tokio::fs::rename(&tmp, &path).await {
+                    Err(e) => warn!("Dedup rename failed: {}", e),
+                    Ok(()) => sync_parent_dir(&path).await,
+                },
             },
         }
     }
@@ -986,6 +1440,95 @@ fn parse_save_conditions(s: &str) -> Vec<SaveCondition> {
 
 // ── Replication server (primary side) ────────────────────────────────────────
 
+/// Per-peer replication auth throttle.
+///
+/// The RESP port drops a connection after `MAX_AUTH_FAILURES` guesses, but the
+/// replication handshake is one-shot: a wrong password costs the attacker a
+/// single TCP connection and nothing else, so the port offered effectively
+/// unlimited guesses at a secret that yields the entire keyspace. Failures are
+/// counted per source address over a rolling window, and a peer that exhausts
+/// them is refused before the handshake is read at all.
+///
+/// Keyed by address rather than by connection, which is the whole point — the
+/// weakness being closed is that reconnecting reset the count.
+struct ReplAuthThrottle {
+    failures: std::sync::Mutex<HashMap<IpAddr, (u32, std::time::Instant)>>,
+}
+
+impl ReplAuthThrottle {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            failures: std::sync::Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// True when this peer has spent its attempts and must be refused.
+    fn is_blocked(&self, ip: IpAddr) -> bool {
+        let Ok(map) = self.failures.lock() else {
+            return false;
+        };
+        match map.get(&ip) {
+            Some((count, last)) => *count >= MAX_AUTH_FAILURES && last.elapsed() < REPL_AUTH_WINDOW,
+            None => false,
+        }
+    }
+
+    fn record_failure(&self, ip: IpAddr) {
+        let Ok(mut map) = self.failures.lock() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        // Sweep before inserting so a spray across many source addresses cannot
+        // grow the map without bound.
+        if map.len() >= REPL_AUTH_SWEEP_THRESHOLD {
+            map.retain(|_, (_, last)| last.elapsed() < REPL_AUTH_WINDOW);
+        }
+        let entry = map.entry(ip).or_insert((0, now));
+        // A peer that went quiet for longer than the window starts over, so a
+        // slow trickle is not punished forever.
+        if entry.1.elapsed() >= REPL_AUTH_WINDOW {
+            *entry = (0, now);
+        }
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = now;
+    }
+
+    fn record_success(&self, ip: IpAddr) {
+        if let Ok(mut map) = self.failures.lock() {
+            map.remove(&ip);
+        }
+    }
+}
+
+/// Read the newline-terminated replication auth line.
+///
+/// Reads until the terminator rather than reading exactly `password.len() + 1`
+/// bytes, which is how the previous implementation worked: the number of bytes
+/// the server waited for *was* the password length, so an attacker could
+/// recover it exactly by drip-feeding one byte at a time and watching when the
+/// server replied.
+async fn read_repl_auth_line<S>(socket: &mut S) -> std::io::Result<Vec<u8>>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut line = Vec::with_capacity(64);
+    let mut byte = [0u8; 1];
+    loop {
+        socket.read_exact(&mut byte).await?;
+        if byte[0] == b'\n' {
+            return Ok(line);
+        }
+        if line.len() >= MAX_REPL_AUTH_LINE {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "replication auth line too long",
+            ));
+        }
+        line.push(byte[0]);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_repl_server(
     bind_host: String,
     port: u16,
@@ -994,6 +1537,10 @@ async fn run_repl_server(
     replicas: ReplRegistry,
     repl_password: Option<Arc<String>>,
     repl_channel_capacity: usize,
+    allowed_ips: Option<Arc<Vec<IpAddr>>>,
+    semaphore: Arc<Semaphore>,
+    throttle: Arc<ReplAuthThrottle>,
+    tls: Arc<Option<TlsAcceptor>>,
 ) {
     let listener = match TcpListener::bind(format!("{}:{}", bind_host, port)).await {
         Ok(l) => l,
@@ -1002,26 +1549,96 @@ async fn run_repl_server(
             return;
         }
     };
-    info!("Replication server listening on {}:{}", bind_host, port);
+    info!(
+        "Replication server listening on {}:{} ({})",
+        bind_host,
+        port,
+        if tls.is_some() { "TLS" } else { "plaintext" }
+    );
     loop {
         match listener.accept().await {
             Ok((socket, addr)) => {
+                // The IP allowlist and the connection limit were previously
+                // applied on the RESP and WebSocket listeners only, so neither
+                // constrained the one port that streams the whole keyspace.
+                if let Some(allowed) = &allowed_ips
+                    && !allowed.contains(&addr.ip())
+                {
+                    debug!("Replication: rejected IP {}", addr.ip());
+                    continue;
+                }
+                if throttle.is_blocked(addr.ip()) {
+                    warn!(
+                        "Replication: {} refused — too many failed auth attempts",
+                        addr.ip()
+                    );
+                    continue;
+                }
+                let permit = match Arc::clone(&semaphore).try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        warn!("Replication: connection limit reached, dropping {}", addr);
+                        continue;
+                    }
+                };
                 info!("Replica connected from {}", addr);
                 let store = Arc::clone(&store);
                 let snap_cfg = Arc::clone(&snap_cfg);
                 let replicas = Arc::clone(&replicas);
                 let pwd = repl_password.clone();
+                let thr = Arc::clone(&throttle);
+                let tls = Arc::clone(&tls);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_replica(
-                        socket,
-                        store,
-                        snap_cfg,
-                        replicas,
-                        pwd,
-                        repl_channel_capacity,
-                    )
-                    .await
-                    {
+                    let _permit = permit;
+                    // Bounded like the other listeners: the permit is already
+                    // held, so a peer that never negotiates must not keep it.
+                    let outcome = if let Some(acceptor) = tls.as_ref() {
+                        match tokio::time::timeout(handshake_timeout(), acceptor.accept(socket))
+                            .await
+                        {
+                            Ok(Ok(stream)) => {
+                                handle_replica(
+                                    stream,
+                                    store,
+                                    snap_cfg,
+                                    replicas,
+                                    pwd,
+                                    repl_channel_capacity,
+                                    addr.ip(),
+                                    thr,
+                                )
+                                .await
+                            }
+                            Ok(Err(e)) => {
+                                // The most likely cause by far is a replica that
+                                // has not been given RECACHED_REPL_TLS_CA, which
+                                // otherwise looks like an unexplained disconnect.
+                                warn!(
+                                    "Replication TLS handshake failed from {}: {} — is that \
+                                     replica configured with RECACHED_REPL_TLS_CA?",
+                                    addr, e
+                                );
+                                return;
+                            }
+                            Err(_) => {
+                                debug!("Replication TLS handshake from {} timed out", addr);
+                                return;
+                            }
+                        }
+                    } else {
+                        handle_replica(
+                            socket,
+                            store,
+                            snap_cfg,
+                            replicas,
+                            pwd,
+                            repl_channel_capacity,
+                            addr.ip(),
+                            thr,
+                        )
+                        .await
+                    };
+                    if let Err(e) = outcome {
                         info!("Replica {} disconnected: {}", addr, e);
                     }
                 });
@@ -1031,21 +1648,38 @@ async fn run_repl_server(
     }
 }
 
-async fn handle_replica(
-    mut socket: TcpStream,
+#[allow(clippy::too_many_arguments)]
+async fn handle_replica<S>(
+    mut socket: S,
     store: Arc<KeyValueStore>,
     _snap_cfg: Arc<SnapshotConfig>,
     replicas: ReplRegistry,
     repl_password: Option<Arc<String>>,
     repl_channel_capacity: usize,
-) -> std::io::Result<()> {
-    // 0. Auth handshake — replica must send "<password>\n" before anything else
+    peer_ip: IpAddr,
+    throttle: Arc<ReplAuthThrottle>,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    // 0. Auth handshake — replica must send "<password>\n" before anything else.
+    //
+    // Bounded by a deadline as well as a length: a peer that connects and then
+    // says nothing would otherwise hold its connection permit forever.
     if let Some(pwd) = &repl_password {
-        let mut auth_buf = vec![0u8; pwd.len() + 1];
-        socket.read_exact(&mut auth_buf).await?;
-        let received_pwd = &auth_buf[..pwd.len()];
-        let terminator = auth_buf[pwd.len()];
-        if !ct_eq_bytes(received_pwd, pwd.as_bytes()) || terminator != b'\n' {
+        let line = match tokio::time::timeout(handshake_timeout(), read_repl_auth_line(&mut socket))
+            .await
+        {
+            Ok(res) => res?,
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    "replication auth handshake timed out",
+                ));
+            }
+        };
+        if !ct_eq_bytes(&line, pwd.as_bytes()) {
+            throttle.record_failure(peer_ip);
             let _ = socket
                 .write_all(b"-ERR invalid replication password\n")
                 .await;
@@ -1054,6 +1688,7 @@ async fn handle_replica(
                 "replication auth failed",
             ));
         }
+        throttle.record_success(peer_ip);
         socket.write_all(b"+OK\n").await?;
         socket.flush().await?;
     }
@@ -1087,7 +1722,7 @@ async fn handle_replica(
     // now writes back a cumulative count of applied frames; `sent - acked` is
     // the lag. Reading and writing are selected over so a replica that stops
     // acknowledging cannot stall the write side, and vice versa.
-    let (mut rd, mut wr) = socket.split();
+    let (mut rd, mut wr) = tokio::io::split(socket);
     let mut ack_buf = [0u8; 8];
     loop {
         tokio::select! {
@@ -1124,6 +1759,7 @@ async fn run_repl_client(
     repl_password: Option<String>,
     failover_timeout_secs: Option<u64>,
     tx: broadcast::Sender<SyncMsg>,
+    tls: Option<(TlsConnector, String)>,
 ) {
     let mut backoff_secs = 2u64;
     let mut unreachable_since: Option<std::time::Instant> = None;
@@ -1140,14 +1776,70 @@ async fn run_repl_client(
                 warn!("Replica: connect failed: {}", e);
                 unreachable_since.get_or_insert_with(std::time::Instant::now);
             }
-            Ok(mut socket) => {
+            Ok(socket) => {
                 // Primary is reachable — reset the unreachable timer.
                 unreachable_since = None;
                 backoff_secs = 2;
-                if let Err(e) =
-                    sync_from_primary(&mut socket, &store, repl_password.as_deref(), &tx, &state)
+
+                // TLS is what makes the primary's *identity* checked, not just
+                // the channel encrypted: without it a DNS hijack or an on-path
+                // attacker can feed this replica an arbitrary keyspace, and the
+                // replica has no way to tell.
+                let result = match &tls {
+                    None => {
+                        sync_from_primary(
+                            &mut { socket },
+                            &store,
+                            repl_password.as_deref(),
+                            &tx,
+                            &state,
+                        )
                         .await
-                {
+                    }
+                    Some((connector, servername)) => {
+                        match ServerName::try_from(servername.clone()) {
+                            Err(_) => {
+                                error!(
+                                    "Replica: '{}' is not a valid TLS server name — set \
+                                     RECACHED_REPL_TLS_SERVERNAME to the name on the primary's \
+                                     certificate",
+                                    servername
+                                );
+                                return;
+                            }
+                            Ok(name) => {
+                                match tokio::time::timeout(
+                                    handshake_timeout(),
+                                    connector.connect(name, socket),
+                                )
+                                .await
+                                {
+                                    Err(_) => Err(std::io::Error::new(
+                                        ErrorKind::TimedOut,
+                                        "TLS handshake with primary timed out",
+                                    )),
+                                    Ok(Err(e)) => Err(std::io::Error::other(format!(
+                                        "TLS handshake with primary failed: {e} — check that the \
+                                         primary has RECACHED_TLS_CERT set and that \
+                                         RECACHED_REPL_TLS_CA trusts it"
+                                    ))),
+                                    Ok(Ok(mut stream)) => {
+                                        sync_from_primary(
+                                            &mut stream,
+                                            &store,
+                                            repl_password.as_deref(),
+                                            &tx,
+                                            &state,
+                                        )
+                                        .await
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+
+                if let Err(e) = result {
                     warn!("Replica: sync ended: {}", e);
                     // Sync dropped — primary may be gone; start tracking if not already.
                     unreachable_since.get_or_insert_with(std::time::Instant::now);
@@ -1177,13 +1869,16 @@ async fn run_repl_client(
     }
 }
 
-async fn sync_from_primary(
-    socket: &mut TcpStream,
+async fn sync_from_primary<S>(
+    socket: &mut S,
     store: &KeyValueStore,
     repl_password: Option<&str>,
     tx: &broadcast::Sender<SyncMsg>,
     state: &ServerState,
-) -> std::io::Result<()> {
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // 0. Send auth password if configured
     if let Some(pwd) = repl_password {
         let msg = format!("{}\n", pwd);
@@ -1362,6 +2057,17 @@ fn verify_sync_token(secret: &str, token: &str) -> Result<Vec<String>, &'static 
     if patterns.is_empty() {
         return Err("token grants no patterns");
     }
+    // Token patterns reach `glob_match` without passing through the command
+    // parser, so the cap `check_pattern` applies to `KEYS`/`SCAN`/`PSUBSCRIBE`
+    // has to be repeated here. These are matched once per key per write, so an
+    // over-long one is the most expensive place to put a pattern — and a
+    // compromised or careless minting service should not be able to.
+    if patterns
+        .iter()
+        .any(|p| p.len() > core_engine::store::MAX_PATTERN_BYTES)
+    {
+        return Err("token grants an over-long pattern");
+    }
     Ok(patterns)
 }
 
@@ -1394,6 +2100,12 @@ fn command_scope(cmd: &Command) -> CommandScope {
         // QSUB patterns are scope-checked against the grant in the WS handler.
         | Command::QSub(_)
         | Command::QUnsub(_)
+        // QUIT and CLIENT describe the connection itself, which a scoped
+        // connection is entitled to know about; COMMAND describes the server's
+        // vocabulary, which is public.
+        | Command::Quit
+        | Command::Client(_)
+        | Command::CommandQuery(_)
         | Command::Unknown(_) => CommandScope::KeyLess,
 
         Command::Keys(_)
@@ -1407,6 +2119,9 @@ fn command_scope(cmd: &Command) -> CommandScope {
         // size, replication topology. A connection scoped to a handful of keys
         // has no business reading it.
         | Command::Info(_)
+        // CONFIG reports server-wide limits and whether auth is on. Same
+        // reasoning as INFO: not for a connection scoped to a few keys.
+        | Command::Config(_)
         | Command::ReplicaOfNoOne => CommandScope::Admin,
 
         Command::ESet(k, _)
@@ -1414,6 +2129,7 @@ fn command_scope(cmd: &Command) -> CommandScope {
         | Command::Get(k)
         | Command::Append(k, _)
         | Command::Strlen(k)
+        | Command::GetRange(k, _, _)
         | Command::GetSet(k, _)
         | Command::SetNx(k, _)
         | Command::SetEx(k, _, _)
@@ -1442,6 +2158,9 @@ fn command_scope(cmd: &Command) -> CommandScope {
         | Command::HExists(k, _)
         | Command::HSetNx(k, _, _)
         | Command::HMGet(k, _)
+        | Command::HScan(k, _)
+        | Command::SScan(k, _)
+        | Command::ZScan(k, _)
         | Command::LPush(k, _)
         | Command::RPush(k, _)
         | Command::LPushX(k, _)
@@ -2193,6 +2912,286 @@ fn eviction_policy_name(policy: EvictionPolicy) -> &'static str {
         EvictionPolicy::AllKeysRandom => "allkeys-random",
         EvictionPolicy::VolatileLru => "volatile-lru",
         EvictionPolicy::VolatileTtl => "volatile-ttl",
+    }
+}
+
+// ── CLIENT / CONFIG / COMMAND ─────────────────────────────────────────────────
+
+/// Wrong-subcommand error in Redis's wording, which some clients match on.
+fn unknown_subcommand(container: &str, sub: &str) -> Value {
+    Value::Error(format!(
+        "ERR Unknown subcommand or wrong number of arguments for '{sub}'. \
+         Try {container} HELP."
+    ))
+}
+
+/// Handle `CLIENT <subcommand>`, mutating this connection's `meta` in place.
+///
+/// Returns `None` for subcommands Recached does not implement, so the caller
+/// can answer with the standard error rather than this function inventing a
+/// reply. `SETNAME`, `SETINFO` and the protocol version write through to the
+/// registry, which is what makes them visible to another connection's
+/// `CLIENT LIST`.
+fn handle_client_command(args: &[String], meta: &mut ClientMeta) -> Value {
+    let sub = args[0].to_uppercase();
+    match (sub.as_str(), args.len()) {
+        ("ID", 1) => Value::Integer(meta.id as i64),
+        ("INFO", 1) => Value::BulkString(Some(meta.render().into_bytes())),
+        ("LIST", 1) => Value::BulkString(Some(client_list_lines().into_bytes())),
+        ("GETNAME", 1) => {
+            if meta.name.is_empty() {
+                Value::BulkString(None)
+            } else {
+                Value::BulkString(Some(meta.name.clone().into_bytes()))
+            }
+        }
+        ("SETNAME", 2) => {
+            // Redis reserves spaces and newlines because the name is echoed
+            // into the space-separated CLIENT LIST format.
+            if args[1].contains(' ') || args[1].contains('\n') {
+                return Value::Error(
+                    "ERR Client names cannot contain spaces, newlines or special characters."
+                        .to_string(),
+                );
+            }
+            meta.name = args[1].clone();
+            publish_client(meta.clone());
+            Value::SimpleString("OK".to_string())
+        }
+        ("SETINFO", 3) => match args[1].to_uppercase().as_str() {
+            "LIB-NAME" => {
+                meta.lib_name = args[2].clone();
+                publish_client(meta.clone());
+                Value::SimpleString("OK".to_string())
+            }
+            "LIB-VER" => {
+                meta.lib_ver = args[2].clone();
+                publish_client(meta.clone());
+                Value::SimpleString("OK".to_string())
+            }
+            other => Value::Error(format!("ERR Unrecognized option '{other}'")),
+        },
+        ("HELP", 1) => Value::Array(Some(
+            [
+                "CLIENT <subcommand>",
+                "ID -- Return this connection's identifier.",
+                "INFO -- Return information about this connection.",
+                "LIST -- Return information about all connections.",
+                "GETNAME -- Return this connection's name.",
+                "SETNAME <name> -- Set this connection's name.",
+                "SETINFO <LIB-NAME|LIB-VER> <value> -- Identify the client library.",
+            ]
+            .iter()
+            .map(|l| Value::SimpleString(l.to_string()))
+            .collect(),
+        )),
+        // KILL, UNPAUSE, NO-EVICT and friends are administrative operations
+        // with real semantics. Answering +OK without performing them would be
+        // worse than saying no: a client would believe a connection had been
+        // killed or eviction disabled when nothing happened.
+        _ => unknown_subcommand("CLIENT", &args.join(" ")),
+    }
+}
+
+/// The configuration parameters `CONFIG GET` reports, resolved from the values
+/// actually in force rather than from a table of defaults.
+fn config_parameters(facts: &ServerFacts, store: &KeyValueStore) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "maxmemory",
+            store.max_memory_bytes().unwrap_or(0).to_string(),
+        ),
+        (
+            "maxmemory-policy",
+            eviction_policy_name(store.eviction_policy()).to_string(),
+        ),
+        ("maxclients", facts.max_connections.to_string()),
+        ("port", facts.tcp_port.to_string()),
+        (
+            "tls-port",
+            if facts.tls_enabled {
+                facts.tcp_port.to_string()
+            } else {
+                "0".to_string()
+            },
+        ),
+        (
+            "appendonly",
+            if facts.aof_enabled {
+                "yes".into()
+            } else {
+                "no".into()
+            },
+        ),
+        // Recached has a single keyspace. Clients that SELECT anything other
+        // than 0 need to know that before they try.
+        ("databases", "1".to_string()),
+        // Reported as masked, exactly as Redis does: the presence of a
+        // password is not a secret, its value is.
+        (
+            "requirepass",
+            if facts.auth_enabled {
+                "*".into()
+            } else {
+                String::new()
+            },
+        ),
+        ("proto-max-bulk-len", MAX_BULK_STRING_BYTES.to_string()),
+        ("timeout", "0".to_string()),
+        ("save", String::new()),
+    ]
+}
+
+/// Handle `CONFIG <subcommand>`.
+fn handle_config_command(args: &[String], facts: &ServerFacts, store: &KeyValueStore) -> Value {
+    let sub = args[0].to_uppercase();
+    match sub.as_str() {
+        "GET" if args.len() >= 2 => {
+            let params = config_parameters(facts, store);
+            let mut out = Vec::new();
+            for (name, value) in &params {
+                if args[1..].iter().any(|pat| glob_match(pat, name)) {
+                    out.push(Value::BulkString(Some(name.as_bytes().to_vec())));
+                    out.push(Value::BulkString(Some(value.clone().into_bytes())));
+                }
+            }
+            Value::Array(Some(out))
+        }
+        // Recached reads its configuration from the environment at startup and
+        // holds it behind an `Arc` for the life of the process, so there is
+        // nothing a runtime SET could change. Saying so is better than
+        // returning OK and leaving the operator to discover later that the
+        // limit they set never applied.
+        "SET" if args.len() >= 3 => Value::Error(format!(
+            "ERR CONFIG SET is not supported: Recached is configured at startup. \
+             Set '{}' through the environment and restart.",
+            args[1]
+        )),
+        "RESETSTAT" if args.len() == 1 => Value::Error(
+            "ERR CONFIG RESETSTAT is not supported: counters are exported to Prometheus, \
+             where resetting them would break rate calculations."
+                .to_string(),
+        ),
+        _ => unknown_subcommand("CONFIG", &args.join(" ")),
+    }
+}
+
+/// `COMMAND INFO`'s per-command reply: name, arity, flags, key positions.
+fn command_info_entry(spec: &catalog::CommandSpec) -> Value {
+    Value::Array(Some(vec![
+        Value::BulkString(Some(spec.name.as_bytes().to_vec())),
+        Value::Integer(spec.arity as i64),
+        Value::Array(Some(
+            spec.flags
+                .iter()
+                .map(|f| Value::SimpleString((*f).to_string()))
+                .collect(),
+        )),
+        Value::Integer(spec.first_key as i64),
+        Value::Integer(spec.last_key as i64),
+        Value::Integer(spec.step as i64),
+        // ACL categories, tips, key specs and subcommands: Redis 7 appends
+        // four more elements here. Recached has no ACL system and no
+        // subcommand tree to describe, so it reports them empty rather than
+        // omitting them — a client indexing element 6 gets an empty list
+        // instead of an out-of-range error.
+        Value::Array(Some(vec![])),
+        Value::Array(Some(vec![])),
+        Value::Array(Some(vec![])),
+        Value::Array(Some(vec![])),
+    ]))
+}
+
+/// `COMMAND DOCS`'s per-command reply. RESP2 clients see the same pairs as a
+/// flat array, which is how Redis degrades a map on the older protocol.
+fn command_docs_entry(spec: &catalog::CommandSpec, protover: u8) -> Value {
+    let fields = vec![
+        (
+            "summary",
+            Value::BulkString(Some(spec.summary.as_bytes().to_vec())),
+        ),
+        ("since", Value::BulkString(Some(b"1.0.0".to_vec()))),
+        (
+            "group",
+            Value::BulkString(Some(spec.group.as_bytes().to_vec())),
+        ),
+        ("arity", Value::Integer(spec.arity as i64)),
+    ];
+    map_or_flat(fields, protover)
+}
+
+/// RESP3 sends a map; RESP2 has no map type and flattens to alternating
+/// key/value entries. Same split `HELLO` already makes.
+fn map_or_flat(fields: Vec<(&str, Value)>, protover: u8) -> Value {
+    if protover >= 3 {
+        Value::Map(
+            fields
+                .into_iter()
+                .map(|(k, v)| (Value::BulkString(Some(k.as_bytes().to_vec())), v))
+                .collect(),
+        )
+    } else {
+        let mut flat = Vec::with_capacity(fields.len() * 2);
+        for (k, v) in fields {
+            flat.push(Value::BulkString(Some(k.as_bytes().to_vec())));
+            flat.push(v);
+        }
+        Value::Array(Some(flat))
+    }
+}
+
+/// Handle `COMMAND [subcommand]`.
+fn handle_command_query(args: &[String], protover: u8) -> Value {
+    let Some(sub) = args.first() else {
+        // Bare COMMAND: the whole catalog, as COMMAND INFO entries.
+        return Value::Array(Some(
+            catalog::CATALOG.iter().map(command_info_entry).collect(),
+        ));
+    };
+    match sub.to_uppercase().as_str() {
+        "COUNT" if args.len() == 1 => Value::Integer(catalog::CATALOG.len() as i64),
+        "LIST" if args.len() == 1 => Value::Array(Some(
+            catalog::CATALOG
+                .iter()
+                .map(|c| Value::BulkString(Some(c.name.as_bytes().to_vec())))
+                .collect(),
+        )),
+        "INFO" => {
+            if args.len() == 1 {
+                return Value::Array(Some(
+                    catalog::CATALOG.iter().map(command_info_entry).collect(),
+                ));
+            }
+            // A name the server does not have replies nil in its slot, so the
+            // reply stays positionally aligned with the request.
+            Value::Array(Some(
+                args[1..]
+                    .iter()
+                    .map(|n| match catalog::lookup(n) {
+                        Some(spec) => command_info_entry(spec),
+                        None => Value::Array(None),
+                    })
+                    .collect(),
+            ))
+        }
+        "DOCS" => {
+            let specs: Vec<&catalog::CommandSpec> = if args.len() == 1 {
+                catalog::CATALOG.iter().collect()
+            } else {
+                args[1..]
+                    .iter()
+                    .filter_map(|n| catalog::lookup(n))
+                    .collect()
+            };
+            // Unknown names are absent from the map rather than nil-filled:
+            // COMMAND DOCS is keyed by name, so there is no slot to align.
+            let fields: Vec<(&str, Value)> = specs
+                .iter()
+                .map(|s| (s.name, command_docs_entry(s, protover)))
+                .collect();
+            map_or_flat(fields, protover)
+        }
+        _ => unknown_subcommand("COMMAND", &args.join(" ")),
     }
 }
 
@@ -3011,6 +4010,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!("IP allowlist DISABLED. Accepting all connections.");
     }
 
+    // ── WebSocket origin allowlist ────────────────────────────────────────
+    let allowed_origins: Arc<Option<Vec<String>>> =
+        Arc::new(match std::env::var("RECACHED_ALLOWED_ORIGINS").ok() {
+            None => None,
+            Some(raw) => match parse_allowed_origins(&raw) {
+                Ok(list) => Some(list),
+                Err(msg) => {
+                    error!("{msg}");
+                    std::process::exit(1);
+                }
+            },
+        });
+
+    if let Some(list) = allowed_origins.as_ref() {
+        info!("WebSocket origin allowlist ENABLED: {:?}", list);
+    } else {
+        warn!(
+            "WebSocket origin allowlist DISABLED. Any web page a user visits can open a socket to \
+             port 6380 — browsers apply neither CORS nor a preflight to WebSockets. Set \
+             RECACHED_ALLOWED_ORIGINS before exposing this port to a browser."
+        );
+    }
+
     // ── store ─────────────────────────────────────────────────────────────
     let max_keys = std::env::var("RECACHED_MAX_KEYS")
         .ok()
@@ -3113,6 +4135,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         AofSync::No => "no",
                     }
                 );
+                // `always` fsyncs inside the AOF lock, so every write in the
+                // process waits for one disk barrier — measured at roughly
+                // 20 ms per append on APFS, i.e. tens of writes per second
+                // rather than tens of thousands. That is the honest cost of the
+                // guarantee, but an operator who picked it casually will read
+                // the result as a hang, so say so at startup.
+                if aof_sync == AofSync::Always {
+                    warn!(
+                        "RECACHED_AOF_SYNC=always fsyncs on every write and serialises all writers \
+                         behind it — expect write throughput in the tens per second. Use everysec \
+                         unless you genuinely cannot lose one second of writes."
+                    );
+                }
                 Some(writer)
             }
             Err(e) => {
@@ -3123,6 +4158,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+
+    // ── TLS ───────────────────────────────────────────────────────────────
+    // Resolved before replication: the replication listener uses the same
+    // certificate, so it has to exist before that listener is spawned.
+    let tls_acceptor: Option<TlsAcceptor> = load_tls_acceptor();
+    if tls_acceptor.is_some() {
+        info!(
+            "TLS ENABLED (cert={}, key={})",
+            std::env::var("RECACHED_TLS_CERT").unwrap_or_default(),
+            std::env::var("RECACHED_TLS_KEY").unwrap_or_default()
+        );
+    } else {
+        warn!("TLS DISABLED. Set RECACHED_TLS_CERT and RECACHED_TLS_KEY to enable.");
+    }
+    let tls_acceptor = Arc::new(tls_acceptor);
+
+    // ── connection limiter ────────────────────────────────────────────────
+    // Resolved before replication because the replication listener shares this
+    // budget: a flood of replica connections must not be able to starve real
+    // clients, and `maxclients` should mean the total.
+    let max_connections = std::env::var("RECACHED_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_CONNECTIONS);
+    info!("Max connections: {}", max_connections);
+    let semaphore = Arc::new(Semaphore::new(max_connections));
 
     // ── Replication ───────────────────────────────────────────────────────
     let replicaof = std::env::var("RECACHED_REPLICAOF").ok();
@@ -3141,11 +4202,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse().ok())
         .filter(|&n| n > 0);
 
-    if repl_password.is_some() {
-        info!("Replication auth ENABLED (RECACHED_REPL_PASSWORD is set).");
+    // Whether to bind the replication listener at all. Refuses to start on a
+    // network-reachable interface without a password rather than serving the
+    // keyspace unauthenticated.
+    let repl_listen = match resolve_repl_listen(
+        std::env::var("RECACHED_REPL_ENABLE").ok(),
+        &bind_host,
+        repl_password.as_deref(),
+    ) {
+        Ok(v) => v,
+        Err(msg) => {
+            error!("{msg}");
+            std::process::exit(1);
+        }
+    };
+
+    // Outbound replication TLS. Configured separately from the listener's TLS
+    // because the two directions are independent: this node may serve replicas
+    // over TLS, follow a primary over TLS, both, or neither.
+    let repl_tls: Option<(TlsConnector, String)> = match std::env::var("RECACHED_REPL_TLS_CA")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        None => None,
+        Some(ca) => match load_repl_tls_connector(&ca) {
+            Ok(connector) => {
+                let servername = repl_tls_servername(
+                    replicaof.as_deref().unwrap_or_default(),
+                    std::env::var("RECACHED_REPL_TLS_SERVERNAME").ok(),
+                );
+                info!(
+                    "Replication client TLS ENABLED (CA={}, verifying primary as '{}')",
+                    ca, servername
+                );
+                Some((connector, servername))
+            }
+            Err(msg) => {
+                error!("{msg}");
+                std::process::exit(1);
+            }
+        },
+    };
+
+    if replicaof.is_some() && repl_tls.is_none() {
+        warn!(
+            "Replication to the primary is PLAINTEXT — the password and the entire keyspace cross \
+             the network unencrypted, and the primary's identity is not verified. Set \
+             RECACHED_REPL_TLS_CA, or keep replication on a private network."
+        );
+    }
+
+    if !repl_listen {
+        info!(
+            "Replication server DISABLED — port {} is not bound. Set RECACHED_REPL_ENABLE=1 on any \
+             node that serves replicas (including a replica serving sub-replicas).",
+            repl_port
+        );
+    } else if repl_password.is_some() {
+        info!(
+            "Replication server ENABLED on port {} with auth (RECACHED_REPL_PASSWORD is set).",
+            repl_port
+        );
     } else {
         warn!(
-            "Replication auth DISABLED. Set RECACHED_REPL_PASSWORD to secure the replication port."
+            "Replication server ENABLED on port {} WITHOUT a password, on loopback only. It serves \
+             the entire keyspace to whoever connects — set RECACHED_REPL_PASSWORD before binding \
+             any other interface.",
+            repl_port
         );
     }
 
@@ -3221,17 +4344,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx, _rx) = broadcast::channel::<SyncMsg>(BROADCAST_CHANNEL_CAPACITY);
 
     // ── start replication ─────────────────────────────────────────────────
-    // The replication server runs on every node — including replicas — so a
-    // replica can in turn serve sub-replicas (multi-tier replication).
-    {
+    // Opt-in. The listener may run on a replica as well as a primary, so a
+    // replica can serve sub-replicas (multi-tier replication) — but it is a
+    // decision the operator makes, not a port that appears by default.
+    if repl_listen {
         let store_r = Arc::clone(&store);
         let snap_r = Arc::clone(&snap_cfg);
         let reg_r = Arc::clone(&replicas);
         let pwd_r = repl_password.clone().map(Arc::new);
         let cap_r = repl_channel_capacity;
         let host_r = bind_host.clone();
+        let allowed_r = allowed_ips.clone();
+        let sem_r = Arc::clone(&semaphore);
+        let thr_r = ReplAuthThrottle::new();
+        let tls_r = Arc::clone(&tls_acceptor);
         tokio::spawn(async move {
-            run_repl_server(host_r, repl_port, store_r, snap_r, reg_r, pwd_r, cap_r).await;
+            run_repl_server(
+                host_r, repl_port, store_r, snap_r, reg_r, pwd_r, cap_r, allowed_r, sem_r, thr_r,
+                tls_r,
+            )
+            .await;
         });
     }
     if is_replica_start && let Some(primary_addr) = replicaof {
@@ -3240,8 +4372,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let pwd_r = repl_password.clone();
         let fo_r = failover_timeout_secs;
         let tx_r = tx.clone();
+        let tls_r = repl_tls;
         tokio::spawn(async move {
-            run_repl_client(primary_addr, store_r, state_r, pwd_r, fo_r, tx_r).await;
+            run_repl_client(primary_addr, store_r, state_r, pwd_r, fo_r, tx_r, tls_r).await;
         });
         if let Some(t) = failover_timeout_secs {
             info!(
@@ -3311,27 +4444,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // ── connection limiter ────────────────────────────────────────────────
-    let max_connections = std::env::var("RECACHED_MAX_CONNECTIONS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_MAX_CONNECTIONS);
-    info!("Max connections: {}", max_connections);
-    let semaphore = Arc::new(Semaphore::new(max_connections));
-
-    // ── TLS ───────────────────────────────────────────────────────────────
-    let tls_acceptor: Option<TlsAcceptor> = load_tls_acceptor();
-    if tls_acceptor.is_some() {
-        info!(
-            "TLS ENABLED (cert={}, key={})",
-            std::env::var("RECACHED_TLS_CERT").unwrap_or_default(),
-            std::env::var("RECACHED_TLS_KEY").unwrap_or_default()
-        );
-    } else {
-        warn!("TLS DISABLED. Set RECACHED_TLS_CERT and RECACHED_TLS_KEY to enable.");
-    }
-    let tls_acceptor = Arc::new(tls_acceptor);
-
     // Startup facts for INFO. Recorded once the configuration is fully
     // resolved and before any listener binds, so no connection can observe the
     // defaults.
@@ -3398,16 +4510,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tokio::spawn(async move {
                             let _permit = permit;
                             if let Some(acc) = tls.as_ref() {
-                                match acc.accept(socket).await {
-                                    Ok(tls_stream) => {
-                                        handle_tcp(tls_stream, s, t, p, ps, wr, sc).await
+                                // Bounded: the permit is already held, so a peer
+                                // that opens a socket and never negotiates would
+                                // otherwise occupy a slot indefinitely.
+                                match tokio::time::timeout(handshake_timeout(), acc.accept(socket))
+                                    .await
+                                {
+                                    Ok(Ok(tls_stream)) => {
+                                        handle_tcp(
+                                            tls_stream,
+                                            s,
+                                            t,
+                                            p,
+                                            ps,
+                                            wr,
+                                            sc,
+                                            addr.to_string(),
+                                        )
+                                        .await
                                     }
-                                    Err(e) => {
+                                    Ok(Err(e)) => {
                                         warn!("TCP TLS handshake failed from {}: {}", addr, e)
+                                    }
+                                    Err(_) => {
+                                        debug!("TCP TLS handshake from {} timed out", addr)
                                     }
                                 }
                             } else {
-                                handle_tcp(socket, s, t, p, ps, wr, sc).await;
+                                handle_tcp(socket, s, t, p, ps, wr, sc, addr.to_string()).await;
                             }
                         });
                     }
@@ -3466,16 +4596,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let tls = Arc::clone(&tls_acceptor);
                         let sc = Arc::clone(&state);
                         let ss = Arc::clone(&sync_secret);
+                        let ao = Arc::clone(&allowed_origins);
                         let id = next_conn_id();
                         tokio::spawn(async move {
                             let _permit = permit;
                             if let Some(acc) = tls.as_ref() {
-                                match acc.accept(socket).await {
-                                    Ok(tls_stream) => handle_ws(tls_stream, s, t, p, id, ps, wr, sc, ss).await,
-                                    Err(e) => warn!("WS TLS handshake failed from {}: {}", addr, e),
+                                match tokio::time::timeout(handshake_timeout(), acc.accept(socket)).await {
+                                    Ok(Ok(tls_stream)) => {
+                                        handle_ws(tls_stream, s, t, p, id, ps, wr, sc, ss, ao, addr.to_string()).await
+                                    }
+                                    Ok(Err(e)) => warn!("WS TLS handshake failed from {}: {}", addr, e),
+                                    Err(_) => debug!("WS TLS handshake from {} timed out", addr),
                                 }
                             } else {
-                                handle_ws(socket, s, t, p, id, ps, wr, sc, ss).await;
+                                handle_ws(socket, s, t, p, id, ps, wr, sc, ss, ao, addr.to_string()).await;
                             }
                         });
                     }
@@ -3497,6 +4631,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // ── TCP handler ───────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_tcp<S>(
     socket: S,
     store: Arc<KeyValueStore>,
@@ -3505,10 +4640,17 @@ async fn handle_tcp<S>(
     pubsub: SharedPubSub,
     watch_registry: WatchRegistry,
     state: Arc<ServerState>,
+    peer: String,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let _guard = ConnectionGuard::tcp();
+    let conn_id = next_conn_id();
+    let mut client_meta = ClientMeta::new(
+        conn_id,
+        peer,
+        format!("127.0.0.1:{}", server_facts().tcp_port),
+    );
+    let _guard = ConnectionGuard::new("tcp", client_meta.clone());
     let (mut reader, raw_writer) = tokio::io::split(socket);
     let mut writer = tokio::io::BufWriter::with_capacity(32 * 1024, raw_writer);
     let mut buf = Vec::<u8>::new();
@@ -3532,10 +4674,19 @@ async fn handle_tcp<S>(
     let mut watched_keys: HashSet<String> = HashSet::new();
     let mut watch_dirty = false;
     let (watch_tx, mut watch_rx) = mpsc::unbounded_channel::<WatchNotif>();
-    let conn_id = next_conn_id();
 
     'outer: loop {
         let is_subscribed = !subscribed_channels.is_empty() || !subscribed_patterns.is_empty();
+        // Republish only when the counts moved: CLIENT LIST has to see live
+        // subscription state, but taking the registry's write lock once per
+        // command would put it on the hot path.
+        if client_meta.sub != subscribed_channels.len()
+            || client_meta.psub != subscribed_patterns.len()
+        {
+            client_meta.sub = subscribed_channels.len();
+            client_meta.psub = subscribed_patterns.len();
+            publish_client(client_meta.clone());
+        }
 
         tokio::select! {
             result = reader.read(&mut read_buf) => {
@@ -3581,7 +4732,24 @@ async fn handle_tcp<S>(
                                             state.is_replica(),
                                         );
                                         if writer.write_all(&resp).await.is_err() { break 'outer; }
+                                        // CLIENT LIST reports resp= per connection,
+                                        // so a renegotiation has to reach the registry.
+                                        if client_meta.resp != protover {
+                                            client_meta.resp = protover;
+                                            publish_client(client_meta.clone());
+                                        }
                                         continue 'parse;
+                                    }
+
+                                    // QUIT is answered before the auth gate and
+                                    // before the subscribe-mode gate, as in Redis:
+                                    // a client that cannot authenticate, or is
+                                    // parked in subscribe mode, still deserves a
+                                    // clean close rather than a dropped socket.
+                                    if matches!(cmd, Command::Quit) {
+                                        let _ = writer.write_all(b"+OK\r\n").await;
+                                        let _ = writer.flush().await;
+                                        break 'outer;
                                     }
 
                                     if !is_authenticated {
@@ -3836,6 +5004,21 @@ async fn handle_tcp<S>(
                                                     if writer.write_all(&resp).await.is_err() { break 'outer; }
                                                     continue 'parse;
                                                 }
+                                                Command::Client(args) => {
+                                                    let resp = handle_client_command(args, &mut client_meta).serialize();
+                                                    if writer.write_all(&resp).await.is_err() { break 'outer; }
+                                                    continue 'parse;
+                                                }
+                                                Command::Config(args) => {
+                                                    let resp = handle_config_command(args, server_facts(), &store).serialize();
+                                                    if writer.write_all(&resp).await.is_err() { break 'outer; }
+                                                    continue 'parse;
+                                                }
+                                                Command::CommandQuery(args) => {
+                                                    let resp = handle_command_query(args, protover).serialize();
+                                                    if writer.write_all(&resp).await.is_err() { break 'outer; }
+                                                    continue 'parse;
+                                                }
                                                 Command::ReplicaOfNoOne => {
                                                     state.promote_to_primary();
                                                     if writer.write_all(b"+OK\r\n").await.is_err() { break 'outer; }
@@ -3924,6 +5107,62 @@ async fn handle_tcp<S>(
 
 // ── WebSocket handler ─────────────────────────────────────────────────────────
 
+/// Complete the WebSocket handshake, enforcing the origin allowlist and a
+/// deadline. Returns `None` when the connection was refused, failed, or stalled
+/// — in every case the caller simply drops the socket and its permit.
+///
+/// Split out from `handle_ws` so both the origin decision and the timeout are
+/// reachable from a test without standing up a listener.
+///
+/// `result_large_err`: the error type is tungstenite's `ErrorResponse`, which is
+/// an `http::Response` — its size is the handshake callback's signature, not
+/// ours, and boxing it would not satisfy the trait.
+#[allow(clippy::result_large_err)]
+async fn ws_handshake<S>(
+    socket: S,
+    allowed_origins: Option<&[String]>,
+    timeout: Duration,
+    conn_id: u64,
+) -> Option<tokio_tungstenite::WebSocketStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let check_origin = |req: &HandshakeRequest,
+                        resp: HandshakeResponse|
+     -> Result<HandshakeResponse, ErrorResponse> {
+        let origin = req
+            .headers()
+            .get("origin")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        if origin_allowed(allowed_origins, origin.as_deref()) {
+            return Ok(resp);
+        }
+        warn!(
+            "WS conn {}: refused Origin {:?} — not in RECACHED_ALLOWED_ORIGINS",
+            conn_id, origin
+        );
+        let mut err = ErrorResponse::new(Some(
+            "Origin not allowed. Add it to RECACHED_ALLOWED_ORIGINS to permit this page."
+                .to_string(),
+        ));
+        *err.status_mut() = StatusCode::FORBIDDEN;
+        Err(err)
+    };
+
+    match tokio::time::timeout(timeout, accept_hdr_async(socket, check_origin)).await {
+        Ok(Ok(ws)) => Some(ws),
+        Ok(Err(e)) => {
+            warn!("WS handshake failed on conn {}: {}", conn_id, e);
+            None
+        }
+        Err(_) => {
+            debug!("WS handshake on conn {} timed out", conn_id);
+            None
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_ws<S>(
     socket: S,
@@ -3935,16 +5174,28 @@ async fn handle_ws<S>(
     watch_registry: WatchRegistry,
     state: Arc<ServerState>,
     sync_secret: Arc<Option<String>>,
+    allowed_origins: Arc<Option<Vec<String>>>,
+    peer: String,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let _guard = ConnectionGuard::ws();
-    let ws_stream = match accept_async(socket).await {
-        Ok(ws) => ws,
-        Err(e) => {
-            warn!("WS handshake failed on conn {}: {}", conn_id, e);
-            return;
-        }
+    let mut client_meta = ClientMeta::new(
+        conn_id,
+        peer,
+        format!("127.0.0.1:{}", server_facts().ws_port),
+    );
+    // The WebSocket transport speaks RESP3 from the first frame.
+    client_meta.resp = 3;
+    let _guard = ConnectionGuard::new("ws", client_meta.clone());
+    let Some(ws_stream) = ws_handshake(
+        socket,
+        allowed_origins.as_deref(),
+        handshake_timeout(),
+        conn_id,
+    )
+    .await
+    else {
+        return;
     };
 
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
@@ -4052,6 +5303,11 @@ async fn handle_ws<S>(
                             };
                             ws_send!(&resp);
                             continue;
+                        }
+
+                        if matches!(cmd, Command::Quit) {
+                            ws_send!(b"+OK\r\n");
+                            break 'outer;
                         }
 
                         if !is_authenticated {
@@ -4428,6 +5684,20 @@ async fn handle_ws<S>(
                                         ws_send!(&Value::BulkString(Some(body.into_bytes())).serialize());
                                         continue 'outer;
                                     }
+                                    Command::Client(args) => {
+                                        ws_send!(&handle_client_command(args, &mut client_meta).serialize());
+                                        continue 'outer;
+                                    }
+                                    Command::Config(args) => {
+                                        ws_send!(&handle_config_command(args, server_facts(), &store).serialize());
+                                        continue 'outer;
+                                    }
+                                    Command::CommandQuery(args) => {
+                                        // The WebSocket transport is RESP3-only,
+                                        // so the catalog always replies as a map.
+                                        ws_send!(&handle_command_query(args, 3).serialize());
+                                        continue 'outer;
+                                    }
                                     Command::ReplicaOfNoOne => {
                                         state.promote_to_primary();
                                         ws_send!(b"+OK\r\n");
@@ -4562,7 +5832,7 @@ async fn handle_ws<S>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_engine::cmd::{SetOptions, ZAddOptions};
+    use core_engine::cmd::{ScanArgs, SetOptions, ZAddOptions};
     use core_engine::resp::Value;
     use core_engine::store::KeyValueStore;
     use std::sync::atomic::{AtomicBool, AtomicI64};
@@ -4639,7 +5909,11 @@ mod tests {
                     Arc::clone(&state2),
                 );
                 tokio::spawn(async move {
-                    handle_tcp(socket, s, t, p, ps, wr, st).await;
+                    let peer = socket
+                        .peer_addr()
+                        .map(|a| a.to_string())
+                        .unwrap_or_default();
+                    handle_tcp(socket, s, t, p, ps, wr, st, peer).await;
                     drop(permit);
                 });
             }
@@ -4699,6 +5973,12 @@ mod tests {
                     Err(e) => panic!("RESP parse error: {e}"),
                 }
             }
+        }
+
+        /// True once the peer has closed its half of the connection.
+        async fn read_raw_eof(&mut self) -> bool {
+            let mut buf = [0u8; 64];
+            matches!(self.stream.read(&mut buf).await, Ok(0))
         }
 
         async fn read_until_closed(&mut self) {
@@ -5028,6 +6308,172 @@ mod tests {
             got,
             Value::Array(Some(vec![bulk("1"), bulk("2"), bulk("3"), nil()]))
         );
+    }
+
+    #[tokio::test]
+    async fn integration_bounded_reads_over_resp() {
+        // The pair of primitives a client needs to inspect a large key without
+        // pulling it whole: a byte window into a string, and a cursor over a
+        // collection. Exercised over the wire because that is where the reply
+        // shape — bulk cursor, nested array — has to be right.
+        let srv = spawn_server().await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        c.cmd(&["SET", "s", "This is a string"]).await;
+        assert_eq!(c.cmd(&["GETRANGE", "s", "0", "3"]).await, bulk("This"));
+        assert_eq!(c.cmd(&["GETRANGE", "s", "-6", "-1"]).await, bulk("string"));
+        assert_eq!(c.cmd(&["GETRANGE", "ghost", "0", "-1"]).await, bulk(""));
+
+        c.cmd(&["HSET", "h", "a", "1", "b", "2", "c", "3"]).await;
+        assert_eq!(
+            c.cmd(&["HSCAN", "h", "0", "COUNT", "2"]).await,
+            Value::Array(Some(vec![
+                bulk("2"),
+                Value::Array(Some(vec![bulk("a"), bulk("1"), bulk("b"), bulk("2")])),
+            ]))
+        );
+        assert_eq!(
+            c.cmd(&["HSCAN", "h", "2"]).await,
+            Value::Array(Some(vec![
+                bulk("0"),
+                Value::Array(Some(vec![bulk("c"), bulk("3")])),
+            ]))
+        );
+        assert_eq!(
+            c.cmd(&["HSCAN", "h", "0", "NOVALUES"]).await,
+            Value::Array(Some(vec![
+                bulk("0"),
+                Value::Array(Some(vec![bulk("a"), bulk("b"), bulk("c")])),
+            ]))
+        );
+
+        c.cmd(&["SADD", "st", "x", "y"]).await;
+        assert_eq!(
+            c.cmd(&["SSCAN", "st", "0", "MATCH", "x*"]).await,
+            Value::Array(Some(vec![bulk("0"), Value::Array(Some(vec![bulk("x")])),]))
+        );
+
+        c.cmd(&["ZADD", "z", "1.5", "amy"]).await;
+        assert_eq!(
+            c.cmd(&["ZSCAN", "z", "0"]).await,
+            Value::Array(Some(vec![
+                bulk("0"),
+                Value::Array(Some(vec![bulk("amy"), bulk("1.5")])),
+            ]))
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_bounded_reads_are_allowed_on_a_replica() {
+        // Read-only by construction: a replica must serve them, and the
+        // is_write_command allowlist is what decides that.
+        let srv = spawn_server_cfg(None, None, true).await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        assert_eq!(c.cmd(&["GETRANGE", "s", "0", "-1"]).await, bulk(""));
+        assert_eq!(
+            c.cmd(&["HSCAN", "h", "0"]).await,
+            Value::Array(Some(vec![bulk("0"), Value::Array(Some(vec![]))]))
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_handshake_commands_over_resp() {
+        // Every current client library opens with HELLO + CLIENT SETINFO and
+        // closes with QUIT. This is that sequence, on the wire.
+        let srv = spawn_server().await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        assert_eq!(
+            c.cmd(&["CLIENT", "SETINFO", "LIB-NAME", "node-redis"])
+                .await,
+            ok()
+        );
+        assert_eq!(
+            c.cmd(&["CLIENT", "SETINFO", "LIB-VER", "6.2.0"]).await,
+            ok()
+        );
+        assert_eq!(c.cmd(&["CLIENT", "SETNAME", "tap"]).await, ok());
+        assert_eq!(c.cmd(&["CLIENT", "GETNAME"]).await, bulk("tap"));
+
+        let Value::Integer(id) = c.cmd(&["CLIENT", "ID"]).await else {
+            panic!("CLIENT ID must be an integer")
+        };
+        assert!(id > 0);
+
+        let Value::BulkString(Some(info)) = c.cmd(&["CLIENT", "INFO"]).await else {
+            panic!("CLIENT INFO must be a bulk string")
+        };
+        let info = String::from_utf8(info).unwrap();
+        assert!(info.contains(&format!("id={id}")), "{info}");
+        assert!(info.contains("lib-name=node-redis"), "{info}");
+        assert!(info.contains("name=tap"), "{info}");
+        assert!(info.contains("addr=127.0.0.1:"), "{info}");
+
+        // This connection must appear in the list it asks for.
+        let Value::BulkString(Some(list)) = c.cmd(&["CLIENT", "LIST"]).await else {
+            panic!("CLIENT LIST must be a bulk string")
+        };
+        let list = String::from_utf8(list).unwrap();
+        assert!(
+            list.lines().any(|l| l.contains(&format!("id={id}"))),
+            "{list}"
+        );
+
+        assert_eq!(
+            c.cmd(&["CONFIG", "GET", "maxmemory-policy"]).await,
+            Value::Array(Some(vec![bulk("maxmemory-policy"), bulk("noeviction")]))
+        );
+
+        let Value::Integer(n) = c.cmd(&["COMMAND", "COUNT"]).await else {
+            panic!("COMMAND COUNT must be an integer")
+        };
+        assert!(
+            n > 100,
+            "the catalog should cover the whole command set, got {n}"
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_quit_replies_then_closes() {
+        let srv = spawn_server().await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+        assert_eq!(c.cmd(&["PING"]).await, Value::SimpleString("PONG".into()));
+        // +OK first, then the close — a client that reads its reply before
+        // dropping the socket must not see a connection error instead.
+        assert_eq!(c.cmd(&["QUIT"]).await, ok());
+        assert!(
+            c.read_raw_eof().await,
+            "the server must close the connection after QUIT"
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_quit_works_before_authentication() {
+        // Redis flags QUIT no_auth. A client that cannot authenticate still
+        // gets a clean close instead of leaving a socket parked on the server.
+        let srv = spawn_server_cfg(Some("hunter2"), None, false).await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+        assert!(matches!(c.cmd(&["PING"]).await, Value::Error(e) if e.contains("NOAUTH")));
+        assert_eq!(c.cmd(&["QUIT"]).await, ok());
+    }
+
+    #[tokio::test]
+    async fn integration_client_list_sees_other_connections() {
+        let srv = spawn_server().await;
+        let mut a = RespClient::connect(srv.tcp_addr).await;
+        let mut b = RespClient::connect(srv.tcp_addr).await;
+        b.cmd(&["CLIENT", "SETNAME", "second"]).await;
+
+        let Value::BulkString(Some(list)) = a.cmd(&["CLIENT", "LIST"]).await else {
+            panic!("expected a bulk string")
+        };
+        let list = String::from_utf8(list).unwrap();
+        assert!(
+            list.lines().any(|l| l.contains("name=second")),
+            "a connection must see its peers, got:\n{list}"
+        );
+        assert!(list.lines().count() >= 2, "{list}");
     }
 
     #[tokio::test]
@@ -5602,6 +7048,8 @@ mod tests {
                     r,
                     None,
                     DEFAULT_REPL_CHANNEL_CAPACITY,
+                    IpAddr::from([127, 0, 0, 1]),
+                    ReplAuthThrottle::new(),
                 ));
             }
         });
@@ -5657,7 +7105,11 @@ mod tests {
                         Arc::clone(&state2),
                     );
                     tokio::spawn(async move {
-                        handle_tcp(socket, s, t, p, ps, wrr, st).await;
+                        let peer = socket
+                            .peer_addr()
+                            .map(|a| a.to_string())
+                            .unwrap_or_default();
+                        handle_tcp(socket, s, t, p, ps, wrr, st, peer).await;
                         drop(permit);
                     });
                 }
@@ -5689,7 +7141,7 @@ mod tests {
         let repl_addr = format!("127.0.0.1:{repl_port}");
         let rtx = broadcast::channel::<SyncMsg>(16).0;
         tokio::spawn(async move {
-            run_repl_client(repl_addr, rs, rst, None, None, rtx).await;
+            run_repl_client(repl_addr, rs, rst, None, None, rtx, None).await;
         });
 
         // Give replica time to connect and receive initial snapshot
@@ -5800,8 +7252,17 @@ mod tests {
             );
             tokio::spawn(async move {
                 if let Ok((socket, _)) = listener.accept().await {
-                    let _ =
-                        handle_replica(socket, s, sc, r, None, DEFAULT_REPL_CHANNEL_CAPACITY).await;
+                    let _ = handle_replica(
+                        socket,
+                        s,
+                        sc,
+                        r,
+                        None,
+                        DEFAULT_REPL_CHANNEL_CAPACITY,
+                        IpAddr::from([127, 0, 0, 1]),
+                        ReplAuthThrottle::new(),
+                    )
+                    .await;
                 }
             });
         }
@@ -5932,7 +7393,11 @@ mod tests {
                     Arc::clone(&state2),
                 );
                 tokio::spawn(async move {
-                    handle_tcp(socket, s, t, p, ps, wr, st).await;
+                    let peer = socket
+                        .peer_addr()
+                        .map(|a| a.to_string())
+                        .unwrap_or_default();
+                    handle_tcp(socket, s, t, p, ps, wr, st, peer).await;
                     drop(permit);
                 });
             }
@@ -6035,7 +7500,7 @@ mod tests {
         drop(listener);
         let rtx = broadcast::channel::<SyncMsg>(16).0;
         tokio::spawn(async move {
-            run_repl_client(dead_addr, rs, rst, None, Some(1), rtx).await;
+            run_repl_client(dead_addr, rs, rst, None, Some(1), rtx, None).await;
         });
 
         // Wait for 2 backoff cycles (initial fail + 2s sleep + retry fail → promote)
@@ -6057,6 +7522,87 @@ mod tests {
 
     /// Like `spawn_ws_server`, with an optional sync-scope secret (strict mode).
     async fn spawn_ws_server_cfg(sync_secret: Option<String>) -> TestServer {
+        spawn_ws_server_full(sync_secret, None).await
+    }
+
+    /// Like `spawn_ws_server`, with an origin allowlist in force.
+    async fn spawn_ws_server_origins(origins: Vec<String>) -> TestServer {
+        spawn_ws_server_full(None, Some(origins)).await
+    }
+
+    /// Open a WebSocket to `addr`, optionally sending an `Origin` header, and
+    /// report whether the handshake completed.
+    async fn ws_connect_with_origin(
+        addr: std::net::SocketAddr,
+        origin: Option<&str>,
+    ) -> Result<(), String> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut req = format!("ws://{addr}").into_client_request().unwrap();
+        if let Some(o) = origin {
+            req.headers_mut().insert("origin", o.parse().unwrap());
+        }
+        tokio_tungstenite::connect_async(req)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    #[tokio::test]
+    async fn ws_refuses_a_cross_origin_handshake() {
+        // Browsers apply neither CORS nor a preflight to WebSockets, so before
+        // this check any page a user visited could open a socket to port 6380
+        // and read or write the whole keyspace with that user's network
+        // position. On ws://localhost:6380 that is every site in every tab.
+        let srv = spawn_ws_server_origins(vec!["https://app.example.com".to_string()]).await;
+
+        let err = ws_connect_with_origin(srv.tcp_addr, Some("https://evil.example"))
+            .await
+            .expect_err("a foreign Origin must not complete the handshake");
+        assert!(
+            err.contains("403") || err.to_lowercase().contains("forbidden"),
+            "expected a 403, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_admits_an_allowlisted_origin_and_serves_commands() {
+        // The rejection is worthless if it also breaks the deployed app, so
+        // assert the permitted path all the way through to a working command.
+        let srv = spawn_ws_server_origins(vec!["https://app.example.com".to_string()]).await;
+        ws_connect_with_origin(srv.tcp_addr, Some("https://app.example.com"))
+            .await
+            .expect("an allowlisted Origin must connect");
+
+        let mut c = WsClient::connect(srv.tcp_addr).await;
+        assert_eq!(c.cmd(&["SET", "k", "v"]).await, ok());
+        assert_eq!(c.cmd(&["GET", "k"]).await, bulk("v"));
+    }
+
+    #[tokio::test]
+    async fn ws_admits_a_client_that_sends_no_origin() {
+        // Native clients omit the header, and an attacker with a raw socket can
+        // forge it — refusing here would break real clients while stopping
+        // nobody. `WsClient::connect` is exactly such a client.
+        let srv = spawn_ws_server_origins(vec!["https://app.example.com".to_string()]).await;
+        ws_connect_with_origin(srv.tcp_addr, None)
+            .await
+            .expect("a client with no Origin must connect");
+    }
+
+    #[tokio::test]
+    async fn ws_without_an_allowlist_accepts_any_origin() {
+        // Unset means allow, matching RECACHED_PASSWORD. The startup warning is
+        // what keeps this from being a silent default.
+        let srv = spawn_ws_server().await;
+        ws_connect_with_origin(srv.tcp_addr, Some("https://anything.example"))
+            .await
+            .expect("no allowlist means no origin restriction");
+    }
+
+    async fn spawn_ws_server_full(
+        sync_secret: Option<String>,
+        allowed_origins: Option<Vec<String>>,
+    ) -> TestServer {
         let store = Arc::new(KeyValueStore::new());
         let (tx, _rx) = broadcast::channel::<SyncMsg>(256);
         let pubsub: SharedPubSub = Arc::new(tokio::sync::Mutex::new(PubSubHub::new()));
@@ -6080,23 +7626,29 @@ mod tests {
         let store2 = Arc::clone(&store);
         let state2 = Arc::clone(&state);
         let secret = Arc::new(sync_secret);
+        let origins = Arc::new(allowed_origins);
 
         let task = tokio::spawn(async move {
             loop {
                 let Ok((socket, _)) = listener.accept().await else {
                     return;
                 };
-                let (s, t, ps, wr, st, ss) = (
+                let (s, t, ps, wr, st, ss, ao) = (
                     Arc::clone(&store2),
                     tx.clone(),
                     Arc::clone(&pubsub),
                     Arc::clone(&watch_registry),
                     Arc::clone(&state2),
                     Arc::clone(&secret),
+                    Arc::clone(&origins),
                 );
                 let id = next_conn_id();
+                let peer = socket
+                    .peer_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_default();
                 tokio::spawn(async move {
-                    handle_ws(socket, s, t, Arc::new(None), id, ps, wr, st, ss).await;
+                    handle_ws(socket, s, t, Arc::new(None), id, ps, wr, st, ss, ao, peer).await;
                 });
             }
         });
@@ -6639,6 +8191,7 @@ mod tests {
                 Expect::Keys(&["k"]),
             ),
             (Command::Strlen("k".into()), Expect::Keys(&["k"])),
+            (Command::GetRange("k".into(), 0, -1), Expect::Keys(&["k"])),
             (
                 Command::GetSet("k".into(), "v".into()),
                 Expect::Keys(&["k"]),
@@ -6712,6 +8265,10 @@ mod tests {
                 Expect::Keys(&["k"]),
             ),
             (
+                Command::HScan("k".into(), ScanArgs::default()),
+                Expect::Keys(&["k"]),
+            ),
+            (
                 Command::LPush("k".into(), vec!["v".into()]),
                 Expect::Keys(&["k"]),
             ),
@@ -6777,6 +8334,10 @@ mod tests {
             (Command::SPop("k".into(), None), Expect::Keys(&["k"])),
             (Command::SRandMember("k".into(), None), Expect::Keys(&["k"])),
             (
+                Command::SScan("k".into(), ScanArgs::default()),
+                Expect::Keys(&["k"]),
+            ),
+            (
                 Command::SMove("k".into(), "d".into(), "m".into()),
                 Expect::Keys(&["k", "d"]),
             ),
@@ -6827,6 +8388,10 @@ mod tests {
                 Expect::Keys(&["k"]),
             ),
             (
+                Command::ZScan("k".into(), ScanArgs::default()),
+                Expect::Keys(&["k"]),
+            ),
+            (
                 Command::JSet("k".into(), "$".into(), "1".into()),
                 Expect::Keys(&["k"]),
             ),
@@ -6854,6 +8419,13 @@ mod tests {
             (Command::BgSave, Expect::Admin),
             (Command::LastSave, Expect::Admin),
             (Command::ReplicaOfNoOne, Expect::Admin),
+            (Command::Quit, Expect::KeyLess),
+            (Command::Client(vec!["ID".into()]), Expect::KeyLess),
+            (
+                Command::Config(vec!["GET".into(), "*".into()]),
+                Expect::Admin,
+            ),
+            (Command::CommandQuery(vec![]), Expect::KeyLess),
             (Command::Unknown("X".into()), Expect::KeyLess),
         ]
     }
@@ -6922,6 +8494,249 @@ mod tests {
         assert!(
             !frame.contains("ESET"),
             "replica should receive SET, not ESET"
+        );
+    }
+
+    #[test]
+    fn every_command_is_in_the_catalog() {
+        // The other half of the loop closed in `catalog_names_are_real_commands`:
+        // every `Command` variant the parser can produce must have a catalog
+        // row, or `COMMAND DOCS` silently under-reports what the server can do
+        // and `COMMAND COUNT` lies about how much.
+        for (cmd, _) in all_commands() {
+            let name = command_name(&cmd);
+            if name == "unknown" {
+                continue; // Not a command — the reply for anything unrecognised.
+            }
+            assert!(
+                catalog::lookup(name).is_some(),
+                "{name} is a real command with no catalog entry"
+            );
+        }
+    }
+
+    #[test]
+    fn command_count_matches_the_catalog() {
+        let Value::Integer(n) = handle_command_query(&["COUNT".to_string()], 2) else {
+            panic!("COMMAND COUNT must reply an integer")
+        };
+        assert_eq!(n as usize, catalog::CATALOG.len());
+    }
+
+    #[test]
+    fn command_info_reports_ten_fields_per_entry() {
+        // Redis 7 returns ten elements. A client that indexes past the sixth
+        // must find an empty list, not a short array.
+        let reply = handle_command_query(&["INFO".into(), "get".into()], 2);
+        let Value::Array(Some(entries)) = reply else {
+            panic!("expected an array")
+        };
+        let Value::Array(Some(fields)) = &entries[0] else {
+            panic!("expected an entry array")
+        };
+        assert_eq!(fields.len(), 10);
+        assert_eq!(fields[0], Value::BulkString(Some(b"get".to_vec())));
+        assert_eq!(fields[1], Value::Integer(2));
+        assert_eq!(fields[3], Value::Integer(1), "GET's key is at position 1");
+    }
+
+    #[test]
+    fn command_info_nils_unknown_names_in_place() {
+        let reply = handle_command_query(&["INFO".into(), "get".into(), "nosuchthing".into()], 2);
+        let Value::Array(Some(entries)) = reply else {
+            panic!("expected an array")
+        };
+        assert_eq!(entries.len(), 2, "the reply stays aligned with the request");
+        assert_eq!(entries[1], Value::Array(None));
+    }
+
+    #[test]
+    fn command_docs_shape_follows_the_protocol() {
+        // RESP3 gets a map; RESP2 gets the same pairs flattened.
+        let resp3 = handle_command_query(&["DOCS".into(), "getrange".into()], 3);
+        assert!(matches!(resp3, Value::Map(_)), "{resp3:?}");
+        let resp2 = handle_command_query(&["DOCS".into(), "getrange".into()], 2);
+        let Value::Array(Some(flat)) = resp2 else {
+            panic!("RESP2 must flatten the map")
+        };
+        assert_eq!(flat.len(), 2, "one command, one entry");
+        assert_eq!(flat[0], Value::BulkString(Some(b"getrange".to_vec())));
+    }
+
+    #[test]
+    fn command_docs_omits_unknown_names() {
+        let Value::Array(Some(flat)) =
+            handle_command_query(&["DOCS".into(), "nosuchthing".into()], 2)
+        else {
+            panic!("expected an array")
+        };
+        assert!(flat.is_empty(), "an unknown name has no entry to key");
+    }
+
+    #[test]
+    fn command_rejects_unknown_subcommands() {
+        let reply = handle_command_query(&["GETKEYS".into(), "get".into(), "k".into()], 2);
+        assert!(
+            matches!(&reply, Value::Error(e) if e.contains("Unknown subcommand")),
+            "{reply:?}"
+        );
+    }
+
+    #[test]
+    fn client_setinfo_is_recorded_and_visible() {
+        let mut meta = ClientMeta::new(42, "127.0.0.1:1".into(), "127.0.0.1:6379".into());
+        assert_eq!(
+            handle_client_command(
+                &["SETINFO".into(), "LIB-NAME".into(), "node-redis".into()],
+                &mut meta
+            ),
+            Value::SimpleString("OK".into())
+        );
+        assert_eq!(
+            handle_client_command(
+                &["SETINFO".into(), "LIB-VER".into(), "6.2.0".into()],
+                &mut meta
+            ),
+            Value::SimpleString("OK".into())
+        );
+        let Value::BulkString(Some(line)) = handle_client_command(&["INFO".into()], &mut meta)
+        else {
+            panic!("CLIENT INFO must reply a bulk string")
+        };
+        let line = String::from_utf8(line).unwrap();
+        assert!(line.contains("lib-name=node-redis"), "{line}");
+        assert!(line.contains("lib-ver=6.2.0"), "{line}");
+        assert!(line.contains("id=42"), "{line}");
+    }
+
+    #[test]
+    fn client_setinfo_rejects_unknown_attributes() {
+        let mut meta = ClientMeta::new(1, String::new(), String::new());
+        let reply = handle_client_command(
+            &["SETINFO".into(), "LIB-COLOUR".into(), "blue".into()],
+            &mut meta,
+        );
+        assert!(
+            matches!(&reply, Value::Error(e) if e.contains("Unrecognized")),
+            "{reply:?}"
+        );
+    }
+
+    #[test]
+    fn client_setname_round_trips_and_rejects_spaces() {
+        let mut meta = ClientMeta::new(1, String::new(), String::new());
+        assert_eq!(
+            handle_client_command(&["GETNAME".into()], &mut meta),
+            Value::BulkString(None),
+            "an unnamed connection reports nil, not an empty string"
+        );
+        handle_client_command(&["SETNAME".into(), "worker-3".into()], &mut meta);
+        assert_eq!(
+            handle_client_command(&["GETNAME".into()], &mut meta),
+            Value::BulkString(Some(b"worker-3".to_vec()))
+        );
+        // A space would break the key=value line CLIENT LIST emits.
+        let reply = handle_client_command(&["SETNAME".into(), "two words".into()], &mut meta);
+        assert!(matches!(reply, Value::Error(_)), "{reply:?}");
+    }
+
+    #[test]
+    fn client_declines_what_it_cannot_do() {
+        // KILL must not answer +OK: a caller would believe a connection had
+        // been closed when it is still open.
+        let mut meta = ClientMeta::new(1, String::new(), String::new());
+        for args in [
+            vec!["KILL".to_string(), "id".into(), "3".into()],
+            vec!["NO-EVICT".to_string(), "on".into()],
+            vec!["UNPAUSE".to_string()],
+        ] {
+            let reply = handle_client_command(&args, &mut meta);
+            assert!(
+                matches!(&reply, Value::Error(e) if e.contains("Unknown subcommand")),
+                "{args:?} -> {reply:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_get_reports_values_in_force() {
+        let store = KeyValueStore::new();
+        let facts = test_facts();
+        let Value::Array(Some(flat)) =
+            handle_config_command(&["GET".into(), "maxmemory-policy".into()], &facts, &store)
+        else {
+            panic!("CONFIG GET must reply an array")
+        };
+        assert_eq!(flat.len(), 2);
+        assert_eq!(
+            flat[0],
+            Value::BulkString(Some(b"maxmemory-policy".to_vec()))
+        );
+        assert_eq!(
+            flat[1],
+            Value::BulkString(Some(
+                eviction_policy_name(store.eviction_policy())
+                    .as_bytes()
+                    .to_vec()
+            )),
+            "the reported policy must be the one actually in force"
+        );
+    }
+
+    #[test]
+    fn config_get_matches_globs_and_multiple_names() {
+        let store = KeyValueStore::new();
+        let facts = test_facts();
+        let Value::Array(Some(flat)) =
+            handle_config_command(&["GET".into(), "maxmemory*".into()], &facts, &store)
+        else {
+            panic!("expected an array")
+        };
+        // maxmemory and maxmemory-policy both match; the reply is flat pairs.
+        assert_eq!(flat.len(), 4, "{flat:?}");
+
+        let Value::Array(Some(none)) =
+            handle_config_command(&["GET".into(), "nosuchparam".into()], &facts, &store)
+        else {
+            panic!("expected an array")
+        };
+        assert!(
+            none.is_empty(),
+            "an unmatched name yields no pair, not an error"
+        );
+    }
+
+    #[test]
+    fn config_get_masks_the_password() {
+        let store = KeyValueStore::new();
+        let mut facts = test_facts();
+        facts.auth_enabled = true;
+        let Value::Array(Some(flat)) =
+            handle_config_command(&["GET".into(), "requirepass".into()], &facts, &store)
+        else {
+            panic!("expected an array")
+        };
+        assert_eq!(
+            flat[1],
+            Value::BulkString(Some(b"*".to_vec())),
+            "the password itself must never leave the process"
+        );
+    }
+
+    #[test]
+    fn config_set_refuses_rather_than_pretending() {
+        let store = KeyValueStore::new();
+        let facts = test_facts();
+        let reply = handle_config_command(
+            &["SET".into(), "maxmemory".into(), "100mb".into()],
+            &facts,
+            &store,
+        );
+        // Nothing in the running server can change, so +OK would be a lie the
+        // operator only discovers when the limit fails to apply.
+        assert!(
+            matches!(&reply, Value::Error(e) if e.contains("configured at startup")),
+            "{reply:?}"
         );
     }
 
@@ -8026,6 +9841,88 @@ mod tls_loading_tests {
         path
     }
 
+    // ── replication TLS (2.2) ───────────────────────────────────────────────
+
+    #[test]
+    fn the_verified_servername_defaults_to_the_primarys_host() {
+        // What an operator means by "connect to this primary" is the host they
+        // named, so that is what the certificate is checked against.
+        assert_eq!(
+            repl_tls_servername("primary.internal:6381", None),
+            "primary.internal"
+        );
+        assert_eq!(repl_tls_servername("10.0.1.5:6381", None), "10.0.1.5");
+        assert_eq!(
+            repl_tls_servername("primary.internal", None),
+            "primary.internal"
+        );
+    }
+
+    #[test]
+    fn an_ipv6_primary_address_is_not_split_inside_the_address() {
+        // Splitting on the last colon would cut inside an IPv6 literal and
+        // produce a servername that could never validate.
+        assert_eq!(repl_tls_servername("[::1]:6381", None), "::1");
+        assert_eq!(repl_tls_servername("[fd00::5]:6381", None), "fd00::5");
+    }
+
+    #[test]
+    fn the_servername_override_wins_and_ignores_blanks() {
+        // The common deployment points RECACHED_REPLICAOF at an IP while the
+        // certificate names a host, which cannot validate without an IP SAN.
+        assert_eq!(
+            repl_tls_servername("10.0.1.5:6381", Some("primary.internal".into())),
+            "primary.internal"
+        );
+        assert_eq!(
+            repl_tls_servername("10.0.1.5:6381", Some("  primary.internal  ".into())),
+            "primary.internal"
+        );
+        // Empty or whitespace is "unset", not "verify against nothing".
+        assert_eq!(
+            repl_tls_servername("10.0.1.5:6381", Some(String::new())),
+            "10.0.1.5"
+        );
+        assert_eq!(
+            repl_tls_servername("10.0.1.5:6381", Some("   ".into())),
+            "10.0.1.5"
+        );
+    }
+
+    #[test]
+    fn a_missing_or_unusable_replication_ca_is_a_startup_error() {
+        // Trusting nothing would fail every connection at runtime rather than at
+        // startup, which is much harder to diagnose from a replica's logs.
+        // `TlsConnector` is not Debug, so unwrap the error side by hand.
+        let missing = load_repl_tls_connector("/nonexistent/recached-ca.pem");
+        let Err(err) = missing else {
+            panic!("a missing CA file must be refused");
+        };
+        assert!(err.contains("RECACHED_REPL_TLS_CA"), "{err}");
+
+        let junk = write("repl_ca_junk.pem", "not a certificate\n");
+        let unusable = load_repl_tls_connector(junk.to_str().unwrap());
+        let _ = std::fs::remove_file(&junk);
+        let Err(err) = unusable else {
+            panic!("a file with no certificates must be refused");
+        };
+        assert!(err.contains("RECACHED_REPL_TLS_CA"), "{err}");
+    }
+
+    #[test]
+    fn a_self_signed_certificate_works_as_the_replication_trust_anchor() {
+        // Pinning the primary's own certificate is the documented path, and the
+        // reason the trust anchor is an explicit file rather than the system root
+        // store: replication is a private link between two hosts one operator
+        // runs, so trusting every public CA to vouch for it would be backwards.
+        let ca = write("repl_ca_ok.pem", TEST_CERT);
+        assert!(
+            load_repl_tls_connector(ca.to_str().unwrap()).is_ok(),
+            "a valid self-signed PEM must build a connector"
+        );
+        let _ = std::fs::remove_file(&ca);
+    }
+
     #[test]
     fn a_pem_certificate_and_key_load() {
         // PEM parsing moved from the deprecated rustls-pemfile to
@@ -8151,5 +10048,609 @@ mod limit_config_tests {
         assert_eq!(max_watches_per_conn(), 1_024);
         assert_eq!(max_qsubs_per_conn(), 64);
         assert_eq!(max_qsub_initial_keys(), 10_000);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Hardening: the network-exposure fixes and their decision functions.
+//
+// Every check here guards a boundary that was open in 0.2.4 or earlier. The
+// pure-function shape is deliberate: the replication gate and the origin
+// allowlist are decisions, and a decision can be asserted without standing up a
+// listener or mutating process-global environment state.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    // ── replication listener gate ─────────────────────────────────────────────
+
+    #[test]
+    fn the_replication_port_stays_closed_unless_asked_for() {
+        // The default. Before this gate existed the listener bound
+        // 0.0.0.0:6381 on every node and, with no password, served the entire
+        // keyspace to anyone who connected — so an operator who set
+        // RECACHED_PASSWORD was protecting nothing.
+        assert_eq!(resolve_repl_listen(None, "0.0.0.0", None), Ok(false));
+        assert_eq!(resolve_repl_listen(None, "0.0.0.0", Some("pw")), Ok(false));
+        // An empty value is "unset", not "true".
+        assert_eq!(
+            resolve_repl_listen(Some(String::new()), "0.0.0.0", None),
+            Ok(false)
+        );
+        assert_eq!(
+            resolve_repl_listen(Some("  ".to_string()), "0.0.0.0", None),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn enabling_it_on_a_public_interface_without_a_password_refuses_to_start() {
+        let err = resolve_repl_listen(Some("1".into()), "0.0.0.0", None)
+            .expect_err("public + no password must not be allowed");
+        // The message has to name both variables — an operator reading a log
+        // line needs to know what to set, not merely that something is wrong.
+        assert!(err.contains("RECACHED_REPL_PASSWORD"), "{err}");
+        assert!(err.contains("RECACHED_REPL_ENABLE"), "{err}");
+        assert!(err.contains("0.0.0.0"), "{err}");
+
+        // A specific LAN address is just as reachable as 0.0.0.0.
+        assert!(resolve_repl_listen(Some("1".into()), "10.0.1.5", None).is_err());
+        // So is a hostname we cannot resolve to a loopback address: the
+        // conservative reading is the one that demands a password.
+        assert!(resolve_repl_listen(Some("1".into()), "cache.internal", None).is_err());
+        // An empty password is not a password.
+        assert!(resolve_repl_listen(Some("1".into()), "0.0.0.0", Some("")).is_err());
+    }
+
+    #[test]
+    fn enabling_it_is_allowed_on_loopback_or_with_a_password() {
+        // Loopback without a password is a development setup, not an exposure.
+        assert_eq!(
+            resolve_repl_listen(Some("1".into()), "127.0.0.1", None),
+            Ok(true)
+        );
+        assert_eq!(
+            resolve_repl_listen(Some("yes".into()), "::1", None),
+            Ok(true)
+        );
+        assert_eq!(
+            resolve_repl_listen(Some("on".into()), "localhost", None),
+            Ok(true)
+        );
+        // Public is fine once authenticated — this is the multi-tier
+        // replication path, which must keep working.
+        assert_eq!(
+            resolve_repl_listen(Some("true".into()), "0.0.0.0", Some("pw")),
+            Ok(true)
+        );
+        assert_eq!(
+            resolve_repl_listen(Some("1".into()), "10.0.1.5", Some("pw")),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_enable_value_refuses_to_start() {
+        // Treating `please` as false would leave an operator believing
+        // replication was on; treating it as true would open a port nobody
+        // asked for. Neither is acceptable for a variable gating a boundary.
+        let err = resolve_repl_listen(Some("please".into()), "127.0.0.1", None).unwrap_err();
+        assert!(err.contains("RECACHED_REPL_ENABLE"), "{err}");
+        assert!(err.contains("not a boolean"), "{err}");
+    }
+
+    #[test]
+    fn boolean_env_values_cover_the_conventional_spellings() {
+        for yes in ["1", "true", "TRUE", "yes", "On", " on "] {
+            assert_eq!(parse_env_bool("V", yes), Ok(true), "{yes:?}");
+        }
+        for no in ["0", "false", "FALSE", "no", "Off", " off "] {
+            assert_eq!(parse_env_bool("V", no), Ok(false), "{no:?}");
+        }
+        assert!(parse_env_bool("V", "maybe").is_err());
+    }
+
+    #[test]
+    fn loopback_detection_treats_unparseable_hosts_as_public() {
+        assert!(bind_is_loopback("127.0.0.1"));
+        assert!(bind_is_loopback("127.0.0.53"));
+        assert!(bind_is_loopback("::1"));
+        assert!(bind_is_loopback("localhost"));
+        assert!(bind_is_loopback("LOCALHOST"));
+        assert!(!bind_is_loopback("0.0.0.0"));
+        assert!(!bind_is_loopback("10.0.1.5"));
+        assert!(!bind_is_loopback("::"));
+        assert!(!bind_is_loopback("cache.internal"));
+        assert!(!bind_is_loopback(""));
+        // An IPv6 bind address must be written bracketed for the listeners to
+        // format it correctly, so the brackets have to be tolerated here too —
+        // otherwise `[::1]` is misread as public and demands a password.
+        assert!(bind_is_loopback("[::1]"));
+        assert!(!bind_is_loopback("[::]"));
+        assert!(!bind_is_loopback("[fd00::5]"));
+    }
+
+    // ── replication auth: throttle and handshake ─────────────────────────────
+
+    #[test]
+    fn repeated_bad_replication_passwords_block_the_peer() {
+        // The RESP port drops a connection after five guesses, but the
+        // replication handshake is one-shot: reconnecting used to reset the
+        // count, so the port offered unlimited guesses at a secret that yields
+        // the whole keyspace. The throttle is keyed by address for that reason.
+        let throttle = ReplAuthThrottle::new();
+        let ip = IpAddr::from([203, 0, 113, 7]);
+        assert!(!throttle.is_blocked(ip));
+        for _ in 0..MAX_AUTH_FAILURES {
+            assert!(!throttle.is_blocked(ip), "must not block before the cap");
+            throttle.record_failure(ip);
+        }
+        assert!(throttle.is_blocked(ip), "cap reached, peer must be refused");
+
+        // Other peers are unaffected — one attacker must not lock out a fleet.
+        assert!(!throttle.is_blocked(IpAddr::from([203, 0, 113, 8])));
+
+        // A successful handshake clears the record.
+        throttle.record_success(ip);
+        assert!(!throttle.is_blocked(ip));
+    }
+
+    #[test]
+    fn the_throttle_does_not_grow_without_bound() {
+        // A spray from many source addresses must not be a memory-growth
+        // vector; the map sweeps once it crosses the threshold.
+        let throttle = ReplAuthThrottle::new();
+        for i in 0..(REPL_AUTH_SWEEP_THRESHOLD + 64) {
+            let ip = IpAddr::from([
+                10,
+                ((i >> 16) & 0xff) as u8,
+                ((i >> 8) & 0xff) as u8,
+                (i & 0xff) as u8,
+            ]);
+            throttle.record_failure(ip);
+        }
+        let len = throttle.failures.lock().unwrap().len();
+        // Entries are all fresh so none are swept, but the sweep must have run
+        // without panicking and the map must stay proportional to the input
+        // rather than duplicating it.
+        assert!(len <= REPL_AUTH_SWEEP_THRESHOLD + 64, "{len}");
+    }
+
+    #[tokio::test]
+    async fn the_auth_line_is_read_to_its_terminator_not_to_the_password_length() {
+        // Reading exactly `password.len() + 1` bytes made the number of bytes
+        // the server waited for *be* the password length, recoverable by
+        // drip-feeding one byte at a time.
+        let (mut client, mut server) = tokio::io::duplex(256);
+        client.write_all(b"hunter2\n").await.unwrap();
+        let line = read_repl_auth_line(&mut server).await.unwrap();
+        assert_eq!(line, b"hunter2");
+    }
+
+    #[tokio::test]
+    async fn an_auth_line_without_a_terminator_is_refused_at_the_cap() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let flood = vec![b'x'; MAX_REPL_AUTH_LINE + 16];
+        // Write concurrently: the reader gives up mid-stream, so the writer
+        // must not block on a full pipe.
+        tokio::spawn(async move {
+            let _ = client.write_all(&flood).await;
+        });
+        let err = read_repl_auth_line(&mut server)
+            .await
+            .expect_err("an unterminated line must not be read forever");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn a_short_auth_line_still_compares_unequal() {
+        // The comparison is constant-time and length-checked, so a truncated
+        // guess fails rather than matching a prefix.
+        let (mut client, mut server) = tokio::io::duplex(256);
+        client.write_all(b"hunt\n").await.unwrap();
+        let line = read_repl_auth_line(&mut server).await.unwrap();
+        assert!(!ct_eq_bytes(&line, b"hunter2"));
+    }
+
+    // ── WebSocket origin allowlist ──────────────────────────────────────────
+
+    #[test]
+    fn an_unset_origin_allowlist_permits_everything() {
+        // Matches how an unset RECACHED_PASSWORD behaves. The project ships
+        // insecure-by-default deliberately and says so; what it must not do is
+        // ship a *silent* default, hence the startup warning.
+        assert!(origin_allowed(None, Some("https://evil.example")));
+        assert!(origin_allowed(None, None));
+    }
+
+    #[test]
+    fn a_foreign_origin_is_refused_when_the_allowlist_is_set() {
+        // The finding this closes: browsers apply neither CORS nor a preflight
+        // to WebSockets, so without this check any page a user visits could
+        // open a socket to ws://localhost:6380 and read or write every key.
+        let allow = vec!["https://app.example.com".to_string()];
+        assert!(origin_allowed(
+            Some(&allow),
+            Some("https://app.example.com")
+        ));
+        assert!(!origin_allowed(Some(&allow), Some("https://evil.example")));
+        // A different scheme or port is a different origin.
+        assert!(!origin_allowed(
+            Some(&allow),
+            Some("http://app.example.com")
+        ));
+        assert!(!origin_allowed(
+            Some(&allow),
+            Some("https://app.example.com:8443")
+        ));
+        // Substring matching would be a hole: `app.example.com.evil.test`
+        // contains an allowlisted origin as a prefix.
+        assert!(!origin_allowed(
+            Some(&allow),
+            Some("https://app.example.com.evil.test")
+        ));
+    }
+
+    #[test]
+    fn an_absent_origin_is_permitted_because_only_browsers_send_one() {
+        // A native client omits the header and an attacker with a socket can
+        // forge it, so refusing here would break legitimate clients while
+        // stopping nobody. The control exists to separate "the app I deployed"
+        // from "another page in the same browser".
+        let allow = vec!["https://app.example.com".to_string()];
+        assert!(origin_allowed(Some(&allow), None));
+    }
+
+    #[test]
+    fn origin_comparison_ignores_case_and_a_trailing_slash() {
+        let allow = parse_allowed_origins("https://App.Example.com/").unwrap();
+        assert!(origin_allowed(
+            Some(&allow),
+            Some("https://app.example.com")
+        ));
+        assert!(origin_allowed(
+            Some(&allow),
+            Some("HTTPS://APP.EXAMPLE.COM/")
+        ));
+    }
+
+    #[test]
+    fn the_origin_allowlist_parses_a_list_and_admits_null() {
+        let list = parse_allowed_origins(
+            "https://app.example.com, http://localhost:3000 ,https://admin.example.com:8443",
+        )
+        .unwrap();
+        assert_eq!(
+            list,
+            vec![
+                "https://app.example.com",
+                "http://localhost:3000",
+                "https://admin.example.com:8443",
+            ]
+        );
+        // Sandboxed iframes and file:// documents send the literal `null`.
+        assert_eq!(parse_allowed_origins("null").unwrap(), vec!["null"]);
+        assert!(origin_allowed(
+            Some(&parse_allowed_origins("null").unwrap()),
+            Some("null")
+        ));
+    }
+
+    #[test]
+    fn the_origin_allowlist_rejects_entries_that_could_never_match() {
+        // Each of these would parse into something a browser never sends, so
+        // the allowlist would silently reject every connection. Failing at
+        // startup is the only way an operator finds out.
+        for bad in [
+            "app.example.com",
+            "https://app.example.com/dashboard",
+            "://nohost",
+            "https://",
+        ] {
+            assert!(
+                parse_allowed_origins(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+        // Set-but-empty would reject every browser; unset is how you allow all.
+        let err = parse_allowed_origins(" , ").unwrap_err();
+        assert!(err.contains("Unset it"), "{err}");
+    }
+
+    // ── handshake deadline ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_stalled_websocket_handshake_gives_up_and_releases_the_socket() {
+        // The connection permit is acquired *before* the handshake runs, so
+        // without this deadline `RECACHED_MAX_CONNECTIONS` sockets that connect
+        // and then say nothing — costing an attacker nothing — hold every slot
+        // indefinitely and the server stops accepting real clients.
+        let (_client, server) = tokio::io::duplex(1024);
+        let start = std::time::Instant::now();
+        let out = ws_handshake(server, None, Duration::from_millis(150), 1).await;
+        assert!(out.is_none(), "a silent peer must not produce a stream");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "gave up after {:?} — the deadline did not apply",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn the_handshake_deadline_has_a_documented_default() {
+        assert_eq!(DEFAULT_HANDSHAKE_TIMEOUT_SECS, 10);
+    }
+
+    // ── persistence file permissions ────────────────────────────────────────
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn snapshot_and_sidecar_files_are_not_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("recached_perm_{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("perm-test.rdb");
+
+        write_private(&path, b"payload").await.unwrap();
+        let mode = tokio::fs::metadata(&path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "snapshots are plaintext dumps of the keyspace; 0644 lets any local user read the cache"
+        );
+
+        // A file left behind 0644 by an earlier version must be tightened on
+        // the next write, not keep its old mode forever.
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .await
+            .unwrap();
+        write_private(&path, b"payload2").await.unwrap();
+        let mode = tokio::fs::metadata(&path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "an existing loose mode must be fixed");
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"payload2");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn the_aof_is_not_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("recached_aofperm_{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("perm-test.aof");
+
+        // Pre-create it loose, as an upgrade from an earlier version would.
+        tokio::fs::write(&path, b"").await.unwrap();
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .await
+            .unwrap();
+
+        let writer = AofWriter::open(path.clone(), AofSync::No).await.unwrap();
+        writer.append(b"*1\r\n$4\r\nPING\r\n").await;
+        let mode = tokio::fs::metadata(&path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn temp_files_do_not_collide_between_processes() {
+        // A fixed `.tmp` name meant two servers sharing a data directory would
+        // clobber each other's half-written snapshot.
+        let a = temp_sibling(std::path::Path::new("/data/recached.rdb"), "snap");
+        assert!(
+            a.to_string_lossy()
+                .contains(&std::process::id().to_string()),
+            "{a:?}"
+        );
+        assert!(a.to_string_lossy().ends_with(".tmp"), "{a:?}");
+        assert_ne!(
+            a,
+            temp_sibling(std::path::Path::new("/data/recached.rdb"), "dedup")
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Durability: the guarantees `RECACHED_AOF_SYNC` and snapshot saving advertise.
+//
+// These assert reachability and effect rather than device-level durability — a
+// unit test cannot pull the power. What they pin is that the fsync path is
+// actually taken, that it does not corrupt or lose data, and that the pieces a
+// crash-consistency argument depends on (temp file synced before rename, parent
+// directory synced after) are wired up.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "recached_dur_{}_{}_{}",
+            name,
+            std::process::id(),
+            next_conn_id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    #[tokio::test]
+    async fn aof_always_survives_a_reopen_with_every_byte_intact() {
+        // `always` previously called flush(), which reaches the page cache and
+        // not the device. The observable part of the fix is that the fsync path
+        // runs and is still byte-exact.
+        let dir = scratch("aof_always");
+        let path = dir.join("a.aof");
+        let w = AofWriter::open(path.clone(), AofSync::Always)
+            .await
+            .unwrap();
+        for i in 0..64 {
+            w.append(format!("*1\r\n${}\r\n{}\r\n", i.to_string().len(), i).as_bytes())
+                .await;
+        }
+        drop(w);
+
+        let on_disk = tokio::fs::read(&path).await.unwrap();
+        let expected: Vec<u8> = (0..64)
+            .flat_map(|i| format!("*1\r\n${}\r\n{}\r\n", i.to_string().len(), i).into_bytes())
+            .collect();
+        assert_eq!(on_disk, expected, "fsync must not disturb the byte stream");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn aof_everysec_flush_is_idempotent_and_lossless() {
+        // The everysec ticker calls flush() on a cadence, including when nothing
+        // has been appended since the last tick.
+        let dir = scratch("aof_everysec");
+        let path = dir.join("b.aof");
+        let w = AofWriter::open(path.clone(), AofSync::EverySec)
+            .await
+            .unwrap();
+        w.append(b"*1\r\n$4\r\nPING\r\n").await;
+        w.flush().await;
+        w.flush().await; // nothing new to sync
+        assert_eq!(
+            tokio::fs::read(&path).await.unwrap(),
+            b"*1\r\n$4\r\nPING\r\n"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn truncating_the_aof_leaves_it_empty_and_reusable() {
+        // Truncation follows a snapshot, and is now fsynced so a crash cannot
+        // resurrect a log the snapshot already subsumed. It must also leave the
+        // handle writable — the server keeps appending to it afterwards.
+        let dir = scratch("aof_trunc");
+        let path = dir.join("c.aof");
+        let w = AofWriter::open(path.clone(), AofSync::No).await.unwrap();
+        w.append(b"*1\r\n$4\r\nPING\r\n").await;
+        w.truncate().await;
+        assert_eq!(tokio::fs::metadata(&path).await.unwrap().len(), 0);
+
+        w.append(b"*1\r\n$4\r\nECHO\r\n").await;
+        w.flush().await;
+        assert_eq!(
+            tokio::fs::read(&path).await.unwrap(),
+            b"*1\r\n$4\r\nECHO\r\n",
+            "the writer must still be usable after truncation"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_lands_atomically_and_leaves_no_temp_file() {
+        // The temp file is fsynced, renamed over the target, and then the
+        // directory is fsynced. A leftover temp file would mean the rename never
+        // happened, which is the failure this sequence exists to prevent.
+        let dir = scratch("snap");
+        let path = dir.join("dump.rdb");
+        let store = KeyValueStore::new();
+        for i in 0..32 {
+            store.execute(Command::Set(
+                format!("k{i}"),
+                format!("v{i}").into_bytes(),
+                Default::default(),
+            ));
+        }
+        let cfg = SnapshotConfig {
+            path: path.clone(),
+            last_save: AtomicI64::new(0),
+        };
+        save_snapshot(&store, &cfg).await;
+
+        assert!(path.exists(), "snapshot must exist after save");
+        assert!(
+            cfg.last_save.load(Ordering::Relaxed) > 0,
+            "a completed save must advance LASTSAVE"
+        );
+
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+
+        // And the bytes are a snapshot we can actually read back.
+        let restored = KeyValueStore::new();
+        assert!(load_snapshot(&restored, &path).await);
+        assert_eq!(
+            restored.execute(Command::Get("k7".into())),
+            Value::BulkString(Some(b"v7".to_vec()))
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn syncing_a_parent_directory_tolerates_odd_paths() {
+        // Best-effort by contract: a path with no parent, or one that does not
+        // exist, must warn rather than panic or hang. The snapshot path is
+        // frequently relative ("recached.rdb"), which has an empty parent.
+        sync_parent_dir(std::path::Path::new("recached.rdb")).await;
+        sync_parent_dir(std::path::Path::new("/")).await;
+        sync_parent_dir(std::path::Path::new("/nonexistent-recached-dir/x.rdb")).await;
+    }
+
+    #[test]
+    fn a_sync_token_cannot_grant_an_over_long_pattern() {
+        // Token patterns reach glob_match without passing through the command
+        // parser, so the cap has to be repeated there. These are matched once
+        // per key per write — the most expensive place a pattern can sit.
+        use base64::Engine as _;
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let secret = "s3cret";
+        let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let mint = |payload: &str| {
+            let p = engine.encode(payload);
+            let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+            mac.update(p.as_bytes());
+            format!("{}.{}", p, engine.encode(mac.finalize().into_bytes()))
+        };
+
+        let long = "a".repeat(core_engine::store::MAX_PATTERN_BYTES + 1);
+        let err = verify_sync_token(secret, &mint(&long))
+            .expect_err("an over-long granted pattern must be refused");
+        assert_eq!(err, "token grants an over-long pattern");
+
+        // One over-long pattern in an otherwise fine list is still refused.
+        assert!(verify_sync_token(secret, &mint(&format!("cart:*,{long}"))).is_err());
+
+        // A pattern exactly at the cap is still honoured.
+        let at_cap = "a".repeat(core_engine::store::MAX_PATTERN_BYTES);
+        assert_eq!(
+            verify_sync_token(secret, &mint(&at_cap)),
+            Ok(vec![at_cap.clone()])
+        );
+        assert_eq!(
+            verify_sync_token(secret, &mint("cart:42:*,user:1:*")),
+            Ok(vec!["cart:42:*".to_string(), "user:1:*".to_string()])
+        );
     }
 }

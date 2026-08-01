@@ -8,7 +8,9 @@ Recached is configured entirely through environment variables. There is no confi
 |---|---|---|
 | `RECACHED_BIND` | `0.0.0.0` | Network interface all listeners (TCP, WebSocket, replication, metrics) bind to. Defaults to `0.0.0.0` (all interfaces). Set to `127.0.0.1` to restrict the server to localhost — strongly recommended unless the server is deliberately public. |
 | `RECACHED_PASSWORD` | _(none)_ | Require clients to authenticate with `AUTH <password>`. If unset, the server accepts connections without authentication. After 5 consecutive failed `AUTH` attempts, the connection is closed. The password is compared in constant time. |
-| `RECACHED_ALLOW_IPS` | _(allow all)_ | Comma-separated list of IP addresses allowed to connect. Any connection from an IP not in the list is immediately closed. Invalid entries are logged and skipped. |
+| `RECACHED_ALLOW_IPS` | _(allow all)_ | Comma-separated list of exact IP addresses allowed to connect, applied to the RESP, WebSocket and replication listeners. Any connection from an IP not in the list is immediately closed. An entry that is not a valid IP address — including CIDR ranges and hostnames — makes the server **refuse to start**, rather than silently applying a narrower allowlist than configured. |
+| `RECACHED_ALLOWED_ORIGINS` | _(allow all)_ | Comma-separated list of exact origins (`https://app.example.com`, `http://localhost:3000`) permitted to open the WebSocket sync port. A handshake from any other origin is refused with `403`. `null` admits sandboxed iframes and `file://` documents. Clients that send no `Origin` header at all — every native client — are admitted. Unset accepts all origins with a startup warning. See [Security](/server/security#the-sync-port-is-a-different-threat-model). |
+| `RECACHED_HANDSHAKE_TIMEOUT` | `10` | Seconds a connection may take to complete its TLS and/or WebSocket handshake before being dropped. The connection permit is taken before the handshake runs, so without this a peer that connects and then says nothing would hold one of `RECACHED_MAX_CONNECTIONS` slots indefinitely. |
 | `RECACHED_SYNC_SECRET` | _(none)_ | Enables **strict sync scoping** on the WebSocket port: clients receive no mutation pushes and may run no key commands until they present a signed scope token (`SYNC TOKEN <token>`), and are then restricted to the keys their token grants. Without it, every WebSocket client receives every mutation. See [Sync Scopes](/server/sync-scopes). |
 | `RECACHED_MAX_KEYS` | _(unlimited)_ | Maximum number of keys in the store. When this limit is reached, behavior depends on `RECACHED_EVICTION`. If set to `noeviction` (the default), write commands that would exceed the cap return an error. |
 | `RECACHED_EVICTION` | `noeviction` | Eviction policy when `RECACHED_MAX_KEYS` is reached. See eviction policies below. |
@@ -17,21 +19,24 @@ Recached is configured entirely through environment variables. There is no confi
 | `RECACHED_SAVE` | _(none)_ | Multi-condition autosave policy as comma-separated `seconds:changes` pairs. A snapshot is triggered when **any** condition is satisfied: `elapsed_since_last_save >= seconds` **and** `dirty_writes >= changes`. Example: `"900:1,300:10,60:10000"` — save after 1 write in 15 min, 10 writes in 5 min, or 10 000 writes in 1 min. When set, `RECACHED_SAVE_INTERVAL` is ignored. Skips saves when no writes have occurred since the last snapshot. |
 | `RECACHED_SAVE_INTERVAL` | `900` | Autosave interval in seconds (single-condition fallback when `RECACHED_SAVE` is not set). The server saves automatically at this interval if at least one write has occurred since the last save. Set to `0` to disable autosave entirely (manual `SAVE`/`BGSAVE` still work). |
 | `RECACHED_AOF_PATH` | _(disabled)_ | Path to the append-only file. When set, every write command is appended to this file in addition to snapshot saves. On startup the snapshot is loaded first, then AOF commands are replayed for the delta. The AOF is truncated after each successful snapshot save. |
-| `RECACHED_AOF_SYNC` | `everysec` | AOF fsync policy. `always`: fsync after every write (safest, slowest). `everysec`: fsync once per second (default, good balance). `no`: let the OS decide (fastest, least safe). |
-| `RECACHED_MAX_CONNECTIONS` | `1024` | Maximum number of concurrent client connections (TCP + WebSocket combined). New connections are dropped when the limit is reached. |
+| `RECACHED_AOF_SYNC` | `everysec` | AOF fsync policy. `always`: fsync after every write — **see the throughput warning below before choosing this**. `everysec`: fsync once per second (default) — at most one second of acknowledged writes lost to a power cut. `no`: no explicit fsync, the OS decides. Prior to 0.2.4 all three only flushed to the operating system, so nothing was durable against power loss or a kernel panic regardless of the setting. |
+| `RECACHED_MAX_CONNECTIONS` | `1024` | Maximum number of concurrent connections (TCP + WebSocket + attached replicas, sharing one budget). New connections are dropped when the limit is reached. |
 | `RECACHED_EVICTION_SAMPLE` | `10` | Keys sampled per eviction pass. A larger sample approximates true LRU/TTL ordering more closely at the cost of more work per eviction — the knob Redis exposes as `maxmemory-samples`. |
 | `RECACHED_MAX_MULTI_QUEUE` | `10000` | Commands that may be queued inside one `MULTI`. |
 | `RECACHED_MAX_WATCHES_PER_CONN` | `1024` | Keys a single connection may `WATCH`. |
 | `RECACHED_MAX_LIVE_QUERIES` | `64` | Live queries (`QSUB`) a single connection may hold. |
 | `RECACHED_MAX_QSUB_INITIAL_KEYS` | `10000` | Keys returned in a live query's initial `qstate` reply. Beyond this the snapshot is truncated — narrow the pattern instead of raising it. |
-| `RECACHED_REPL_PORT` | `6381` | TCP port the primary listens on for incoming replica connections. Only active when `RECACHED_REPLICAOF` is not set (i.e. this server is a primary). |
-| `RECACHED_REPLICAOF` | _(none)_ | Set to `host:port` to run this server as a read-only replica. On startup it connects to the primary, receives a full snapshot, and then streams all subsequent writes. Reconnects automatically with exponential backoff on disconnect. |
-| `RECACHED_REPL_PASSWORD` | _(none)_ | Shared secret for the replication channel. When set, replicas must send this password during the handshake before receiving any data. Must match on both primary and replica. Strongly recommended for any network-exposed replication port. |
+| `RECACHED_REPL_ENABLE` | _(disabled)_ | Set to `1`/`true`/`yes`/`on` to bind the replication listener. **Required on every node that serves replicas**, including a replica serving sub-replicas. Without it the port is not bound at all. Enabling it on any interface other than loopback without `RECACHED_REPL_PASSWORD` makes the server **refuse to start**. An unrecognised value is also a startup error. |
+| `RECACHED_REPL_PORT` | `6381` | TCP port the replication listener binds, when `RECACHED_REPL_ENABLE` is set. Honours `RECACHED_ALLOW_IPS` and counts against `RECACHED_MAX_CONNECTIONS`. |
+| `RECACHED_REPLICAOF` | _(none)_ | Set to `host:port` to run this server as a read-only replica. On startup it connects to the primary, receives a full snapshot, and then streams all subsequent writes. Reconnects automatically with exponential backoff on disconnect. Independent of `RECACHED_REPL_ENABLE`, which governs only whether *this* node accepts replicas of its own. |
+| `RECACHED_REPL_PASSWORD` | _(none)_ | Shared secret for the replication channel. When set, replicas must send this password during the handshake before receiving any data. Must match on both primary and replica. **Mandatory** when the replication listener is enabled on a non-loopback interface. Failed attempts are throttled per source address. |
+| `RECACHED_REPL_TLS_CA` | _(none)_ | Path to a PEM file holding the **CA certificate** that issued the primary's certificate. Setting it enables **TLS on the outbound replication connection** and makes the primary's identity verified rather than assumed. Note this needs a real two-certificate chain — a single self-signed certificate is rejected as `CaUsedAsEndEntity`; see [Security → Encrypting replication](/server/security#encrypting-replication) for the `openssl` recipe. A public bundle such as `/etc/ssl/certs/ca-certificates.crt` works if the primary's certificate is publicly issued. Set on **replicas**. |
+| `RECACHED_REPL_TLS_SERVERNAME` | _(host of `RECACHED_REPLICAOF`)_ | Name to verify the primary's certificate against. Override when `RECACHED_REPLICAOF` points at an IP but the certificate names a host — a cert for `primary.internal` does not validate against `10.0.1.5` unless it carries that IP as a SAN. |
 | `RECACHED_FAILOVER_TIMEOUT` | _(disabled)_ | Seconds a replica waits with the primary unreachable before automatically promoting itself to primary. Set on replicas only. `0` or unset disables auto-failover — the replica reconnects indefinitely. See [auto-failover](#auto-failover) below. |
 | `RECACHED_REPL_BUFFER` | `4096` | Per-replica channel capacity (number of pending write frames buffered on the primary before a lagging replica is disconnected). A replica that falls this many writes behind is dropped and must reconnect from a fresh snapshot. Increase if replicas are on a consistently slow or high-latency link; decrease to reduce memory use per replica. |
 | `RECACHED_MAX_MEMORY` | _(unlimited)_ | Maximum approximate heap usage for the key-value store. Accepts a byte count or a human-readable suffix: `512mb`, `2gb`, `1073741824`. When the limit is exceeded, the background eviction loop runs the configured eviction policy. Has no effect when `RECACHED_EVICTION` is `noeviction`. |
-| `RECACHED_TLS_CERT` | _(none)_ | Path to a PEM-encoded TLS certificate file. TLS is enabled on both ports when this and `RECACHED_TLS_KEY` are set. |
-| `RECACHED_TLS_KEY` | _(none)_ | Path to a PEM-encoded TLS private key file. If either `RECACHED_TLS_CERT` or `RECACHED_TLS_KEY` is missing, the server falls back to plain TCP/WS. |
+| `RECACHED_TLS_CERT` | _(none)_ | Path to a PEM-encoded TLS certificate file. TLS is enabled on both client ports (RESP and WebSocket) when this and `RECACHED_TLS_KEY` are set. It does not cover the replication or metrics ports. |
+| `RECACHED_TLS_KEY` | _(none)_ | Path to a PEM-encoded TLS private key file. Set both this and `RECACHED_TLS_CERT` or neither — if exactly one is present the server **refuses to start** rather than silently serving plaintext. |
 | `RUST_LOG` | `info` | Log level. Accepts `error`, `warn`, `info`, `debug`, `trace`. Module-specific: `RUST_LOG=recached=debug,tokio=warn`. |
 
 ---
@@ -97,11 +102,11 @@ recached-server
 
 ```bash
 RECACHED_PASSWORD="secret" \
-RECACHED_ALLOW_IPS="127.0.0.1,10.0.0.0/8,192.168.1.100" \
+RECACHED_ALLOW_IPS="127.0.0.1,10.0.1.5,192.168.1.100" \
 recached-server
 ```
 
-Note: `RECACHED_ALLOW_IPS` accepts individual IP addresses. CIDR notation support depends on the version — check the release notes. If only specific hosts should connect, prefer TLS + auth over IP allowlisting in cloud environments where IPs rotate.
+`RECACHED_ALLOW_IPS` accepts **exact IP addresses only**. CIDR ranges and hostnames are not supported, and an entry that is not a valid address makes the server refuse to start rather than quietly applying a narrower allowlist than you wrote. In cloud environments where addresses rotate, prefer TLS plus authentication and enforce network boundaries with security groups.
 
 ### With TLS (secure RESP and WSS)
 
@@ -170,13 +175,49 @@ recached-server
 
 On startup: snapshot is loaded first, then any AOF commands written after the snapshot are replayed. The AOF is automatically truncated after each successful snapshot save.
 
+#### What each sync mode costs
+
+From 0.2.4 these modes genuinely `fsync`. Before that they only flushed to the operating system, so
+they were all roughly the speed of `no` and none of them survived a power cut — if you benchmarked
+`always` on an earlier version, that number was measuring the wrong thing.
+
+| Mode | Worst-case loss on power cut | Measured append cost |
+|---|---|---|
+| `no` | Everything the OS has not written back | ~40–50 µs |
+| `everysec` | Up to one second of writes | ~40–50 µs |
+| `always` | Nothing | **~20 ms** |
+
+::: danger `always` costs roughly 400× more per write
+The fsync happens while the AOF lock is held, so *every* writer in the process queues behind one disk
+barrier. Measured on macOS/APFS that is around 20 ms per append — **tens of writes per second, not
+tens of thousands.** The server logs a warning at startup when you select it.
+
+Choose `always` only when losing one second of acknowledged writes is genuinely unacceptable and you
+have measured the throughput on your own hardware. `everysec` is the default because it costs nothing
+measurable and bounds the loss to a second. Linux with ext4 or xfs is typically far faster than APFS
+here, so measure rather than assuming these numbers transfer.
+
+Note also that on macOS `fsync()` asks the OS to write back but does not force the drive to flush its
+own cache — `F_FULLFSYNC` is required for that, and Recached does not currently issue it. So on macOS
+`always` pays most of the cost of durability without the last step of the guarantee. Treat macOS as a
+development platform for this setting.
+:::
+
 ### With leader-follower replication
 
 Run a primary and one or more read-only replicas. Replicas receive a full snapshot on connect, then stream every subsequent write in real time.
 
+::: warning The replication listener is opt-in
+`RECACHED_REPL_ENABLE=1` is required on any node that accepts replicas. Without it port 6381 is
+not bound and replicas cannot attach. This changed in 0.2.4 — the port previously opened on every
+node by default, unauthenticated, which meant anyone who could reach it received the entire
+keyspace regardless of `RECACHED_PASSWORD`.
+:::
+
 ```bash
-# Primary (default replication port 6381, auth required)
+# Primary (serves replicas, so the listener is enabled and authenticated)
 RECACHED_SAVE_PATH="/data/recached.rdb" \
+RECACHED_REPL_ENABLE=1 \
 RECACHED_REPL_PORT="6381" \
 RECACHED_REPL_PASSWORD="repl-secret" \
 recached-server
@@ -186,6 +227,10 @@ RECACHED_REPLICAOF="primary-host:6381" \
 RECACHED_REPL_PASSWORD="repl-secret" \
 recached-server
 ```
+
+The replica above does **not** set `RECACHED_REPL_ENABLE`: it consumes replication but does not
+serve it. Add the variable only if that replica should itself accept sub-replicas (multi-tier
+replication).
 
 Replicas reconnect automatically with exponential backoff (2s → 4s → … → 30s cap) if the primary is temporarily unavailable. Write commands sent to a replica return `-READONLY`.
 
@@ -200,6 +245,7 @@ Set `RECACHED_FAILOVER_TIMEOUT` on the replica. If the primary is unreachable fo
 ```bash
 # Primary
 RECACHED_SAVE_PATH="/data/recached.rdb" \
+RECACHED_REPL_ENABLE=1 \
 RECACHED_REPL_PORT="6381" \
 RECACHED_REPL_PASSWORD="repl-secret" \
 recached-server

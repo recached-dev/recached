@@ -1,4 +1,32 @@
 use crate::resp::Value;
+use crate::store::MAX_PATTERN_BYTES;
+
+/// Reject a glob pattern longer than `MAX_PATTERN_BYTES`.
+///
+/// Matching costs O(pattern × text) and runs once per key for `KEYS`/`SCAN
+/// MATCH`, once per key per write for sync scopes, and once per published
+/// message per subscriber for `PSUBSCRIBE`. Pattern length was previously
+/// bounded only by `proto-max-bulk-len` (64 MB), so one command could occupy the
+/// process for an unbounded time. Rejected at parse time so no execution path
+/// has to think about it.
+fn check_pattern(p: &str) -> Result<(), String> {
+    if p.len() > MAX_PATTERN_BYTES {
+        return Err(format!(
+            "ERR pattern is too long ({} > {} bytes)",
+            p.len(),
+            MAX_PATTERN_BYTES
+        ));
+    }
+    Ok(())
+}
+
+/// `check_pattern` for a list of patterns.
+fn check_patterns(ps: &[String]) -> Result<(), String> {
+    for p in ps {
+        check_pattern(p)?;
+    }
+    Ok(())
+}
 
 // ── SET options ───────────────────────────────────────────────────────────────
 
@@ -41,6 +69,22 @@ pub struct ZAddOptions {
     pub incr: bool,
 }
 
+// ── Collection scan options ───────────────────────────────────────────────────
+
+/// Arguments shared by `HSCAN` / `SSCAN` / `ZSCAN`.
+///
+/// The cursor is an offset into the collection's name-ordered element list —
+/// the same scheme keyspace `SCAN` uses — so a cursor is only meaningful when
+/// the same `MATCH` is passed on every call of an iteration, as Redis requires.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ScanArgs {
+    pub cursor: u64,
+    pub pattern: Option<String>,
+    pub count: Option<usize>,
+    /// `HSCAN` only: reply with field names and no values (Redis 7.4).
+    pub novalues: bool,
+}
+
 // ── Command enum ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -55,6 +99,17 @@ pub enum Command {
     /// server, not the store, so the store refuses it. An empty section list
     /// means the default set.
     Info(Vec<String>),
+    /// `QUIT` — reply `+OK`, then close. Connection-level: only the connection
+    /// task can honour it, so the store never sees it.
+    Quit,
+    /// `CLIENT <subcommand> [arg ...]` — connection introspection. Held as the
+    /// raw argument list because every answer depends on the connection or on
+    /// the client registry, neither of which the store knows about.
+    Client(Vec<String>),
+    /// `CONFIG <subcommand> [arg ...]` — server configuration.
+    Config(Vec<String>),
+    /// `COMMAND [subcommand] [arg ...]` — the command catalog.
+    CommandQuery(Vec<String>),
     // ── Strings ──────────────────────────────────────────────────────────────
     Set(String, Vec<u8>, SetOptions),
     Get(String),
@@ -66,6 +121,10 @@ pub enum Command {
     Unlink(Vec<String>),
     Append(String, Vec<u8>),
     Strlen(String),
+    /// `GETRANGE key start end` — inclusive byte range, negative offsets
+    /// counting back from the end. The bounded counterpart of `GET`: reading a
+    /// window of a large value must not cost the whole value.
+    GetRange(String, i64, i64),
     GetSet(String, Vec<u8>),
     MGet(Vec<String>),
     MSet(Vec<(String, Vec<u8>)>),
@@ -105,6 +164,9 @@ pub enum Command {
     HExists(String, String),
     HSetNx(String, String, Vec<u8>),
     HMGet(String, Vec<String>),
+    /// `HSCAN key cursor [MATCH pat] [COUNT n] [NOVALUES]` — the bounded
+    /// counterpart of `HGETALL`, which has to clone an entire hash.
+    HScan(String, ScanArgs),
     // ── List ─────────────────────────────────────────────────────────────────
     LPush(String, Vec<Vec<u8>>),
     RPush(String, Vec<Vec<u8>>),
@@ -134,6 +196,9 @@ pub enum Command {
     SPop(String, Option<u64>),
     SRandMember(String, Option<i64>),
     SMove(String, String, String),
+    /// `SSCAN key cursor [MATCH pat] [COUNT n]` — the bounded counterpart of
+    /// `SMEMBERS`.
+    SScan(String, ScanArgs),
     // ── Sorted Set ───────────────────────────────────────────────────────────
     ZAdd(String, ZAddOptions, Vec<(f64, String)>),
     ZRange(String, i64, i64, bool),
@@ -148,6 +213,10 @@ pub enum Command {
     ZCard(String),
     ZIncrBy(String, f64, String),
     ZCount(String, String, String),
+    /// `ZSCAN key cursor [MATCH pat] [COUNT n]` — pages `member, score` pairs.
+    /// Ordered by member, not by score: the cursor is an offset, and only the
+    /// member ordering survives a score being updated mid-iteration.
+    ZScan(String, ScanArgs),
     // ── JSON ──────────────────────────────────────────────────────────────────
     /// JSET key path value — set JSON at a path (`$` = whole document).
     JSet(String, String, String),
@@ -279,6 +348,20 @@ impl Command {
                             .map(|v| extract_string(v).unwrap_or_default().to_lowercase())
                             .collect(),
                     )),
+                    "QUIT" => Ok(Command::Quit),
+                    // The subcommand and its arguments are carried through
+                    // verbatim. Parsing them here would split the knowledge of
+                    // what each subcommand means across two files, and every
+                    // answer is the connection layer's to give anyway.
+                    "CLIENT" => {
+                        need!(2);
+                        Ok(Command::Client(collect_strings(&mut arr[1..])))
+                    }
+                    "CONFIG" => {
+                        need!(2);
+                        Ok(Command::Config(collect_strings(&mut arr[1..])))
+                    }
+                    "COMMAND" => Ok(Command::CommandQuery(collect_strings(&mut arr[1..]))),
 
                     // ── Strings ───────────────────────────────────────────────
                     "SET" => {
@@ -382,6 +465,14 @@ impl Command {
                     "STRLEN" => {
                         need!(2);
                         Ok(Command::Strlen(extract_key(&arr[1])?))
+                    }
+                    "GETRANGE" => {
+                        need!(4);
+                        Ok(Command::GetRange(
+                            extract_key(&arr[1])?,
+                            extract_int(&arr[2])?,
+                            extract_int(&arr[3])?,
+                        ))
                     }
                     "GETSET" => {
                         need!(3);
@@ -533,41 +624,14 @@ impl Command {
                     }
                     "KEYS" => {
                         need!(2);
-                        Ok(Command::Keys(extract_string(&arr[1]).unwrap_or_default()))
+                        let pattern = extract_string(&arr[1]).unwrap_or_default();
+                        check_pattern(&pattern)?;
+                        Ok(Command::Keys(pattern))
                     }
                     "SCAN" => {
                         need!(2);
-                        let cursor = extract_string(&arr[1])
-                            .unwrap_or_default()
-                            .parse::<u64>()
-                            .map_err(|_| {
-                                "ERR value is not an integer or out of range".to_string()
-                            })?;
-                        let mut pattern = None;
-                        let mut count = None;
-                        let mut i = 2usize;
-                        while i < arr.len() {
-                            let opt = extract_string(&arr[i]).unwrap_or_default().to_uppercase();
-                            match opt.as_str() {
-                                "MATCH" => {
-                                    i += 1;
-                                    if i >= arr.len() {
-                                        return Err("ERR syntax error".to_string());
-                                    }
-                                    pattern = extract_string(&arr[i]);
-                                }
-                                "COUNT" => {
-                                    i += 1;
-                                    if i >= arr.len() {
-                                        return Err("ERR syntax error".to_string());
-                                    }
-                                    count = Some(extract_int(&arr[i])? as usize);
-                                }
-                                _ => return Err("ERR syntax error".to_string()),
-                            }
-                            i += 1;
-                        }
-                        Ok(Command::Scan(cursor, pattern, count))
+                        let args = parse_scan_args(&arr[1], &arr[2..], false)?;
+                        Ok(Command::Scan(args.cursor, args.pattern, args.count))
                     }
                     "DBSIZE" => Ok(Command::DbSize),
                     "FLUSHDB" => Ok(Command::FlushDb),
@@ -584,12 +648,16 @@ impl Command {
                     }
 
                     // ── Sync scoping ───────────────────────────────────────────
-                    "SYNC" => Ok(Command::Sync(
-                        arr[1..]
+                    "SYNC" => {
+                        let patterns: Vec<String> = arr[1..]
                             .iter()
                             .map(|v| extract_string(v).unwrap_or_default())
-                            .collect(),
-                    )),
+                            .collect();
+                        // A signed token is checked separately in the server
+                        // layer; this covers the inline-pattern form.
+                        check_patterns(&patterns)?;
+                        Ok(Command::Sync(patterns))
+                    }
 
                     // ── Exactly-once delivery ──────────────────────────────────
                     "DEDUP" => {
@@ -616,6 +684,7 @@ impl Command {
                         if pattern.is_empty() {
                             return Err("ERR QSUB requires a non-empty pattern".to_string());
                         }
+                        check_pattern(&pattern)?;
                         Ok(Command::QSub(pattern))
                     }
                     "QUNSUB" => {
@@ -624,6 +693,9 @@ impl Command {
                         } else {
                             None
                         };
+                        if let Some(p) = &pattern {
+                            check_pattern(p)?;
+                        }
                         Ok(Command::QUnsub(pattern))
                     }
 
@@ -761,6 +833,14 @@ impl Command {
                         let key = extract_key(&arr[1])?;
                         let fields = arr[2..].iter_mut().filter_map(take_string).collect();
                         Ok(Command::HMGet(key, fields))
+                    }
+                    "HSCAN" => {
+                        need!(3);
+                        let key = extract_key(&arr[1])?;
+                        Ok(Command::HScan(
+                            key,
+                            parse_scan_args(&arr[2], &arr[3..], true)?,
+                        ))
                     }
 
                     // ── List ───────────────────────────────────────────────────
@@ -952,6 +1032,14 @@ impl Command {
                             extract_string(&arr[3]).unwrap_or_default(),
                         ))
                     }
+                    "SSCAN" => {
+                        need!(3);
+                        let key = extract_key(&arr[1])?;
+                        Ok(Command::SScan(
+                            key,
+                            parse_scan_args(&arr[2], &arr[3..], false)?,
+                        ))
+                    }
 
                     // ── Sorted Set ─────────────────────────────────────────────
                     "ZADD" => {
@@ -1118,6 +1206,14 @@ impl Command {
                             extract_string(&arr[3]).unwrap_or_default(),
                         ))
                     }
+                    "ZSCAN" => {
+                        need!(3);
+                        let key = extract_key(&arr[1])?;
+                        Ok(Command::ZScan(
+                            key,
+                            parse_scan_args(&arr[2], &arr[3..], false)?,
+                        ))
+                    }
 
                     // ── Transactions ─────────────────────────────────────
                     "MULTI" => Ok(Command::Multi),
@@ -1136,13 +1232,20 @@ impl Command {
                     )),
                     "PSUBSCRIBE" => {
                         need!(2);
-                        Ok(Command::PSubscribe(
-                            arr[1..].iter_mut().filter_map(take_string).collect(),
-                        ))
+                        let patterns: Vec<String> =
+                            arr[1..].iter_mut().filter_map(take_string).collect();
+                        // Matched against every published channel name for the
+                        // life of the subscription, so an unbounded pattern here
+                        // taxes every PUBLISH, not just one command.
+                        check_patterns(&patterns)?;
+                        Ok(Command::PSubscribe(patterns))
                     }
-                    "PUNSUBSCRIBE" => Ok(Command::PUnsubscribe(
-                        arr[1..].iter_mut().filter_map(take_string).collect(),
-                    )),
+                    "PUNSUBSCRIBE" => {
+                        let patterns: Vec<String> =
+                            arr[1..].iter_mut().filter_map(take_string).collect();
+                        check_patterns(&patterns)?;
+                        Ok(Command::PUnsubscribe(patterns))
+                    }
                     "PUBLISH" => {
                         need!(3);
                         Ok(Command::Publish(
@@ -1217,6 +1320,12 @@ fn parse_rl_config(limit: &Value, window: &Value, cmd: &str) -> Result<(u64, u64
         return Err(format!("ERR window must be >= 1 in '{}' command", cmd));
     }
     Ok((limit as u64, window as u64))
+}
+
+/// Move every argument out as a string, for the commands whose arguments are
+/// an opaque subcommand tail (`CLIENT`, `CONFIG`, `COMMAND`).
+fn collect_strings(vals: &mut [Value]) -> Vec<String> {
+    vals.iter_mut().filter_map(take_string).collect()
 }
 
 fn extract_key(val: &Value) -> Result<String, String> {
@@ -1347,6 +1456,62 @@ fn extract_float(val: &Value) -> Result<f64, String> {
         Value::Integer(i) => Ok(*i as f64),
         _ => Err("ERR value is not a valid float".to_string()),
     }
+}
+
+/// Parse the `cursor [MATCH pat] [COUNT n] [NOVALUES]` tail shared by `SCAN`
+/// and the collection scans. `novalues_ok` gates the HSCAN-only token, so
+/// `SSCAN k 0 NOVALUES` is a syntax error rather than a silently ignored
+/// argument — a client that asked for a shape it did not get is worse off than
+/// one told no.
+fn parse_scan_args(
+    cursor: &Value,
+    tokens: &[Value],
+    novalues_ok: bool,
+) -> Result<ScanArgs, String> {
+    let cursor = extract_string(cursor)
+        .unwrap_or_default()
+        .parse::<u64>()
+        .map_err(|_| "ERR invalid cursor".to_string())?;
+    let mut args = ScanArgs {
+        cursor,
+        ..Default::default()
+    };
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let opt = extract_string(&tokens[i])
+            .unwrap_or_default()
+            .to_uppercase();
+        match opt.as_str() {
+            "MATCH" => {
+                i += 1;
+                if i >= tokens.len() {
+                    return Err("ERR syntax error".to_string());
+                }
+                let pattern = extract_string(&tokens[i]);
+                if let Some(p) = &pattern {
+                    check_pattern(p)?;
+                }
+                args.pattern = pattern;
+            }
+            "COUNT" => {
+                i += 1;
+                if i >= tokens.len() {
+                    return Err("ERR syntax error".to_string());
+                }
+                // Redis rejects a non-positive COUNT rather than treating it as
+                // "unbounded"; casting it to usize here would wrap into one.
+                let n = extract_int(&tokens[i])?;
+                if n < 1 {
+                    return Err("ERR syntax error".to_string());
+                }
+                args.count = Some(n as usize);
+            }
+            "NOVALUES" if novalues_ok => args.novalues = true,
+            _ => return Err("ERR syntax error".to_string()),
+        }
+        i += 1;
+    }
+    Ok(args)
 }
 
 /// Parse `[WITHSCORES] [LIMIT offset count]` options for ZRANGEBYSCORE / ZREVRANGEBYSCORE.
@@ -1866,6 +2031,109 @@ mod tests {
     }
 
     #[test]
+    fn handshake_commands_parse() {
+        assert_eq!(
+            Command::from_value(array(&["QUIT"])).unwrap(),
+            Command::Quit
+        );
+        assert_eq!(
+            Command::from_value(array(&["CLIENT", "SETINFO", "LIB-NAME", "node-redis"])).unwrap(),
+            Command::Client(vec![
+                "SETINFO".into(),
+                "LIB-NAME".into(),
+                "node-redis".into()
+            ])
+        );
+        assert_eq!(
+            Command::from_value(array(&["CONFIG", "GET", "maxmemory*"])).unwrap(),
+            Command::Config(vec!["GET".into(), "maxmemory*".into()])
+        );
+        // Bare COMMAND is valid and means "the whole catalog".
+        assert_eq!(
+            Command::from_value(array(&["COMMAND"])).unwrap(),
+            Command::CommandQuery(vec![])
+        );
+        assert_eq!(
+            Command::from_value(array(&["COMMAND", "DOCS", "get"])).unwrap(),
+            Command::CommandQuery(vec!["DOCS".into(), "get".into()])
+        );
+        // CLIENT and CONFIG need a subcommand; the arity check is the parser's.
+        assert!(Command::from_value(array(&["CLIENT"])).is_err());
+        assert!(Command::from_value(array(&["CONFIG"])).is_err());
+    }
+
+    #[test]
+    fn getrange_parse() {
+        assert_eq!(
+            Command::from_value(array(&["GETRANGE", "k", "0", "-1"])).unwrap(),
+            Command::GetRange("k".into(), 0, -1)
+        );
+        assert!(Command::from_value(array(&["GETRANGE", "k", "0"])).is_err());
+        assert!(Command::from_value(array(&["GETRANGE", "k", "0", "x"])).is_err());
+    }
+
+    #[test]
+    fn hscan_parse_full_options() {
+        assert_eq!(
+            Command::from_value(array(&[
+                "HSCAN", "h", "12", "MATCH", "u:*", "COUNT", "50", "NOVALUES"
+            ]))
+            .unwrap(),
+            Command::HScan(
+                "h".into(),
+                ScanArgs {
+                    cursor: 12,
+                    pattern: Some("u:*".into()),
+                    count: Some(50),
+                    novalues: true,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn sscan_and_zscan_parse_without_novalues() {
+        assert_eq!(
+            Command::from_value(array(&["SSCAN", "s", "0"])).unwrap(),
+            Command::SScan("s".into(), ScanArgs::default())
+        );
+        assert_eq!(
+            Command::from_value(array(&["ZSCAN", "z", "0", "COUNT", "3"])).unwrap(),
+            Command::ZScan(
+                "z".into(),
+                ScanArgs {
+                    count: Some(3),
+                    ..Default::default()
+                }
+            )
+        );
+        // NOVALUES is HSCAN-only. Accepting and ignoring it would hand back a
+        // reply shape the caller did not ask for.
+        assert!(Command::from_value(array(&["SSCAN", "s", "0", "NOVALUES"])).is_err());
+    }
+
+    #[test]
+    fn scan_family_rejects_bad_cursors_and_counts() {
+        for cmd in [
+            vec!["SCAN", "abc"],
+            vec!["HSCAN", "h", "abc"],
+            vec!["SSCAN", "s", "-1"],
+        ] {
+            let err = Command::from_value(array(&cmd)).unwrap_err();
+            assert_eq!(err, "ERR invalid cursor", "{cmd:?}");
+        }
+        for cmd in [
+            vec!["HSCAN", "h", "0", "COUNT", "0"],
+            vec!["SCAN", "0", "COUNT", "-5"],
+            vec!["ZSCAN", "z", "0", "MATCH"],
+            vec!["SSCAN", "s", "0", "BOGUS"],
+        ] {
+            let err = Command::from_value(array(&cmd)).unwrap_err();
+            assert_eq!(err, "ERR syntax error", "{cmd:?}");
+        }
+    }
+
+    #[test]
     fn rename_parse() {
         assert_eq!(
             Command::from_value(array(&["RENAME", "src", "dst"])).unwrap(),
@@ -2292,6 +2560,79 @@ mod parse_coverage_tests {
     // ── Live queries ──────────────────────────────────────────────────────────
 
     #[test]
+    fn over_long_glob_patterns_are_rejected_at_parse_time() {
+        // Matching is O(pattern x text) and runs once per key for KEYS, once per
+        // key per write for sync scopes, and once per published message per
+        // subscriber for PSUBSCRIBE. Length was previously bounded only by
+        // proto-max-bulk-len (64 MB), so one command could occupy the process
+        // for an unbounded time.
+        let long = "a".repeat(MAX_PATTERN_BYTES + 1);
+        let cases: Vec<Vec<String>> = vec![
+            vec!["KEYS".into(), long.clone()],
+            vec!["SCAN".into(), "0".into(), "MATCH".into(), long.clone()],
+            vec![
+                "HSCAN".into(),
+                "h".into(),
+                "0".into(),
+                "MATCH".into(),
+                long.clone(),
+            ],
+            vec![
+                "SSCAN".into(),
+                "s".into(),
+                "0".into(),
+                "MATCH".into(),
+                long.clone(),
+            ],
+            vec![
+                "ZSCAN".into(),
+                "z".into(),
+                "0".into(),
+                "MATCH".into(),
+                long.clone(),
+            ],
+            vec!["QSUB".into(), long.clone()],
+            vec!["QUNSUB".into(), long.clone()],
+            vec!["PSUBSCRIBE".into(), long.clone()],
+            vec!["PUNSUBSCRIBE".into(), long.clone()],
+            vec!["SYNC".into(), long.clone()],
+            vec!["SYNC".into(), "ok:*".into(), long.clone()],
+        ];
+        for args in cases {
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let err = parse(&refs)
+                .expect_err(&format!("{:?} should reject an over-long pattern", refs[0]));
+            assert!(
+                err.contains("pattern is too long"),
+                "{}: got {err}",
+                refs[0]
+            );
+        }
+    }
+
+    #[test]
+    fn a_pattern_exactly_at_the_cap_is_accepted() {
+        // Off-by-one here would reject the largest legitimate pattern.
+        let at_cap = "a".repeat(MAX_PATTERN_BYTES);
+        assert_eq!(
+            parse(&["KEYS", &at_cap]).unwrap(),
+            Command::Keys(at_cap.clone())
+        );
+        assert!(parse(&["PSUBSCRIBE", &at_cap]).is_ok());
+        assert!(parse(&["SYNC", &at_cap]).is_ok());
+    }
+
+    #[test]
+    fn ordinary_patterns_are_unaffected_by_the_cap() {
+        assert_eq!(
+            parse(&["KEYS", "user:*"]).unwrap(),
+            Command::Keys("user:*".into())
+        );
+        assert!(parse(&["SCAN", "0", "MATCH", "cart:42:*"]).is_ok());
+        assert!(parse(&["QSUB", "cart:*"]).is_ok());
+    }
+
+    #[test]
     fn qsub_requires_a_non_empty_pattern() {
         assert_eq!(
             parse(&["QSUB", "cart:*"]).unwrap(),
@@ -2406,6 +2747,9 @@ mod arity_and_error_tests {
             &["GETSET", "k"],
             &["APPEND", "k"],
             &["STRLEN"],
+            &["GETRANGE", "k", "0"],
+            &["CLIENT"],
+            &["CONFIG"],
             &["INCR"],
             &["DECR"],
             &["INCRBY", "k"],
@@ -2435,6 +2779,7 @@ mod arity_and_error_tests {
             &["HINCRBY", "h", "f"],
             &["HINCRBYFLOAT", "h", "f"],
             &["HSETNX", "h", "f"],
+            &["HSCAN", "h"],
             &["LPUSH", "l"],
             &["RPUSH", "l"],
             &["LPOP"],
@@ -2456,6 +2801,7 @@ mod arity_and_error_tests {
             &["SMOVE", "a", "b"],
             &["SPOP"],
             &["SRANDMEMBER"],
+            &["SSCAN", "s"],
             &["ZADD", "z", "1"],
             &["ZSCORE", "z"],
             &["ZREM", "z"],
@@ -2465,6 +2811,7 @@ mod arity_and_error_tests {
             &["ZRANGE", "z", "0"],
             &["ZREVRANGE", "z", "0"],
             &["ZCOUNT", "z", "0"],
+            &["ZSCAN", "z"],
             &["JSET", "j", "$"],
             &["JGET"],
             &["JMERGE", "j"],
