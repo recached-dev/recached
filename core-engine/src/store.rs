@@ -2936,36 +2936,71 @@ fn set_expiry(data: &DashMap<String, Entry>, key: String, ts_ms: u64) -> Value {
     }
 }
 
-/// Glob match with `*`, `?`, and `[abc]` classes — iterative DP, O(m × n),
-/// immune to backtracking blowup. Used by KEYS/SCAN and exported for the
-/// server layer's sync-scope filtering.
+/// Longest glob pattern accepted from a client, in bytes.
+///
+/// Matching is O(pattern × text) in the worst case and runs once per key for
+/// `KEYS`/`SCAN MATCH`, once per key per write for sync-scope filtering, and
+/// once per published message per subscriber for `PSUBSCRIBE`. Pattern length
+/// was previously bounded only by `proto-max-bulk-len` (64 MB), so a single
+/// `KEYS <very long pattern>` against a large keyspace could occupy the process
+/// for an unbounded time. No legitimate pattern is anywhere near this cap.
+pub const MAX_PATTERN_BYTES: usize = 1024;
+
+/// Glob match with `*` and `?` against raw bytes.
+///
+/// Two-pointer greedy matching with a single backtrack point: worst case
+/// O(pattern × text) time, and **no allocation at all**.
+///
+/// This is the third implementation. The first was recursive and backtracked
+/// exponentially on patterns like `*a*a*a*b`; the second fixed the time bound
+/// with an iterative DP but allocated two `Vec<bool>` of `text.len() + 1` on
+/// *every call*, so a single 64 MB value made `KEYS *` allocate 128 MB — on a
+/// path that runs once per key. The greedy form keeps the DP's time bound and
+/// needs no memory, which is why it replaced it.
+///
+/// Supports `*` (any run of bytes, including empty) and `?` (exactly one byte).
+/// **Character classes like `[abc]` are not supported** — brackets match
+/// literally, so `[ab]` matches the four-byte string `[ab]` and not `a`. An
+/// earlier version of this comment claimed class support; it was never
+/// implemented. Matching is byte-wise, so `?` matches one *byte* and a
+/// multi-byte UTF-8 character spans several positions.
 pub fn glob_match(pattern: &str, s: &str) -> bool {
     let pat = pattern.as_bytes();
     let text = s.as_bytes();
     let (m, n) = (pat.len(), text.len());
 
-    // Iterative DP: prev[j] = pat[..i] matches text[..j].
-    // This replaces a recursive matcher that had exponential worst-case
-    // backtracking on patterns like "*.*.*x" against long non-matching strings.
-    let mut prev = vec![false; n + 1];
-    let mut curr = vec![false; n + 1];
-    prev[0] = true;
+    let mut i = 0usize; // position in text
+    let mut j = 0usize; // position in pattern
+    // The most recent `*` and the text position it was first allowed to stop at.
+    // Only the latest `*` needs remembering: any backtracking an earlier one
+    // could do, the latest one can do too.
+    let mut star: Option<usize> = None;
+    let mut resume = 0usize;
 
-    for i in 1..=m {
-        curr[0] = pat[i - 1] == b'*' && prev[0];
-        for j in 1..=n {
-            curr[j] = if pat[i - 1] == b'*' {
-                prev[j] || curr[j - 1]
-            } else if pat[i - 1] == b'?' || pat[i - 1] == text[j - 1] {
-                prev[j - 1]
-            } else {
-                false
-            };
+    while i < n {
+        if j < m && (pat[j] == b'?' || pat[j] == text[i]) {
+            i += 1;
+            j += 1;
+        } else if j < m && pat[j] == b'*' {
+            star = Some(j);
+            j += 1;
+            resume = i;
+        } else if let Some(star_at) = star {
+            // The last `*` consumed too little — give it one more byte and
+            // retry. `resume` only ever advances, which is what bounds this.
+            j = star_at + 1;
+            resume += 1;
+            i = resume;
+        } else {
+            return false;
         }
-        std::mem::swap(&mut prev, &mut curr);
     }
 
-    prev[n]
+    // Any `*` left over matches the empty remainder; anything else does not.
+    while j < m && pat[j] == b'*' {
+        j += 1;
+    }
+    j == m
 }
 
 fn no_list_response(count: Option<u64>) -> Value {
@@ -5887,6 +5922,128 @@ mod critical_path_tests {
             "glob_match took {:?} — exponential backtracking has returned",
             start.elapsed()
         );
+    }
+
+    /// The DP implementation this replaced, kept as a reference oracle.
+    ///
+    /// `glob_match` is not just a `KEYS` helper — it decides sync-scope access,
+    /// so a rewrite that changed semantics anywhere would be a silent
+    /// authorisation change. Comparing against the previous implementation is
+    /// the only way to make "behaviour is unchanged" an assertion rather than a
+    /// claim.
+    fn glob_match_dp_reference(pattern: &str, s: &str) -> bool {
+        let pat = pattern.as_bytes();
+        let text = s.as_bytes();
+        let (m, n) = (pat.len(), text.len());
+        let mut prev = vec![false; n + 1];
+        let mut curr = vec![false; n + 1];
+        prev[0] = true;
+        for i in 1..=m {
+            curr[0] = pat[i - 1] == b'*' && prev[0];
+            for j in 1..=n {
+                curr[j] = if pat[i - 1] == b'*' {
+                    prev[j] || curr[j - 1]
+                } else if pat[i - 1] == b'?' || pat[i - 1] == text[j - 1] {
+                    prev[j - 1]
+                } else {
+                    false
+                };
+            }
+            std::mem::swap(&mut prev, &mut curr);
+        }
+        prev[n]
+    }
+
+    #[test]
+    fn glob_match_agrees_with_the_dp_reference_on_every_small_input() {
+        // Exhaustive rather than random: every pattern over {a, b, *, ?} up to
+        // length 5 against every text over {a, b} up to length 4. That is the
+        // whole space where `*` interacts with `?` and with literals, which is
+        // where a greedy matcher would differ from the DP if it were wrong.
+        let pat_alphabet = [b'a', b'b', b'*', b'?'];
+        let txt_alphabet = [b'a', b'b'];
+
+        fn all_strings(alphabet: &[u8], max_len: usize) -> Vec<String> {
+            let mut out = vec![String::new()];
+            let mut frontier = vec![String::new()];
+            for _ in 0..max_len {
+                let mut next = Vec::new();
+                for s in &frontier {
+                    for &c in alphabet {
+                        let mut t = s.clone();
+                        t.push(c as char);
+                        next.push(t);
+                    }
+                }
+                out.extend(next.iter().cloned());
+                frontier = next;
+            }
+            out
+        }
+
+        let patterns = all_strings(&pat_alphabet, 5);
+        let texts = all_strings(&txt_alphabet, 4);
+        let mut compared = 0usize;
+        for p in &patterns {
+            for t in &texts {
+                let got = glob_match(p, t);
+                let want = glob_match_dp_reference(p, t);
+                assert_eq!(got, want, "glob_match({p:?}, {t:?}) disagrees with the DP");
+                compared += 1;
+            }
+        }
+        // Guard against the loops silently collapsing to nothing.
+        assert!(compared > 20_000, "only compared {compared} pairs");
+    }
+
+    #[test]
+    fn glob_match_agrees_with_the_dp_reference_on_realistic_key_shapes() {
+        // The exhaustive sweep uses a two-letter alphabet, so it never produces
+        // a `:`-delimited key or a repeated-literal run — the shapes real
+        // patterns and real keys actually have.
+        let cases = [
+            ("cart:*", "cart:42:item:9"),
+            ("cart:42:*", "cart:99:item:1"),
+            ("*:secret", "a:b:c:secret"),
+            ("user:1*", "user:1:private"),
+            ("tenant:7:*", "tenant:7:orders:2024:11"),
+            ("*a*a*a*a*b", "aaaaaaaaaaaaaaaaaaaa"),
+            ("a*b*c*d", "axxbyyczzd"),
+            ("a*b*c*d", "axxbyyczz"),
+            ("?????", "abcde"),
+            ("*?", ""),
+            ("?*", "x"),
+            ("**?**", "xy"),
+            ("session:*:token", "session:abc:token"),
+            ("session:*:token", "session::token"),
+            ("[ab]", "a"),
+            ("[ab]", "[ab]"),
+        ];
+        for (p, t) in cases {
+            assert_eq!(
+                glob_match(p, t),
+                glob_match_dp_reference(p, t),
+                "glob_match({p:?}, {t:?}) disagrees with the DP"
+            );
+        }
+    }
+
+    #[test]
+    fn glob_match_does_not_allocate_per_call() {
+        // The DP allocated two Vec<bool> of text.len() + 1 on every call, so one
+        // 64 MB value made `KEYS *` request 128 MB — on a path that runs once
+        // per key. A long text must now cost nothing but time.
+        let long = "k".repeat(4 * 1024 * 1024);
+        assert!(glob_match("*", &long));
+        assert!(glob_match("k*k", &long));
+        assert!(!glob_match("*z", &long));
+    }
+
+    #[test]
+    fn glob_pattern_cap_is_generous_but_finite() {
+        // Enforced where patterns are parsed, not here — this pins the value so
+        // it cannot drift without someone noticing.
+        assert_eq!(MAX_PATTERN_BYTES, 1024);
     }
 
     #[test]

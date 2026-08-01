@@ -14,7 +14,19 @@ WebSocket-only (the TCP port is for trusted backends and is unaffected).
 | `SYNC TOKEN <token>` | Sets scopes from a signed token — requires `RECACHED_SYNC_SECRET` on the server. |
 | `SYNC <pattern> [pattern ...]` | Sets scopes directly. Only allowed when no secret is configured — this is a bandwidth filter, **not** an authorization boundary. |
 
-Patterns are the same globs `KEYS` uses: `*`, `?`, `[abc]` — e.g. `cart:42:*`, `catalog:*`.
+Patterns are the same globs `KEYS` uses: `*` matches any sequence of bytes and `?` matches exactly
+one byte — e.g. `cart:42:*`, `catalog:*`.
+
+::: warning Character classes are not supported
+`[abc]` is **not** a character class here; the brackets match literally. Earlier versions of this
+page said otherwise. A scope written as `user:[12]:*` therefore grants access to keys beginning with
+the literal text `user:[12]:`, and matches nothing a normal application writes — it fails closed, but
+it does not grant what its author intended. Enumerate the prefixes instead:
+`user:1:*,user:2:*`.
+
+Patterns are capped at 1,024 bytes. Matching is byte-wise, so `?` matches one *byte* and a
+multi-byte UTF-8 character spans several positions.
+:::
 
 ## Two modes
 

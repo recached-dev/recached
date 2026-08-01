@@ -222,10 +222,6 @@ What it does **not** defend against, and you should not assume:
 - **No encryption at rest.** Snapshots and AOF files are plaintext MessagePack. They are created
   `0600` so other local users cannot read them, but anyone who can read them as the server's user,
   or who obtains the disk, has the whole keyspace. Use disk encryption.
-- **`always` and `everysec` do not fsync yet.** `RECACHED_AOF_SYNC` currently flushes to the
-  operating system rather than to the storage device, so acknowledged writes survive a process crash
-  but not a power loss or kernel panic. This is a known gap being closed; do not rely on the AOF as
-  a durability boundary against hardware failure.
 - **No rate limiting on the RESP port.** `RLSET`/`RLCHECK` are commands you can use for *your*
   application's rate limiting; they do not throttle clients of the cache itself.
 - **No third-party security review.** The sync layer in particular is young. See

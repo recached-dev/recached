@@ -146,6 +146,63 @@ cannot attach.
   write. Snapshot and dedup temp files also carry the process id, so two servers sharing a data
   directory can no longer clobber each other's half-written file.
 
+- **The RESP parser no longer reserves memory for a count it has not received.** An aggregate header
+  declares how many elements follow and arrives before any of them, and the parser reserved capacity
+  for the declared count. Nine bytes — `*1000000\r\n` — reserved 32 MB, and nesting that to the depth
+  limit made 160 bytes of input request **512 MB**. Because an incomplete frame is re-parsed from the
+  start whenever more bytes arrive, a client dripping one byte per packet repeated the reservation on
+  every packet, and none of it counted against `RECACHED_MAX_MEMORY`, which tracks stored data only.
+
+  Reservations are now capped at 1,024 elements, so allocation is proportional to bytes *received*
+  rather than bytes *claimed*: the same two inputs now cost 32 KB and 512 KB. The cap is a floor and
+  not a limit — aggregates larger than 1,024 elements still parse in full, and `proto-max-bulk-len`
+  and the million-element ceiling are unchanged.
+
+- **Glob patterns are capped at 1,024 bytes** for `KEYS`, `SCAN`/`HSCAN`/`SSCAN`/`ZSCAN MATCH`,
+  `QSUB`, `PSUBSCRIBE`, `SYNC` scopes and signed sync tokens, reported as
+  `ERR pattern is too long`. Matching costs O(pattern × text) and runs once per key for `KEYS`, once
+  per key per write for sync scopes, and once per published message per subscriber for `PSUBSCRIBE`;
+  pattern length was previously bounded only by `proto-max-bulk-len` at 64 MB, so a single command
+  could occupy the process for an unbounded time. No legitimate pattern is near the cap.
+
+### Fixed
+
+- **`RECACHED_AOF_SYNC` now actually fsyncs.** `always` and `everysec` called `flush()`, which pushes
+  the buffer into a `write` syscall and leaves the bytes in the page cache — so acknowledged writes
+  survived a process crash but *not* a power loss or kernel panic, which is the case `always` exists
+  to cover. Both now `fsync`. The AOF truncation that follows a snapshot is fsynced too, so a crash
+  cannot resurrect a log the snapshot has already subsumed.
+
+  Snapshots gained the same treatment: the temp file is fsynced before the rename, and the containing
+  **directory** is fsynced after it. Without the second step the file contents were durable but the
+  directory entry naming them was not, so a crash could leave the previous snapshot or none at all.
+
+  ::: danger `always` is now roughly 400× more expensive per write
+  It was never doing the work, so it never cost anything. Measured on macOS/APFS: `no` and `everysec`
+  both run ~40–50 µs per append, `always` runs **~20 ms** — tens of writes per second rather than tens
+  of thousands, because the fsync is held inside the AOF lock and every writer queues behind it. The
+  server now logs a warning at startup when `always` is selected.
+
+  If you benchmarked `always` on an earlier version and found it acceptable, re-measure: that number
+  was the cost of a `write` syscall, not of durability. `everysec` remains the default and costs
+  nothing measurable. See [Configuration](/server/configuration#what-each-sync-mode-costs).
+  :::
+
+- **`glob_match` no longer allocates.** It ran an O(pattern × text) dynamic program that allocated two
+  `Vec<bool>` of `text.len() + 1` on **every call**, so one 64 MB value made `KEYS *` request 128 MB
+  on a path that runs once per key. Replaced with two-pointer greedy matching: same worst-case time
+  bound, zero allocation. Semantics are unchanged, verified by differential testing against the
+  previous implementation over every pattern of up to 5 bytes drawn from `{a, b, *, ?}` against every
+  text of up to 4 bytes drawn from `{a, b}`.
+
+- **Documentation: glob character classes were never supported.** `commands.md`, `sync-scopes.md` and
+  the `glob_match` doc comment all described `[abc]` as a character class. It has never been
+  implemented — brackets match literally, so `[ab]` matches the four-byte string `[ab]` and not `a`.
+  This matters most for sync scopes: a scope written `user:[12]:*` grants access to keys starting with
+  the literal text `user:[12]:` and matches nothing a normal application writes. It fails closed, so
+  no data was over-exposed, but a scope written that way never granted what its author intended.
+  Enumerate prefixes instead — `user:1:*,user:2:*`.
+
 ### Changed
 
 - **`SCAN` now rejects `COUNT 0` and negative counts** with `ERR syntax error`, as Redis does.

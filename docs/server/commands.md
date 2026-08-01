@@ -157,7 +157,7 @@ The most common data type. Values are always stored as byte strings; numeric ope
 | `EXISTS key [key ...]` | Returns the number of keys that exist among the provided arguments. A key listed multiple times counts multiple times. |
 | `TYPE key` | Returns the type of the value stored at key: `string`, `hash`, `list`, `set`, `zset`, `ratelimit`, or `none` if the key does not exist. |
 | `RENAME key newkey` | Renames a key. Returns an error if the source key does not exist. Overwrites `newkey` if it already exists. |
-| `KEYS pattern` | Returns all keys matching the glob pattern. `*` matches any sequence of characters, `?` matches a single character, `[abc]` matches a character class. Warning: `KEYS *` on a large store is slow — prefer `SCAN`. |
+| `KEYS pattern` | Returns all keys matching the glob pattern. `*` matches any sequence of bytes, `?` matches exactly one byte. **Character classes (`[abc]`) are not supported** — brackets match literally. Patterns are capped at 1,024 bytes. Warning: `KEYS *` on a large store is slow — prefer `SCAN`. |
 | `SCAN cursor [MATCH pattern] [COUNT count]` | Iterates keys incrementally, returning at most `COUNT` keys per call (default 10) plus the next cursor. Start with cursor `0` and continue until the returned cursor is `0`. `MATCH` filters results by glob pattern. As in Redis, keys inserted or deleted mid-iteration may be missed or returned twice. |
 | `DBSIZE` | Returns the total number of keys in the store. |
 | `FLUSHDB [ASYNC]` | Removes all keys from the store. `ASYNC` is accepted but does not change behavior (the flush is always synchronous). |
@@ -453,7 +453,7 @@ Pub/Sub works over both TCP (port 6379) and WebSocket (port 6380).
 |---|---|
 | `SUBSCRIBE channel [channel ...]` | Subscribes the client to one or more channels. The client enters pub/sub mode and can only use pub/sub commands until it unsubscribes. |
 | `UNSUBSCRIBE [channel ...]` | Unsubscribes from the given channels. With no arguments, unsubscribes from all channels. |
-| `PSUBSCRIBE pattern [pattern ...]` | Subscribes to channels matching a glob pattern. `*` matches any sequence, `?` matches any single character, `[abc]` matches a character class. |
+| `PSUBSCRIBE pattern [pattern ...]` | Subscribes to channels matching a glob pattern. `*` matches any sequence of bytes, `?` matches exactly one byte. **Character classes (`[abc]`) are not supported** — brackets match literally. Patterns are capped at 1,024 bytes. |
 | `PUNSUBSCRIBE [pattern ...]` | Unsubscribes from pattern subscriptions. With no arguments, unsubscribes from all patterns. |
 | `PUBLISH channel message` | Publishes a message to all subscribers of the given channel and all clients with matching pattern subscriptions. Returns the number of clients that received the message. |
 

@@ -19,7 +19,7 @@ Recached is configured entirely through environment variables. There is no confi
 | `RECACHED_SAVE` | _(none)_ | Multi-condition autosave policy as comma-separated `seconds:changes` pairs. A snapshot is triggered when **any** condition is satisfied: `elapsed_since_last_save >= seconds` **and** `dirty_writes >= changes`. Example: `"900:1,300:10,60:10000"` — save after 1 write in 15 min, 10 writes in 5 min, or 10 000 writes in 1 min. When set, `RECACHED_SAVE_INTERVAL` is ignored. Skips saves when no writes have occurred since the last snapshot. |
 | `RECACHED_SAVE_INTERVAL` | `900` | Autosave interval in seconds (single-condition fallback when `RECACHED_SAVE` is not set). The server saves automatically at this interval if at least one write has occurred since the last save. Set to `0` to disable autosave entirely (manual `SAVE`/`BGSAVE` still work). |
 | `RECACHED_AOF_PATH` | _(disabled)_ | Path to the append-only file. When set, every write command is appended to this file in addition to snapshot saves. On startup the snapshot is loaded first, then AOF commands are replayed for the delta. The AOF is truncated after each successful snapshot save. |
-| `RECACHED_AOF_SYNC` | `everysec` | AOF flush policy. `always`: flush after every write. `everysec`: flush once per second (default). `no`: let the OS decide. **These currently flush to the operating system, not to the storage device** — acknowledged writes survive a process crash but not a power loss or kernel panic. Earlier versions of this table described them as `fsync`; that was inaccurate. Real `fsync` is a known gap being closed. |
+| `RECACHED_AOF_SYNC` | `everysec` | AOF fsync policy. `always`: fsync after every write — **see the throughput warning below before choosing this**. `everysec`: fsync once per second (default) — at most one second of acknowledged writes lost to a power cut. `no`: no explicit fsync, the OS decides. Prior to 0.2.4 all three only flushed to the operating system, so nothing was durable against power loss or a kernel panic regardless of the setting. |
 | `RECACHED_MAX_CONNECTIONS` | `1024` | Maximum number of concurrent connections (TCP + WebSocket + attached replicas, sharing one budget). New connections are dropped when the limit is reached. |
 | `RECACHED_EVICTION_SAMPLE` | `10` | Keys sampled per eviction pass. A larger sample approximates true LRU/TTL ordering more closely at the cost of more work per eviction — the knob Redis exposes as `maxmemory-samples`. |
 | `RECACHED_MAX_MULTI_QUEUE` | `10000` | Commands that may be queued inside one `MULTI`. |
@@ -172,6 +172,34 @@ recached-server
 ```
 
 On startup: snapshot is loaded first, then any AOF commands written after the snapshot are replayed. The AOF is automatically truncated after each successful snapshot save.
+
+#### What each sync mode costs
+
+From 0.2.4 these modes genuinely `fsync`. Before that they only flushed to the operating system, so
+they were all roughly the speed of `no` and none of them survived a power cut — if you benchmarked
+`always` on an earlier version, that number was measuring the wrong thing.
+
+| Mode | Worst-case loss on power cut | Measured append cost |
+|---|---|---|
+| `no` | Everything the OS has not written back | ~40–50 µs |
+| `everysec` | Up to one second of writes | ~40–50 µs |
+| `always` | Nothing | **~20 ms** |
+
+::: danger `always` costs roughly 400× more per write
+The fsync happens while the AOF lock is held, so *every* writer in the process queues behind one disk
+barrier. Measured on macOS/APFS that is around 20 ms per append — **tens of writes per second, not
+tens of thousands.** The server logs a warning at startup when you select it.
+
+Choose `always` only when losing one second of acknowledged writes is genuinely unacceptable and you
+have measured the throughput on your own hardware. `everysec` is the default because it costs nothing
+measurable and bounds the loss to a second. Linux with ext4 or xfs is typically far faster than APFS
+here, so measure rather than assuming these numbers transfer.
+
+Note also that on macOS `fsync()` asks the OS to write back but does not force the drive to flush its
+own cache — `F_FULLFSYNC` is required for that, and Recached does not currently issue it. So on macOS
+`always` pays most of the cost of durability without the last step of the guarantee. Treat macOS as a
+development platform for this setting.
+:::
 
 ### With leader-follower replication
 

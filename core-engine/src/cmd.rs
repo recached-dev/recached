@@ -1,4 +1,32 @@
 use crate::resp::Value;
+use crate::store::MAX_PATTERN_BYTES;
+
+/// Reject a glob pattern longer than `MAX_PATTERN_BYTES`.
+///
+/// Matching costs O(pattern × text) and runs once per key for `KEYS`/`SCAN
+/// MATCH`, once per key per write for sync scopes, and once per published
+/// message per subscriber for `PSUBSCRIBE`. Pattern length was previously
+/// bounded only by `proto-max-bulk-len` (64 MB), so one command could occupy the
+/// process for an unbounded time. Rejected at parse time so no execution path
+/// has to think about it.
+fn check_pattern(p: &str) -> Result<(), String> {
+    if p.len() > MAX_PATTERN_BYTES {
+        return Err(format!(
+            "ERR pattern is too long ({} > {} bytes)",
+            p.len(),
+            MAX_PATTERN_BYTES
+        ));
+    }
+    Ok(())
+}
+
+/// `check_pattern` for a list of patterns.
+fn check_patterns(ps: &[String]) -> Result<(), String> {
+    for p in ps {
+        check_pattern(p)?;
+    }
+    Ok(())
+}
 
 // ── SET options ───────────────────────────────────────────────────────────────
 
@@ -596,7 +624,9 @@ impl Command {
                     }
                     "KEYS" => {
                         need!(2);
-                        Ok(Command::Keys(extract_string(&arr[1]).unwrap_or_default()))
+                        let pattern = extract_string(&arr[1]).unwrap_or_default();
+                        check_pattern(&pattern)?;
+                        Ok(Command::Keys(pattern))
                     }
                     "SCAN" => {
                         need!(2);
@@ -618,12 +648,16 @@ impl Command {
                     }
 
                     // ── Sync scoping ───────────────────────────────────────────
-                    "SYNC" => Ok(Command::Sync(
-                        arr[1..]
+                    "SYNC" => {
+                        let patterns: Vec<String> = arr[1..]
                             .iter()
                             .map(|v| extract_string(v).unwrap_or_default())
-                            .collect(),
-                    )),
+                            .collect();
+                        // A signed token is checked separately in the server
+                        // layer; this covers the inline-pattern form.
+                        check_patterns(&patterns)?;
+                        Ok(Command::Sync(patterns))
+                    }
 
                     // ── Exactly-once delivery ──────────────────────────────────
                     "DEDUP" => {
@@ -650,6 +684,7 @@ impl Command {
                         if pattern.is_empty() {
                             return Err("ERR QSUB requires a non-empty pattern".to_string());
                         }
+                        check_pattern(&pattern)?;
                         Ok(Command::QSub(pattern))
                     }
                     "QUNSUB" => {
@@ -658,6 +693,9 @@ impl Command {
                         } else {
                             None
                         };
+                        if let Some(p) = &pattern {
+                            check_pattern(p)?;
+                        }
                         Ok(Command::QUnsub(pattern))
                     }
 
@@ -1194,13 +1232,20 @@ impl Command {
                     )),
                     "PSUBSCRIBE" => {
                         need!(2);
-                        Ok(Command::PSubscribe(
-                            arr[1..].iter_mut().filter_map(take_string).collect(),
-                        ))
+                        let patterns: Vec<String> =
+                            arr[1..].iter_mut().filter_map(take_string).collect();
+                        // Matched against every published channel name for the
+                        // life of the subscription, so an unbounded pattern here
+                        // taxes every PUBLISH, not just one command.
+                        check_patterns(&patterns)?;
+                        Ok(Command::PSubscribe(patterns))
                     }
-                    "PUNSUBSCRIBE" => Ok(Command::PUnsubscribe(
-                        arr[1..].iter_mut().filter_map(take_string).collect(),
-                    )),
+                    "PUNSUBSCRIBE" => {
+                        let patterns: Vec<String> =
+                            arr[1..].iter_mut().filter_map(take_string).collect();
+                        check_patterns(&patterns)?;
+                        Ok(Command::PUnsubscribe(patterns))
+                    }
                     "PUBLISH" => {
                         need!(3);
                         Ok(Command::Publish(
@@ -1442,7 +1487,11 @@ fn parse_scan_args(
                 if i >= tokens.len() {
                     return Err("ERR syntax error".to_string());
                 }
-                args.pattern = extract_string(&tokens[i]);
+                let pattern = extract_string(&tokens[i]);
+                if let Some(p) = &pattern {
+                    check_pattern(p)?;
+                }
+                args.pattern = pattern;
             }
             "COUNT" => {
                 i += 1;
@@ -2509,6 +2558,79 @@ mod parse_coverage_tests {
     }
 
     // ── Live queries ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn over_long_glob_patterns_are_rejected_at_parse_time() {
+        // Matching is O(pattern x text) and runs once per key for KEYS, once per
+        // key per write for sync scopes, and once per published message per
+        // subscriber for PSUBSCRIBE. Length was previously bounded only by
+        // proto-max-bulk-len (64 MB), so one command could occupy the process
+        // for an unbounded time.
+        let long = "a".repeat(MAX_PATTERN_BYTES + 1);
+        let cases: Vec<Vec<String>> = vec![
+            vec!["KEYS".into(), long.clone()],
+            vec!["SCAN".into(), "0".into(), "MATCH".into(), long.clone()],
+            vec![
+                "HSCAN".into(),
+                "h".into(),
+                "0".into(),
+                "MATCH".into(),
+                long.clone(),
+            ],
+            vec![
+                "SSCAN".into(),
+                "s".into(),
+                "0".into(),
+                "MATCH".into(),
+                long.clone(),
+            ],
+            vec![
+                "ZSCAN".into(),
+                "z".into(),
+                "0".into(),
+                "MATCH".into(),
+                long.clone(),
+            ],
+            vec!["QSUB".into(), long.clone()],
+            vec!["QUNSUB".into(), long.clone()],
+            vec!["PSUBSCRIBE".into(), long.clone()],
+            vec!["PUNSUBSCRIBE".into(), long.clone()],
+            vec!["SYNC".into(), long.clone()],
+            vec!["SYNC".into(), "ok:*".into(), long.clone()],
+        ];
+        for args in cases {
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let err = parse(&refs)
+                .expect_err(&format!("{:?} should reject an over-long pattern", refs[0]));
+            assert!(
+                err.contains("pattern is too long"),
+                "{}: got {err}",
+                refs[0]
+            );
+        }
+    }
+
+    #[test]
+    fn a_pattern_exactly_at_the_cap_is_accepted() {
+        // Off-by-one here would reject the largest legitimate pattern.
+        let at_cap = "a".repeat(MAX_PATTERN_BYTES);
+        assert_eq!(
+            parse(&["KEYS", &at_cap]).unwrap(),
+            Command::Keys(at_cap.clone())
+        );
+        assert!(parse(&["PSUBSCRIBE", &at_cap]).is_ok());
+        assert!(parse(&["SYNC", &at_cap]).is_ok());
+    }
+
+    #[test]
+    fn ordinary_patterns_are_unaffected_by_the_cap() {
+        assert_eq!(
+            parse(&["KEYS", "user:*"]).unwrap(),
+            Command::Keys("user:*".into())
+        );
+        assert!(parse(&["SCAN", "0", "MATCH", "cart:42:*"]).is_ok());
+        assert!(parse(&["QSUB", "cart:*"]).is_ok());
+    }
 
     #[test]
     fn qsub_requires_a_non_empty_pattern() {
