@@ -7240,7 +7240,7 @@ mod tests {
         let store = KeyValueStore::new();
         let payload = info_for(&[], &store);
         for section in DEFAULT_INFO_SECTIONS {
-            let header = format!("# {}{}\r\n", &section[..1].to_uppercase(), &section[1..]);
+            let header = format!("# {}{}\r\n", section[..1].to_uppercase(), &section[1..]);
             assert!(
                 payload.contains(&header),
                 "missing section header {header:?} in {payload:?}"
