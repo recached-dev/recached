@@ -4,6 +4,95 @@ All notable changes to Recached are documented here.
 
 ---
 
+## [0.2.4] — Unreleased
+
+### Added
+
+- **`QUIT`.** Every client library closes a connection by sending `QUIT` and reading `+OK`.
+  Recached answered `ERR unknown command`, and node-redis surfaced that as a thrown error from
+  `.quit()` — a clean shutdown reported as a failure. It now replies `+OK` and closes. Answered
+  before the authentication gate and before the subscribe-mode gate, as Redis does: a client that
+  cannot authenticate, or is parked in subscribe mode, still deserves a clean close rather than a
+  dropped socket. The subscribe-mode error already claimed `QUIT` was allowed there; now it is.
+
+- **`CLIENT ID | INFO | LIST | GETNAME | SETNAME | SETINFO`.** node-redis, ioredis, redis-py and
+  go-redis all send `CLIENT SETINFO LIB-NAME` and `LIB-VER` immediately after `HELLO`. All four
+  tolerate the error, so nothing broke — but every connection from every modern client logged two
+  or three `unknown command` errors before doing any work, and the server could not say which
+  library was on the other end of a connection. `CLIENT LIST` and `CLIENT INFO` report in Redis's
+  `key=value` line format, carrying the fields Recached can answer truthfully — id, addresses,
+  name, age, subscription counts, protocol, library — and omitting the buffer sizes, file
+  descriptors and event masks it cannot. A plausible invented `omem` is worse than an absent one,
+  because nothing downstream can tell the difference. `CLIENT KILL`, `NO-EVICT` and `UNPAUSE`
+  return "unknown subcommand" rather than `+OK`: answering OK without doing the thing would leave
+  a caller believing a connection had been closed or eviction disabled.
+
+- **`CONFIG GET`.** Reports `maxmemory`, `maxmemory-policy`, `maxclients`, `port`, `tls-port`,
+  `appendonly`, `databases`, `requirepass`, `proto-max-bulk-len`, `timeout` and `save`, resolved
+  from the values actually in force rather than a table of defaults — the eviction policy comes
+  from the store, the ports and limits from the same startup facts `INFO` reads. Glob patterns and
+  multiple names work as in Redis. `requirepass` is masked to `*`: whether a password exists is not
+  a secret, its value is. **`CONFIG SET` is refused with an explanatory error.** Recached reads its
+  configuration from the environment at startup and holds it for the life of the process, so there
+  is nothing a runtime SET could change; returning `+OK` would leave an operator to discover much
+  later that the limit they set never applied.
+
+- **`COMMAND`, `COMMAND COUNT`, `COMMAND LIST`, `COMMAND INFO`, `COMMAND DOCS`.** Backed by a new
+  `core-engine::catalog` module holding one row per command. Arity, flags and key positions are
+  transcribed from a real `redis-server` 7.2.5's own `COMMAND INFO` rather than written from
+  memory: cluster-aware clients and proxies route on `first_key`/`step`, and a wrong arity makes a
+  client reject a call the server would have accepted. Summaries come from
+  `docs/server/commands.md`, so the text a client sees is the text that was reviewed and published.
+  The catalog cannot drift from the parser: one test asserts every catalog row names a command the
+  parser accepts, and another walks the exhaustive `Command` variant table asserting every command
+  has a row.
+
+  Worth recording, since it contradicts a guess made while planning this work: **no client library
+  sends `COMMAND DOCS` or `CONFIG GET` during connect.** Tapping the wire for node-redis 6.2.0,
+  ioredis 6.0.0, redis-py 8.1.0 and go-redis 9.21.0 showed all four opening with `HELLO 3`,
+  `CLIENT SETINFO` ×2 and `CLIENT MAINT_NOTIFICATIONS`, and nothing else. `COMMAND DOCS` is used
+  interactively by `redis-cli`, and `CONFIG GET maxmemory-policy` by background-job frameworks —
+  both worth having, neither on the connect path.
+
+`CLIENT MAINT_NOTIFICATIONS` is still refused. It asks the server to push notifications before a
+maintenance event moves the connection elsewhere; Recached has no such event to announce, and every
+client that sends it treats the error as "not supported here" and carries on.
+
+- **Bounded reads: `GETRANGE`, `HSCAN`, `SSCAN`, `ZSCAN`.** Until now the only way to read a hash,
+  a set or a sorted set was `HGETALL` / `SMEMBERS` / `ZRANGE`, and the only way to read a string was
+  `GET`. Each of those is unbounded: the reply is as large as the value, and building it clones the
+  whole collection while holding the shard guard for that key — so one oversized key delays every
+  other key that hashes to the same shard. The cursor variants bound both the reply and the time
+  the guard is held, and `GETRANGE` reads a byte window of a large value without transferring it
+  whole. Tools that browse a keyspace they did not write — `redis-cli --scan`, TUI browsers such as
+  keylens, admin dashboards — need exactly these four to stay bounded; without them they must
+  measure with `STRLEN` / `HLEN` / `SCARD` and refuse to display anything big.
+
+  ```bash
+  GETRANGE log:2026-08 0 4095            # first 4 KB of a large value
+  HSCAN session:42 0 COUNT 100           # → [cursor, [field, value, …]]
+  HSCAN session:42 0 NOVALUES            # field names only (Redis 7.4)
+  SSCAN tags:hot 0 MATCH "eu:*"
+  ZSCAN leaderboard 0 COUNT 50           # → [cursor, [member, score, …]]
+  ```
+
+  The cursor is an offset into the collection's name-ordered element list, the same scheme keyspace
+  `SCAN` already used, so the same caveat applies: elements added or removed mid-iteration may be
+  missed or returned twice, and `MATCH` must stay the same across an iteration. `ZSCAN` orders by
+  **member**, not by score — a score can change under an in-flight cursor, and only the member
+  ordering survives that. A cursor pointing past the end of a collection that shrank returns an
+  empty final page rather than an error.
+
+### Changed
+
+- **`SCAN` now rejects `COUNT 0` and negative counts** with `ERR syntax error`, as Redis does.
+  They were previously cast to `usize`, where `-1` wrapped to a count of 18 quintillion and was
+  then silently clamped back to a normal page. The cursor argument reports `ERR invalid cursor`
+  rather than `ERR value is not an integer or out of range`, which is both Redis's wording and
+  what the whole SCAN family now shares.
+
+---
+
 ## [0.2.3] — 2026-08-01
 
 ### Added

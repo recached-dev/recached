@@ -1,6 +1,9 @@
 const MAX_ARRAY_DEPTH: usize = 16;
 const MAX_ARRAY_ELEMENTS: usize = 1_000_000;
-const MAX_BULK_STRING_BYTES: usize = 64 * 1024 * 1024; // 64 MB
+/// Largest bulk string the parser will accept, in bytes. Public because
+/// `CONFIG GET proto-max-bulk-len` has to report the limit actually enforced
+/// rather than a second copy of the number.
+pub const MAX_BULK_STRING_BYTES: usize = 64 * 1024 * 1024; // 64 MB
 const MAX_TOTAL_MESSAGE_BYTES: usize = 64 * 1024 * 1024; // 64 MB total per message
 
 #[derive(Debug, Clone, PartialEq)]

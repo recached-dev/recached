@@ -10,6 +10,58 @@ Recached implements the subset of RESP commands that most applications use. Comm
 | `AUTH password` | Authenticates the connection. Required on the first command if `RECACHED_PASSWORD` is set. 5 consecutive failures close the connection. |
 | `HELLO [protover]` | Reports server info and negotiates the protocol version. `3` switches the connection to RESP3, `2` back to RESP2, no argument reports without changing. Unsupported versions return `-NOPROTO` and leave the connection unchanged. Requires authentication. See [Wire Protocol](/server/protocol#protocol-version-tcp). |
 | `INFO [section ...]` | Reports server statistics as a text blob, in Redis's `# Section` / `field:value` format. No arguments returns the default sections; naming sections returns only those, in the order given. `all`, `everything`, and `default` are accepted as aliases for the default set. Unknown section names return nothing rather than an error. Requires authentication. See [INFO](#info) below. |
+| `QUIT` | Replies `+OK` and closes the connection. Accepted before authentication and in subscribe mode, so a client can always close cleanly. |
+| `CLIENT <subcommand>` | Connection introspection. See [CLIENT](#client) below. |
+| `CONFIG GET parameter [parameter ...]` | Reports configuration parameters, matched by glob. See [CONFIG](#config) below. |
+| `COMMAND [COUNT\|LIST\|INFO\|DOCS]` | Reports the command catalog. See [COMMAND](#command) below. |
+
+---
+
+## CLIENT
+
+Every current client library — node-redis, ioredis, redis-py, go-redis — sends `CLIENT SETINFO LIB-NAME` and `CLIENT SETINFO LIB-VER` immediately after `HELLO`, so the server can attribute a connection to the library that opened it.
+
+| Subcommand | Description |
+|---|---|
+| `CLIENT ID` | This connection's numeric identifier. |
+| `CLIENT INFO` | One line describing this connection, in Redis's `key=value` format. |
+| `CLIENT LIST` | The same line for every live connection, in connection order. |
+| `CLIENT GETNAME` | This connection's name, or nil if unnamed. |
+| `CLIENT SETNAME name` | Names this connection. Spaces and newlines are refused, because the name is echoed into the space-separated `CLIENT LIST` format. |
+| `CLIENT SETINFO LIB-NAME\|LIB-VER value` | Records the client library's name or version against this connection. |
+
+The reported fields are `id`, `addr`, `laddr`, `name`, `age`, `idle`, `flags`, `db`, `sub`, `psub`, `multi`, `resp`, `lib-name` and `lib-ver`. Redis also reports buffer sizes, file descriptors and an event mask; Recached omits them rather than emitting plausible numbers, since nothing downstream could distinguish an invented `omem` from a real one. Parsers read this format key by key and skip what they do not recognise.
+
+`CLIENT KILL`, `CLIENT NO-EVICT`, `CLIENT NO-TOUCH`, `CLIENT UNPAUSE` and `CLIENT MAINT_NOTIFICATIONS` return an "unknown subcommand" error. Each is an operation with real consequences, and replying `+OK` without performing it would leave the caller believing a connection had been killed or eviction disabled.
+
+---
+
+## CONFIG
+
+| Subcommand | Description |
+|---|---|
+| `CONFIG GET parameter [parameter ...]` | Returns matching parameter/value pairs. Names may be globs: `CONFIG GET maxmemory*` returns both `maxmemory` and `maxmemory-policy`. An unmatched name yields no pair rather than an error. |
+| `CONFIG SET` | Refused with an explanatory error — see below. |
+
+The reported parameters are `maxmemory`, `maxmemory-policy`, `maxclients`, `port`, `tls-port`, `appendonly`, `databases`, `requirepass`, `proto-max-bulk-len`, `timeout` and `save`. Every value is read from what is actually in force: the eviction policy from the store, the ports and connection limit from the same startup facts `INFO` reports. `requirepass` is masked to `*` when a password is set and empty when it is not — whether a password exists is not a secret, its value is.
+
+**`CONFIG SET` is not supported.** Recached reads its configuration from the environment at startup and holds it for the life of the process, so there is nothing a runtime `SET` could change. It returns an error naming the parameter and pointing at the environment variable instead, because returning `+OK` would leave an operator to discover much later that the limit they set never applied. See [Configuration](/server/configuration).
+
+---
+
+## COMMAND
+
+| Subcommand | Description |
+|---|---|
+| `COMMAND` | Every command in the catalog, as `COMMAND INFO` entries. |
+| `COMMAND COUNT` | How many commands the server implements. |
+| `COMMAND LIST` | Their names. |
+| `COMMAND INFO [name ...]` | Name, arity, flags and key positions. A name the server does not have replies nil in its slot, so the reply stays aligned with the request. |
+| `COMMAND DOCS [name ...]` | Summary, group and arity per command. RESP3 returns a map; RESP2 returns the same pairs flattened, as Redis degrades it. |
+
+Arity, flags and key positions are transcribed from a real `redis-server`'s own `COMMAND INFO` rather than written by hand: cluster-aware clients and proxies route on `first_key` and `step`, and a wrong arity makes a client reject a call the server would have accepted. The nine commands with no Redis counterpart — `ESET`, `JSET`, `JGET`, `JMERGE`, `RLSET`, `RLCHECK`, `SYNC`, `DEDUP`, `QSUB`, `QUNSUB` — are declared directly.
+
+Recached has no ACL system and no subcommand tree, so the ACL-categories, tips, key-specs and subcommands elements Redis 7 appends to each `COMMAND INFO` entry are present but empty. A client indexing past the sixth element finds an empty list rather than running off the end of the array.
 
 ---
 
@@ -74,6 +126,7 @@ The most common data type. Values are always stored as byte strings; numeric ope
 | `PSETEX key milliseconds value` | Set a key with a millisecond-precision expiry. |
 | `APPEND key value` | Appends a string to the end of the existing value. If the key does not exist, it is created. Returns the new length. |
 | `STRLEN key` | Returns the length of the string stored at key. Returns 0 if the key does not exist. |
+| `GETRANGE key start end` | Returns the inclusive byte range `start`..`end` of the string. Negative offsets count back from the end (`-1` is the last byte). `end` clamps to the last byte, but `start` does not: a `start` past the end of the value returns an empty string rather than the final byte, as in Redis. A missing key is an empty string, so every range of it is empty. Use it to read a window of a large value without transferring the whole thing. |
 | `INCR key` | Increments the integer value of a key by 1. Creates the key with value 1 if it does not exist. Returns an error if the value is not a valid integer. |
 | `DECR key` | Decrements the integer value of a key by 1. Creates the key with value -1 if it does not exist. |
 | `INCRBY key increment` | Increments the integer value of a key by the given integer. |
@@ -129,6 +182,7 @@ A hash is a map of field-value pairs stored under a single key. Use hashes to st
 | `HSETNX key field value` | Sets a field only if it does not already exist. Returns 1 if set, 0 if the field already existed. |
 | `HINCRBY key field increment` | Increments the integer value of a hash field by the given integer. Creates the field with value 0 before incrementing if it does not exist. |
 | `HINCRBYFLOAT key field increment` | Increments the float value of a hash field by the given float. |
+| `HSCAN key cursor [MATCH pattern] [COUNT count] [NOVALUES]` | Iterates a hash incrementally: returns the next cursor plus at most `COUNT` field-value pairs (default 10). Start at cursor `0` and continue until the returned cursor is `0`. `MATCH` filters on field names; `NOVALUES` returns field names only. The bounded counterpart of `HGETALL` — prefer it for hashes whose size you do not control. |
 
 ### Example
 
@@ -184,6 +238,7 @@ An unordered collection of unique string members. Supports set operations (inter
 | `SPOP key [count]` | Removes and returns one or more random members from the set. |
 | `SRANDMEMBER key [count]` | Returns one or more random members without removing them. Positive `count`: unique members. Negative `count`: may repeat. |
 | `SMOVE source destination member` | Atomically moves a member from one set to another. Returns 1 on success, 0 if the member did not exist in source. |
+| `SSCAN key cursor [MATCH pattern] [COUNT count]` | Iterates a set incrementally: returns the next cursor plus at most `COUNT` members (default 10). The bounded counterpart of `SMEMBERS`. |
 
 ---
 
@@ -206,6 +261,7 @@ An ordered collection where each member has a numeric score. Members are unique;
 | `ZREVRANK key member` | Returns the rank in descending score order. |
 | `ZCARD key` | Returns the number of members in the sorted set. |
 | `ZCOUNT key min max` | Returns the number of members with scores between `min` and `max`. |
+| `ZSCAN key cursor [MATCH pattern] [COUNT count]` | Iterates a sorted set incrementally: returns the next cursor plus at most `COUNT` `member, score` pairs (default 10). Ordered by member rather than by score, because the cursor is a position and only the member ordering survives a score changing mid-iteration. |
 
 ### Example: leaderboard
 

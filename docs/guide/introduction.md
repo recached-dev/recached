@@ -109,7 +109,7 @@ The road to 1.0 is hardening, not features: fuzzing the parser surfaces, automat
 | Replication | Primary/replica + auto-failover | Yes (+ Sentinel/Cluster) |
 | Lua scripting | No (WASM scripting on roadmap) | Yes |
 | Cluster mode | No | Yes |
-| Command coverage | ~106 commands | 250+ |
+| Command coverage | ~115 commands | 250+ |
 | License | Apache 2.0 | AGPLv3 / RSALv2 + SSPLv1 (BSD-3 up to 7.2; Valkey stayed BSD-3) |
 
 ## Recached vs SWR / React Query
