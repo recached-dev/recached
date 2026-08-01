@@ -15,8 +15,8 @@ run `FLUSHDB`. This is the single most common way self-hosted caches get comprom
 - [ ] **Bind to a private interface** — `RECACHED_BIND=127.0.0.1` or a VPC address, never `0.0.0.0`
       on a public host.
 - [ ] **Enable TLS** (`RECACHED_TLS_CERT` + `RECACHED_TLS_KEY`) if traffic crosses any network you do
-      not control. Note this covers the RESP and WebSocket ports only — see
-      [Replication](#replication).
+      not control. This covers the RESP, WebSocket and replication listeners; replicas additionally
+      need `RECACHED_REPL_TLS_CA` — see [Replication](#replication).
 - [ ] **Firewall the metrics port** — it has no authentication of its own, and
       `RECACHED_ALLOW_IPS` does not apply to it.
 - [ ] **Set `RECACHED_SYNC_SECRET`** before any browser connects to a multi-tenant deployment.
@@ -52,8 +52,8 @@ RECACHED_TLS_CERT=./cert.pem RECACHED_TLS_KEY=./key.pem recached-server
 ```
 
 TLS applies to **both client ports** when enabled: clients use `rediss://` for RESP and `wss://` for
-the browser sync socket. It does not apply to the replication port or the metrics port, which are
-always plaintext.
+the browser sync socket. It also covers the replication listener; a replica must be
+given `RECACHED_REPL_TLS_CA` to use it. The metrics port is always plaintext.
 
 ::: tip TLS is all-or-nothing, and fails loudly
 Set both variables or neither. If exactly one is present the server **refuses to start** with an
@@ -169,15 +169,74 @@ recached-server
 - **Failed auth is throttled per source address.** The handshake is one-shot, so before this a wrong
   guess cost an attacker only a reconnect.
 
-::: warning Replication traffic is never encrypted
-TLS covers the RESP and WebSocket ports. It does **not** cover port 6381 — both the listener and the
-replica's outbound connection are plain TCP, so the password and the entire keyspace cross the
-network in the clear. Earlier versions of this page claimed otherwise; that was wrong. Run
-replication over a private network or a tunnel (WireGuard, an SSH tunnel, a service mesh), and treat
-the replication password as protecting against a rogue replica rather than against an observer.
+### Encrypting replication
 
-The replica also does not verify the primary's identity, so a DNS hijack or an on-path attacker can
-feed it an arbitrary keyspace. The same mitigation applies.
+Replication is **plaintext unless you configure it otherwise**, and it carries the password followed
+by the entire keyspace. Two variables turn it into an authenticated, encrypted channel:
+
+::: warning A single self-signed certificate will not work here
+Replication TLS needs a **two-certificate chain**: a CA certificate, and a separate leaf certificate
+for the primary that the CA signed. The usual one-liner —
+`openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -nodes` — produces a certificate
+marked `CA:TRUE`, and the replica's TLS stack refuses to accept a CA certificate as a server
+certificate (`CaUsedAsEndEntity`). OpenSSL clients such as `redis-cli --cacert` are more forgiving,
+so the same certificate can work for `rediss://` while failing for replication. Generate the chain
+below rather than reusing a self-signed file.
+:::
+
+```bash
+# 1. A private CA. Keep ca-key.pem off both servers.
+openssl req -x509 -newkey rsa:2048 -keyout ca-key.pem -out ca.pem -days 3650 -nodes \
+  -subj "/CN=my-recached-ca"
+
+# 2. A leaf certificate for the primary, signed by that CA. The SANs must list
+#    every name or address a replica will use in RECACHED_REPLICAOF.
+openssl req -newkey rsa:2048 -keyout server-key.pem -out server.csr -nodes \
+  -subj "/CN=primary.internal"
+openssl x509 -req -in server.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial \
+  -out server.pem -days 3650 -sha256 -extfile <(printf '%s\n' \
+    'basicConstraints=critical,CA:FALSE' \
+    'subjectAltName=DNS:primary.internal,IP:10.0.1.5' \
+    'extendedKeyUsage=serverAuth')
+```
+
+```bash
+# Primary — the replication listener reuses the server certificate.
+RECACHED_TLS_CERT=./server.pem RECACHED_TLS_KEY=./server-key.pem \
+RECACHED_REPL_ENABLE=1 \
+RECACHED_REPL_PASSWORD="$(openssl rand -base64 32)" \
+recached-server
+
+# Replica — trusts the CA, and verifies the primary against it.
+RECACHED_REPLICAOF="primary.internal:6381" \
+RECACHED_REPL_TLS_CA=./ca.pem \
+RECACHED_REPL_PASSWORD="…same…" \
+recached-server
+```
+
+The point is not only confidentiality. Without TLS the replica has no way to check *who* it is
+following, so a DNS hijack or an on-path attacker can feed it an arbitrary keyspace and it will load
+it. Certificate verification is what closes that, which is why the trust anchor is required rather
+than optional — there is no "encrypt but do not verify" mode.
+
+`RECACHED_REPL_TLS_CA` is an explicit file rather than the system root store on purpose: replication
+links two hosts the same operator runs, so trusting one private CA is both simpler and tighter than
+trusting every public CA to vouch for a host that streams your whole dataset. A public bundle such as
+`/etc/ssl/certs/ca-certificates.crt` works too if the primary's certificate is publicly issued.
+
+If `RECACHED_REPLICAOF` names an IP but the certificate names a host, either add the IP as a SAN (as
+above) or set `RECACHED_REPL_TLS_SERVERNAME` to the certificate's name. A mismatch is refused with a
+message naming both what was expected and what the certificate actually covers.
+
+::: warning A plaintext replication link is still the default
+Setting `RECACHED_TLS_CERT` on the primary encrypts the RESP, WebSocket **and** replication
+listeners, but a replica that has no `RECACHED_REPL_TLS_CA` connects in the clear — and against a
+TLS-enabled primary its handshake simply fails. The server logs a warning at startup on any replica
+following a primary without TLS. If you cannot use TLS, keep replication on a private network or a
+tunnel (WireGuard, SSH, a service mesh), and treat the replication password as protection against a
+rogue replica rather than against an observer.
+
+The metrics port remains plaintext and unauthenticated regardless — firewall it.
 :::
 
 Note the failover model: single-replica automatic promotion only. In a multi-replica topology,
@@ -202,13 +261,15 @@ compiled in and cannot be configured.
 What Recached defends against today:
 
 - Unauthenticated access (password, constant-time comparison)
-- Network eavesdropping on the RESP and WebSocket ports (TLS)
+- Network eavesdropping on every port except metrics (TLS on RESP, WebSocket and replication)
 - Browser clients reading data they should not (sync scopes, signed tokens)
 - Cross-origin WebSocket hijacking (`RECACHED_ALLOWED_ORIGINS`)
 - Brute-force password guessing (connection dropped after 5 failures; replication auth throttled
   per source address)
 - Rogue replicas (replication password, and an opt-in listener that will not run unauthenticated
   off-loopback)
+- A rogue *primary* feeding a replica an arbitrary keyspace, when replication TLS is configured
+  (certificate verification)
 - Connection-slot exhaustion by half-open sockets (handshake deadline)
 - Local users reading the cache off disk (snapshot, AOF and dedup files created `0600`)
 
@@ -217,7 +278,8 @@ What it does **not** defend against, and you should not assume:
 - **No per-command ACLs.** Unlike Redis 6+ ACLs, authentication is all-or-nothing on the RESP port —
   any authenticated client can run any command. Scoping exists only on the WebSocket sync path.
 - **No audit log.** There is no record of who read or wrote what.
-- **No encryption in transit for replication.** Port 6381 is always plaintext. See
+- **Replication is plaintext by default.** It can be encrypted and authenticated end to end
+  (`RECACHED_REPL_TLS_CA`), but a replica configured without it connects in the clear. See
   [Replication](#replication).
 - **No encryption at rest.** Snapshots and AOF files are plaintext MessagePack. They are created
   `0600` so other local users cannot read them, but anyone who can read them as the server's user,

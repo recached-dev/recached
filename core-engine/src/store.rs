@@ -5960,8 +5960,8 @@ mod critical_path_tests {
         // length 5 against every text over {a, b} up to length 4. That is the
         // whole space where `*` interacts with `?` and with literals, which is
         // where a greedy matcher would differ from the DP if it were wrong.
-        let pat_alphabet = [b'a', b'b', b'*', b'?'];
-        let txt_alphabet = [b'a', b'b'];
+        let pat_alphabet = *b"ab*?";
+        let txt_alphabet = *b"ab";
 
         fn all_strings(alphabet: &[u8], max_len: usize) -> Vec<String> {
             let mut out = vec![String::new()];

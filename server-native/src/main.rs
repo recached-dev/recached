@@ -23,10 +23,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, broadcast, mpsc};
-use tokio_rustls::TlsAcceptor;
-use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{
@@ -441,6 +441,61 @@ fn resolve_tls_paths(
     }
 }
 
+/// The name a replica verifies the primary's certificate against.
+///
+/// Defaults to the host portion of `RECACHED_REPLICAOF`, which is what an
+/// operator means by "connect to this primary". It is overridable because the
+/// address is frequently an IP while the certificate names a host: a cert issued
+/// for `primary.internal` does not validate against `10.0.1.5` unless it also
+/// carries that IP as a SAN, and pointing at the IP is the common deployment.
+fn repl_tls_servername(primary_addr: &str, override_name: Option<String>) -> String {
+    if let Some(name) = override_name.map(|n| n.trim().to_string())
+        && !name.is_empty()
+    {
+        return name;
+    }
+    // `host:port`, or a bare host. An IPv6 literal is bracketed, so splitting on
+    // the last colon would cut inside the address.
+    match primary_addr.rsplit_once(':') {
+        Some((host, _)) if !host.is_empty() && !host.contains(':') => host.to_string(),
+        _ => primary_addr
+            .trim_start_matches('[')
+            .split(']')
+            .next()
+            .unwrap_or(primary_addr)
+            .to_string(),
+    }
+}
+
+/// Build the TLS connector a replica uses to reach its primary.
+///
+/// The trust anchor is an explicit file rather than the system root store, and
+/// that is deliberate. Replication is a link between two machines the same
+/// operator runs, so the right model is pinning the certificate (or the private
+/// CA that issued it) — not trusting every public CA on earth to vouch for a
+/// host that streams the entire keyspace. Pointing this at a system bundle still
+/// works if the primary genuinely uses a publicly-issued certificate.
+fn load_repl_tls_connector(ca_path: &str) -> Result<TlsConnector, String> {
+    let certs =
+        load_certs(ca_path).map_err(|e| format!("RECACHED_REPL_TLS_CA '{ca_path}': {e}"))?;
+    if certs.is_empty() {
+        return Err(format!(
+            "RECACHED_REPL_TLS_CA '{ca_path}' contains no certificates — replication TLS would \
+             trust nothing and every connection would fail."
+        ));
+    }
+    let mut roots = RootCertStore::empty();
+    for cert in certs {
+        roots
+            .add(cert)
+            .map_err(|e| format!("RECACHED_REPL_TLS_CA '{ca_path}': {e}"))?;
+    }
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(TlsConnector::from(Arc::new(config)))
+}
+
 /// Returns a `TlsAcceptor` when both `RECACHED_TLS_CERT` and `RECACHED_TLS_KEY`
 /// are set, `None` when neither is. Exits if exactly one is set.
 fn load_tls_acceptor() -> Option<TlsAcceptor> {
@@ -683,7 +738,16 @@ fn bind_is_loopback(bind_host: &str) -> bool {
     if bind_host.eq_ignore_ascii_case("localhost") {
         return true;
     }
-    IpAddr::from_str(bind_host)
+    // An IPv6 bind address has to be written bracketed — `[::1]` — because the
+    // listeners format it as `{host}:{port}`, and `::1:6379` does not parse.
+    // Without stripping them, `[::1]` fails to parse as an address and would be
+    // classified as public, demanding a replication password on what is in fact
+    // loopback.
+    let host = bind_host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(bind_host);
+    IpAddr::from_str(host)
         .map(|ip| ip.is_loopback())
         .unwrap_or(false)
 }
@@ -1476,6 +1540,7 @@ async fn run_repl_server(
     allowed_ips: Option<Arc<Vec<IpAddr>>>,
     semaphore: Arc<Semaphore>,
     throttle: Arc<ReplAuthThrottle>,
+    tls: Arc<Option<TlsAcceptor>>,
 ) {
     let listener = match TcpListener::bind(format!("{}:{}", bind_host, port)).await {
         Ok(l) => l,
@@ -1484,7 +1549,12 @@ async fn run_repl_server(
             return;
         }
     };
-    info!("Replication server listening on {}:{}", bind_host, port);
+    info!(
+        "Replication server listening on {}:{} ({})",
+        bind_host,
+        port,
+        if tls.is_some() { "TLS" } else { "plaintext" }
+    );
     loop {
         match listener.accept().await {
             Ok((socket, addr)) => {
@@ -1517,20 +1587,58 @@ async fn run_repl_server(
                 let replicas = Arc::clone(&replicas);
                 let pwd = repl_password.clone();
                 let thr = Arc::clone(&throttle);
+                let tls = Arc::clone(&tls);
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if let Err(e) = handle_replica(
-                        socket,
-                        store,
-                        snap_cfg,
-                        replicas,
-                        pwd,
-                        repl_channel_capacity,
-                        addr.ip(),
-                        thr,
-                    )
-                    .await
-                    {
+                    // Bounded like the other listeners: the permit is already
+                    // held, so a peer that never negotiates must not keep it.
+                    let outcome = if let Some(acceptor) = tls.as_ref() {
+                        match tokio::time::timeout(handshake_timeout(), acceptor.accept(socket))
+                            .await
+                        {
+                            Ok(Ok(stream)) => {
+                                handle_replica(
+                                    stream,
+                                    store,
+                                    snap_cfg,
+                                    replicas,
+                                    pwd,
+                                    repl_channel_capacity,
+                                    addr.ip(),
+                                    thr,
+                                )
+                                .await
+                            }
+                            Ok(Err(e)) => {
+                                // The most likely cause by far is a replica that
+                                // has not been given RECACHED_REPL_TLS_CA, which
+                                // otherwise looks like an unexplained disconnect.
+                                warn!(
+                                    "Replication TLS handshake failed from {}: {} — is that \
+                                     replica configured with RECACHED_REPL_TLS_CA?",
+                                    addr, e
+                                );
+                                return;
+                            }
+                            Err(_) => {
+                                debug!("Replication TLS handshake from {} timed out", addr);
+                                return;
+                            }
+                        }
+                    } else {
+                        handle_replica(
+                            socket,
+                            store,
+                            snap_cfg,
+                            replicas,
+                            pwd,
+                            repl_channel_capacity,
+                            addr.ip(),
+                            thr,
+                        )
+                        .await
+                    };
+                    if let Err(e) = outcome {
                         info!("Replica {} disconnected: {}", addr, e);
                     }
                 });
@@ -1541,8 +1649,8 @@ async fn run_repl_server(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_replica(
-    mut socket: TcpStream,
+async fn handle_replica<S>(
+    mut socket: S,
     store: Arc<KeyValueStore>,
     _snap_cfg: Arc<SnapshotConfig>,
     replicas: ReplRegistry,
@@ -1550,7 +1658,10 @@ async fn handle_replica(
     repl_channel_capacity: usize,
     peer_ip: IpAddr,
     throttle: Arc<ReplAuthThrottle>,
-) -> std::io::Result<()> {
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     // 0. Auth handshake — replica must send "<password>\n" before anything else.
     //
     // Bounded by a deadline as well as a length: a peer that connects and then
@@ -1611,7 +1722,7 @@ async fn handle_replica(
     // now writes back a cumulative count of applied frames; `sent - acked` is
     // the lag. Reading and writing are selected over so a replica that stops
     // acknowledging cannot stall the write side, and vice versa.
-    let (mut rd, mut wr) = socket.split();
+    let (mut rd, mut wr) = tokio::io::split(socket);
     let mut ack_buf = [0u8; 8];
     loop {
         tokio::select! {
@@ -1648,6 +1759,7 @@ async fn run_repl_client(
     repl_password: Option<String>,
     failover_timeout_secs: Option<u64>,
     tx: broadcast::Sender<SyncMsg>,
+    tls: Option<(TlsConnector, String)>,
 ) {
     let mut backoff_secs = 2u64;
     let mut unreachable_since: Option<std::time::Instant> = None;
@@ -1664,14 +1776,70 @@ async fn run_repl_client(
                 warn!("Replica: connect failed: {}", e);
                 unreachable_since.get_or_insert_with(std::time::Instant::now);
             }
-            Ok(mut socket) => {
+            Ok(socket) => {
                 // Primary is reachable — reset the unreachable timer.
                 unreachable_since = None;
                 backoff_secs = 2;
-                if let Err(e) =
-                    sync_from_primary(&mut socket, &store, repl_password.as_deref(), &tx, &state)
+
+                // TLS is what makes the primary's *identity* checked, not just
+                // the channel encrypted: without it a DNS hijack or an on-path
+                // attacker can feed this replica an arbitrary keyspace, and the
+                // replica has no way to tell.
+                let result = match &tls {
+                    None => {
+                        sync_from_primary(
+                            &mut { socket },
+                            &store,
+                            repl_password.as_deref(),
+                            &tx,
+                            &state,
+                        )
                         .await
-                {
+                    }
+                    Some((connector, servername)) => {
+                        match ServerName::try_from(servername.clone()) {
+                            Err(_) => {
+                                error!(
+                                    "Replica: '{}' is not a valid TLS server name — set \
+                                     RECACHED_REPL_TLS_SERVERNAME to the name on the primary's \
+                                     certificate",
+                                    servername
+                                );
+                                return;
+                            }
+                            Ok(name) => {
+                                match tokio::time::timeout(
+                                    handshake_timeout(),
+                                    connector.connect(name, socket),
+                                )
+                                .await
+                                {
+                                    Err(_) => Err(std::io::Error::new(
+                                        ErrorKind::TimedOut,
+                                        "TLS handshake with primary timed out",
+                                    )),
+                                    Ok(Err(e)) => Err(std::io::Error::other(format!(
+                                        "TLS handshake with primary failed: {e} — check that the \
+                                         primary has RECACHED_TLS_CERT set and that \
+                                         RECACHED_REPL_TLS_CA trusts it"
+                                    ))),
+                                    Ok(Ok(mut stream)) => {
+                                        sync_from_primary(
+                                            &mut stream,
+                                            &store,
+                                            repl_password.as_deref(),
+                                            &tx,
+                                            &state,
+                                        )
+                                        .await
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+
+                if let Err(e) = result {
                     warn!("Replica: sync ended: {}", e);
                     // Sync dropped — primary may be gone; start tracking if not already.
                     unreachable_since.get_or_insert_with(std::time::Instant::now);
@@ -1701,13 +1869,16 @@ async fn run_repl_client(
     }
 }
 
-async fn sync_from_primary(
-    socket: &mut TcpStream,
+async fn sync_from_primary<S>(
+    socket: &mut S,
     store: &KeyValueStore,
     repl_password: Option<&str>,
     tx: &broadcast::Sender<SyncMsg>,
     state: &ServerState,
-) -> std::io::Result<()> {
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // 0. Send auth password if configured
     if let Some(pwd) = repl_password {
         let msg = format!("{}\n", pwd);
@@ -3988,6 +4159,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // ── TLS ───────────────────────────────────────────────────────────────
+    // Resolved before replication: the replication listener uses the same
+    // certificate, so it has to exist before that listener is spawned.
+    let tls_acceptor: Option<TlsAcceptor> = load_tls_acceptor();
+    if tls_acceptor.is_some() {
+        info!(
+            "TLS ENABLED (cert={}, key={})",
+            std::env::var("RECACHED_TLS_CERT").unwrap_or_default(),
+            std::env::var("RECACHED_TLS_KEY").unwrap_or_default()
+        );
+    } else {
+        warn!("TLS DISABLED. Set RECACHED_TLS_CERT and RECACHED_TLS_KEY to enable.");
+    }
+    let tls_acceptor = Arc::new(tls_acceptor);
+
     // ── connection limiter ────────────────────────────────────────────────
     // Resolved before replication because the replication listener shares this
     // budget: a flood of replica connections must not be able to starve real
@@ -4030,6 +4216,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     };
+
+    // Outbound replication TLS. Configured separately from the listener's TLS
+    // because the two directions are independent: this node may serve replicas
+    // over TLS, follow a primary over TLS, both, or neither.
+    let repl_tls: Option<(TlsConnector, String)> = match std::env::var("RECACHED_REPL_TLS_CA")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        None => None,
+        Some(ca) => match load_repl_tls_connector(&ca) {
+            Ok(connector) => {
+                let servername = repl_tls_servername(
+                    replicaof.as_deref().unwrap_or_default(),
+                    std::env::var("RECACHED_REPL_TLS_SERVERNAME").ok(),
+                );
+                info!(
+                    "Replication client TLS ENABLED (CA={}, verifying primary as '{}')",
+                    ca, servername
+                );
+                Some((connector, servername))
+            }
+            Err(msg) => {
+                error!("{msg}");
+                std::process::exit(1);
+            }
+        },
+    };
+
+    if replicaof.is_some() && repl_tls.is_none() {
+        warn!(
+            "Replication to the primary is PLAINTEXT — the password and the entire keyspace cross \
+             the network unencrypted, and the primary's identity is not verified. Set \
+             RECACHED_REPL_TLS_CA, or keep replication on a private network."
+        );
+    }
 
     if !repl_listen {
         info!(
@@ -4136,9 +4357,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let allowed_r = allowed_ips.clone();
         let sem_r = Arc::clone(&semaphore);
         let thr_r = ReplAuthThrottle::new();
+        let tls_r = Arc::clone(&tls_acceptor);
         tokio::spawn(async move {
             run_repl_server(
                 host_r, repl_port, store_r, snap_r, reg_r, pwd_r, cap_r, allowed_r, sem_r, thr_r,
+                tls_r,
             )
             .await;
         });
@@ -4149,8 +4372,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let pwd_r = repl_password.clone();
         let fo_r = failover_timeout_secs;
         let tx_r = tx.clone();
+        let tls_r = repl_tls;
         tokio::spawn(async move {
-            run_repl_client(primary_addr, store_r, state_r, pwd_r, fo_r, tx_r).await;
+            run_repl_client(primary_addr, store_r, state_r, pwd_r, fo_r, tx_r, tls_r).await;
         });
         if let Some(t) = failover_timeout_secs {
             info!(
@@ -4219,19 +4443,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
-
-    // ── TLS ───────────────────────────────────────────────────────────────
-    let tls_acceptor: Option<TlsAcceptor> = load_tls_acceptor();
-    if tls_acceptor.is_some() {
-        info!(
-            "TLS ENABLED (cert={}, key={})",
-            std::env::var("RECACHED_TLS_CERT").unwrap_or_default(),
-            std::env::var("RECACHED_TLS_KEY").unwrap_or_default()
-        );
-    } else {
-        warn!("TLS DISABLED. Set RECACHED_TLS_CERT and RECACHED_TLS_KEY to enable.");
-    }
-    let tls_acceptor = Arc::new(tls_acceptor);
 
     // Startup facts for INFO. Recorded once the configuration is fully
     // resolved and before any listener binds, so no connection can observe the
@@ -6930,7 +7141,7 @@ mod tests {
         let repl_addr = format!("127.0.0.1:{repl_port}");
         let rtx = broadcast::channel::<SyncMsg>(16).0;
         tokio::spawn(async move {
-            run_repl_client(repl_addr, rs, rst, None, None, rtx).await;
+            run_repl_client(repl_addr, rs, rst, None, None, rtx, None).await;
         });
 
         // Give replica time to connect and receive initial snapshot
@@ -7289,7 +7500,7 @@ mod tests {
         drop(listener);
         let rtx = broadcast::channel::<SyncMsg>(16).0;
         tokio::spawn(async move {
-            run_repl_client(dead_addr, rs, rst, None, Some(1), rtx).await;
+            run_repl_client(dead_addr, rs, rst, None, Some(1), rtx, None).await;
         });
 
         // Wait for 2 backoff cycles (initial fail + 2s sleep + retry fail → promote)
@@ -9630,6 +9841,88 @@ mod tls_loading_tests {
         path
     }
 
+    // ── replication TLS (2.2) ───────────────────────────────────────────────
+
+    #[test]
+    fn the_verified_servername_defaults_to_the_primarys_host() {
+        // What an operator means by "connect to this primary" is the host they
+        // named, so that is what the certificate is checked against.
+        assert_eq!(
+            repl_tls_servername("primary.internal:6381", None),
+            "primary.internal"
+        );
+        assert_eq!(repl_tls_servername("10.0.1.5:6381", None), "10.0.1.5");
+        assert_eq!(
+            repl_tls_servername("primary.internal", None),
+            "primary.internal"
+        );
+    }
+
+    #[test]
+    fn an_ipv6_primary_address_is_not_split_inside_the_address() {
+        // Splitting on the last colon would cut inside an IPv6 literal and
+        // produce a servername that could never validate.
+        assert_eq!(repl_tls_servername("[::1]:6381", None), "::1");
+        assert_eq!(repl_tls_servername("[fd00::5]:6381", None), "fd00::5");
+    }
+
+    #[test]
+    fn the_servername_override_wins_and_ignores_blanks() {
+        // The common deployment points RECACHED_REPLICAOF at an IP while the
+        // certificate names a host, which cannot validate without an IP SAN.
+        assert_eq!(
+            repl_tls_servername("10.0.1.5:6381", Some("primary.internal".into())),
+            "primary.internal"
+        );
+        assert_eq!(
+            repl_tls_servername("10.0.1.5:6381", Some("  primary.internal  ".into())),
+            "primary.internal"
+        );
+        // Empty or whitespace is "unset", not "verify against nothing".
+        assert_eq!(
+            repl_tls_servername("10.0.1.5:6381", Some(String::new())),
+            "10.0.1.5"
+        );
+        assert_eq!(
+            repl_tls_servername("10.0.1.5:6381", Some("   ".into())),
+            "10.0.1.5"
+        );
+    }
+
+    #[test]
+    fn a_missing_or_unusable_replication_ca_is_a_startup_error() {
+        // Trusting nothing would fail every connection at runtime rather than at
+        // startup, which is much harder to diagnose from a replica's logs.
+        // `TlsConnector` is not Debug, so unwrap the error side by hand.
+        let missing = load_repl_tls_connector("/nonexistent/recached-ca.pem");
+        let Err(err) = missing else {
+            panic!("a missing CA file must be refused");
+        };
+        assert!(err.contains("RECACHED_REPL_TLS_CA"), "{err}");
+
+        let junk = write("repl_ca_junk.pem", "not a certificate\n");
+        let unusable = load_repl_tls_connector(junk.to_str().unwrap());
+        let _ = std::fs::remove_file(&junk);
+        let Err(err) = unusable else {
+            panic!("a file with no certificates must be refused");
+        };
+        assert!(err.contains("RECACHED_REPL_TLS_CA"), "{err}");
+    }
+
+    #[test]
+    fn a_self_signed_certificate_works_as_the_replication_trust_anchor() {
+        // Pinning the primary's own certificate is the documented path, and the
+        // reason the trust anchor is an explicit file rather than the system root
+        // store: replication is a private link between two hosts one operator
+        // runs, so trusting every public CA to vouch for it would be backwards.
+        let ca = write("repl_ca_ok.pem", TEST_CERT);
+        assert!(
+            load_repl_tls_connector(ca.to_str().unwrap()).is_ok(),
+            "a valid self-signed PEM must build a connector"
+        );
+        let _ = std::fs::remove_file(&ca);
+    }
+
     #[test]
     fn a_pem_certificate_and_key_load() {
         // PEM parsing moved from the deprecated rustls-pemfile to
@@ -9870,6 +10163,12 @@ mod hardening_tests {
         assert!(!bind_is_loopback("::"));
         assert!(!bind_is_loopback("cache.internal"));
         assert!(!bind_is_loopback(""));
+        // An IPv6 bind address must be written bracketed for the listeners to
+        // format it correctly, so the brackets have to be tolerated here too —
+        // otherwise `[::1]` is misread as public and demands a password.
+        assert!(bind_is_loopback("[::1]"));
+        assert!(!bind_is_loopback("[::]"));
+        assert!(!bind_is_loopback("[fd00::5]"));
     }
 
     // ── replication auth: throttle and handshake ─────────────────────────────

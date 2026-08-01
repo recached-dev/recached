@@ -158,6 +158,32 @@ cannot attach.
   not a limit — aggregates larger than 1,024 elements still parse in full, and `proto-max-bulk-len`
   and the million-element ceiling are unchanged.
 
+- **Replication can now be encrypted and the primary's identity verified.** Both ends of port 6381
+  were plain TCP, so the replication password and then the entire keyspace crossed the network in the
+  clear. Worse than the eavesdropping: a replica had no way to check *who* it was following, so a DNS
+  hijack or an on-path attacker could feed it an arbitrary keyspace and it would load it.
+
+  The listener now reuses `RECACHED_TLS_CERT`/`RECACHED_TLS_KEY` — enabling TLS covers the RESP,
+  WebSocket **and** replication listeners. Replicas opt in with `RECACHED_REPL_TLS_CA`, pointing at
+  the primary's certificate or the CA that issued it, with `RECACHED_REPL_TLS_SERVERNAME` to override
+  the verified name when `RECACHED_REPLICAOF` names an IP but the certificate names a host.
+
+  The trust anchor is a file rather than the system root store deliberately: replication links two
+  hosts one operator runs, so trusting one private CA is both simpler and tighter than trusting every
+  public CA to vouch for a host that streams the whole dataset. A public bundle still works if the
+  primary's certificate is publicly issued. There is no encrypt-without-verify mode, because
+  verification is the half that stops a rogue primary.
+
+  Note that this needs a genuine **two-certificate chain** — a CA plus a leaf it signed. A single
+  self-signed certificate, which is what the common `openssl req -x509` one-liner produces, is marked
+  `CA:TRUE` and is refused as a server certificate (`CaUsedAsEndEntity`). OpenSSL-based clients like
+  `redis-cli --cacert` accept such a certificate, so the same file can work for `rediss://` and fail
+  for replication. The security docs carry the `openssl` recipe.
+
+  Replication remains **plaintext unless configured**, and a replica following a primary without TLS
+  now says so at startup. A replica without `RECACHED_REPL_TLS_CA` cannot talk to a TLS-enabled
+  primary; that handshake failure names the variable to set.
+
 - **Glob patterns are capped at 1,024 bytes** for `KEYS`, `SCAN`/`HSCAN`/`SSCAN`/`ZSCAN MATCH`,
   `QSUB`, `PSUBSCRIBE`, `SYNC` scopes and signed sync tokens, reported as
   `ERR pattern is too long`. Matching costs O(pattern × text) and runs once per key for `KEYS`, once
