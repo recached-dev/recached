@@ -1,18 +1,18 @@
 class Recached < Formula
   desc "Blazing fast, multi-core drop-in replacement for Redis"
-  homepage "https://github.com/thinkgrid-labs/recached"
+  homepage "https://github.com/recached-dev/recached"
   version "0.1.8"
   license "MIT"
 
   on_macos do
     on_intel do
-      url "https://github.com/thinkgrid-labs/recached/releases/download/v0.1.8/recached-macos-x86_64"
+      url "https://github.com/recached-dev/recached/releases/download/v0.1.8/recached-macos-x86_64"
       # shasum -a 256 of the binary in target/dist/recached-macos-x86_64;
       # recompute if the release binary is rebuilt before uploading.
       sha256 "227fca7d7ff5c9511f9482863024e222c0c66f93ad40288581ca1fb32a9f20bd"
     end
     on_arm do
-      url "https://github.com/thinkgrid-labs/recached/releases/download/v0.1.8/recached-macos-arm64"
+      url "https://github.com/recached-dev/recached/releases/download/v0.1.8/recached-macos-arm64"
       # TODO: build on Apple Silicon (or cross-compile: cargo build --release
       # --target aarch64-apple-darwin), upload, then: shasum -a 256 recached-macos-arm64
       sha256 "REPLACE_WITH_ARM64_SHA256"

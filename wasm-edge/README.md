@@ -1,6 +1,6 @@
 # recached-edge
 
-The browser and edge runtime client for [Recached](https://github.com/thinkgrid-labs/recached) — a Rust-powered in-memory cache that runs natively on the server and inside the browser via WebAssembly.
+The browser and edge runtime client for [Recached](https://github.com/recached-dev/recached) — a Rust-powered in-memory cache that runs natively on the server and inside the browser via WebAssembly.
 
 Zero-latency local reads. Automatic background sync to the Recached server over WebSockets.
 
@@ -324,13 +324,13 @@ await cache.clear_persistence();
 
 ```bash
 # Docker
-docker run -p 6380:6380 ghcr.io/thinkgrid-labs/recached:latest
+docker run -p 6380:6380 ghcr.io/recached-dev/recached:latest
 
 # With authentication
-docker run -p 6380:6380 -e RECACHED_PASSWORD=secret ghcr.io/thinkgrid-labs/recached:latest
+docker run -p 6380:6380 -e RECACHED_PASSWORD=secret ghcr.io/recached-dev/recached:latest
 ```
 
-See the [Recached README](https://github.com/thinkgrid-labs/recached) for full server configuration.
+See the [Recached README](https://github.com/recached-dev/recached) for full server configuration.
 
 ## Browser compatibility
 

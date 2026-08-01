@@ -133,6 +133,19 @@ livenessProbe:
 The `/metrics` endpoint returning 200 proves the metrics listener is up, **not** that the cache is
 healthy — they are separate listeners. Probe the cache port.
 
+For a human-readable snapshot at a terminal — uptime, connected clients, keyspace size, replication
+role — use [`INFO`](/server/commands#info):
+
+```bash
+redis-cli -p 6379 INFO              # all default sections
+redis-cli -p 6379 INFO replication  # just the topology
+```
+
+`INFO` and Prometheus serve different jobs and neither replaces the other: `INFO` is a point-in-time
+snapshot for an operator or a client's ready-check, while `/metrics` carries the per-command
+counters, error counts, and history that dashboards and alerts need. Alert on the metrics, not on
+scraped `INFO` output.
+
 ## Capacity limits
 
 Hard limits compiled into the server. Exceeding them produces errors rather than degradation, so it
@@ -181,7 +194,7 @@ costs you every write since the last save.
 ## Upgrades
 
 Recached is pre-1.0 and the wire protocol is not frozen — see the
-[protocol spec](/server/protocol). Read the [changelog](https://github.com/thinkgrid-labs/recached/blob/main/CHANGELOG.md)
+[protocol spec](/server/protocol). Read the [changelog](https://github.com/recached-dev/recached/blob/main/CHANGELOG.md)
 before upgrading a minor version, and upgrade server and browser SDK together: the sync protocol is
 versioned between them, and mixed versions are not a supported configuration.
 

@@ -124,7 +124,7 @@ dependencies = [
 
 [[package]]
 name = "core-engine"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "dashmap",
  "indexmap",
@@ -1058,7 +1058,7 @@ dependencies = [
 
 [[package]]
 name = "server-native"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "base64",
  "core-engine",
@@ -1067,6 +1067,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "num_cpus",
+ "rand",
  "rmp-serde",
  "serde",
  "sha2",
@@ -1194,7 +1195,7 @@ dependencies = [
 
 [[package]]
 name = "sync-client"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "core-engine",
 ]
@@ -1580,7 +1581,7 @@ checksum = "60238e5b4b1b295701d6f9a66d2a126fe19990348f5fb9dae3b623a370119d94"
 
 [[package]]
 name = "wasm-edge"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "core-engine",
  "getrandom 0.3.4",

@@ -10,11 +10,11 @@ resolver = "2"
 # ── Single source of truth for all crate versions ────────────────────────────
 # Members inherit with:  version.workspace = true  /  edition.workspace = true
 [workspace.package]
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["ThinkGrid Labs"]
-repository = "https://github.com/thinkgrid-labs/recached"
+repository = "https://github.com/recached-dev/recached"
 
 # ── Shared dependency versions ────────────────────────────────────────────────
 # Members inherit with:  tokio.workspace = true  (add features per-crate if needed)

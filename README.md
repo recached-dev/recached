@@ -27,10 +27,10 @@ The same Rust cache engine runs natively on your server (RESP on port 6379 — a
 
 ```bash
 # Docker
-docker run -p 6379:6379 -p 6380:6380 ghcr.io/thinkgrid-labs/recached:latest
+docker run -p 6379:6379 -p 6380:6380 ghcr.io/recached-dev/recached:latest
 
 # Homebrew (macOS)
-brew tap thinkgrid-labs/recached && brew install recached && recached-server
+brew tap recached-dev/recached && brew install recached && recached-server
 
 # Cargo
 cargo install recached && recached-server

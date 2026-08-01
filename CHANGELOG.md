@@ -4,6 +4,47 @@ All notable changes to Recached are documented here.
 
 ---
 
+## [0.2.3] — 2026-08-01
+
+### Added
+
+- **`INFO [section ...]`.** Recached previously answered `INFO` with `-ERR unknown command`, which
+  breaks more than `redis-cli info`: client libraries call it during their connection ready-check,
+  and monitoring agents treat its absence as a dead server. It now reports the `server`, `clients`,
+  `memory`, `persistence`, `stats`, `replication`, `keyspace`, and `recached` sections in Redis's
+  `# Section` / `field:value` format, with CRLF endings, so existing tooling parses it unmodified.
+  Section arguments are honoured in the order given; `all`, `everything`, and `default` alias the
+  default set; unknown sections return nothing rather than an error, as in Redis.
+
+  `redis_version` reports **`6.2.0`** rather than Recached's own version. Clients feature-gate on
+  that field, and one reading `redis_version:0.2.3` concludes the server predates everything and
+  disables capabilities it could safely use. 6.2 is the honest floor — RESP3 and `HELLO` exist
+  there and Recached implements both — and the real version ships alongside as `recached_version`,
+  the same split KeyDB and Dragonfly use. `role` likewise reports `master`/`slave` because tooling
+  greps for exactly those strings, with `connected_replicas` as a readable alias.
+
+  `INFO` requires authentication and is refused on scope-limited WebSocket connections: it reports
+  server-wide state, which a connection granted a handful of keys has no business reading. The
+  `cpu`, `commandstats`, `latencystats`, and `errorstats` sections are deliberately absent —
+  per-command counters and latency histograms stay on the Prometheus endpoint, where dashboards and
+  alerting can use them properly.
+
+### Changed
+
+- **The 5-second metrics sampler walks the keyspace once instead of twice.** `recached_keys` and
+  `recached_memory_bytes` each triggered a full scan; they now share a single pass via the new
+  `KeyValueStore::keyspace_sample()`, which also supplies `INFO`. `INFO` reads that cached sample
+  rather than rescanning, so polling it once a second costs no more than polling it once a minute —
+  `used_memory` and the keyspace counts are at most 5 seconds stale, and both were already
+  approximations.
+
+- **Repository moved to [`recached-dev/recached`](https://github.com/recached-dev/recached).** Crate
+  metadata, the three npm package manifests, the Homebrew formula, the `ghcr.io` image path, and all
+  documentation links now point at the new organisation. The GitHub Actions workflows derive the
+  image name from `github.repository` and needed no change.
+
+---
+
 ## [0.2.2] — 2026-07-20
 
 ### Added

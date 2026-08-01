@@ -6,7 +6,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use core_engine::cmd::{Command, SetExpiry, ZAddCondition};
 use core_engine::resp::Value;
-use core_engine::store::{EvictionPolicy, KeyValueStore, SnapshotEntry};
+use core_engine::store::{EvictionPolicy, KeyValueStore, KeyspaceSample, SnapshotEntry};
 use futures_util::{SinkExt, StreamExt};
 use metrics::{counter, gauge};
 use std::collections::{HashMap, HashSet};
@@ -30,6 +30,18 @@ use tracing::{debug, error, info, warn};
 
 // ── metrics ───────────────────────────────────────────────────────────────────
 
+/// Counters mirrored out of the `metrics` registry so `INFO` can read them.
+///
+/// `metrics::Counter` and `Gauge` handles are write-only — there is no way to
+/// read a recorded value back out — so every number `INFO` reports from the
+/// registry needs a plain atomic alongside it. These are the only ones INFO
+/// needs; the rest of its fields come from the store or `ServerState`.
+static STAT_CONNECTIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STAT_CONNECTIONS_ACTIVE: AtomicI64 = AtomicI64::new(0);
+static STAT_COMMANDS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STAT_KEYSPACE_HITS: AtomicU64 = AtomicU64::new(0);
+static STAT_KEYSPACE_MISSES: AtomicU64 = AtomicU64::new(0);
+
 /// RAII guard that tracks an active connection. Increments on creation,
 /// decrements when dropped (i.e. when the handler future completes).
 struct ConnectionGuard;
@@ -38,12 +50,16 @@ impl ConnectionGuard {
     fn tcp() -> Self {
         counter!("recached_connections_total", "type" => "tcp").increment(1);
         gauge!("recached_connections_active").increment(1.0);
+        STAT_CONNECTIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        STAT_CONNECTIONS_ACTIVE.fetch_add(1, Ordering::Relaxed);
         Self
     }
 
     fn ws() -> Self {
         counter!("recached_connections_total", "type" => "ws").increment(1);
         gauge!("recached_connections_active").increment(1.0);
+        STAT_CONNECTIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        STAT_CONNECTIONS_ACTIVE.fetch_add(1, Ordering::Relaxed);
         Self
     }
 }
@@ -51,6 +67,7 @@ impl ConnectionGuard {
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         gauge!("recached_connections_active").decrement(1.0);
+        STAT_CONNECTIONS_ACTIVE.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -59,6 +76,7 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::Ping(_) => "ping",
         Command::Auth(_) => "auth",
         Command::Hello(_) => "hello",
+        Command::Info(_) => "info",
         Command::Get(_) => "get",
         Command::ESet(_, _) => "eset",
         Command::Set(_, _, _) => "set",
@@ -179,6 +197,7 @@ static CMD_COUNTERS: std::sync::LazyLock<
 > = std::sync::LazyLock::new(Default::default);
 
 fn record_command(name: &'static str) {
+    STAT_COMMANDS_TOTAL.fetch_add(1, Ordering::Relaxed);
     if let Some(c) = CMD_COUNTERS.read().unwrap().get(name) {
         c.increment(1);
         return;
@@ -209,8 +228,14 @@ fn execute_and_record(store: &KeyValueStore, cmd: Command) -> Value {
     }
     if is_get {
         match &response {
-            Value::BulkString(Some(_)) => KEYSPACE_HITS.increment(1),
-            Value::BulkString(None) => KEYSPACE_MISSES.increment(1),
+            Value::BulkString(Some(_)) => {
+                KEYSPACE_HITS.increment(1);
+                STAT_KEYSPACE_HITS.fetch_add(1, Ordering::Relaxed);
+            }
+            Value::BulkString(None) => {
+                KEYSPACE_MISSES.increment(1);
+                STAT_KEYSPACE_MISSES.fetch_add(1, Ordering::Relaxed);
+            }
             _ => {}
         }
     }
@@ -1378,6 +1403,10 @@ fn command_scope(cmd: &Command) -> CommandScope {
         | Command::Save
         | Command::BgSave
         | Command::LastSave
+        // INFO reports server-wide state — uptime, client counts, keyspace
+        // size, replication topology. A connection scoped to a handful of keys
+        // has no business reading it.
+        | Command::Info(_)
         | Command::ReplicaOfNoOne => CommandScope::Admin,
 
         Command::ESet(k, _)
@@ -2017,6 +2046,333 @@ fn process_hello(
         }
         Value::Array(Some(flat)).serialize()
     }
+}
+
+// ── INFO ─────────────────────────────────────────────────────────────────────
+
+/// Redis compatibility level advertised as `redis_version`.
+///
+/// Clients feature-gate on this field, so it cannot be Recached's own version:
+/// a library seeing `redis_version:0.2.3` concludes the server predates
+/// everything and disables features it could safely use. 6.2 is the honest
+/// floor — RESP3 and `HELLO` exist there, which Recached implements, while
+/// nothing in 7.x that Recached lacks (functions, `OBJECT FREQ`, sharded
+/// pub/sub) gets advertised. The real version ships alongside it as
+/// `recached_version`, the same split KeyDB and Dragonfly use.
+const REDIS_COMPAT_VERSION: &str = "6.2.0";
+
+/// Sections `INFO` reports when called with no arguments.
+const DEFAULT_INFO_SECTIONS: &[&str] = &[
+    "server",
+    "clients",
+    "memory",
+    "persistence",
+    "stats",
+    "replication",
+    "keyspace",
+    "recached",
+];
+
+/// Process-wide startup facts, set once by `main`.
+///
+/// Threaded through a static rather than the connection-handler signatures:
+/// these values are immutable for the life of the process and needed only by
+/// `INFO`, and the handlers already carry a long parameter list. Tests that
+/// exercise `render_info` build their own `ServerFacts` and never touch this.
+static SERVER_FACTS: std::sync::OnceLock<ServerFacts> = std::sync::OnceLock::new();
+
+fn server_facts() -> &'static ServerFacts {
+    SERVER_FACTS.get_or_init(ServerFacts::default)
+}
+
+/// Startup facts `INFO` reports that are fixed for the life of the process.
+/// Captured in `main` once rather than re-read from the environment per call.
+#[derive(Clone, Debug)]
+struct ServerFacts {
+    start: SystemTime,
+    /// Random per-process identifier, as Redis reports it: 40 hex chars.
+    run_id: String,
+    tcp_port: u16,
+    ws_port: u16,
+    max_connections: usize,
+    tls_enabled: bool,
+    auth_enabled: bool,
+    aof_enabled: bool,
+}
+
+impl Default for ServerFacts {
+    fn default() -> Self {
+        Self {
+            start: SystemTime::now(),
+            run_id: String::new(),
+            tcp_port: 6379,
+            ws_port: 6380,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            tls_enabled: false,
+            auth_enabled: false,
+            aof_enabled: false,
+        }
+    }
+}
+
+fn generate_run_id() -> String {
+    use rand::Rng;
+    let mut rng = rand::rng();
+    (0..40)
+        .map(|_| std::char::from_digit(rng.random_range(0..16), 16).unwrap_or('0'))
+        .collect()
+}
+
+/// Replication numbers, resolved by the caller.
+///
+/// The registry's depth and lag accessors are async (they lock per-replica
+/// queues), and `render_info` is a pure synchronous formatter so it stays
+/// trivially testable — so the caller awaits them and passes the results in.
+#[derive(Clone, Copy, Debug, Default)]
+struct ReplInfo {
+    connected: usize,
+    queue_depth: usize,
+    lag_frames: u64,
+}
+
+/// Last keyspace walk, refreshed every 5s by the metrics sampler.
+///
+/// `keyspace_sample()` is O(keyspace). A monitoring agent polling `INFO` once a
+/// second must not walk every key each time, so `INFO` reports the sample
+/// instead. `u64::MAX` means "not sampled yet" — `INFO` then walks once itself,
+/// which only happens in the first few seconds of uptime.
+static SAMPLED_KEYS: AtomicU64 = AtomicU64::new(u64::MAX);
+static SAMPLED_VOLATILE_KEYS: AtomicU64 = AtomicU64::new(u64::MAX);
+static SAMPLED_MEMORY_BYTES: AtomicU64 = AtomicU64::new(u64::MAX);
+
+fn store_sampled_keyspace(sample: KeyspaceSample) {
+    SAMPLED_KEYS.store(sample.keys as u64, Ordering::Relaxed);
+    SAMPLED_VOLATILE_KEYS.store(sample.volatile_keys as u64, Ordering::Relaxed);
+    SAMPLED_MEMORY_BYTES.store(sample.memory_bytes as u64, Ordering::Relaxed);
+}
+
+fn sampled_keyspace(store: &KeyValueStore) -> KeyspaceSample {
+    let keys = SAMPLED_KEYS.load(Ordering::Relaxed);
+    if keys == u64::MAX {
+        // Sampler has not run yet — walk once so the first INFO is not blank.
+        let sample = store.keyspace_sample();
+        store_sampled_keyspace(sample);
+        return sample;
+    }
+    KeyspaceSample {
+        keys: keys as usize,
+        volatile_keys: SAMPLED_VOLATILE_KEYS.load(Ordering::Relaxed) as usize,
+        memory_bytes: SAMPLED_MEMORY_BYTES.load(Ordering::Relaxed) as usize,
+    }
+}
+
+/// Render bytes the way Redis does for `*_human` fields.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [(&str, f64); 4] = [
+        ("G", 1024.0 * 1024.0 * 1024.0),
+        ("M", 1024.0 * 1024.0),
+        ("K", 1024.0),
+        ("B", 1.0),
+    ];
+    for (suffix, size) in UNITS {
+        if bytes as f64 >= size {
+            return if suffix == "B" {
+                format!("{}B", bytes)
+            } else {
+                format!("{:.2}{}", bytes as f64 / size, suffix)
+            };
+        }
+    }
+    "0B".to_string()
+}
+
+fn eviction_policy_name(policy: EvictionPolicy) -> &'static str {
+    match policy {
+        EvictionPolicy::NoEviction => "noeviction",
+        EvictionPolicy::AllKeysLru => "allkeys-lru",
+        EvictionPolicy::AllKeysRandom => "allkeys-random",
+        EvictionPolicy::VolatileLru => "volatile-lru",
+        EvictionPolicy::VolatileTtl => "volatile-ttl",
+    }
+}
+
+/// Build the `INFO` payload for `sections` (empty = the default set).
+///
+/// The format is load-bearing: `# Section` header, `field:value` lines, CRLF
+/// throughout, and a blank line between sections. Every Redis client and
+/// monitoring agent parses exactly that shape, so it is covered by tests rather
+/// than left to formatting drift. Unknown section names yield no output, which
+/// is what Redis does.
+#[allow(clippy::too_many_arguments)]
+fn render_info(
+    sections: &[String],
+    facts: &ServerFacts,
+    store: &KeyValueStore,
+    sample: KeyspaceSample,
+    is_replica: bool,
+    repl: ReplInfo,
+    last_save: i64,
+    live_queries: u64,
+    watched_keys: u64,
+) -> String {
+    let wanted: Vec<&str> = if sections.is_empty()
+        || sections
+            .iter()
+            .any(|s| s == "all" || s == "everything" || s == "default")
+    {
+        DEFAULT_INFO_SECTIONS.to_vec()
+    } else {
+        sections.iter().map(|s| s.as_str()).collect()
+    };
+
+    let uptime = facts
+        .start
+        .elapsed()
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let mut out = String::new();
+
+    for section in wanted {
+        let body = match section {
+            "server" => {
+                format!(
+                    "redis_version:{}\r\n\
+                     recached_version:{}\r\n\
+                     redis_mode:standalone\r\n\
+                     os:{}\r\n\
+                     arch_bits:{}\r\n\
+                     process_id:{}\r\n\
+                     run_id:{}\r\n\
+                     tcp_port:{}\r\n\
+                     recached_ws_port:{}\r\n\
+                     recached_tls_enabled:{}\r\n\
+                     recached_auth_enabled:{}\r\n\
+                     uptime_in_seconds:{}\r\n\
+                     uptime_in_days:{}\r\n",
+                    REDIS_COMPAT_VERSION,
+                    env!("CARGO_PKG_VERSION"),
+                    std::env::consts::OS,
+                    usize::BITS,
+                    std::process::id(),
+                    facts.run_id,
+                    facts.tcp_port,
+                    facts.ws_port,
+                    u8::from(facts.tls_enabled),
+                    u8::from(facts.auth_enabled),
+                    uptime,
+                    uptime / 86_400,
+                )
+            }
+            "clients" => {
+                // A negative count would mean the guard accounting is broken;
+                // clamp rather than emit a value no client can parse.
+                let active = STAT_CONNECTIONS_ACTIVE.load(Ordering::Relaxed).max(0);
+                format!(
+                    "connected_clients:{}\r\n\
+                     maxclients:{}\r\n\
+                     blocked_clients:0\r\n",
+                    active, facts.max_connections,
+                )
+            }
+            "memory" => {
+                let used = sample.memory_bytes as u64;
+                let max = store.max_memory_bytes().unwrap_or(0) as u64;
+                format!(
+                    "used_memory:{}\r\n\
+                     used_memory_human:{}\r\n\
+                     maxmemory:{}\r\n\
+                     maxmemory_human:{}\r\n\
+                     maxmemory_policy:{}\r\n\
+                     recached_max_keys:{}\r\n",
+                    used,
+                    human_bytes(used),
+                    max,
+                    human_bytes(max),
+                    eviction_policy_name(store.eviction_policy()),
+                    store.max_keys().unwrap_or(0),
+                )
+            }
+            "persistence" => {
+                // `loading` is what a client's ready-check reads to decide the
+                // server can serve traffic. Recached loads its snapshot before
+                // it binds a listener, so a client that can reach us is never
+                // looking at a loading server: the answer is always 0.
+                format!(
+                    "loading:0\r\n\
+                     rdb_changes_since_last_save:{}\r\n\
+                     rdb_last_save_time:{}\r\n\
+                     rdb_bgsave_in_progress:0\r\n\
+                     aof_enabled:{}\r\n",
+                    store.dirty_count(),
+                    last_save,
+                    u8::from(facts.aof_enabled),
+                )
+            }
+            "stats" => {
+                format!(
+                    "total_connections_received:{}\r\n\
+                     total_commands_processed:{}\r\n\
+                     keyspace_hits:{}\r\n\
+                     keyspace_misses:{}\r\n\
+                     evicted_keys:{}\r\n",
+                    STAT_CONNECTIONS_TOTAL.load(Ordering::Relaxed),
+                    STAT_COMMANDS_TOTAL.load(Ordering::Relaxed),
+                    STAT_KEYSPACE_HITS.load(Ordering::Relaxed),
+                    STAT_KEYSPACE_MISSES.load(Ordering::Relaxed),
+                    store.evicted_count(),
+                )
+            }
+            "replication" => {
+                // Redis still spells these `slave`; tooling greps for exactly
+                // that, so the compatible spelling is authoritative and the
+                // `replica` names are emitted alongside it.
+                format!(
+                    "role:{}\r\n\
+                     connected_slaves:{}\r\n\
+                     connected_replicas:{}\r\n\
+                     recached_replication_queue_depth:{}\r\n\
+                     recached_replication_lag_frames:{}\r\n",
+                    if is_replica { "slave" } else { "master" },
+                    repl.connected,
+                    repl.connected,
+                    repl.queue_depth,
+                    repl.lag_frames,
+                )
+            }
+            "keyspace" => {
+                // Redis omits the db line entirely when the database is empty.
+                if sample.keys == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        "db0:keys={},expires={},avg_ttl=0\r\n",
+                        sample.keys, sample.volatile_keys,
+                    )
+                }
+            }
+            // Recached-specific: the live-query machinery has no Redis analogue,
+            // so it gets its own section rather than being smuggled into one.
+            "recached" => {
+                format!(
+                    "live_queries:{}\r\n\
+                     watched_keys:{}\r\n",
+                    live_queries, watched_keys,
+                )
+            }
+            _ => continue,
+        };
+
+        let title = {
+            let mut c = section.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => continue,
+            }
+        };
+        out.push_str(&format!("# {}\r\n{}\r\n", title, body));
+    }
+
+    out
 }
 
 fn encode_pubsub_msg(msg: PubSubMsg, protover: u8) -> Vec<u8> {
@@ -2932,8 +3288,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(5));
             loop {
                 ticker.tick().await;
-                gauge!("recached_memory_bytes").set(store_m.approximate_memory_bytes() as f64);
-                gauge!("recached_keys").set(store_m.key_count() as f64);
+                // One walk of the keyspace feeds both gauges and the cached
+                // sample INFO reads, instead of one walk per number.
+                let sample = store_m.keyspace_sample();
+                store_sampled_keyspace(sample);
+                gauge!("recached_memory_bytes").set(sample.memory_bytes as f64);
+                gauge!("recached_keys").set(sample.keys as f64);
                 counter!("recached_evictions_total").absolute(store_m.evicted_count());
                 gauge!("recached_replicas_connected")
                     .set(state_m.replicas.count.load(Ordering::Relaxed) as f64);
@@ -2971,6 +3331,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!("TLS DISABLED. Set RECACHED_TLS_CERT and RECACHED_TLS_KEY to enable.");
     }
     let tls_acceptor = Arc::new(tls_acceptor);
+
+    // Startup facts for INFO. Recorded once the configuration is fully
+    // resolved and before any listener binds, so no connection can observe the
+    // defaults.
+    let _ = SERVER_FACTS.set(ServerFacts {
+        start: SystemTime::now(),
+        run_id: generate_run_id(),
+        tcp_port: 6379,
+        ws_port: 6380,
+        max_connections,
+        tls_enabled: tls_acceptor.is_some(),
+        auth_enabled: global_password.is_some(),
+        aof_enabled: state.aof.is_some(),
+    });
 
     // ── listeners ─────────────────────────────────────────────────────────
     let n_accept = num_cpus::get();
@@ -3439,6 +3813,27 @@ async fn handle_tcp<S>(
                                                 Command::LastSave => {
                                                     let ts = state.snap.last_save.load(Ordering::Relaxed);
                                                     if writer.write_all(&Value::Integer(ts).serialize()).await.is_err() { break 'outer; }
+                                                    continue 'parse;
+                                                }
+                                                Command::Info(sections) => {
+                                                    let repl = ReplInfo {
+                                                        connected: state.replicas.count.load(Ordering::Relaxed),
+                                                        queue_depth: state.replicas.max_queue_depth().await,
+                                                        lag_frames: state.replicas.max_lag_frames().await,
+                                                    };
+                                                    let body = render_info(
+                                                        sections,
+                                                        server_facts(),
+                                                        &store,
+                                                        sampled_keyspace(&store),
+                                                        state.is_replica(),
+                                                        repl,
+                                                        state.snap.last_save.load(Ordering::Relaxed),
+                                                        watch_registry.watched_patterns.load(Ordering::Relaxed) as u64,
+                                                        watch_registry.watched_keys.load(Ordering::Relaxed) as u64,
+                                                    );
+                                                    let resp = Value::BulkString(Some(body.into_bytes())).serialize();
+                                                    if writer.write_all(&resp).await.is_err() { break 'outer; }
                                                     continue 'parse;
                                                 }
                                                 Command::ReplicaOfNoOne => {
@@ -4011,6 +4406,26 @@ async fn handle_ws<S>(
                                     Command::LastSave => {
                                         let ts = state.snap.last_save.load(Ordering::Relaxed);
                                         ws_send!(&Value::Integer(ts).serialize());
+                                        continue 'outer;
+                                    }
+                                    Command::Info(sections) => {
+                                        let repl = ReplInfo {
+                                            connected: state.replicas.count.load(Ordering::Relaxed),
+                                            queue_depth: state.replicas.max_queue_depth().await,
+                                            lag_frames: state.replicas.max_lag_frames().await,
+                                        };
+                                        let body = render_info(
+                                            sections,
+                                            server_facts(),
+                                            &store,
+                                            sampled_keyspace(&store),
+                                            state.is_replica(),
+                                            repl,
+                                            state.snap.last_save.load(Ordering::Relaxed),
+                                            watch_registry.watched_patterns.load(Ordering::Relaxed) as u64,
+                                            watch_registry.watched_keys.load(Ordering::Relaxed) as u64,
+                                        );
+                                        ws_send!(&Value::BulkString(Some(body.into_bytes())).serialize());
                                         continue 'outer;
                                     }
                                     Command::ReplicaOfNoOne => {
@@ -6759,6 +7174,393 @@ mod tests {
             String::from_utf8_lossy(&process_hello(None, &mut protover, true, true)).into_owned();
         assert!(primary.contains("master"), "{primary:?}");
         assert!(replica.contains("replica"), "{replica:?}");
+    }
+
+    // ── INFO ──────────────────────────────────────────────────────────────────
+
+    fn test_facts() -> ServerFacts {
+        ServerFacts {
+            start: SystemTime::now() - std::time::Duration::from_secs(90_000),
+            run_id: "a".repeat(40),
+            tcp_port: 6379,
+            ws_port: 6380,
+            max_connections: 512,
+            tls_enabled: true,
+            auth_enabled: true,
+            aof_enabled: true,
+        }
+    }
+
+    /// Render `sections` against `store`, walking it for the keyspace numbers.
+    ///
+    /// Tests pass the sample explicitly rather than going through the shared
+    /// 5s cache — `render_info` is pure so that concurrent tests cannot
+    /// observe each other's keyspace through a process-global.
+    fn info_for(sections: &[&str], store: &KeyValueStore) -> String {
+        render_info(
+            &sections.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            &test_facts(),
+            store,
+            store.keyspace_sample(),
+            false,
+            ReplInfo::default(),
+            1_700_000_000,
+            0,
+            0,
+        )
+    }
+
+    /// Parse an INFO payload into (section, field) → value, enforcing the shape
+    /// clients rely on: CRLF endings, `# Section` headers, `field:value` lines.
+    fn parse_info(payload: &str) -> HashMap<(String, String), String> {
+        assert!(
+            !payload.contains('\n') || payload.contains("\r\n"),
+            "INFO must use CRLF line endings"
+        );
+        let mut out = HashMap::new();
+        let mut section = String::new();
+        for line in payload.split("\r\n") {
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(name) = line.strip_prefix("# ") {
+                section = name.to_lowercase();
+                continue;
+            }
+            let (k, v) = line
+                .split_once(':')
+                .unwrap_or_else(|| panic!("malformed INFO line: {line:?}"));
+            out.insert((section.clone(), k.to_string()), v.to_string());
+        }
+        out
+    }
+
+    #[test]
+    fn info_default_emits_every_default_section() {
+        let store = KeyValueStore::new();
+        let payload = info_for(&[], &store);
+        for section in DEFAULT_INFO_SECTIONS {
+            let header = format!("# {}{}\r\n", &section[..1].to_uppercase(), &section[1..]);
+            assert!(
+                payload.contains(&header),
+                "missing section header {header:?} in {payload:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn info_uses_crlf_and_blank_line_separated_sections() {
+        let store = KeyValueStore::new();
+        let payload = info_for(&["server", "clients"], &store);
+        assert!(payload.starts_with("# Server\r\n"), "{payload:?}");
+        // A blank line must close each section, or parsers merge them.
+        assert!(payload.contains("\r\n\r\n# Clients\r\n"), "{payload:?}");
+        assert!(payload.ends_with("\r\n\r\n"), "{payload:?}");
+        assert!(!payload.contains('\n') || !payload.replace("\r\n", "").contains('\n'));
+    }
+
+    #[test]
+    fn info_server_section_reports_compat_version_separately_from_ours() {
+        let store = KeyValueStore::new();
+        let f = parse_info(&info_for(&["server"], &store));
+        // Clients feature-gate on redis_version, so it must be a Redis version,
+        // never Recached's own — that is the entire point of the split.
+        assert_eq!(f[&("server".into(), "redis_version".into())], "6.2.0");
+        assert_eq!(
+            f[&("server".into(), "recached_version".into())],
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_eq!(f[&("server".into(), "redis_mode".into())], "standalone");
+        assert_eq!(f[&("server".into(), "tcp_port".into())], "6379");
+        assert_eq!(f[&("server".into(), "recached_ws_port".into())], "6380");
+        assert_eq!(f[&("server".into(), "run_id".into())].len(), 40);
+        // 90_000s of uptime is one day and change.
+        assert_eq!(f[&("server".into(), "uptime_in_days".into())], "1");
+        assert!(
+            f[&("server".into(), "uptime_in_seconds".into())]
+                .parse::<u64>()
+                .unwrap()
+                >= 90_000
+        );
+    }
+
+    #[test]
+    fn info_memory_section_reports_limits_and_policy() {
+        let store =
+            KeyValueStore::with_config(Some(50), Some(1024 * 1024), EvictionPolicy::AllKeysLru);
+        let f = parse_info(&info_for(&["memory"], &store));
+        assert_eq!(f[&("memory".into(), "maxmemory".into())], "1048576");
+        assert_eq!(f[&("memory".into(), "maxmemory_human".into())], "1.00M");
+        assert_eq!(
+            f[&("memory".into(), "maxmemory_policy".into())],
+            "allkeys-lru"
+        );
+        assert_eq!(f[&("memory".into(), "recached_max_keys".into())], "50");
+    }
+
+    #[test]
+    fn info_memory_reports_zero_maxmemory_when_unbounded() {
+        // Redis reports 0 for "no limit"; None must not leak as a debug string.
+        let f = parse_info(&info_for(&["memory"], &KeyValueStore::new()));
+        assert_eq!(f[&("memory".into(), "maxmemory".into())], "0");
+        assert_eq!(
+            f[&("memory".into(), "maxmemory_policy".into())],
+            "noeviction"
+        );
+    }
+
+    #[test]
+    fn info_persistence_always_reports_loading_zero() {
+        // A client's ready-check gates on this field; the snapshot is loaded
+        // before any listener binds, so a reachable server is never loading.
+        let f = parse_info(&info_for(&["persistence"], &KeyValueStore::new()));
+        assert_eq!(f[&("persistence".into(), "loading".into())], "0");
+        assert_eq!(
+            f[&("persistence".into(), "rdb_last_save_time".into())],
+            "1700000000"
+        );
+        assert_eq!(f[&("persistence".into(), "aof_enabled".into())], "1");
+    }
+
+    #[test]
+    fn info_replication_reports_both_redis_and_recached_spellings() {
+        let store = KeyValueStore::new();
+        let repl = ReplInfo {
+            connected: 2,
+            queue_depth: 7,
+            lag_frames: 3,
+        };
+        let primary = parse_info(&render_info(
+            &[],
+            &test_facts(),
+            &store,
+            store.keyspace_sample(),
+            false,
+            repl,
+            0,
+            0,
+            0,
+        ));
+        assert_eq!(primary[&("replication".into(), "role".into())], "master");
+        // Tooling greps for `connected_slaves`; the modern alias ships too.
+        assert_eq!(
+            primary[&("replication".into(), "connected_slaves".into())],
+            "2"
+        );
+        assert_eq!(
+            primary[&("replication".into(), "connected_replicas".into())],
+            "2"
+        );
+        assert_eq!(
+            primary[&(
+                "replication".into(),
+                "recached_replication_lag_frames".into()
+            )],
+            "3"
+        );
+
+        let replica = parse_info(&render_info(
+            &[],
+            &test_facts(),
+            &store,
+            store.keyspace_sample(),
+            true,
+            ReplInfo::default(),
+            0,
+            0,
+            0,
+        ));
+        // Redis still spells a replica `slave` in INFO, and clients match on it.
+        assert_eq!(replica[&("replication".into(), "role".into())], "slave");
+    }
+
+    #[test]
+    fn info_keyspace_omits_the_db_line_when_empty_and_counts_ttls_when_not() {
+        let store = KeyValueStore::new();
+        assert!(
+            !info_for(&["keyspace"], &store).contains("db0:"),
+            "an empty keyspace must not report a db0 line"
+        );
+
+        store.execute(Command::Set(
+            "a".into(),
+            b"v".to_vec(),
+            SetOptions::default(),
+        ));
+        store.execute(Command::Set(
+            "b".into(),
+            b"v".to_vec(),
+            SetOptions::default(),
+        ));
+        store.execute(Command::Expire("b".into(), 60));
+        let payload = info_for(&["keyspace"], &store);
+        assert!(
+            payload.contains("db0:keys=2,expires=1,avg_ttl=0"),
+            "{payload:?}"
+        );
+    }
+
+    #[test]
+    fn sampled_keyspace_falls_back_to_a_live_walk_before_the_sampler_runs() {
+        // First INFO of a process arrives before the 5s sampler has ever run,
+        // and must not report an empty keyspace.
+        let store = KeyValueStore::new();
+        store.execute(Command::Set(
+            "k".into(),
+            b"v".to_vec(),
+            SetOptions::default(),
+        ));
+        SAMPLED_KEYS.store(u64::MAX, Ordering::Relaxed);
+        assert_eq!(sampled_keyspace(&store).keys, 1);
+    }
+
+    #[test]
+    fn info_unknown_section_yields_nothing() {
+        // Redis answers an unknown section with an empty payload, not an error.
+        assert_eq!(info_for(&["nosuchsection"], &KeyValueStore::new()), "");
+    }
+
+    #[test]
+    fn info_all_and_everything_expand_to_the_default_sections() {
+        let store = KeyValueStore::new();
+        let default = info_for(&[], &store);
+        for alias in ["all", "everything", "default"] {
+            assert_eq!(
+                info_for(&[alias], &store).lines().count(),
+                default.lines().count(),
+                "INFO {alias} must cover the default sections"
+            );
+        }
+    }
+
+    #[test]
+    fn info_honours_section_selection_and_order() {
+        let payload = info_for(&["clients", "server"], &KeyValueStore::new());
+        assert!(payload.starts_with("# Clients\r\n"), "{payload:?}");
+        assert!(payload.contains("# Server\r\n"), "{payload:?}");
+        assert!(!payload.contains("# Memory"), "{payload:?}");
+    }
+
+    #[test]
+    fn human_bytes_matches_redis_formatting() {
+        assert_eq!(human_bytes(0), "0B");
+        assert_eq!(human_bytes(512), "512B");
+        assert_eq!(human_bytes(1024), "1.00K");
+        assert_eq!(human_bytes(1024 * 1024), "1.00M");
+        assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.00G");
+    }
+
+    #[test]
+    fn run_ids_are_forty_hex_chars_and_differ_per_process() {
+        let a = generate_run_id();
+        assert_eq!(a.len(), 40);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
+        assert_ne!(a, generate_run_id());
+    }
+
+    #[test]
+    fn info_is_administrative_scope() {
+        // Scoped WebSocket connections must not be able to read server-wide
+        // state, so INFO has to classify as Admin, not KeyLess.
+        assert!(matches!(
+            command_scope(&Command::Info(vec![])),
+            CommandScope::Admin
+        ));
+    }
+
+    #[test]
+    fn info_is_not_a_write_command() {
+        assert!(!is_write_command(&Command::Info(vec![])));
+    }
+
+    #[tokio::test]
+    async fn info_over_tcp_returns_a_parseable_bulk_string() {
+        let srv = spawn_server().await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        let Value::BulkString(Some(bytes)) = c.cmd(&["INFO"]).await else {
+            panic!("INFO must reply with a bulk string");
+        };
+        let payload = String::from_utf8(bytes).unwrap();
+        let f = parse_info(&payload);
+        assert_eq!(f[&("server".into(), "redis_version".into())], "6.2.0");
+        assert_eq!(f[&("replication".into(), "role".into())], "master");
+        assert!(f.contains_key(&("stats".into(), "total_commands_processed".into())));
+    }
+
+    #[tokio::test]
+    async fn info_section_argument_is_honoured_over_the_wire() {
+        let srv = spawn_server().await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        let Value::BulkString(Some(bytes)) = c.cmd(&["INFO", "server"]).await else {
+            panic!("INFO must reply with a bulk string");
+        };
+        let payload = String::from_utf8(bytes).unwrap();
+        assert!(payload.starts_with("# Server\r\n"), "{payload:?}");
+        assert!(!payload.contains("# Memory"), "{payload:?}");
+    }
+
+    #[tokio::test]
+    async fn info_reflects_live_server_state() {
+        let srv = spawn_server().await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        c.cmd(&["SET", "k", "v"]).await;
+        c.cmd(&["GET", "k"]).await; // hit
+        c.cmd(&["GET", "missing"]).await; // miss
+
+        let Value::BulkString(Some(bytes)) = c.cmd(&["INFO", "stats", "persistence"]).await else {
+            panic!("INFO must reply with a bulk string");
+        };
+        let f = parse_info(&String::from_utf8(bytes).unwrap());
+        assert!(
+            f[&("stats".into(), "keyspace_hits".into())]
+                .parse::<u64>()
+                .unwrap()
+                >= 1
+        );
+        assert!(
+            f[&("stats".into(), "keyspace_misses".into())]
+                .parse::<u64>()
+                .unwrap()
+                >= 1
+        );
+        // The SET must show up as an unsaved change.
+        assert!(
+            f[&("persistence".into(), "rdb_changes_since_last_save".into())]
+                .parse::<u64>()
+                .unwrap()
+                >= 1
+        );
+    }
+
+    #[tokio::test]
+    async fn info_requires_authentication() {
+        let srv = spawn_server_cfg(Some("hunter2"), None, false).await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        // INFO leaks deployment details, so it must sit behind AUTH like every
+        // other non-handshake command.
+        match c.cmd(&["INFO"]).await {
+            Value::Error(e) => assert!(e.starts_with("NOAUTH"), "{e}"),
+            other => panic!("unauthenticated INFO must be refused, got {other:?}"),
+        }
+
+        assert_eq!(c.cmd(&["AUTH", "hunter2"]).await, ok());
+        assert!(matches!(c.cmd(&["INFO"]).await, Value::BulkString(Some(_))));
+    }
+
+    #[tokio::test]
+    async fn info_on_a_replica_reports_the_slave_role() {
+        let srv = spawn_server_cfg(None, None, true).await;
+        let mut c = RespClient::connect(srv.tcp_addr).await;
+
+        let Value::BulkString(Some(bytes)) = c.cmd(&["INFO", "replication"]).await else {
+            panic!("INFO must reply with a bulk string");
+        };
+        let f = parse_info(&String::from_utf8(bytes).unwrap());
+        assert_eq!(f[&("replication".into(), "role".into())], "slave");
     }
 
     #[test]

@@ -50,6 +50,11 @@ pub enum Command {
     /// `HELLO [protover]` — protocol negotiation. Connection-level like AUTH:
     /// the store never sees it, because the answer depends on the connection.
     Hello(Option<String>),
+    /// `INFO [section ...]` — server introspection. Connection-level like
+    /// HELLO: most of the answer (uptime, clients, replication) lives in the
+    /// server, not the store, so the store refuses it. An empty section list
+    /// means the default set.
+    Info(Vec<String>),
     // ── Strings ──────────────────────────────────────────────────────────────
     Set(String, Vec<u8>, SetOptions),
     Get(String),
@@ -264,6 +269,16 @@ impl Command {
                     } else {
                         None
                     })),
+                    // Section names are lowercased here so the connection layer
+                    // can compare them directly — Redis matches them
+                    // case-insensitively, and `INFO Server` is common in the
+                    // wild.
+                    "INFO" => Ok(Command::Info(
+                        arr[1..]
+                            .iter()
+                            .map(|v| extract_string(v).unwrap_or_default().to_lowercase())
+                            .collect(),
+                    )),
 
                     // ── Strings ───────────────────────────────────────────────
                     "SET" => {
@@ -1580,6 +1595,36 @@ mod tests {
     #[test]
     fn non_array_input() {
         assert!(Command::from_value(Value::SimpleString("PING".into())).is_err());
+    }
+
+    // ── INFO ──────────────────────────────────────────────────────────────
+    #[test]
+    fn info_without_arguments_requests_the_default_sections() {
+        assert_eq!(
+            Command::from_value(array(&["INFO"])).unwrap(),
+            Command::Info(vec![])
+        );
+    }
+    #[test]
+    fn info_lowercases_section_names() {
+        assert_eq!(
+            Command::from_value(array(&["INFO", "Server"])).unwrap(),
+            Command::Info(vec!["server".into()])
+        );
+    }
+    #[test]
+    fn info_accepts_multiple_sections() {
+        assert_eq!(
+            Command::from_value(array(&["INFO", "server", "REPLICATION"])).unwrap(),
+            Command::Info(vec!["server".into(), "replication".into()])
+        );
+    }
+    #[test]
+    fn info_is_case_insensitive_like_every_other_command() {
+        assert_eq!(
+            Command::from_value(array(&["info"])).unwrap(),
+            Command::Info(vec![])
+        );
     }
 
     // ── Phase 4: Transactions ─────────────────────────────────────────────

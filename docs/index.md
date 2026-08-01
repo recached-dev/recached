@@ -19,7 +19,7 @@ hero:
       link: /guide/how-it-works
     - theme: alt
       text: GitHub
-      link: https://github.com/thinkgrid-labs/recached
+      link: https://github.com/recached-dev/recached
     - theme: alt
       text: npm
       link: https://www.npmjs.com/package/recached-edge

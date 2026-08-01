@@ -1,7 +1,7 @@
 {
   "name": "recached-edge",
   "description": "Browser and edge WebAssembly client for Recached \u2014 zero-latency local cache with automatic server sync",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "type": "module",
   "main": "sdk.js",
   "module": "sdk.js",
@@ -31,10 +31,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/thinkgrid-labs/recached"
+    "url": "https://github.com/recached-dev/recached"
   },
-  "homepage": "https://github.com/thinkgrid-labs/recached",
-  "bugs": "https://github.com/thinkgrid-labs/recached/issues",
+  "homepage": "https://github.com/recached-dev/recached",
+  "bugs": "https://github.com/recached-dev/recached/issues",
   "keywords": [
     "cache",
     "wasm",

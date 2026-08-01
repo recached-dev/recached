@@ -100,7 +100,7 @@ export default defineConfig({
     },
 
     socialLinks: [
-      { icon: 'github', link: 'https://github.com/thinkgrid-labs/recached' },
+      { icon: 'github', link: 'https://github.com/recached-dev/recached' },
     ],
 
     footer: {
@@ -109,7 +109,7 @@ export default defineConfig({
     },
 
     editLink: {
-      pattern: 'https://github.com/thinkgrid-labs/recached/edit/main/docs/:path',
+      pattern: 'https://github.com/recached-dev/recached/edit/main/docs/:path',
       text: 'Edit this page on GitHub',
     },
 

@@ -59,4 +59,4 @@ Under consideration behind these: a CRDT text type for collaborative editing (li
 
 ---
 
-Feedback on priorities is welcome — [open an issue](https://github.com/thinkgrid-labs/recached/issues) or write to [dennis@thinkgrid.dev](mailto:dennis@thinkgrid.dev).
+Feedback on priorities is welcome — [open an issue](https://github.com/recached-dev/recached/issues) or write to [dennis@thinkgrid.dev](mailto:dennis@thinkgrid.dev).

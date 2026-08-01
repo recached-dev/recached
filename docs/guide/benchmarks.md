@@ -28,7 +28,7 @@ Methodology:
 - Servers ran **one at a time** on localhost, with the load generator on the same machine.
 - Persistence disabled everywhere: `RECACHED_SAVE_INTERVAL=0` for Recached; `--save '' --appendonly no` for Redis and Valkey.
 - Each server got a 10k-request warm-up, then `FLUSHDB`, then the measured run: **100,000 requests, 50 parallel connections, 64-byte values, randomized keys** (`-n 100000 -c 50 -d 64 -r 100000`), tests back-to-back in suite order.
-- Reproduce with [`scripts/benchmark.sh`](https://github.com/thinkgrid-labs/recached/blob/main/scripts/benchmark.sh).
+- Reproduce with [`scripts/benchmark.sh`](https://github.com/recached-dev/recached/blob/main/scripts/benchmark.sh).
 
 One caveat: this is a 4-core laptop and the benchmark tool competes with the servers for cores — absolute numbers on server hardware will be higher for all three systems. Recached's multi-threaded runtime has the most headroom to gain from more cores; Redis and Valkey process commands on a single thread.
 

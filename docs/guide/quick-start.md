@@ -9,7 +9,7 @@ Pick the method that fits your environment.
 ### Docker (recommended)
 
 ```bash
-docker run -p 6379:6379 -p 6380:6380 ghcr.io/thinkgrid-labs/recached:latest
+docker run -p 6379:6379 -p 6380:6380 ghcr.io/recached-dev/recached:latest
 ```
 
 Port 6379 is the RESP TCP port (Redis-compatible). Port 6380 is the WebSocket sync port for browser clients.
@@ -17,7 +17,7 @@ Port 6379 is the RESP TCP port (Redis-compatible). Port 6380 is the WebSocket sy
 ### Homebrew (macOS)
 
 ```bash
-brew tap thinkgrid-labs/recached
+brew tap recached-dev/recached
 brew install recached
 recached-server
 ```

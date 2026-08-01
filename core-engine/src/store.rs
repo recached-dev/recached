@@ -621,9 +621,22 @@ macro_rules! type_guard {
     }};
 }
 
+// ── KeyspaceSample ────────────────────────────────────────────────────────────
+
+/// One pass over the keyspace, as reported to metrics and `INFO`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct KeyspaceSample {
+    /// Live keys, excluding expired entries awaiting sweep.
+    pub keys: usize,
+    /// Of those, how many carry a TTL (`INFO keyspace` reports it as `expires`).
+    pub volatile_keys: usize,
+    /// Approximate heap usage: key+value sizes plus fixed per-entry overhead.
+    pub memory_bytes: usize,
+}
+
 // ── EvictionPolicy ────────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub enum EvictionPolicy {
     #[default]
     NoEviction,
@@ -904,6 +917,21 @@ impl KeyValueStore {
         self.evicted.load(Ordering::Relaxed)
     }
 
+    /// Configured memory cap, if any. Reported by `INFO memory` as `maxmemory`.
+    pub fn max_memory_bytes(&self) -> Option<usize> {
+        self.max_memory_bytes
+    }
+
+    /// Configured key-count cap, if any.
+    pub fn max_keys(&self) -> Option<usize> {
+        self.max_keys
+    }
+
+    /// Active eviction policy. Reported by `INFO memory` as `maxmemory_policy`.
+    pub fn eviction_policy(&self) -> EvictionPolicy {
+        self.eviction_policy
+    }
+
     /// Live key count, excluding expired entries awaiting sweep.
     pub fn key_count(&self) -> usize {
         let now = now_ms();
@@ -911,6 +939,27 @@ impl KeyValueStore {
             .iter()
             .filter(|r| !r.value().is_expired(now))
             .count()
+    }
+
+    /// Live keys, keys carrying a TTL, and approximate bytes — in one pass.
+    ///
+    /// `key_count()` and `approximate_memory_bytes()` each walk the whole
+    /// keyspace. Callers that want more than one of these numbers (the metrics
+    /// sampler, `INFO`) would otherwise pay that walk two or three times over.
+    pub fn keyspace_sample(&self) -> KeyspaceSample {
+        let now = now_ms();
+        let mut sample = KeyspaceSample::default();
+        for r in self.data.iter() {
+            if r.value().is_expired(now) {
+                continue;
+            }
+            sample.keys += 1;
+            if r.value().expires_at_ms.is_some() {
+                sample.volatile_keys += 1;
+            }
+            sample.memory_bytes += entry_size(r.key(), r.value());
+        }
+        sample
     }
 
     fn evict_one(&self, now: u64) -> Option<usize> {
@@ -1076,6 +1125,9 @@ impl KeyValueStore {
             ),
             Command::Hello(_) => Value::Error(
                 "ERR HELLO is handled by the connection layer, not the store".to_string(),
+            ),
+            Command::Info(_) => Value::Error(
+                "ERR INFO is handled by the connection layer, not the store".to_string(),
             ),
 
             // ── Strings ───────────────────────────────────────────────────────
@@ -4934,7 +4986,7 @@ mod capacity_tests {
     #[test]
     fn volatile_policies_only_evict_keys_that_have_a_ttl() {
         for policy in [EvictionPolicy::VolatileLru, EvictionPolicy::VolatileTtl] {
-            let s = KeyValueStore::with_config(None, Some(256), policy.clone());
+            let s = KeyValueStore::with_config(None, Some(256), policy);
             // Persistent keys only — a volatile policy has nothing it may touch.
             for i in 0..30 {
                 set(&s, &format!("p{i}"), &"x".repeat(100));
@@ -5196,6 +5248,70 @@ mod semantics_tests {
         );
     }
 
+    // ── keyspace_sample ───────────────────────────────────────────────────────
+
+    #[test]
+    fn keyspace_sample_counts_keys_ttls_and_bytes_in_one_pass() {
+        let s = KeyValueStore::new();
+        s.execute(Command::Set(
+            "a".into(),
+            b"xx".to_vec(),
+            SetOptions::default(),
+        ));
+        s.execute(Command::Set(
+            "b".into(),
+            b"yy".to_vec(),
+            SetOptions::default(),
+        ));
+        s.execute(Command::Expire("b".into(), 60));
+
+        let sample = s.keyspace_sample();
+        assert_eq!(sample.keys, 2);
+        assert_eq!(sample.volatile_keys, 1, "only b carries a TTL");
+        assert!(sample.memory_bytes > 0);
+        // Must agree with the single-purpose accessors it replaces at call sites.
+        assert_eq!(sample.keys, s.key_count());
+        assert_eq!(sample.memory_bytes, s.approximate_memory_bytes());
+    }
+
+    #[test]
+    fn keyspace_sample_excludes_expired_entries() {
+        let s = KeyValueStore::new();
+        s.execute(Command::Set(
+            "gone".into(),
+            b"v".to_vec(),
+            SetOptions::default(),
+        ));
+        s.execute(Command::PExpire("gone".into(), 1));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let sample = s.keyspace_sample();
+        assert_eq!(sample.keys, 0);
+        assert_eq!(sample.volatile_keys, 0);
+        assert_eq!(sample.memory_bytes, 0);
+    }
+
+    #[test]
+    fn keyspace_sample_is_empty_on_a_fresh_store() {
+        assert_eq!(
+            KeyValueStore::new().keyspace_sample(),
+            KeyspaceSample::default()
+        );
+    }
+
+    #[test]
+    fn store_config_accessors_report_what_was_configured() {
+        let s = KeyValueStore::with_config(Some(10), Some(4096), EvictionPolicy::AllKeysLru);
+        assert_eq!(s.max_keys(), Some(10));
+        assert_eq!(s.max_memory_bytes(), Some(4096));
+        assert_eq!(s.eviction_policy(), EvictionPolicy::AllKeysLru);
+
+        let unbounded = KeyValueStore::new();
+        assert_eq!(unbounded.max_keys(), None);
+        assert_eq!(unbounded.max_memory_bytes(), None);
+        assert_eq!(unbounded.eviction_policy(), EvictionPolicy::NoEviction);
+    }
+
     // ── Commands the engine deliberately refuses ──────────────────────────────
     // These are server-layer concerns; the pure engine must reject rather than
     // half-implement them, so a WASM build can never silently "succeed".
@@ -5210,6 +5326,8 @@ mod semantics_tests {
             Command::ReplicaOfNoOne,
             Command::Watch(vec!["k".into()]),
             Command::Unwatch(vec![]),
+            Command::Hello(None),
+            Command::Info(vec![]),
         ] {
             assert!(
                 matches!(s.execute(cmd.clone()), Value::Error(_)),

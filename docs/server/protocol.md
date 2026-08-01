@@ -1,6 +1,6 @@
 # Wire Protocol
 
-This page is **normative**: client SDKs (browser `recached-edge`, the planned mobile bindings) and the server implement exactly what is written here. If code and this page disagree, one of them has a bug. The reference client implementation is the platform-neutral [`sync-client`](https://github.com/thinkgrid-labs/recached/tree/main/sync-client) crate.
+This page is **normative**: client SDKs (browser `recached-edge`, the planned mobile bindings) and the server implement exactly what is written here. If code and this page disagree, one of them has a bug. The reference client implementation is the platform-neutral [`sync-client`](https://github.com/recached-dev/recached/tree/main/sync-client) crate.
 
 ## Transports
 

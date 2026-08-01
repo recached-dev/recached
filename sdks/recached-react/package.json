@@ -1,6 +1,6 @@
 {
   "name": "@recached/react",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Official React hooks for Recached \u2014 zero-latency reactive cache",
   "type": "module",
   "main": "./dist/index.js",
@@ -43,8 +43,8 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/thinkgrid-labs/recached"
+    "url": "https://github.com/recached-dev/recached"
   },
-  "homepage": "https://github.com/thinkgrid-labs/recached/tree/main/sdks/recached-react",
-  "bugs": "https://github.com/thinkgrid-labs/recached/issues"
+  "homepage": "https://github.com/recached-dev/recached/tree/main/sdks/recached-react",
+  "bugs": "https://github.com/recached-dev/recached/issues"
 }

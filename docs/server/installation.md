@@ -5,7 +5,7 @@
 The fastest way to run Recached in any environment.
 
 ```bash
-docker run -p 6379:6379 -p 6380:6380 ghcr.io/thinkgrid-labs/recached:latest
+docker run -p 6379:6379 -p 6380:6380 ghcr.io/recached-dev/recached:latest
 ```
 
 With environment variables for a production-like setup:
@@ -19,7 +19,7 @@ docker run \
   -e RECACHED_EVICTION="lru" \
   -e RECACHED_METRICS_PORT="9091" \
   -p 9091:9091 \
-  ghcr.io/thinkgrid-labs/recached:latest
+  ghcr.io/recached-dev/recached:latest
 ```
 
 ### Docker Compose
@@ -27,7 +27,7 @@ docker run \
 ```yaml
 services:
   recached:
-    image: ghcr.io/thinkgrid-labs/recached:latest
+    image: ghcr.io/recached-dev/recached:latest
     ports:
       - "6379:6379"
       - "6380:6380"
@@ -46,7 +46,7 @@ services:
 ## Homebrew (macOS)
 
 ```bash
-brew tap thinkgrid-labs/recached
+brew tap recached-dev/recached
 brew install recached
 recached-server
 ```
@@ -89,7 +89,7 @@ RECACHED_PASSWORD="secret" RECACHED_MAX_KEYS="100000" recached-server
 Requirements: Rust 1.78+ with the `wasm32-unknown-unknown` target.
 
 ```bash
-git clone https://github.com/thinkgrid-labs/recached
+git clone https://github.com/recached-dev/recached
 cd recached
 
 # Build just the server binary

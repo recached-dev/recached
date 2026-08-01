@@ -9,6 +9,51 @@ Recached implements the subset of RESP commands that most applications use. Comm
 | `PING [message]` | Returns `PONG`, or echoes `message` if provided. Used to test connectivity and measure latency. |
 | `AUTH password` | Authenticates the connection. Required on the first command if `RECACHED_PASSWORD` is set. 5 consecutive failures close the connection. |
 | `HELLO [protover]` | Reports server info and negotiates the protocol version. `3` switches the connection to RESP3, `2` back to RESP2, no argument reports without changing. Unsupported versions return `-NOPROTO` and leave the connection unchanged. Requires authentication. See [Wire Protocol](/server/protocol#protocol-version-tcp). |
+| `INFO [section ...]` | Reports server statistics as a text blob, in Redis's `# Section` / `field:value` format. No arguments returns the default sections; naming sections returns only those, in the order given. `all`, `everything`, and `default` are accepted as aliases for the default set. Unknown section names return nothing rather than an error. Requires authentication. See [INFO](#info) below. |
+
+---
+
+## INFO
+
+`INFO` reports the server's own state — uptime, client counts, memory, replication topology — in the same line format Redis uses, so `redis-cli info`, monitoring agents, and client library ready-checks all parse it unmodified.
+
+```bash
+redis-cli -p 6379 INFO              # every default section
+redis-cli -p 6379 INFO replication  # one section
+redis-cli -p 6379 INFO server memory
+```
+
+### Sections
+
+| Section | Fields |
+|---|---|
+| `server` | `redis_version`, `recached_version`, `redis_mode`, `os`, `arch_bits`, `process_id`, `run_id`, `tcp_port`, `recached_ws_port`, `recached_tls_enabled`, `recached_auth_enabled`, `uptime_in_seconds`, `uptime_in_days` |
+| `clients` | `connected_clients`, `maxclients`, `blocked_clients` |
+| `memory` | `used_memory`, `used_memory_human`, `maxmemory`, `maxmemory_human`, `maxmemory_policy`, `recached_max_keys` |
+| `persistence` | `loading`, `rdb_changes_since_last_save`, `rdb_last_save_time`, `rdb_bgsave_in_progress`, `aof_enabled` |
+| `stats` | `total_connections_received`, `total_commands_processed`, `keyspace_hits`, `keyspace_misses`, `evicted_keys` |
+| `replication` | `role`, `connected_slaves`, `connected_replicas`, `recached_replication_queue_depth`, `recached_replication_lag_frames` |
+| `keyspace` | `db0:keys=N,expires=N,avg_ttl=0` — omitted entirely when the keyspace is empty, as in Redis |
+| `recached` | `live_queries`, `watched_keys` — Recached-specific, no Redis equivalent |
+
+### Version reporting
+
+`redis_version` reports **`6.2.0`**, not Recached's version. Client libraries feature-gate on that field, and a library reading `redis_version:0.2.3` concludes the server predates everything and disables capabilities it could safely use. 6.2 is the honest floor: RESP3 and `HELLO` exist there and Recached implements both, while nothing newer that Recached lacks gets advertised. Recached's real version ships alongside it as **`recached_version`** — the same split KeyDB and Dragonfly use.
+
+### Field notes
+
+- **`role`** reports `master` or `slave`, matching Redis's wire spelling because tooling greps for exactly those strings. `connected_replicas` is emitted as an alias of `connected_slaves` for readability; both carry the same number.
+- **`loading`** is always `0`. Recached loads its snapshot before binding a listener, so a client that can reach the server is never looking at one still loading. Client ready-checks gate on this field.
+- **`used_memory`** and the `keyspace` counts come from a keyspace sample refreshed every 5 seconds, not a fresh walk per call — so polling `INFO` once a second costs the same as polling it once a minute. Both are approximations, as `used_memory` is in Redis.
+- **`maxmemory`** and `recached_max_keys` report `0` when no limit is configured, matching Redis's convention for "unbounded".
+
+### Not implemented
+
+`INFO` does not report the `cpu`, `commandstats`, `latencystats`, `cluster`, or `errorstats` sections. Per-command counters, error counts, and latency histograms are exported to [Prometheus](/server/operations#metrics-endpoint) on port 9091 instead, which is where they belong for dashboards and alerting. `INFO` is for the operator at a terminal and for client ready-checks.
+
+### Access
+
+`INFO` requires authentication when `RECACHED_PASSWORD` is set, and is rejected on scope-limited WebSocket connections (`-NOSCOPE`) — a connection granted a handful of keys has no business reading server-wide state. See [Sync Scoping](/server/sync-scopes).
 
 ---
 

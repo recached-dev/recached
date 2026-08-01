@@ -1,6 +1,6 @@
 # @recached/vue
 
-Official Vue 3 composables for [Recached](https://github.com/thinkgrid-labs/recached) — zero-latency reactive cache with automatic server sync and cross-tab sharing.
+Official Vue 3 composables for [Recached](https://github.com/recached-dev/recached) — zero-latency reactive cache with automatic server sync and cross-tab sharing.
 
 ## Features
 

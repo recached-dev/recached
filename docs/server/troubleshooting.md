@@ -234,4 +234,4 @@ cache and letting it fill — see [Migrating from Redis](/guide/use-cases#migrat
 
 Include the server version, the startup log lines (they state which subsystems are enabled), the
 exact error string, and whether the client is RESP or the browser SDK:
-[open an issue](https://github.com/thinkgrid-labs/recached/issues).
+[open an issue](https://github.com/recached-dev/recached/issues).
