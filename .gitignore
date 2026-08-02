@@ -33,7 +33,16 @@ Thumbs.db
 PLAN.md
 NOTES.md
 
-scripts/
+# Local scratch scripts stay out, but the ones the README and the docs site link
+# to have to be tracked or those links 404.
+#
+# `scripts/*` rather than `scripts/`: git cannot re-include a file whose parent
+# directory is excluded, so a bare `scripts/` would make the negations below
+# silently do nothing.
+scripts/*
+!scripts/bump-version.sh
+!scripts/benchmark.sh
+!scripts/update-formula-checksums.sh
 
 # Cache snapshots / AOF written by a server started in the repo root
 # (e.g. while running scripts/benchmark.sh). Never artifacts to commit.

@@ -1,27 +1,33 @@
 class Recached < Formula
   desc "Blazing fast, multi-core drop-in replacement for Redis"
   homepage "https://github.com/recached-dev/recached"
-  version "0.1.8"
-  license "MIT"
+  version "0.2.4"
+  license "Apache-2.0"
 
+  # The checksums below are placeholders until the v0.2.4 release artifacts
+  # exist. Fill them with `scripts/update-formula-checksums.sh v0.2.4`, which
+  # downloads the published binaries and rewrites this file.
+  #
+  # `scripts/bump-version.sh` resets them to placeholders on every bump, and
+  # that is deliberate: this formula sat at 0.1.8 with *valid* 0.1.8 URLs and
+  # checksums while the project shipped 0.2.x, so `brew install recached`
+  # silently succeeded and handed people the old binary — including the one
+  # whose replication port served the keyspace without authentication. A
+  # placeholder makes brew fail loudly, which is the far better failure.
   on_macos do
     on_intel do
-      url "https://github.com/recached-dev/recached/releases/download/v0.1.8/recached-macos-x86_64"
-      # shasum -a 256 of the binary in target/dist/recached-macos-x86_64;
-      # recompute if the release binary is rebuilt before uploading.
-      sha256 "227fca7d7ff5c9511f9482863024e222c0c66f93ad40288581ca1fb32a9f20bd"
+      url "https://github.com/recached-dev/recached/releases/download/v0.2.4/recached-macos-amd64"
+      sha256 "REPLACE_WITH_AMD64_SHA256"
     end
     on_arm do
-      url "https://github.com/recached-dev/recached/releases/download/v0.1.8/recached-macos-arm64"
-      # TODO: build on Apple Silicon (or cross-compile: cargo build --release
-      # --target aarch64-apple-darwin), upload, then: shasum -a 256 recached-macos-arm64
+      url "https://github.com/recached-dev/recached/releases/download/v0.2.4/recached-macos-arm64"
       sha256 "REPLACE_WITH_ARM64_SHA256"
     end
   end
 
   def install
     # Rename the downloaded binary to 'recached-server' and install it into the Homebrew bin
-    binary = Hardware::CPU.arm? ? "recached-macos-arm64" : "recached-macos-x86_64"
+    binary = Hardware::CPU.arm? ? "recached-macos-arm64" : "recached-macos-amd64"
     bin.install binary => "recached-server"
   end
 
