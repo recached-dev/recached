@@ -25,6 +25,97 @@ fn prealloc_for(declared: usize) -> usize {
 pub const MAX_BULK_STRING_BYTES: usize = 64 * 1024 * 1024; // 64 MB
 const MAX_TOTAL_MESSAGE_BYTES: usize = 64 * 1024 * 1024; // 64 MB total per message
 
+/// Bytes in the shortest encodable RESP value — `+\r\n`, the empty simple
+/// string. Used to bound from below how much space an aggregate's outstanding
+/// elements must still take up, which is what makes `ParseError::Incomplete`'s
+/// `needed` useful for a multi-element frame rather than just the element it
+/// happens to be blocked on.
+pub const MIN_ELEMENT_BYTES: usize = 3;
+
+/// Why a buffer could not be parsed as a RESP frame.
+///
+/// [`ParseError::Incomplete`] is not really a failure: it is the ordinary
+/// answer for a frame whose bytes have not all arrived, which in a streaming
+/// server is most reads. It carries no payload precisely so that the common
+/// case allocates nothing.
+///
+/// This replaces a `Result<_, String>` whose callers told the two apart by
+/// comparing the message to the literal `"Incomplete"` — so a partial TCP
+/// segment cost a heap allocation, and a typo in that literal would silently
+/// reclassify a half-arrived frame as a protocol violation and reset the
+/// connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ParseError {
+    /// The buffer does not yet hold a complete frame; read more and retry.
+    ///
+    /// `needed` is a *lower bound* on the total bytes this frame will occupy,
+    /// counted from the start of the slice that was handed to [`Value::parse`].
+    /// A caller that re-parses only once the buffer has grown to `needed` skips
+    /// the re-parses that cannot possibly succeed.
+    ///
+    /// It is a lower bound and never an over-estimate — over-estimating would
+    /// stall a connection forever, waiting on bytes the client already sent.
+    /// Where the exact length is knowable (a bulk string whose header has
+    /// arrived) it is exact; for an aggregate it is the bytes consumed so far
+    /// plus [`MIN_ELEMENT_BYTES`] for every element still to come.
+    Incomplete { needed: usize },
+    /// The leading byte is not one of `+ - : $ * > %`.
+    InvalidType(u8),
+    /// A length or count header was not a well-formed number.
+    InvalidHeader(&'static str),
+    /// A declared length or element count is over its limit.
+    TooLarge {
+        what: &'static str,
+        declared: u64,
+        max: usize,
+        unit: &'static str,
+    },
+    /// Aggregates nested deeper than `MAX_ARRAY_DEPTH`.
+    DepthExceeded,
+    /// The frame grew past `MAX_TOTAL_MESSAGE_BYTES` while being parsed.
+    MessageTooLarge,
+}
+
+impl ParseError {
+    /// True when the frame is merely unfinished, so the caller should wait for
+    /// more bytes instead of treating this as a protocol violation.
+    #[must_use]
+    pub fn is_incomplete(&self) -> bool {
+        matches!(self, ParseError::Incomplete { .. })
+    }
+
+    /// The lower bound carried by [`ParseError::Incomplete`], or 0 for any
+    /// other variant — a caller gating on it wants "parse now" for real errors.
+    #[must_use]
+    pub fn needed(&self) -> usize {
+        match self {
+            ParseError::Incomplete { needed } => *needed,
+            _ => 0,
+        }
+    }
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseError::Incomplete { .. } => f.write_str("Incomplete"),
+            ParseError::InvalidType(b) => write!(f, "Invalid RESP type (byte {b:#04x})"),
+            ParseError::InvalidHeader(what) => f.write_str(what),
+            ParseError::TooLarge {
+                what,
+                declared,
+                max,
+                unit,
+            } => write!(f, "ERR {what} too large ({declared} > {max} {unit})"),
+            ParseError::DepthExceeded => f.write_str("ERR max nesting depth exceeded"),
+            ParseError::MessageTooLarge => f.write_str("ERR message too large"),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     SimpleString(String),
@@ -106,23 +197,62 @@ impl Value {
     }
 
     /// Parses a byte slice into a RESP Value, returning the Value and the number of bytes consumed.
-    pub fn parse(buffer: &[u8]) -> Result<(Value, usize), String> {
-        Self::parse_inner(buffer, 0)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError::Incomplete`] when `buffer` holds only part of a
+    /// frame — the caller should read more bytes and call again with the same
+    /// starting offset. Any other variant is a protocol violation and the
+    /// connection should be reset.
+    pub fn parse(buffer: &[u8]) -> Result<(Value, usize), ParseError> {
+        match Self::parse_inner(buffer, 0, true)? {
+            (Some(v), n) => Ok((v, n)),
+            // Unreachable with `build = true`; answered rather than asserted
+            // because nothing in this module panics on input.
+            (None, _) => Err(ParseError::InvalidHeader("internal: frame not built")),
+        }
     }
 
-    fn parse_inner(buffer: &[u8], depth: usize) -> Result<(Value, usize), String> {
-        if buffer.is_empty() {
-            return Err("Incomplete".to_string());
-        }
-        match buffer[0] {
-            b'+' => Self::parse_simple_string(buffer),
-            b'-' => Self::parse_error(buffer),
-            b':' => Self::parse_integer(buffer),
-            b'$' => Self::parse_bulk_string(buffer),
-            b'*' => Self::parse_array(buffer, depth),
-            b'>' => Self::parse_push(buffer, depth),
-            b'%' => Self::parse_map(buffer, depth),
-            _ => Err("Invalid RESP type".to_string()),
+    /// Measures the frame at the start of `buffer` without building it.
+    ///
+    /// Same walk, same validation and the same limits as [`Value::parse`] —
+    /// literally the same code, with value construction switched off — so the
+    /// two can never disagree about what counts as a complete frame. What it
+    /// skips is the allocation: bulk payloads are stepped over by arithmetic
+    /// instead of being copied into a `Vec`.
+    ///
+    /// This exists for the streaming read path. `parse` restarts from the first
+    /// byte on every call, so a large multi-bulk arriving over hundreds of TCP
+    /// segments rebuilt — and reallocated — every element it had already seen,
+    /// once per segment, throwing all of it away each time. Checking
+    /// completeness with `frame_len` first turns that into an integer walk over
+    /// headers, and `parse` then runs exactly once, on a frame known to be whole.
+    ///
+    /// # Errors
+    ///
+    /// Identical to [`Value::parse`].
+    pub fn frame_len(buffer: &[u8]) -> Result<usize, ParseError> {
+        Self::parse_inner(buffer, 0, false).map(|(_, n)| n)
+    }
+
+    /// `build == false` measures and validates without constructing values.
+    fn parse_inner(
+        buffer: &[u8],
+        depth: usize,
+        build: bool,
+    ) -> Result<(Option<Value>, usize), ParseError> {
+        let Some(&tag) = buffer.first() else {
+            return Err(ParseError::Incomplete { needed: 1 });
+        };
+        match tag {
+            b'+' => Self::parse_simple_string(buffer, build),
+            b'-' => Self::parse_error(buffer, build),
+            b':' => Self::parse_integer(buffer, build),
+            b'$' => Self::parse_bulk_string(buffer, build),
+            b'*' => Self::parse_array(buffer, depth, build),
+            b'>' => Self::parse_push(buffer, depth, build),
+            b'%' => Self::parse_map(buffer, depth, build),
+            other => Err(ParseError::InvalidType(other)),
         }
     }
 
@@ -135,173 +265,266 @@ impl Value {
         None
     }
 
-    fn parse_simple_string(buffer: &[u8]) -> Result<(Value, usize), String> {
-        match Self::read_until_crlf(buffer) {
-            Some((data, len)) => Ok((
-                Value::SimpleString(String::from_utf8_lossy(data).into_owned()),
-                len,
-            )),
-            None => Err("Incomplete".to_string()),
+    /// The `Incomplete` bound for a header whose terminating CRLF has not
+    /// arrived: whatever we hold, plus at least one more byte.
+    fn need_more(buffer: &[u8]) -> ParseError {
+        ParseError::Incomplete {
+            needed: buffer.len() + 1,
         }
     }
 
-    fn parse_error(buffer: &[u8]) -> Result<(Value, usize), String> {
-        match Self::read_until_crlf(buffer) {
-            Some((data, len)) => Ok((
-                Value::Error(String::from_utf8_lossy(data).into_owned()),
-                len,
-            )),
-            None => Err("Incomplete".to_string()),
+    /// Re-bases a child's `Incomplete` bound onto the enclosing aggregate.
+    ///
+    /// `consumed` is what the aggregate has already eaten — its header plus
+    /// every element that finished — and `outstanding` is how many elements
+    /// have not been started at all. Each of those must still occupy at least
+    /// [`MIN_ELEMENT_BYTES`], so charging for them is what makes the bound
+    /// useful for a large multi-bulk: blocked on element 3 of 20 000, the
+    /// caller learns it needs roughly 60 KB more, not "one more byte".
+    ///
+    /// Only `Incomplete` is re-based; a real protocol error propagates as-is.
+    fn widen(err: ParseError, consumed: usize, outstanding: usize) -> ParseError {
+        match err {
+            ParseError::Incomplete { needed } => ParseError::Incomplete {
+                needed: consumed
+                    .saturating_add(needed)
+                    .saturating_add(outstanding.saturating_mul(MIN_ELEMENT_BYTES)),
+            },
+            other => other,
         }
     }
 
-    fn parse_integer(buffer: &[u8]) -> Result<(Value, usize), String> {
+    fn parse_simple_string(
+        buffer: &[u8],
+        build: bool,
+    ) -> Result<(Option<Value>, usize), ParseError> {
+        match Self::read_until_crlf(buffer) {
+            Some((data, len)) => Ok((
+                build.then(|| Value::SimpleString(String::from_utf8_lossy(data).into_owned())),
+                len,
+            )),
+            None => Err(Self::need_more(buffer)),
+        }
+    }
+
+    fn parse_error(buffer: &[u8], build: bool) -> Result<(Option<Value>, usize), ParseError> {
+        match Self::read_until_crlf(buffer) {
+            Some((data, len)) => Ok((
+                build.then(|| Value::Error(String::from_utf8_lossy(data).into_owned())),
+                len,
+            )),
+            None => Err(Self::need_more(buffer)),
+        }
+    }
+
+    fn parse_integer(buffer: &[u8], build: bool) -> Result<(Option<Value>, usize), ParseError> {
         match Self::read_until_crlf(buffer) {
             Some((data, len)) => {
                 let s = String::from_utf8_lossy(data);
+                // Validated even when only measuring, so `frame_len` rejects
+                // exactly what `parse` rejects.
                 let i = s
                     .parse::<i64>()
-                    .map_err(|_| "Invalid integer format".to_string())?;
-                Ok((Value::Integer(i), len))
+                    .map_err(|_| ParseError::InvalidHeader("Invalid integer format"))?;
+                Ok((build.then_some(Value::Integer(i)), len))
             }
-            None => Err("Incomplete".to_string()),
+            None => Err(Self::need_more(buffer)),
         }
     }
 
-    fn parse_bulk_string(buffer: &[u8]) -> Result<(Value, usize), String> {
+    fn parse_bulk_string(buffer: &[u8], build: bool) -> Result<(Option<Value>, usize), ParseError> {
+        const BAD_LEN: ParseError = ParseError::InvalidHeader("Invalid bulk string length");
         match Self::read_until_crlf(buffer) {
             Some((data, head_len)) => {
                 let s = String::from_utf8_lossy(data);
-                let length: i64 = s
-                    .parse()
-                    .map_err(|_| "Invalid bulk string length".to_string())?;
+                let length: i64 = s.parse().map_err(|_| BAD_LEN)?;
 
                 if length == -1 {
-                    return Ok((Value::BulkString(None), head_len));
+                    return Ok((build.then_some(Value::BulkString(None)), head_len));
                 }
                 if length < 0 {
-                    return Err("Invalid bulk string length".to_string());
+                    return Err(BAD_LEN);
                 }
 
-                let length = length as usize;
-                if length > MAX_BULK_STRING_BYTES {
-                    return Err(format!(
-                        "ERR bulk string too large ({} > {} bytes)",
-                        length, MAX_BULK_STRING_BYTES
-                    ));
+                // Compared as u64 before narrowing: on a 32-bit target (wasm32
+                // builds this crate) `as usize` would truncate a declared
+                // length above 4 GiB and let it past the limit check.
+                let declared = length as u64;
+                if declared > MAX_BULK_STRING_BYTES as u64 {
+                    return Err(ParseError::TooLarge {
+                        what: "bulk string",
+                        declared,
+                        max: MAX_BULK_STRING_BYTES,
+                        unit: "bytes",
+                    });
                 }
+                let length = declared as usize;
                 let end = head_len + length + 2; // +2 for trailing CRLF
                 if buffer.len() < end {
-                    return Err("Incomplete".to_string());
+                    // The header gives the exact size, so the caller can wait
+                    // for the whole payload instead of re-parsing per packet.
+                    return Err(ParseError::Incomplete { needed: end });
                 }
 
-                let str_data = buffer[head_len..head_len + length].to_vec();
-                Ok((Value::BulkString(Some(str_data)), end))
+                // The payload is copied only when a value is being built;
+                // measuring steps over it.
+                let payload = build.then(|| buffer[head_len..head_len + length].to_vec());
+                Ok((payload.map(|d| Value::BulkString(Some(d))), end))
             }
-            None => Err("Incomplete".to_string()),
+            None => Err(Self::need_more(buffer)),
         }
     }
 
-    fn parse_push(buffer: &[u8], depth: usize) -> Result<(Value, usize), String> {
+    fn parse_push(
+        buffer: &[u8],
+        depth: usize,
+        build: bool,
+    ) -> Result<(Option<Value>, usize), ParseError> {
         if depth >= MAX_ARRAY_DEPTH {
-            return Err("ERR max nesting depth exceeded".to_string());
+            return Err(ParseError::DepthExceeded);
         }
         match Self::read_until_crlf(buffer) {
             Some((data, mut offset)) => {
                 let s = String::from_utf8_lossy(data);
                 let count: u64 = s
                     .parse()
-                    .map_err(|_| "Invalid push frame length".to_string())?;
-                if count as usize > MAX_ARRAY_ELEMENTS {
-                    return Err(format!(
-                        "ERR push frame too large ({} > {} elements)",
-                        count, MAX_ARRAY_ELEMENTS
-                    ));
+                    .map_err(|_| ParseError::InvalidHeader("Invalid push frame length"))?;
+                // Compared as u64: see `parse_bulk_string`.
+                if count > MAX_ARRAY_ELEMENTS as u64 {
+                    return Err(ParseError::TooLarge {
+                        what: "push frame",
+                        declared: count,
+                        max: MAX_ARRAY_ELEMENTS,
+                        unit: "elements",
+                    });
                 }
-                let mut arr = Vec::with_capacity(prealloc_for(count as usize));
-                for _ in 0..count {
-                    let (val, len) = Self::parse_inner(&buffer[offset..], depth + 1)?;
-                    arr.push(val);
+                let count = count as usize;
+                let mut arr = Self::element_buffer(count, build);
+                for i in 0..count {
+                    let (val, len) = Self::parse_inner(&buffer[offset..], depth + 1, build)
+                        .map_err(|e| Self::widen(e, offset, count - i - 1))?;
+                    arr.extend(val);
                     offset += len;
                     if offset > MAX_TOTAL_MESSAGE_BYTES {
-                        return Err("ERR message too large".to_string());
+                        return Err(ParseError::MessageTooLarge);
                     }
                 }
-                Ok((Value::Push(arr), offset))
+                Ok((build.then_some(Value::Push(arr)), offset))
             }
-            None => Err("Incomplete".to_string()),
+            None => Err(Self::need_more(buffer)),
         }
     }
 
-    fn parse_map(buffer: &[u8], depth: usize) -> Result<(Value, usize), String> {
+    fn parse_map(
+        buffer: &[u8],
+        depth: usize,
+        build: bool,
+    ) -> Result<(Option<Value>, usize), ParseError> {
         if depth >= MAX_ARRAY_DEPTH {
-            return Err("ERR max nesting depth exceeded".to_string());
+            return Err(ParseError::DepthExceeded);
         }
         match Self::read_until_crlf(buffer) {
             Some((data, mut offset)) => {
                 let s = String::from_utf8_lossy(data);
-                let count: u64 = s.parse().map_err(|_| "Invalid map length".to_string())?;
+                let count: u64 = s
+                    .parse()
+                    .map_err(|_| ParseError::InvalidHeader("Invalid map length"))?;
                 // Each pair is two values, so the element budget is halved.
-                if count as usize > MAX_ARRAY_ELEMENTS / 2 {
-                    return Err(format!(
-                        "ERR map too large ({} > {} pairs)",
-                        count,
-                        MAX_ARRAY_ELEMENTS / 2
-                    ));
+                const MAX_PAIRS: usize = MAX_ARRAY_ELEMENTS / 2;
+                if count > MAX_PAIRS as u64 {
+                    return Err(ParseError::TooLarge {
+                        what: "map",
+                        declared: count,
+                        max: MAX_PAIRS,
+                        unit: "pairs",
+                    });
                 }
-                let mut pairs = Vec::with_capacity(prealloc_for(count as usize));
-                for _ in 0..count {
-                    let (k, klen) = Self::parse_inner(&buffer[offset..], depth + 1)?;
+                let count = count as usize;
+                let mut pairs: Vec<(Value, Value)> = if build {
+                    Vec::with_capacity(prealloc_for(count))
+                } else {
+                    Vec::new()
+                };
+                for i in 0..count {
+                    // Outstanding values, not pairs: blocked on a key, this
+                    // pair's value is still to come as well.
+                    let after = (count - i - 1) * 2;
+                    let (k, klen) = Self::parse_inner(&buffer[offset..], depth + 1, build)
+                        .map_err(|e| Self::widen(e, offset, after + 1))?;
                     offset += klen;
-                    let (v, vlen) = Self::parse_inner(&buffer[offset..], depth + 1)?;
+                    let (v, vlen) = Self::parse_inner(&buffer[offset..], depth + 1, build)
+                        .map_err(|e| Self::widen(e, offset, after))?;
                     offset += vlen;
-                    pairs.push((k, v));
+                    if let (Some(k), Some(v)) = (k, v) {
+                        pairs.push((k, v));
+                    }
                     if offset > MAX_TOTAL_MESSAGE_BYTES {
-                        return Err("ERR message too large".to_string());
+                        return Err(ParseError::MessageTooLarge);
                     }
                 }
-                Ok((Value::Map(pairs), offset))
+                Ok((build.then_some(Value::Map(pairs)), offset))
             }
-            None => Err("Incomplete".to_string()),
+            None => Err(Self::need_more(buffer)),
         }
     }
 
-    fn parse_array(buffer: &[u8], depth: usize) -> Result<(Value, usize), String> {
+    fn parse_array(
+        buffer: &[u8],
+        depth: usize,
+        build: bool,
+    ) -> Result<(Option<Value>, usize), ParseError> {
+        const BAD_LEN: ParseError = ParseError::InvalidHeader("Invalid array length");
         if depth >= MAX_ARRAY_DEPTH {
-            return Err("ERR max nesting depth exceeded".to_string());
+            return Err(ParseError::DepthExceeded);
         }
 
         match Self::read_until_crlf(buffer) {
             Some((data, mut offset)) => {
                 let s = String::from_utf8_lossy(data);
-                let count: i64 = s.parse().map_err(|_| "Invalid array length".to_string())?;
+                let count: i64 = s.parse().map_err(|_| BAD_LEN)?;
 
                 if count == -1 {
-                    return Ok((Value::Array(None), offset));
+                    return Ok((build.then_some(Value::Array(None)), offset));
                 }
                 if count < 0 {
-                    return Err("Invalid array length".to_string());
+                    return Err(BAD_LEN);
                 }
-                if count as usize > MAX_ARRAY_ELEMENTS {
-                    return Err(format!(
-                        "ERR array too large ({} > {} elements)",
-                        count, MAX_ARRAY_ELEMENTS
-                    ));
+                // Compared as u64: see `parse_bulk_string`.
+                let declared = count as u64;
+                if declared > MAX_ARRAY_ELEMENTS as u64 {
+                    return Err(ParseError::TooLarge {
+                        what: "array",
+                        declared,
+                        max: MAX_ARRAY_ELEMENTS,
+                        unit: "elements",
+                    });
                 }
 
-                let mut arr = Vec::with_capacity(prealloc_for(count as usize));
-                for _ in 0..count {
-                    let (val, len) = Self::parse_inner(&buffer[offset..], depth + 1)?;
-                    arr.push(val);
+                let count = declared as usize;
+                let mut arr = Self::element_buffer(count, build);
+                for i in 0..count {
+                    let (val, len) = Self::parse_inner(&buffer[offset..], depth + 1, build)
+                        .map_err(|e| Self::widen(e, offset, count - i - 1))?;
+                    arr.extend(val);
                     offset += len;
                     if offset > MAX_TOTAL_MESSAGE_BYTES {
-                        return Err("ERR message too large".to_string());
+                        return Err(ParseError::MessageTooLarge);
                     }
                 }
 
-                Ok((Value::Array(Some(arr)), offset))
+                Ok((build.then_some(Value::Array(Some(arr))), offset))
             }
-            None => Err("Incomplete".to_string()),
+            None => Err(Self::need_more(buffer)),
+        }
+    }
+
+    /// Element accumulator for an aggregate: pre-sized when building, and left
+    /// unallocated when only measuring.
+    fn element_buffer(count: usize, build: bool) -> Vec<Value> {
+        if build {
+            Vec::with_capacity(prealloc_for(count))
+        } else {
+            Vec::new()
         }
     }
 }
@@ -371,20 +594,17 @@ mod tests {
 
     #[test]
     fn incomplete_returns_error() {
-        assert_eq!(Value::parse(b""), Err("Incomplete".to_string()));
-        assert_eq!(Value::parse(b"+OK"), Err("Incomplete".to_string())); // missing \r\n
-        assert_eq!(Value::parse(b"$5\r\nhell"), Err("Incomplete".to_string())); // truncated bulk
-        assert_eq!(
-            Value::parse(b"*2\r\n+OK\r\n"),
-            Err("Incomplete".to_string())
-        ); // array missing 2nd element
+        assert!(Value::parse(b"").unwrap_err().is_incomplete());
+        assert!(Value::parse(b"+OK").unwrap_err().is_incomplete()); // missing \r\n
+        assert!(Value::parse(b"$5\r\nhell").unwrap_err().is_incomplete()); // truncated bulk
+        assert!(Value::parse(b"*2\r\n+OK\r\n").unwrap_err().is_incomplete()); // array missing 2nd element
     }
 
     #[test]
     fn invalid_resp_type_byte() {
         assert_eq!(
             Value::parse(b"!garbage"),
-            Err("Invalid RESP type".to_string())
+            Err(ParseError::InvalidType(b'!'))
         );
     }
 
@@ -398,7 +618,12 @@ mod tests {
         payload.push_str("+leaf\r\n");
         let result = Value::parse(payload.as_bytes());
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("max nesting depth"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("max nesting depth")
+        );
     }
 
     #[test]
@@ -474,9 +699,8 @@ mod tests {
         )])
         .serialize();
         for cut in 1..full.len() {
-            assert_eq!(
-                Value::parse(&full[..cut]),
-                Err("Incomplete".to_string()),
+            assert!(
+                Value::parse(&full[..cut]).unwrap_err().is_incomplete(),
                 "prefix of length {cut} should be incomplete"
             );
         }
@@ -514,7 +738,13 @@ mod parser_edge_tests {
                 "prefix of {cut} bytes should not parse: {frame:?}"
             ));
             assert!(
-                err.contains("Incomplete") || err.contains("too large") || err.contains("Invalid"),
+                matches!(
+                    err,
+                    ParseError::Incomplete { .. }
+                        | ParseError::TooLarge { .. }
+                        | ParseError::InvalidType(_)
+                        | ParseError::InvalidHeader(_)
+                ),
                 "prefix {cut}: unexpected error {err}"
             );
         }
@@ -536,7 +766,7 @@ mod parser_edge_tests {
 
     #[test]
     fn rejects_malformed_integer() {
-        let err = Value::parse(b":notanumber\r\n").unwrap_err();
+        let err = Value::parse(b":notanumber\r\n").unwrap_err().to_string();
         assert!(err.contains("Invalid integer"), "got {err}");
     }
 
@@ -574,7 +804,7 @@ mod parser_edge_tests {
 
     #[test]
     fn rejects_malformed_push_length() {
-        let err = Value::parse(b">abc\r\n").unwrap_err();
+        let err = Value::parse(b">abc\r\n").unwrap_err().to_string();
         assert!(err.contains("Invalid push frame length"), "got {err}");
     }
 
@@ -583,14 +813,14 @@ mod parser_edge_tests {
         // Declared count over the element cap must be refused on the header
         // alone, before any allocation proportional to it.
         let frame = format!(">{}\r\n", MAX_ARRAY_ELEMENTS + 1);
-        let err = Value::parse(frame.as_bytes()).unwrap_err();
+        let err = Value::parse(frame.as_bytes()).unwrap_err().to_string();
         assert!(err.contains("push frame too large"), "got {err}");
     }
 
     #[test]
     fn rejects_array_frame_with_too_many_elements() {
         let frame = format!("*{}\r\n", MAX_ARRAY_ELEMENTS + 1);
-        let err = Value::parse(frame.as_bytes()).unwrap_err();
+        let err = Value::parse(frame.as_bytes()).unwrap_err().to_string();
         assert!(err.contains("too large"), "got {err}");
     }
 
@@ -603,7 +833,7 @@ mod parser_edge_tests {
             frame.extend_from_slice(b"*1\r\n");
         }
         frame.extend_from_slice(b"$1\r\na\r\n");
-        let err = Value::parse(&frame).unwrap_err();
+        let err = Value::parse(&frame).unwrap_err().to_string();
         assert!(err.contains("nesting depth"), "got {err}");
     }
 
@@ -620,13 +850,13 @@ mod parser_edge_tests {
     #[test]
     fn rejects_oversized_bulk_string_header() {
         let frame = format!("${}\r\n", MAX_BULK_STRING_BYTES + 1);
-        let err = Value::parse(frame.as_bytes()).unwrap_err();
+        let err = Value::parse(frame.as_bytes()).unwrap_err().to_string();
         assert!(err.contains("too large"), "got {err}");
     }
 
     #[test]
     fn rejects_unknown_type_byte() {
-        let err = Value::parse(b"%1\r\n").unwrap_err();
+        let err = Value::parse(b"%1\r\n").unwrap_err().to_string();
         assert!(!err.is_empty());
     }
 
@@ -651,5 +881,309 @@ mod parser_edge_tests {
         let (v2, n2) = Value::parse(&buf[n1..]).unwrap();
         assert_eq!(v2, Value::Integer(2));
         assert_eq!(n2, 4);
+    }
+}
+
+// ── Parse error typing ────────────────────────────────────────────────────────
+
+/// `Value::parse` used to return `Result<_, String>`, and the server told a
+/// half-arrived frame from a protocol violation by comparing that string to the
+/// literal `"Incomplete"`. These tests pin the replacement contract: the
+/// distinction is a variant, the common case allocates nothing, and the wire
+/// text callers log is unchanged.
+#[cfg(test)]
+mod parse_error_tests {
+    use super::*;
+
+    #[test]
+    fn a_partial_frame_is_incomplete_not_a_protocol_error() {
+        let frame = Value::Array(Some(vec![
+            Value::BulkString(Some(b"SET".to_vec())),
+            Value::BulkString(Some(b"k".to_vec())),
+            Value::BulkString(Some(b"v".to_vec())),
+        ]))
+        .serialize();
+
+        for cut in 1..frame.len() {
+            let err = Value::parse(&frame[..cut]).unwrap_err();
+            assert!(
+                err.is_incomplete(),
+                "prefix of {cut} bytes classified as {err:?}, which would reset the connection"
+            );
+        }
+        // And the whole thing parses.
+        assert!(Value::parse(&frame).is_ok());
+    }
+
+    #[test]
+    fn a_real_protocol_violation_is_not_incomplete() {
+        for bad in [
+            &b"!garbage\r\n"[..],
+            &b"*abc\r\n"[..],
+            &b":notanumber\r\n"[..],
+            &b"$xyz\r\n"[..],
+        ] {
+            let err = Value::parse(bad).unwrap_err();
+            assert!(
+                !err.is_incomplete(),
+                "{:?} must not be mistaken for a partial frame",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_type_byte_reports_which_byte_it_was() {
+        assert_eq!(
+            Value::parse(b"!x\r\n").unwrap_err(),
+            ParseError::InvalidType(b'!')
+        );
+    }
+
+    #[test]
+    fn the_wire_text_of_each_error_is_unchanged() {
+        // These strings reach operators through `warn!("TCP protocol error: …")`
+        // and the RESP error replies; drift makes existing runbooks wrong.
+        assert_eq!(
+            ParseError::Incomplete { needed: 1 }.to_string(),
+            "Incomplete"
+        );
+        assert_eq!(
+            ParseError::DepthExceeded.to_string(),
+            "ERR max nesting depth exceeded"
+        );
+        assert_eq!(
+            ParseError::MessageTooLarge.to_string(),
+            "ERR message too large"
+        );
+        assert_eq!(
+            ParseError::TooLarge {
+                what: "bulk string",
+                declared: 99,
+                max: 10,
+                unit: "bytes",
+            }
+            .to_string(),
+            "ERR bulk string too large (99 > 10 bytes)"
+        );
+        assert_eq!(
+            ParseError::TooLarge {
+                what: "map",
+                declared: 9,
+                max: 4,
+                unit: "pairs",
+            }
+            .to_string(),
+            "ERR map too large (9 > 4 pairs)"
+        );
+    }
+
+    /// The limits are compared in `u64` before narrowing to `usize`. On wasm32
+    /// — which this crate is built for — `as usize` truncates, and a declared
+    /// count just above 2^32 would wrap to a small number and slip past the
+    /// check. The comparison must reject it on every target.
+    #[test]
+    fn a_declared_count_above_the_32_bit_range_is_still_rejected() {
+        for frame in [
+            format!("*{}\r\n", u32::MAX as u64 + 2),
+            format!(">{}\r\n", u32::MAX as u64 + 2),
+            format!("%{}\r\n", u32::MAX as u64 + 2),
+            format!("${}\r\n", u32::MAX as u64 + 2),
+        ] {
+            let err = Value::parse(frame.as_bytes()).unwrap_err();
+            assert!(
+                matches!(err, ParseError::TooLarge { .. }),
+                "{frame:?} gave {err:?}, expected TooLarge"
+            );
+        }
+    }
+
+    #[test]
+    fn is_incomplete_agrees_with_the_variant() {
+        assert!(ParseError::Incomplete { needed: 1 }.is_incomplete());
+        assert!(!ParseError::DepthExceeded.is_incomplete());
+        assert!(!ParseError::InvalidType(b'!').is_incomplete());
+        assert!(!ParseError::InvalidHeader("Invalid array length").is_incomplete());
+    }
+}
+
+// ── Incomplete bounds ─────────────────────────────────────────────────────────
+
+/// `ParseError::Incomplete` carries a lower bound on the finished frame's size
+/// so the server can skip re-parses that cannot succeed. Without it, a large
+/// multi-bulk arriving over hundreds of TCP segments was re-parsed from byte
+/// zero on every segment, reallocating every bulk string already received.
+///
+/// The bound being a *lower* bound is load-bearing: an over-estimate would make
+/// the server wait for bytes the client already sent, hanging the connection.
+#[cfg(test)]
+mod incomplete_bound_tests {
+    use super::*;
+
+    fn multibulk(elements: usize, value_len: usize) -> Vec<u8> {
+        Value::Array(Some(
+            (0..elements)
+                .map(|i| Value::BulkString(Some(vec![b'a' + (i % 26) as u8; value_len])))
+                .collect(),
+        ))
+        .serialize()
+    }
+
+    /// The safety property, checked exhaustively over every prefix: the bound
+    /// may never exceed the real frame length.
+    #[test]
+    fn the_bound_never_exceeds_the_real_frame_length() {
+        for frame in [
+            multibulk(20, 8),
+            multibulk(3, 200),
+            multibulk(1, 0),
+            Value::Map(vec![
+                (Value::BulkString(Some(b"k".to_vec())), Value::Integer(1)),
+                (Value::BulkString(Some(b"kk".to_vec())), Value::Integer(2)),
+            ])
+            .serialize(),
+            Value::Push(vec![
+                Value::BulkString(Some(b"message".to_vec())),
+                Value::BulkString(Some(b"chan".to_vec())),
+            ])
+            .serialize(),
+            Value::Array(Some(vec![
+                Value::Array(Some(vec![Value::Integer(1), Value::Integer(2)])),
+                Value::BulkString(Some(b"nested".to_vec())),
+            ]))
+            .serialize(),
+        ] {
+            for cut in 0..frame.len() {
+                let err = Value::parse(&frame[..cut]).unwrap_err();
+                assert!(err.is_incomplete(), "prefix {cut} gave {err:?}");
+                assert!(
+                    err.needed() <= frame.len(),
+                    "prefix {cut}: bound {} exceeds the {} byte frame — a server \
+                     waiting for that would hang on a frame the client finished",
+                    err.needed(),
+                    frame.len()
+                );
+            }
+        }
+    }
+
+    /// The bound must also be strictly ahead of what we already hold, or the
+    /// gate would never let anything through and the loop would spin.
+    #[test]
+    fn the_bound_always_asks_for_at_least_one_more_byte() {
+        let frame = multibulk(12, 16);
+        for cut in 0..frame.len() {
+            let err = Value::parse(&frame[..cut]).unwrap_err();
+            assert!(
+                err.needed() > cut,
+                "prefix {cut} asked for only {} bytes",
+                err.needed()
+            );
+        }
+    }
+
+    /// A bulk string whose header has arrived reports its exact end, so a large
+    /// value is not re-parsed once per segment while its payload streams in.
+    #[test]
+    fn a_bulk_header_yields_the_exact_frame_length() {
+        let frame = Value::BulkString(Some(vec![b'x'; 10_000])).serialize();
+        // Header only: `$10000\r\n`.
+        let header = frame.iter().position(|&b| b == b'\n').unwrap() + 1;
+        for cut in header..frame.len() {
+            assert_eq!(
+                Value::parse(&frame[..cut]).unwrap_err().needed(),
+                frame.len(),
+                "prefix {cut} should already know the exact length"
+            );
+        }
+    }
+
+    /// The point of the whole change: inside a multi-bulk, the bound accounts
+    /// for the elements not yet started, so it grows far beyond "one more byte"
+    /// and the caller skips whole runs of segments.
+    #[test]
+    fn a_multibulk_bound_accounts_for_elements_not_yet_started() {
+        let elements = 5_000;
+        let frame = multibulk(elements, 4);
+        // Just past the `*5000\r\n` header, nothing else parsed yet.
+        let after_header = frame.iter().position(|&b| b == b'\n').unwrap() + 1;
+        let needed = Value::parse(&frame[..after_header]).unwrap_err().needed();
+        assert!(
+            needed >= elements * MIN_ELEMENT_BYTES,
+            "bound {needed} ignores the {elements} outstanding elements"
+        );
+        assert!(needed <= frame.len(), "bound {needed} over-estimates");
+    }
+
+    /// Simulates the read loop: feed the frame one segment at a time, attempting
+    /// a parse only once the buffer has reached the last reported bound. The
+    /// frame must still parse, and the attempts must be well below the segment
+    /// count.
+    ///
+    /// The reduction is a few-fold, not orders of magnitude, and that ceiling is
+    /// inherent: the bound is `consumed + MIN_ELEMENT_BYTES × outstanding`, so
+    /// as a frame nears its end the outstanding term shrinks while the consumed
+    /// term grows byte-for-byte with the buffer, and the bound stops running
+    /// ahead. Cutting the *cost* of the attempts that remain is `frame_len`'s
+    /// job — see `frame_len_and_parse_agree_on_every_prefix` and the allocation
+    /// bounds in `tests/resp_prealloc.rs`.
+    #[test]
+    fn gating_on_the_bound_cuts_parse_attempts_without_losing_the_frame() {
+        const SEGMENT: usize = 1400; // a plausible TCP payload
+        let frame = multibulk(4_000, 100);
+        let segments = frame.len().div_ceil(SEGMENT);
+
+        let mut buf: Vec<u8> = Vec::new();
+        let mut need = 0usize;
+        let mut attempts = 0usize;
+        let mut parsed = None;
+
+        for chunk in frame.chunks(SEGMENT) {
+            buf.extend_from_slice(chunk);
+            if buf.len() < need {
+                continue;
+            }
+            attempts += 1;
+            match Value::parse(&buf) {
+                Ok((v, n)) => {
+                    assert_eq!(n, frame.len());
+                    parsed = Some(v);
+                    break;
+                }
+                Err(e) => {
+                    assert!(e.is_incomplete(), "unexpected {e:?}");
+                    need = e.needed();
+                }
+            }
+        }
+
+        assert!(parsed.is_some(), "frame never completed under the gate");
+        assert!(
+            attempts * 2 < segments,
+            "{attempts} parse attempts over {segments} segments — the bound is not \
+             saving meaningful work"
+        );
+    }
+
+    /// Ungated, the same frame is parsed once per segment. This is the
+    /// behaviour being replaced; it is asserted so the comparison above is not
+    /// measuring a frame that happened to arrive in one piece.
+    #[test]
+    fn without_the_gate_every_segment_costs_a_parse() {
+        const SEGMENT: usize = 1400;
+        let frame = multibulk(4_000, 100);
+        let segments = frame.len().div_ceil(SEGMENT);
+        assert!(segments > 100, "test frame should span many segments");
+
+        let mut buf: Vec<u8> = Vec::new();
+        let mut attempts = 0usize;
+        for chunk in frame.chunks(SEGMENT) {
+            buf.extend_from_slice(chunk);
+            attempts += 1;
+            if Value::parse(&buf).is_ok() {
+                break;
+            }
+        }
+        assert_eq!(attempts, segments);
     }
 }
