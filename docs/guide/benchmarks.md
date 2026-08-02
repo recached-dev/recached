@@ -1,9 +1,11 @@
 # Benchmarks
 
-How the Recached server compares to Redis 7.2.5 and Valkey 9.1.0 under `redis-benchmark`, measured July 2026 on Recached v0.1.8.
+How the Recached server compares to Redis 7.2.5 and Valkey 9.1.0 under `redis-benchmark`. Current release: **v0.2.4**.
 
-::: warning Measured on v0.1.8
-These numbers predate v0.2.0, which added the exactly-once `DEDUP` envelope on every store write and extracted the sync client. Server-side command paths were not the target of those changes, but the suite has not been re-run since — treat the table as v0.1.8 evidence, not a current measurement. Redis 7.2.5 was also current when this ran; newer Redis releases may perform differently.
+::: warning The three-way table is v0.1.8 evidence
+The Recached / Redis / Valkey tables below were measured in July 2026 on v0.1.8 and have **not** been re-run since. Two releases have landed on top of them: v0.2.0 added the exactly-once `DEDUP` envelope on every store write and extracted the sync client, and v0.2.4 reworked the store's write path and rebuilt sorted sets.
+
+For v0.2.4 those command paths were A/B tested against the previous release and all moved within run-to-run noise — see [What changed in v0.2.4](#what-changed-in-v0-2-4) — but that was a Recached-vs-Recached comparison on a loaded machine, not a fresh three-way run. Treat the absolute figures as v0.1.8 evidence. Redis 7.2.5 was also current when this ran; newer Redis releases may perform differently.
 :::
 
 ::: tip TL;DR
@@ -18,7 +20,7 @@ Recached's design goal is not to beat Redis at raw server throughput — it is t
 |---|---|
 | Hardware | Intel Core i5-8259U (4 cores / 8 threads, 2.3 GHz), 8 GB RAM |
 | OS | macOS (Darwin 24.6.0) |
-| Recached | v0.1.8, `cargo build --release` (thin LTO, jemalloc) |
+| Recached | v0.1.8, `cargo build --release` (thin LTO, jemalloc) — see the v0.2.4 notes below |
 | Redis | 7.2.5 (Homebrew) |
 | Valkey | 9.1.0 (Homebrew) |
 | Load generator | `redis-benchmark` from Redis 7.2.5 |
@@ -77,10 +79,66 @@ Unpipelined, the localhost round-trip dominates and single-command latency decid
 In v0.1.7, SPOP selected random members by iterating and cloning the entire set — O(n) per pop — which collapsed to **823 rps** against the ~100k-member set this suite builds. v0.1.8 backs sets with an index-addressable structure (`IndexSet`), making SPOP/SRANDMEMBER O(1) per member: the same large-set workload now runs at **~22,000 rps**, in line with the other set commands.
 :::
 
+## What changed in v0.2.4
+
+v0.2.4 rebuilt sorted sets around a score-ordered index. Before it, every range
+command — `ZRANGE`, `ZREVRANGE`, `ZRANGEBYSCORE`, `ZCOUNT`, `ZRANK` — collected
+the whole set into a vector and sorted it, O(n log n) per query, while holding
+the shard guard for that key. `ZRANGE board 0 9` on a large leaderboard sorted
+every member to return ten, and blocked every other key in the same shard while
+it did.
+
+The index is built on first use and maintained only while something is reading
+it, so a set nobody runs a range query against pays nothing for it.
+
+| Workload (~45k-member sorted set) | v0.2.3 | v0.2.4 | |
+|---|---:|---:|---:|
+| Repeated `ZRANGE key 0 9`, no writes | 244 rps | 133,333 rps | **546× faster** |
+| Alternating `ZADD` + `ZRANGE`, 3,000 pairs | 65.04 s | 0.11 s | **597× faster** |
+| `ZADD` throughput, `-P 16`, growing set | 387k rps | 330k rps | **~15% slower** |
+
+The `ZADD` cost is the trade: a write that keeps an ordering current pays for it.
+Maintaining the index unconditionally cost ~48% of `ZADD` throughput, which is
+why it is built lazily and abandoned again when writes run far ahead of reads —
+that recovers most of it. A write-only sorted set never builds an ordering at
+all and writes at pre-v0.2.4 speed.
+
+::: info How these were measured
+Recached v0.2.3 vs v0.2.4 binaries, same machine, same session, alternating
+round-robin with medians over 4–7 rounds. **The machine was under other load, so
+read these as before/after ratios, not as absolute throughput** — the absolute
+numbers are not comparable to the v0.1.8 tables above, which ran on an idle
+machine. Every other command in the suite (`SET`/`GET`/`INCR`/`LPUSH`/`SADD`/
+`HSET`, pipelined and not) moved within its own run-to-run spread.
+:::
+
+The other v0.2.4 changes were correctness- or memory-driven rather than
+throughput work, and none of them moved the command table:
+
+- **`maxmemory` is now enforced on the write path**, not only by the once-a-second
+  background sweep, so a burst can no longer run past the cap between ticks. The
+  check is two atomics per write; a full keyspace measurement is paid for only
+  when that cheap estimate says the cap is near.
+- **Partial frames are no longer re-parsed from scratch on every TCP segment.**
+  A large multi-bulk arriving over hundreds of segments used to rebuild — and
+  reallocate — every element received so far, once per segment, and throw it
+  away. Completeness is now decided by a non-allocating measure, so streaming a
+  420 KB frame allocates over 10× fewer bytes.
+
 ## What's still on the list
 
+- **A fresh three-way run on an idle machine.** The Recached / Redis / Valkey
+  tables are still v0.1.8 measurements. This is the top of the list.
 - **HSET at P1** is the biggest remaining outlier (46% of Redis despite *beating* Redis pipelined) — single-command hash-write latency deserves its own investigation.
-- **RESP parsing allocates a `String` per argument.** Moving commands to byte-slice arguments is the deepest remaining refactor and the main lever left for unpipelined latency.
+- **RESP parsing allocates a `Vec` per argument.** v0.2.4 removed the allocation
+  from the *incomplete*-frame path, which is the one a streaming read hits most,
+  but a frame that does arrive still copies each argument out. Moving commands to
+  borrowed byte-slice arguments is the deepest remaining refactor and the main
+  lever left for unpipelined latency.
+- **`ZADD` gives up ~15%** against a sorted set that is actively being read, to
+  keep the score index current. Sharing the member allocation between the map and
+  the index, rather than holding an `Arc` per member, is where the rest of that
+  would come from.
 - **LRANGE** builds the full reply `Value` before serializing; serializing straight from the store would cut the remaining gap on large range reads.
 
 ## Reproducing
