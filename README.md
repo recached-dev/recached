@@ -91,6 +91,12 @@ const cache = await createCache({
 cache.get('inventory:item:99'); // "42" — from local WASM memory, 0 ms
 ```
 
+Both examples are plaintext, which is the default. Set `RECACHED_TLS_CERT` and `RECACHED_TLS_KEY`
+and the same ports serve TLS — connect with `rediss://` and `wss://` instead. Before exposing either
+port beyond localhost, work through
+[recached.dev/server/security](https://recached.dev/server/security): a default server has no
+password, no TLS, and no restriction on which web pages may open the sync socket.
+
 ---
 
 ## Benchmarks

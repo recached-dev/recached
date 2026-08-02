@@ -176,5 +176,153 @@ fn an_over_large_declared_count_is_still_refused_outright() {
     // The reservation cap is not a substitute for the element limit — a header
     // above `MAX_ARRAY_ELEMENTS` must still be rejected on the header alone.
     let err = Value::parse(b"*1000001\r\n").unwrap_err();
-    assert!(err.contains("too large"), "got {err}");
+    assert!(err.to_string().contains("too large"), "got {err}");
+}
+
+// ── Streaming re-scan cost ────────────────────────────────────────────────────
+
+/// A multi-bulk frame of `elements` bulk strings, each `value_len` bytes.
+fn multibulk(elements: usize, value_len: usize) -> Vec<u8> {
+    Value::Array(Some(
+        (0..elements)
+            .map(|i| Value::BulkString(Some(vec![b'a' + (i % 26) as u8; value_len])))
+            .collect(),
+    ))
+    .serialize()
+}
+
+/// `Value::parse` restarts from the first byte on every call, so asking it
+/// whether a frame had fully arrived rebuilt every element received so far —
+/// one heap allocation per bulk string — and threw the lot away. Over a frame
+/// spanning hundreds of TCP segments that is quadratic in allocations.
+///
+/// `Value::frame_len` answers the same question by walking headers and stepping
+/// over payloads, so the streaming read path pays no allocation until the frame
+/// is actually complete.
+#[test]
+fn measuring_a_partial_frame_allocates_nothing_worth_counting() {
+    let frame = multibulk(4_000, 100);
+    let partial = &frame[..frame.len() / 2];
+
+    let scanning = bytes_allocated(|| {
+        let r = Value::frame_len(std::hint::black_box(partial));
+        assert!(r.is_err(), "half a frame should not measure as complete");
+        std::hint::black_box(&r);
+    });
+    let building = bytes_allocated(|| {
+        let r = Value::parse(std::hint::black_box(partial));
+        assert!(r.is_err());
+        std::hint::black_box(&r);
+    });
+
+    assert!(
+        scanning < 4 * 1024,
+        "frame_len allocated {scanning} bytes measuring a partial frame"
+    );
+    assert!(
+        building > 20 * scanning.max(1),
+        "parse allocated {building} bytes and frame_len {scanning} — the scan is \
+         not meaningfully cheaper, so gating the read loop on it buys nothing"
+    );
+}
+
+/// The whole point, end to end: feed a large frame segment by segment the way
+/// TCP delivers it and total the allocations. Deciding completeness with
+/// `frame_len` must cost a small fraction of deciding it with `parse`.
+#[test]
+fn streaming_a_large_frame_costs_far_less_when_gated_on_frame_len() {
+    const SEGMENT: usize = 1400;
+    let frame = multibulk(4_000, 100);
+
+    let with_parse = bytes_allocated(|| {
+        let mut buf: Vec<u8> = Vec::with_capacity(frame.len());
+        for chunk in frame.chunks(SEGMENT) {
+            buf.extend_from_slice(chunk);
+            if Value::parse(std::hint::black_box(&buf)).is_ok() {
+                break;
+            }
+        }
+    });
+
+    let with_frame_len = bytes_allocated(|| {
+        let mut buf: Vec<u8> = Vec::with_capacity(frame.len());
+        let mut need = 0usize;
+        for chunk in frame.chunks(SEGMENT) {
+            buf.extend_from_slice(chunk);
+            if buf.len() < need {
+                continue;
+            }
+            match Value::frame_len(std::hint::black_box(&buf)) {
+                Ok(_) => {
+                    let parsed = Value::parse(&buf);
+                    assert!(parsed.is_ok());
+                    std::hint::black_box(&parsed);
+                    break;
+                }
+                Err(e) => {
+                    assert!(e.is_incomplete(), "unexpected {e:?}");
+                    need = e.needed();
+                }
+            }
+        }
+    });
+
+    assert!(
+        with_frame_len * 10 < with_parse,
+        "gated streaming allocated {with_frame_len} bytes vs {with_parse} ungated — \
+         expected at least a tenfold reduction"
+    );
+}
+
+/// Two entry points into one parser is only safe if they agree. They share the
+/// same code with construction switched off, and this pins that: for every
+/// prefix of every frame, `frame_len` and `parse` must reach the same verdict
+/// and the same length.
+#[test]
+fn frame_len_and_parse_agree_on_every_prefix() {
+    let frames = [
+        multibulk(12, 7),
+        multibulk(1, 0),
+        multibulk(3, 300),
+        Value::Map(vec![
+            (Value::BulkString(Some(b"a".to_vec())), Value::Integer(-1)),
+            (Value::SimpleString("s".into()), Value::BulkString(None)),
+        ])
+        .serialize(),
+        Value::Push(vec![
+            Value::BulkString(Some(b"message".to_vec())),
+            Value::Array(Some(vec![Value::Integer(7), Value::Array(None)])),
+        ])
+        .serialize(),
+        b"*-1\r\n".to_vec(),
+        b"+\r\n".to_vec(),
+        b"$-1\r\n".to_vec(),
+    ];
+
+    for frame in &frames {
+        for cut in 0..=frame.len() {
+            let slice = &frame[..cut];
+            match (Value::frame_len(slice), Value::parse(slice)) {
+                (Ok(n), Ok((_, m))) => assert_eq!(n, m, "length disagreement at cut {cut}"),
+                (Err(a), Err(b)) => assert_eq!(a, b, "error disagreement at cut {cut}"),
+                (a, b) => panic!("verdict disagreement at cut {cut}: {a:?} vs {b:?}"),
+            }
+        }
+    }
+
+    // And on inputs that are not frames at all.
+    for bad in [
+        &b"!nope\r\n"[..],
+        &b"*abc\r\n"[..],
+        &b":x\r\n"[..],
+        &b"$-7\r\n"[..],
+        &b"%z\r\n"[..],
+    ] {
+        assert_eq!(
+            Value::frame_len(bad).unwrap_err(),
+            Value::parse(bad).unwrap_err(),
+            "disagreement on {:?}",
+            String::from_utf8_lossy(bad)
+        );
+    }
 }

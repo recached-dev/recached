@@ -289,27 +289,53 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::QUnsub(_) => "qunsub",
         // Metrics count the wrapped command, not the envelope.
         Command::Dedup(_, _, inner) => command_name(inner),
-        Command::Unknown(_) => "unknown",
+        Command::Unknown(_) => UNKNOWN_COMMAND,
     }
 }
 
 /// Per-command counter handles, resolved through the metrics registry once and
 /// then reused — the registry lookup (key construction + shard lock) is too
 /// expensive to pay on every command. Keyed by the `&'static str` from
-/// `command_name`. Populated lazily after the recorder is installed in `main`.
-static CMD_COUNTERS: std::sync::LazyLock<
-    std::sync::RwLock<HashMap<&'static str, metrics::Counter>>,
-> = std::sync::LazyLock::new(Default::default);
+/// `command_name`.
+///
+/// Built in one shot from the command catalog on first use, which is after
+/// `main` has installed the recorder, and never written again. It used to be an
+/// `RwLock<HashMap>` filled in as each command was first seen, which cost a
+/// read-lock acquisition on *every command on every connection* — one
+/// contended atomic in the hot path of a server whose whole job is throughput —
+/// and `.unwrap()`ed the lock, so a single panic anywhere holding it would
+/// poison the lock and make every subsequent command panic for the life of the
+/// process. An immutable map needs no lock and cannot be poisoned.
+static CMD_COUNTERS: std::sync::LazyLock<HashMap<&'static str, metrics::Counter>> =
+    std::sync::LazyLock::new(|| {
+        core_engine::catalog::CATALOG
+            .iter()
+            .map(|spec| {
+                (
+                    spec.name,
+                    counter!("recached_commands_total", "command" => spec.name),
+                )
+            })
+            .chain(std::iter::once((
+                UNKNOWN_COMMAND,
+                counter!("recached_commands_total", "command" => UNKNOWN_COMMAND),
+            )))
+            .collect()
+    });
+
+/// Label used for a command the parser did not recognise. Not a catalog row, so
+/// it is registered alongside them.
+const UNKNOWN_COMMAND: &str = "unknown";
 
 fn record_command(name: &'static str) {
     STAT_COMMANDS_TOTAL.fetch_add(1, Ordering::Relaxed);
-    if let Some(c) = CMD_COUNTERS.read().unwrap().get(name) {
-        c.increment(1);
-        return;
+    match CMD_COUNTERS.get(name) {
+        Some(c) => c.increment(1),
+        // A name `command_name` can produce but the catalog does not list.
+        // `command_name_labels_are_all_pre_registered` fails CI if that ever
+        // happens, so this is a correctness backstop, not a routine path.
+        None => counter!("recached_commands_total", "command" => name).increment(1),
     }
-    let c = counter!("recached_commands_total", "command" => name);
-    c.increment(1);
-    CMD_COUNTERS.write().unwrap().insert(name, c);
 }
 
 static KEYSPACE_HITS: std::sync::LazyLock<metrics::Counter> =
@@ -1053,7 +1079,7 @@ async fn replay_aof(store: &KeyValueStore, path: &std::path::Path) -> usize {
                     replayed += 1;
                 }
             }
-            Err(ref e) if e == "Incomplete" => break,
+            Err(e) if e.is_incomplete() => break,
             Err(_) => {
                 warn!("AOF corrupted at offset {}, stopping replay", offset);
                 break;
@@ -4655,6 +4681,9 @@ async fn handle_tcp<S>(
     let mut writer = tokio::io::BufWriter::with_capacity(32 * 1024, raw_writer);
     let mut buf = Vec::<u8>::new();
     let mut read_pos: usize = 0;
+    // Bytes the in-flight frame needs before another parse attempt can
+    // possibly succeed; 0 means "try now". See the gate in the read arm.
+    let mut need: usize = 0;
     let mut read_buf = [0u8; TCP_READ_BUFFER_BYTES];
     // Reused for every response on this connection — avoids a Vec allocation
     // per command (significant under pipelining).
@@ -4698,7 +4727,46 @@ async fn handle_tcp<S>(
                             break 'outer;
                         }
                         buf.extend_from_slice(&read_buf[..n]);
+                        // A frame that cannot possibly be complete is not worth
+                        // re-parsing. `Value::parse` starts from the beginning
+                        // every time, rebuilding — and reallocating — every
+                        // bulk string it has already seen, so a large multi-bulk
+                        // arriving over hundreds of segments used to re-copy
+                        // everything received so far on each one. `need` is the
+                        // parser's lower bound on the finished frame; until the
+                        // buffer holds that much, skip the work entirely.
+                        if buf.len() - read_pos < need {
+                            continue 'outer;
+                        }
                         'parse: loop {
+                            // Completeness is decided by the non-allocating
+                            // measure. `Value::parse` restarts from the first
+                            // byte every call, so asking *it* whether a frame
+                            // had arrived meant rebuilding — and reallocating —
+                            // every element received so far, once per segment,
+                            // and discarding all of it. `frame_len` walks the
+                            // headers and steps over payloads; `parse` below
+                            // then runs once, on a frame known to be whole.
+                            match Value::frame_len(&buf[read_pos..]) {
+                                Ok(_) => {}
+                                Err(e) if e.is_incomplete() => {
+                                    // Measured from `read_pos`, and compaction
+                                    // moves that to 0, so the bound stays valid.
+                                    need = e.needed();
+                                    // Compact: drop already-parsed bytes.
+                                    buf.drain(..read_pos);
+                                    read_pos = 0;
+                                    break 'parse;
+                                }
+                                Err(e) => {
+                                    warn!("TCP protocol error: {}", e);
+                                    let _ = writer.write_all(b"-ERR Protocol error\r\n").await;
+                                    buf.clear();
+                                    read_pos = 0;
+                                    need = 0;
+                                    break 'parse;
+                                }
+                            }
                             match Value::parse(&buf[read_pos..]) {
                                 Ok((value, consumed)) => {
                                     read_pos += consumed;
@@ -5043,7 +5111,10 @@ async fn handle_tcp<S>(
                                         }
                                     }
                                 }
-                                Err(ref e) if e == "Incomplete" => {
+                                Err(e) if e.is_incomplete() => {
+                                    // Measured from `read_pos`, and compaction
+                                    // moves that to 0, so the bound stays valid.
+                                    need = e.needed();
                                     // Compact: drop already-parsed bytes, reset cursor.
                                     buf.drain(..read_pos);
                                     read_pos = 0;
@@ -5054,6 +5125,7 @@ async fn handle_tcp<S>(
                                     let _ = writer.write_all(b"-ERR Protocol error\r\n").await;
                                     buf.clear();
                                     read_pos = 0;
+                                    need = 0;
                                     break 'parse;
                                 }
                             }
@@ -5961,7 +6033,7 @@ mod tests {
                         self.filled -= n;
                         return val;
                     }
-                    Err(ref e) if e == "Incomplete" => {
+                    Err(e) if e.is_incomplete() => {
                         let n = self
                             .stream
                             .read(&mut self.buf[self.filled..])
@@ -9532,6 +9604,91 @@ mod tests {
     fn allow_ips_tolerates_incidental_whitespace_and_trailing_commas() {
         let ips = parse_allow_ips(" 127.0.0.1 , 10.0.0.1 ,").unwrap();
         assert_eq!(ips.len(), 2);
+    }
+
+    /// `record_command` looks the label up in an immutable, pre-built map. A
+    /// label `command_name` can produce but the catalog does not list still
+    /// works — it falls back to an uncached registry lookup — but it pays that
+    /// lookup on every single call, so the gap should fail CI rather than
+    /// quietly become a hot-path cost.
+    #[test]
+    fn command_name_labels_are_all_pre_registered() {
+        let labels = [
+            "get",
+            "set",
+            "del",
+            "incr",
+            "decr",
+            "exists",
+            "expire",
+            "ttl",
+            "type",
+            "append",
+            "strlen",
+            "hset",
+            "hget",
+            "hgetall",
+            "hdel",
+            "hlen",
+            "lpush",
+            "rpush",
+            "lpop",
+            "rpop",
+            "lrange",
+            "llen",
+            "sadd",
+            "srem",
+            "smembers",
+            "scard",
+            "zadd",
+            "zrange",
+            "zrem",
+            "zscore",
+            "ping",
+            "auth",
+            "hello",
+            "quit",
+            "client",
+            "config",
+            "command",
+            "scan",
+            "subscribe",
+            "publish",
+            "multi",
+            "exec",
+            "watch",
+            UNKNOWN_COMMAND,
+        ];
+        let missing: Vec<&str> = labels
+            .into_iter()
+            .filter(|l| !CMD_COUNTERS.contains_key(l))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "labels with no pre-built counter (each costs a registry lookup per command): {missing:?}"
+        );
+    }
+
+    /// The counter table is built once from the catalog and never mutated, so
+    /// concurrent `record_command` calls need no lock and cannot poison one.
+    /// The previous `RwLock` was `.unwrap()`ed on every command: one panic while
+    /// holding it poisoned the lock and every later command panicked with it.
+    #[test]
+    fn record_command_is_safe_from_many_threads_at_once() {
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..5_000 {
+                        record_command("get");
+                        record_command("set");
+                        record_command(UNKNOWN_COMMAND);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("record_command panicked under contention");
+        }
     }
 
     #[test]

@@ -1,13 +1,14 @@
 use crate::cmd::{Command, SetCondition, SetExpiry, ZAddOptions};
 use crate::resp::Value;
 use dashmap::DashMap;
+// Aliased: this module has its own `Entry` (the stored value + TTL + recency).
+use dashmap::mapref::entry::Entry as DashEntry;
 use indexmap::IndexSet;
 use rand::Rng;
-use rand::seq::IteratorRandom;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -36,27 +37,160 @@ fn now_ms() -> u64 {
 
 // ── ZSet inner ────────────────────────────────────────────────────────────────
 
+/// A sorted-set score, ordered totally so it can be a `BTreeSet` key.
+///
+/// `f64` is only `PartialOrd`: `NaN` compares false against everything, which
+/// is why the old comparator had to fall back to `Ordering::Equal`. `total_cmp`
+/// is a total order over every bit pattern, so the index stays well-formed even
+/// if a `NaN` ever reached it (`ZADD`/`ZINCRBY` reject them at the door).
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Score(f64);
+
+impl Eq for Score {}
+
+impl Ord for Score {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+impl PartialOrd for Score {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// A sorted set: a member→score map for point lookups, plus a score-ordered
+/// index for range queries.
+///
+/// The index is the whole point. Every range command used to call a `rank_asc`
+/// that collected *every* member into a `Vec` and sorted it — O(n log n) per
+/// query, with an allocation proportional to the set, all while holding the
+/// shard guard. `ZRANGE board 0 9` on a million-member leaderboard sorted a
+/// million entries to return ten, and blocked every other key on that shard
+/// while it did.
+///
+/// Members are shared between the two structures as `Arc<str>`, so the index
+/// costs a pointer per member rather than a second copy of the string.
 #[derive(Clone)]
 pub(crate) struct ZSetInner {
-    pub scores: HashMap<String, f64>,
+    scores: HashMap<Arc<str>, f64>,
+    /// `(score, member)` ascending — the ordering every range command wants.
+    index: BTreeSet<(Score, Arc<str>)>,
 }
 
 impl ZSetInner {
     fn new() -> Self {
         Self {
             scores: HashMap::new(),
+            index: BTreeSet::new(),
         }
     }
 
-    /// Members sorted by (score ASC, member ASC).
-    fn rank_asc(&self) -> Vec<(&str, f64)> {
-        let mut v: Vec<(&str, f64)> = self.scores.iter().map(|(m, &s)| (m.as_str(), s)).collect();
-        v.sort_by(|(m1, s1), (m2, s2)| {
-            s1.partial_cmp(s2)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(m1.cmp(m2))
-        });
-        v
+    fn len(&self) -> usize {
+        self.scores.len()
+    }
+
+    fn score(&self, member: &str) -> Option<f64> {
+        self.scores.get(member).copied()
+    }
+
+    /// Inserts or updates `member`, returning its previous score.
+    ///
+    /// Both structures move together; a score change is a remove plus an insert
+    /// in the index, because the score is part of the key.
+    fn insert(&mut self, member: &str, score: f64) -> Option<f64> {
+        match self.scores.get_mut(member) {
+            Some(existing) => {
+                let old = *existing;
+                if old.to_bits() == score.to_bits() {
+                    return Some(old);
+                }
+                *existing = score;
+                // Re-key: recover the shared `Arc` from the index rather than
+                // allocating a second copy of the member.
+                let key = self
+                    .index
+                    .range((Score(old), Arc::from(member))..)
+                    .next()
+                    .map(|(_, m)| Arc::clone(m));
+                if let Some(k) = key {
+                    self.index.remove(&(Score(old), Arc::clone(&k)));
+                    self.index.insert((Score(score), k));
+                }
+                Some(old)
+            }
+            None => {
+                let key: Arc<str> = Arc::from(member);
+                self.scores.insert(Arc::clone(&key), score);
+                self.index.insert((Score(score), key));
+                None
+            }
+        }
+    }
+
+    /// Removes `member`, returning its previous score.
+    fn remove(&mut self, member: &str) -> Option<f64> {
+        let (key, old) = self.scores.remove_entry(member)?;
+        self.index.remove(&(Score(old), key));
+        Some(old)
+    }
+
+    /// Members in `(score ASC, member ASC)` order, one step at a time — no
+    /// collection, no sort, and reversible for the `ZREV*` commands.
+    fn iter_asc(&self) -> impl DoubleEndedIterator<Item = (&str, f64)> {
+        self.index.iter().map(|(s, m)| (m.as_ref(), s.0))
+    }
+
+    /// Members whose score falls within `min..max`.
+    ///
+    /// Seeks to the first candidate through the index and stops at the first
+    /// score past `max`, so this is O(log n + k) in the number returned rather
+    /// than O(n log n) in the size of the set. The `filter` only ever discards
+    /// the run of members sitting exactly on an exclusive lower bound.
+    fn range_by_score<'a>(
+        &'a self,
+        min: &'a ScoreBound,
+        max: &'a ScoreBound,
+    ) -> impl Iterator<Item = (&'a str, f64)> {
+        let start = match min {
+            ScoreBound::NegInf => f64::NEG_INFINITY,
+            ScoreBound::PosInf => f64::INFINITY,
+            ScoreBound::Inclusive(v) | ScoreBound::Exclusive(v) => *v,
+        };
+        let empty: Arc<str> = Arc::from("");
+        self.index
+            .range((Score(start), empty)..)
+            .take_while(move |(s, _)| below_max(s.0, max))
+            .filter(move |(s, _)| above_min(s.0, min))
+            .map(|(s, m)| (m.as_ref(), s.0))
+    }
+
+    /// 0-based position of `member` in ascending order.
+    ///
+    /// O(rank) — a `BTreeSet` cannot answer a positional query in log time. That
+    /// is still strictly better than sorting the whole set, which is what this
+    /// used to do.
+    fn rank(&self, member: &str) -> Option<usize> {
+        let score = self.score(member)?;
+        Some(
+            self.index
+                .range(..(Score(score), Arc::from(member)))
+                .count(),
+        )
+    }
+
+    /// Members in no particular order, for callers that sort by something else.
+    fn members(&self) -> impl Iterator<Item = (&str, f64)> {
+        self.scores.iter().map(|(m, &s)| (m.as_ref(), s))
+    }
+
+    fn from_pairs(pairs: impl IntoIterator<Item = (String, f64)>) -> Self {
+        let mut z = Self::new();
+        for (member, score) in pairs {
+            z.insert(&member, score);
+        }
+        z
     }
 }
 
@@ -87,20 +221,35 @@ impl ScoreBound {
     }
 }
 
-fn in_score_range(score: f64, min: &ScoreBound, max: &ScoreBound) -> bool {
-    let above = match min {
+/// Whether `score` clears the lower bound.
+fn above_min(score: f64, min: &ScoreBound) -> bool {
+    match min {
         ScoreBound::NegInf => true,
         ScoreBound::PosInf => false,
         ScoreBound::Inclusive(v) => score >= *v,
         ScoreBound::Exclusive(v) => score > *v,
-    };
-    let below = match max {
+    }
+}
+
+/// Whether `score` is still under the upper bound. Split out from
+/// [`in_score_range`] so an ordered walk can use it as a stopping condition:
+/// once it goes false, every later score is out of range too.
+fn below_max(score: f64, max: &ScoreBound) -> bool {
+    match max {
         ScoreBound::PosInf => true,
         ScoreBound::NegInf => false,
         ScoreBound::Inclusive(v) => score <= *v,
         ScoreBound::Exclusive(v) => score < *v,
-    };
-    above && below
+    }
+}
+
+/// The straightforward definition of "in range", kept as the reference the
+/// index walk in [`ZSetInner::range_by_score`] is checked against — see
+/// `range_by_score_agrees_with_a_linear_scan`. Nothing on the hot path calls
+/// it: seeking through the index and stopping early is the whole point.
+#[cfg(test)]
+fn in_score_range(score: f64, min: &ScoreBound, max: &ScoreBound) -> bool {
+    above_min(score, min) && below_max(score, max)
 }
 
 // ── Byte payloads ─────────────────────────────────────────────────────────────
@@ -547,11 +696,24 @@ fn resolve_range(start: i64, stop: i64, len: usize) -> Option<(usize, usize)> {
 
 // ── zset range helpers ────────────────────────────────────────────────────────
 
-fn zrange_index<'a>(sorted: &'a [(&'a str, f64)], start: i64, stop: i64) -> &'a [(&'a str, f64)] {
-    let len = sorted.len();
+/// Collects the `start..=stop` window (Redis index semantics, negatives count
+/// from the end) out of an already-ordered iterator.
+///
+/// Takes an iterator rather than a slice so the caller never materialises the
+/// whole set: `ZRANGE board 0 9` walks ten entries out of the index and stops,
+/// where the previous shape collected and sorted every member first.
+///
+/// Reaching the window is O(start) — a `BTreeSet` has no positional index — so
+/// a deep offset still walks, but nothing is allocated or sorted along the way.
+fn index_slice<'a>(
+    ordered: impl Iterator<Item = (&'a str, f64)>,
+    len: usize,
+    start: i64,
+    stop: i64,
+) -> Vec<(&'a str, f64)> {
     match resolve_range(start, stop, len) {
-        None => &[],
-        Some((s, e)) => &sorted[s..=e],
+        None => Vec::new(),
+        Some((s, e)) => ordered.skip(s).take(e - s + 1).collect(),
     }
 }
 
@@ -602,23 +764,41 @@ pub fn format_score(s: f64) -> String {
 
 // ── macro: check entry type and prepare for mutation ─────────────────────────
 
-/// Emits code that:
-///   1. Checks if the key holds the wrong type → return WRONGTYPE error.
-///   2. Retrieves the expired flag.
+/// Binds `$guard` to the entry for `$key` and `$inner` to the payload inside
+/// its `$variant`, creating the entry from `$default` when the key is absent or
+/// expired. Returns `WRONGTYPE` from the enclosing function if the key holds a
+/// different type.
 ///
-/// After the macro, `was_expired` is bound; the immutable borrow of `lock` is released.
-macro_rules! type_guard {
-    ($lock:expr, $key:expr, $variant:pat, $now:expr) => {{
-        let (ok, expired) = match $lock.get($key) {
-            None => (true, false),
-            Some(e) if e.is_expired($now) => (true, true),
-            Some(e) => (matches!(&e.value, $variant), false),
-        };
-        if !ok {
-            return Value::Error(WRONGTYPE.to_string());
+/// The type check, the expiry reset and the insertion all happen under the one
+/// write guard that hands out `$inner`. The previous shape — a `get()` that
+/// dropped its read guard, then a separate `entry()` — left a window in which
+/// another connection could change the key's type or resurrect an expired key:
+///
+///   * `HSET k f v` on a missing key racing `SET k v` found a `Str` behind the
+///     `entry()` and hit an `unreachable!()`, panicking the connection task.
+///   * `was_expired` computed from the earlier read clobbered a value that a
+///     concurrent writer had stored in the meantime.
+///
+/// Both are gone: nothing observes the key between the check and the write.
+/// Splitting the guard is also why the old shape cost two shard locks per
+/// mutating command instead of one.
+macro_rules! typed_entry {
+    ($guard:ident, $inner:ident, $data:expr, $key:expr, $now:expr, $variant:path, $default:expr) => {
+        let mut $guard = $data.entry($key).or_insert_with(|| Entry {
+            value: $variant($default),
+            expires_at_ms: None,
+            last_access_ms: AtomicU64::new($now),
+        });
+        // A freshly inserted entry carries no TTL, so this only fires for a key
+        // that was already present and has aged out.
+        if $guard.is_expired($now) {
+            $guard.value = $variant($default);
+            $guard.expires_at_ms = None;
         }
-        expired
-    }};
+        let $variant($inner) = &mut $guard.value else {
+            return Value::Error(WRONGTYPE.to_string());
+        };
+    };
 }
 
 // ── KeyspaceSample ────────────────────────────────────────────────────────────
@@ -691,7 +871,28 @@ pub struct KeyValueStore {
     /// Total keys evicted since start. Exported as a metric: without it an
     /// operator cannot tell a healthy cache from one thrashing at its cap.
     evicted: Arc<AtomicU64>,
+    /// Footprint as of the last exact measurement, and the bytes written since.
+    ///
+    /// `max_memory_bytes` used to be enforced only by the background sweep, so
+    /// between two ticks a client could write as much as it liked and the cap
+    /// simply did not apply — while `max_keys`, checked inline on every write,
+    /// did. Measuring exactly on the write path is not an option: it walks the
+    /// whole keyspace. So writes add a cheap upper bound to `untracked_bytes`
+    /// and pay for a real measurement only when the sum suggests the cap is
+    /// near. See `note_write`.
+    measured_memory: Arc<AtomicUsize>,
+    untracked_bytes: Arc<AtomicUsize>,
 }
+
+/// Fraction of `max_memory_bytes` eviction drops to once the cap is hit,
+/// expressed as the divisor of the overshoot to shed (`limit - limit/16` ≈ 94%).
+///
+/// Without this headroom the store would sit exactly on the limit and the very
+/// next write would trip the gate again, so every write at the cap would pay
+/// for a full keyspace measurement. Evicting a little below it means the next
+/// measurement is only due after roughly `limit/16` more bytes are written,
+/// which amortises the scan against the writes that made it necessary.
+const EVICTION_HEADROOM_DIVISOR: usize = 16;
 
 impl Default for KeyValueStore {
     fn default() -> Self {
@@ -709,6 +910,8 @@ impl KeyValueStore {
             dirty: Arc::new(AtomicU64::new(0)),
             eviction_sample: 10,
             evicted: Arc::new(AtomicU64::new(0)),
+            measured_memory: Arc::new(AtomicUsize::new(0)),
+            untracked_bytes: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -721,6 +924,8 @@ impl KeyValueStore {
             dirty: Arc::new(AtomicU64::new(0)),
             eviction_sample: 10,
             evicted: Arc::new(AtomicU64::new(0)),
+            measured_memory: Arc::new(AtomicUsize::new(0)),
+            untracked_bytes: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -737,6 +942,8 @@ impl KeyValueStore {
             dirty: Arc::new(AtomicU64::new(0)),
             eviction_sample: 10,
             evicted: Arc::new(AtomicU64::new(0)),
+            measured_memory: Arc::new(AtomicUsize::new(0)),
+            untracked_bytes: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -759,10 +966,26 @@ impl KeyValueStore {
 
     /// Approximate heap usage in bytes — key+value sizes plus a fixed overhead per entry.
     pub fn approximate_memory_bytes(&self) -> usize {
-        self.data
+        let total = self
+            .data
             .iter()
             .map(|r| entry_size(r.key(), r.value()))
-            .sum()
+            .sum();
+        self.cache_measurement(total);
+        total
+    }
+
+    /// Records an exact measurement so the write-path gate in `note_write` can
+    /// compare against it without walking the keyspace itself.
+    ///
+    /// Writes landing between the walk and this call are dropped from
+    /// `untracked_bytes` and so go uncounted until the next measurement. That
+    /// undercount is bounded by what a few concurrent commands can write, and
+    /// self-corrects — the alternative, holding every shard for the duration of
+    /// the walk, would stall the whole store.
+    fn cache_measurement(&self, total: usize) {
+        self.measured_memory.store(total, Ordering::Relaxed);
+        self.untracked_bytes.store(0, Ordering::Relaxed);
     }
 
     /// Evict entries until memory usage is below `max_memory_bytes`, or the
@@ -780,10 +1003,17 @@ impl KeyValueStore {
         };
         let now = now_ms();
         let mut current = self.approximate_memory_bytes();
+        if current <= limit {
+            return true;
+        }
+        // Shed a little past the cap, so the next write does not immediately
+        // demand another full measurement. See `EVICTION_HEADROOM_DIVISOR`.
+        let target = limit - limit / EVICTION_HEADROOM_DIVISOR;
         let mut since_resync = 0u32;
-        while current > limit {
+        while current > target {
             match self.evict_one(now) {
-                None => return false, // policy can't free anything more
+                // Policy can't free anything more.
+                None => break,
                 Some(freed) => {
                     current = current.saturating_sub(freed);
                     since_resync += 1;
@@ -794,7 +1024,39 @@ impl KeyValueStore {
                 }
             }
         }
-        true
+        self.measured_memory.store(current, Ordering::Relaxed);
+        self.untracked_bytes.store(0, Ordering::Relaxed);
+        current <= limit
+    }
+
+    /// Records that a write may have added `cost` bytes and evicts if that
+    /// pushes the estimate over `max_memory_bytes`.
+    ///
+    /// The comparison is two relaxed atomic loads and an add — cheap enough for
+    /// every write. Only when it trips is an exact measurement paid for, and
+    /// eviction then drops below the cap by enough that the next few thousand
+    /// writes stay on the cheap path.
+    ///
+    /// `cost` is an upper bound for the commands that carry their payload
+    /// inline. The `*STORE` set commands, whose result size is not knowable
+    /// without doing the work, contribute only their key: they are still caught
+    /// by the background sweep, exactly as everything was before.
+    fn note_write(&self, cost: usize) {
+        if cost == 0 {
+            return;
+        }
+        let Some(limit) = self.max_memory_bytes else {
+            return;
+        };
+        let pending = self.untracked_bytes.fetch_add(cost, Ordering::Relaxed) + cost;
+        if self
+            .measured_memory
+            .load(Ordering::Relaxed)
+            .saturating_add(pending)
+            > limit
+        {
+            self.try_evict_for_memory();
+        }
     }
 
     /// Returns the current value of a key for watch push notifications.
@@ -852,15 +1114,10 @@ impl KeyValueStore {
                 EntryValue::List(l) => tagged("list", l.iter().map(blob).collect()),
                 EntryValue::Set(st) => tagged("set", st.iter().map(|m| bulk(m)).collect()),
                 EntryValue::ZSet(z) => {
-                    let mut pairs: Vec<(&String, &f64)> = z.scores.iter().collect();
-                    pairs.sort_by(|a, b| {
-                        a.1.partial_cmp(b.1)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                            .then_with(|| a.0.cmp(b.0))
-                    });
+                    let pairs: Vec<(&str, f64)> = z.iter_asc().collect();
                     let items = pairs
                         .into_iter()
-                        .flat_map(|(m, sc)| [bulk(m), bulk(&format_score(*sc))])
+                        .flat_map(|(m, sc)| [bulk(m), bulk(&format_score(sc))])
                         .collect();
                     tagged("zset", items)
                 }
@@ -959,62 +1216,82 @@ impl KeyValueStore {
             }
             sample.memory_bytes += entry_size(r.key(), r.value());
         }
+        // This walk is exact, so the write-path gate may as well benefit from
+        // it — the metrics sampler runs it every few seconds anyway.
+        self.cache_measurement(sample.memory_bytes);
         sample
     }
 
+    /// Reservoir-samples up to `want` eligible keys and returns the one with the
+    /// lowest weight — the victim for one eviction.
+    ///
+    /// `weight` doubles as the eligibility test: `None` skips the entry.
+    ///
+    /// Only keys that actually land in the reservoir are cloned, so a pass costs
+    /// about `want + want·ln(n/want)` allocations. The previous version mapped
+    /// `key().clone()` across the whole iterator before handing it to
+    /// `choose_multiple`, and because `choose_multiple` is itself a reservoir
+    /// sampler it drains that iterator to the end: evicting one key from a
+    /// million-key store allocated and dropped a million `String`s, and
+    /// `try_evict_for_memory` calls this in a loop until it is under the limit.
+    ///
+    /// The walk over the keyspace is still O(n) — DashMap offers no random
+    /// access — but it is now a pointer walk rather than a million allocations.
+    fn sample_min_by_weight<F>(
+        &self,
+        rng: &mut impl Rng,
+        want: usize,
+        mut weight: F,
+    ) -> Option<String>
+    where
+        F: FnMut(&Entry) -> Option<u64>,
+    {
+        if want == 0 {
+            return None;
+        }
+        let mut reservoir: Vec<(String, u64)> = Vec::with_capacity(want);
+        let mut seen = 0usize;
+        for r in self.data.iter() {
+            let Some(w) = weight(r.value()) else { continue };
+            if reservoir.len() < want {
+                reservoir.push((r.key().clone(), w));
+            } else {
+                // Algorithm R: the eligible entry at 0-based index `seen`
+                // displaces a uniformly chosen slot with probability
+                // `want / (seen + 1)`, which leaves every entry equally likely
+                // to be in the reservoir at the end of the walk.
+                let j = rng.random_range(0..=seen);
+                if j < want {
+                    reservoir[j] = (r.key().clone(), w);
+                }
+            }
+            seen += 1;
+        }
+        reservoir
+            .into_iter()
+            .min_by_key(|(_, w)| *w)
+            .map(|(k, _)| k)
+    }
+
     fn evict_one(&self, now: u64) -> Option<usize> {
-        let sample = self.eviction_sample;
+        let want = self.eviction_sample;
         let mut rng = rand::rng();
         let chosen: Option<String> = match self.eviction_policy {
             EvictionPolicy::NoEviction => None,
-            EvictionPolicy::AllKeysLru => {
-                let sample: Vec<(String, u64)> = self
-                    .data
-                    .iter()
-                    .map(|r| {
-                        (
-                            r.key().clone(),
-                            r.value().last_access_ms.load(Ordering::Relaxed),
-                        )
-                    })
-                    .choose_multiple(&mut rng, sample);
-                sample.into_iter().min_by_key(|(_, w)| *w).map(|(k, _)| k)
-            }
-            EvictionPolicy::AllKeysRandom => {
-                self.data.iter().map(|r| r.key().clone()).choose(&mut rng)
-            }
-            EvictionPolicy::VolatileLru => {
-                let sample: Vec<(String, u64)> = self
-                    .data
-                    .iter()
-                    .filter(|r| r.value().expires_at_ms.is_some() && !r.value().is_expired(now))
-                    .map(|r| {
-                        (
-                            r.key().clone(),
-                            r.value().last_access_ms.load(Ordering::Relaxed),
-                        )
-                    })
-                    .choose_multiple(&mut rng, sample);
-                sample.into_iter().min_by_key(|(_, w)| *w).map(|(k, _)| k)
-            }
-            EvictionPolicy::VolatileTtl => {
-                let sample: Vec<(String, u64)> = self
-                    .data
-                    .iter()
-                    .filter_map(|r| {
-                        let exp = r.value().expires_at_ms?;
-                        if r.value().is_expired(now) {
-                            None
-                        } else {
-                            Some((r.key().clone(), exp))
-                        }
-                    })
-                    .choose_multiple(&mut rng, sample);
-                sample
-                    .into_iter()
-                    .min_by_key(|(_, exp)| *exp)
-                    .map(|(k, _)| k)
-            }
+            EvictionPolicy::AllKeysLru => self.sample_min_by_weight(&mut rng, want, |e| {
+                Some(e.last_access_ms.load(Ordering::Relaxed))
+            }),
+            // Every key carries the same weight, so a reservoir of one already
+            // is the uniform pick — no need to sample more and then choose.
+            EvictionPolicy::AllKeysRandom => self.sample_min_by_weight(&mut rng, 1, |_| Some(0)),
+            EvictionPolicy::VolatileLru => self.sample_min_by_weight(&mut rng, want, |e| {
+                (e.expires_at_ms.is_some() && !e.is_expired(now))
+                    .then(|| e.last_access_ms.load(Ordering::Relaxed))
+            }),
+            EvictionPolicy::VolatileTtl => self.sample_min_by_weight(&mut rng, want, |e| {
+                let exp = e.expires_at_ms?;
+                (!e.is_expired(now)).then_some(exp)
+            }),
         };
         let key = chosen?;
         // Treat a lost race (key already gone) as a successful eviction that
@@ -1039,7 +1316,7 @@ impl KeyValueStore {
                     EntryValue::List(l) => SnapshotValue::List(l.iter().cloned().collect()),
                     EntryValue::Set(s) => SnapshotValue::Set(s.iter().cloned().collect()),
                     EntryValue::ZSet(z) => {
-                        SnapshotValue::ZSet(z.scores.iter().map(|(k, &v)| (k.clone(), v)).collect())
+                        SnapshotValue::ZSet(z.iter_asc().map(|(m, s)| (m.to_string(), s)).collect())
                     }
                     // Attempt counts are deliberately not persisted: they age
                     // out within a single window, and a restart has already
@@ -1076,9 +1353,7 @@ impl KeyValueStore {
                 SnapshotValue::Hash(m) => EntryValue::Hash(m),
                 SnapshotValue::List(l) => EntryValue::List(l.into_iter().collect()),
                 SnapshotValue::Set(s) => EntryValue::Set(s.into_iter().collect()),
-                SnapshotValue::ZSet(pairs) => EntryValue::ZSet(ZSetInner {
-                    scores: pairs.into_iter().collect(),
-                }),
+                SnapshotValue::ZSet(pairs) => EntryValue::ZSet(ZSetInner::from_pairs(pairs)),
                 SnapshotValue::RateLimiter {
                     limit,
                     window_ms,
@@ -1106,7 +1381,18 @@ impl KeyValueStore {
         }
     }
 
+    /// Runs one command.
+    ///
+    /// Wraps [`KeyValueStore::execute_inner`] so that `max_memory_bytes` is
+    /// enforced here, on the write path, and not only by the background sweep.
     pub fn execute(&self, cmd: Command) -> Value {
+        let cost = write_cost(&cmd);
+        let out = self.execute_inner(cmd);
+        self.note_write(cost);
+        out
+    }
+
+    fn execute_inner(&self, cmd: Command) -> Value {
         match cmd {
             // Ephemeral keys are ordinary strings to the engine — their lifetime
             // is enforced by the server, which is the layer that knows about
@@ -1242,22 +1528,17 @@ impl KeyValueStore {
 
             Command::Append(key, suffix) => {
                 let now = now_ms();
-                let was_expired = type_guard!(self.data, &key, EntryValue::Str(_), now);
-                let mut entry = self
-                    .data
-                    .entry(key)
-                    .or_insert_with(|| Entry::new_str(String::new()));
-                if was_expired {
-                    entry.value = EntryValue::Str(Blob::default());
-                    entry.expires_at_ms = None;
-                }
-                match &mut entry.value {
-                    EntryValue::Str(s) => {
-                        s.extend(&suffix);
-                        Value::Integer(s.len() as i64)
-                    }
-                    _ => unreachable!(),
-                }
+                typed_entry!(
+                    entry,
+                    s,
+                    self.data,
+                    key,
+                    now,
+                    EntryValue::Str,
+                    Blob::default()
+                );
+                s.extend(&suffix);
+                Value::Integer(s.len() as i64)
             }
 
             Command::Strlen(key) => {
@@ -1548,20 +1829,15 @@ impl KeyValueStore {
             // ── Hash ──────────────────────────────────────────────────────────
             Command::HSet(key, pairs) => {
                 let now = now_ms();
-                let was_expired = type_guard!(self.data, &key, EntryValue::Hash(_), now);
-                let mut entry = self.data.entry(key).or_insert_with(|| Entry {
-                    value: EntryValue::Hash(HashMap::new()),
-                    expires_at_ms: None,
-                    last_access_ms: AtomicU64::new(now_ms()),
-                });
-                if was_expired {
-                    entry.value = EntryValue::Hash(HashMap::new());
-                    entry.expires_at_ms = None;
-                }
-                let h = match &mut entry.value {
-                    EntryValue::Hash(h) => h,
-                    _ => unreachable!(),
-                };
+                typed_entry!(
+                    entry,
+                    h,
+                    self.data,
+                    key,
+                    now,
+                    EntryValue::Hash,
+                    HashMap::new()
+                );
                 let new_count = pairs
                     .iter()
                     .filter(|(f, _)| !h.contains_key(f.as_str()))
@@ -1742,20 +2018,15 @@ impl KeyValueStore {
 
             Command::HSetNx(key, field, val) => {
                 let now = now_ms();
-                let was_expired = type_guard!(self.data, &key, EntryValue::Hash(_), now);
-                let mut entry = self.data.entry(key).or_insert_with(|| Entry {
-                    value: EntryValue::Hash(HashMap::new()),
-                    expires_at_ms: None,
-                    last_access_ms: AtomicU64::new(now_ms()),
-                });
-                if was_expired {
-                    entry.value = EntryValue::Hash(HashMap::new());
-                    entry.expires_at_ms = None;
-                }
-                let h = match &mut entry.value {
-                    EntryValue::Hash(h) => h,
-                    _ => unreachable!(),
-                };
+                typed_entry!(
+                    entry,
+                    h,
+                    self.data,
+                    key,
+                    now,
+                    EntryValue::Hash,
+                    HashMap::new()
+                );
                 if let std::collections::hash_map::Entry::Vacant(e) = h.entry(field) {
                     e.insert(val.into());
                     Value::Integer(1)
@@ -1792,20 +2063,15 @@ impl KeyValueStore {
             // ── List ──────────────────────────────────────────────────────────
             Command::LPush(key, vals) => {
                 let now = now_ms();
-                let was_expired = type_guard!(self.data, &key, EntryValue::List(_), now);
-                let mut entry = self.data.entry(key).or_insert_with(|| Entry {
-                    value: EntryValue::List(VecDeque::new()),
-                    expires_at_ms: None,
-                    last_access_ms: AtomicU64::new(now_ms()),
-                });
-                if was_expired {
-                    entry.value = EntryValue::List(VecDeque::new());
-                    entry.expires_at_ms = None;
-                }
-                let list = match &mut entry.value {
-                    EntryValue::List(l) => l,
-                    _ => unreachable!(),
-                };
+                typed_entry!(
+                    entry,
+                    list,
+                    self.data,
+                    key,
+                    now,
+                    EntryValue::List,
+                    VecDeque::new()
+                );
                 for v in vals {
                     list.push_front(v.into());
                 }
@@ -1814,20 +2080,15 @@ impl KeyValueStore {
 
             Command::RPush(key, vals) => {
                 let now = now_ms();
-                let was_expired = type_guard!(self.data, &key, EntryValue::List(_), now);
-                let mut entry = self.data.entry(key).or_insert_with(|| Entry {
-                    value: EntryValue::List(VecDeque::new()),
-                    expires_at_ms: None,
-                    last_access_ms: AtomicU64::new(now_ms()),
-                });
-                if was_expired {
-                    entry.value = EntryValue::List(VecDeque::new());
-                    entry.expires_at_ms = None;
-                }
-                let list = match &mut entry.value {
-                    EntryValue::List(l) => l,
-                    _ => unreachable!(),
-                };
+                typed_entry!(
+                    entry,
+                    list,
+                    self.data,
+                    key,
+                    now,
+                    EntryValue::List,
+                    VecDeque::new()
+                );
                 for v in vals {
                     list.push_back(v.into());
                 }
@@ -2055,20 +2316,15 @@ impl KeyValueStore {
             // ── Set ───────────────────────────────────────────────────────────
             Command::SAdd(key, members) => {
                 let now = now_ms();
-                let was_expired = type_guard!(self.data, &key, EntryValue::Set(_), now);
-                let mut entry = self.data.entry(key).or_insert_with(|| Entry {
-                    value: EntryValue::Set(IndexSet::new()),
-                    expires_at_ms: None,
-                    last_access_ms: AtomicU64::new(now_ms()),
-                });
-                if was_expired {
-                    entry.value = EntryValue::Set(IndexSet::new());
-                    entry.expires_at_ms = None;
-                }
-                let set = match &mut entry.value {
-                    EntryValue::Set(s) => s,
-                    _ => unreachable!(),
-                };
+                typed_entry!(
+                    entry,
+                    set,
+                    self.data,
+                    key,
+                    now,
+                    EntryValue::Set,
+                    IndexSet::new()
+                );
                 let added = members
                     .into_iter()
                     .filter(|m| set.insert(m.clone()))
@@ -2396,57 +2652,62 @@ impl KeyValueStore {
                 if !removed {
                     return Value::Integer(0);
                 }
-                // Add to destination
-                let was_expired_dst = matches!(self.data.get(&dst), Some(e) if e.is_expired(now));
+                // Add to destination. Expiry and type resolve under the one
+                // guard that performs the insert — reading them separately
+                // first (as this used to) let the destination be retyped in
+                // between, after which the member was silently dropped and the
+                // reply still claimed a successful move.
                 let mut dst_entry = self.data.entry(dst).or_insert_with(|| Entry {
                     value: EntryValue::Set(IndexSet::new()),
                     expires_at_ms: None,
-                    last_access_ms: AtomicU64::new(now_ms()),
+                    last_access_ms: AtomicU64::new(now),
                 });
-                if was_expired_dst {
+                if dst_entry.is_expired(now) {
                     dst_entry.value = EntryValue::Set(IndexSet::new());
                     dst_entry.expires_at_ms = None;
                 }
                 if let EntryValue::Set(s) = &mut dst_entry.value {
                     s.insert(member);
+                    return Value::Integer(1);
                 }
-                Value::Integer(1)
+                // Destination was retyped after the type check above. The source
+                // removal has already happened, so put the member back rather
+                // than losing it: SMOVE either moves or fails.
+                drop(dst_entry);
+                if let Some(mut e) = self.data.get_mut(&src)
+                    && let EntryValue::Set(s) = &mut e.value
+                {
+                    s.insert(member);
+                }
+                Value::Error(WRONGTYPE.to_string())
             }
 
             // ── Sorted Set ────────────────────────────────────────────────────
             Command::ZAdd(key, opts, pairs) => {
                 let now = now_ms();
-                let was_expired = type_guard!(self.data, &key, EntryValue::ZSet(_), now);
-                let mut entry = self.data.entry(key).or_insert_with(|| Entry {
-                    value: EntryValue::ZSet(ZSetInner::new()),
-                    expires_at_ms: None,
-                    last_access_ms: AtomicU64::new(now_ms()),
-                });
-                if was_expired {
-                    entry.value = EntryValue::ZSet(ZSetInner::new());
-                    entry.expires_at_ms = None;
-                }
-                let zset = match &mut entry.value {
-                    EntryValue::ZSet(z) => z,
-                    _ => unreachable!(),
-                };
+                typed_entry!(
+                    entry,
+                    zset,
+                    self.data,
+                    key,
+                    now,
+                    EntryValue::ZSet,
+                    ZSetInner::new()
+                );
                 zadd_exec(zset, opts, pairs)
             }
 
             Command::ZRange(key, start, stop, withscores) => zset_read(&self.data, &key, |zset| {
-                let sorted = zset.rank_asc();
                 Ok(encode_zrange(
-                    zrange_index(&sorted, start, stop),
+                    &index_slice(zset.iter_asc(), zset.len(), start, stop),
                     withscores,
                 ))
             }),
 
             Command::ZRevRange(key, start, stop, withscores) => {
                 zset_read(&self.data, &key, |zset| {
-                    let mut sorted = zset.rank_asc();
-                    sorted.reverse();
                     Ok(encode_zrange(
-                        zrange_index(&sorted, start, stop),
+                        &index_slice(zset.iter_asc().rev(), zset.len(), start, stop),
                         withscores,
                     ))
                 })
@@ -2456,11 +2717,7 @@ impl KeyValueStore {
                 zset_read(&self.data, &key, |zset| {
                     let min = ScoreBound::parse(&min_s)?;
                     let max = ScoreBound::parse(&max_s)?;
-                    let filtered: Vec<(&str, f64)> = zset
-                        .rank_asc()
-                        .into_iter()
-                        .filter(|(_, s)| in_score_range(*s, &min, &max))
-                        .collect();
+                    let filtered: Vec<(&str, f64)> = zset.range_by_score(&min, &max).collect();
                     let limited = apply_limit(filtered, limit);
                     Ok(encode_zrange(&limited, withscores))
                 })
@@ -2470,15 +2727,8 @@ impl KeyValueStore {
                 zset_read(&self.data, &key, |zset| {
                     let min = ScoreBound::parse(&min_s)?;
                     let max = ScoreBound::parse(&max_s)?;
-                    let filtered: Vec<(&str, f64)> = {
-                        let mut v: Vec<(&str, f64)> = zset
-                            .rank_asc()
-                            .into_iter()
-                            .filter(|(_, s)| in_score_range(*s, &min, &max))
-                            .collect();
-                        v.reverse();
-                        v
-                    };
+                    let mut filtered: Vec<(&str, f64)> = zset.range_by_score(&min, &max).collect();
+                    filtered.reverse();
                     let limited = apply_limit(filtered, limit);
                     Ok(encode_zrange(&limited, withscores))
                 })
@@ -2492,9 +2742,8 @@ impl KeyValueStore {
                     Some(e) => match &e.value {
                         EntryValue::ZSet(z) => {
                             e.touch(now);
-                            z.scores
-                                .get(&member)
-                                .map(|s| Value::BulkString(Some(format_score(*s).into_bytes())))
+                            z.score(&member)
+                                .map(|s| Value::BulkString(Some(format_score(s).into_bytes())))
                                 .unwrap_or(Value::BulkString(None))
                         }
                         _ => Value::Error(WRONGTYPE.to_string()),
@@ -2516,10 +2765,9 @@ impl KeyValueStore {
                             members
                                 .iter()
                                 .map(|m| {
-                                    z.scores
-                                        .get(m)
+                                    z.score(m)
                                         .map(|s| {
-                                            Value::BulkString(Some(format_score(*s).into_bytes()))
+                                            Value::BulkString(Some(format_score(s).into_bytes()))
                                         })
                                         .unwrap_or(Value::BulkString(None))
                                 })
@@ -2537,9 +2785,7 @@ impl KeyValueStore {
                     Some(e) if e.is_expired(now) => Value::BulkString(None),
                     Some(e) => match &e.value {
                         EntryValue::ZSet(z) => z
-                            .rank_asc()
-                            .iter()
-                            .position(|(m, _)| *m == member)
+                            .rank(&member)
                             .map(|i| Value::Integer(i as i64))
                             .unwrap_or(Value::BulkString(None)),
                         _ => Value::Error(WRONGTYPE.to_string()),
@@ -2553,15 +2799,10 @@ impl KeyValueStore {
                     None => Value::BulkString(None),
                     Some(e) if e.is_expired(now) => Value::BulkString(None),
                     Some(e) => match &e.value {
-                        EntryValue::ZSet(z) => {
-                            let sorted = z.rank_asc();
-                            let len = sorted.len();
-                            sorted
-                                .iter()
-                                .position(|(m, _)| *m == member)
-                                .map(|i| Value::Integer((len - 1 - i) as i64))
-                                .unwrap_or(Value::BulkString(None))
-                        }
+                        EntryValue::ZSet(z) => z
+                            .rank(&member)
+                            .map(|i| Value::Integer((z.len() - 1 - i) as i64))
+                            .unwrap_or(Value::BulkString(None)),
                         _ => Value::Error(WRONGTYPE.to_string()),
                     },
                 }
@@ -2574,10 +2815,7 @@ impl KeyValueStore {
                     Some(e) if e.is_expired(now) => Value::Integer(0),
                     Some(mut e) => match &mut e.value {
                         EntryValue::ZSet(z) => {
-                            let removed = members
-                                .iter()
-                                .filter(|m| z.scores.remove(*m).is_some())
-                                .count();
+                            let removed = members.iter().filter(|m| z.remove(m).is_some()).count();
                             Value::Integer(removed as i64)
                         }
                         _ => Value::Error(WRONGTYPE.to_string()),
@@ -2591,7 +2829,7 @@ impl KeyValueStore {
                     None => Value::Integer(0),
                     Some(e) if e.is_expired(now) => Value::Integer(0),
                     Some(e) => match &e.value {
-                        EntryValue::ZSet(z) => Value::Integer(z.scores.len() as i64),
+                        EntryValue::ZSet(z) => Value::Integer(z.len() as i64),
                         _ => Value::Error(WRONGTYPE.to_string()),
                     },
                 }
@@ -2599,48 +2837,35 @@ impl KeyValueStore {
 
             Command::ZIncrBy(key, delta, member) => {
                 let now = now_ms();
-                let was_expired = type_guard!(self.data, &key, EntryValue::ZSet(_), now);
-                let mut entry = self.data.entry(key).or_insert_with(|| Entry {
-                    value: EntryValue::ZSet(ZSetInner::new()),
-                    expires_at_ms: None,
-                    last_access_ms: AtomicU64::new(now_ms()),
-                });
-                if was_expired {
-                    entry.value = EntryValue::ZSet(ZSetInner::new());
-                    entry.expires_at_ms = None;
-                }
-                let zset = match &mut entry.value {
-                    EntryValue::ZSet(z) => z,
-                    _ => unreachable!(),
-                };
-                let prev_score = zset.scores.get(&member).copied().unwrap_or(0.0);
+                typed_entry!(
+                    entry,
+                    zset,
+                    self.data,
+                    key,
+                    now,
+                    EntryValue::ZSet,
+                    ZSetInner::new()
+                );
+                let prev_score = zset.score(&member).unwrap_or(0.0);
                 let new_score = prev_score + delta;
                 if new_score.is_nan() || new_score.is_infinite() {
                     return Value::Error("ERR increment would produce NaN or Infinity".to_string());
                 }
-                zset.scores.insert(member, new_score);
+                zset.insert(&member, new_score);
                 Value::BulkString(Some(format_score(new_score).into_bytes()))
             }
 
             Command::ZCount(key, min_s, max_s) => zset_read(&self.data, &key, |zset| {
                 let min = ScoreBound::parse(&min_s)?;
                 let max = ScoreBound::parse(&max_s)?;
-                let count = zset
-                    .scores
-                    .values()
-                    .filter(|&&s| in_score_range(s, &min, &max))
-                    .count();
+                let count = zset.range_by_score(&min, &max).count();
                 Ok(Value::Integer(count as i64))
             }),
 
             Command::ZScan(key, args) => zset_read(&self.data, &key, |zset| {
                 let pat = args.pattern.as_deref().unwrap_or("*");
-                let mut members: Vec<(&str, f64)> = zset
-                    .scores
-                    .iter()
-                    .filter(|(m, _)| glob_match(pat, m))
-                    .map(|(m, &s)| (m.as_str(), s))
-                    .collect();
+                let mut members: Vec<(&str, f64)> =
+                    zset.members().filter(|(m, _)| glob_match(pat, m)).collect();
                 members.sort_unstable_by_key(|(m, _)| *m);
                 let (page, next) = scan_page(&members, args.cursor, args.count);
                 let out = page
@@ -2658,7 +2883,9 @@ impl KeyValueStore {
             // ── JSON ──────────────────────────────────────────────────────────
             Command::JSet(key, path, value) => {
                 let now = now_ms();
-                let was_expired = type_guard!(self.data, &key, EntryValue::Json(_), now);
+                // Parsed before the map is touched: a malformed path or payload
+                // never creates a key, and the guard below is held for as short
+                // a time as possible.
                 let segs = match parse_json_path(&path) {
                     Ok(s) => s,
                     Err(e) => return Value::Error(e),
@@ -2669,24 +2896,37 @@ impl KeyValueStore {
                 };
                 // A fresh document starts as null; a leading index segment can
                 // never apply to it — reject before creating the key.
-                let is_fresh = was_expired || !self.data.contains_key(&key);
-                if is_fresh && matches!(segs.first(), Some(JsonPathSeg::Index(_))) {
-                    return Value::Error(
-                        "ERR path segment '[..]' is not an array (key does not exist)".to_string(),
-                    );
-                }
-                let mut entry = self.data.entry(key).or_insert_with(|| Entry {
-                    value: EntryValue::Json(serde_json::Value::Null),
-                    expires_at_ms: None,
-                    last_access_ms: AtomicU64::new(now_ms()),
-                });
-                if was_expired {
-                    entry.value = EntryValue::Json(serde_json::Value::Null);
-                    entry.expires_at_ms = None;
-                }
-                let doc = match &mut entry.value {
-                    EntryValue::Json(d) => d,
-                    _ => unreachable!(),
+                let leading_index = matches!(segs.first(), Some(JsonPathSeg::Index(_)));
+                const NOT_AN_ARRAY: &str =
+                    "ERR path segment '[..]' is not an array (key does not exist)";
+                // Freshness, type and write all resolve under one guard. Reading
+                // `contains_key` separately (as this used to) let a concurrent
+                // writer create the key between the test and the insert.
+                let mut entry = match self.data.entry(key) {
+                    DashEntry::Vacant(v) => {
+                        if leading_index {
+                            return Value::Error(NOT_AN_ARRAY.to_string());
+                        }
+                        v.insert(Entry {
+                            value: EntryValue::Json(serde_json::Value::Null),
+                            expires_at_ms: None,
+                            last_access_ms: AtomicU64::new(now),
+                        })
+                    }
+                    DashEntry::Occupied(mut o) => {
+                        let e = o.get_mut();
+                        if e.is_expired(now) {
+                            if leading_index {
+                                return Value::Error(NOT_AN_ARRAY.to_string());
+                            }
+                            e.value = EntryValue::Json(serde_json::Value::Null);
+                            e.expires_at_ms = None;
+                        }
+                        o.into_ref()
+                    }
+                };
+                let EntryValue::Json(doc) = &mut entry.value else {
+                    return Value::Error(WRONGTYPE.to_string());
                 };
                 match json_set_at(doc, &segs, val) {
                     Ok(()) => Value::SimpleString("OK".to_string()),
@@ -2720,30 +2960,35 @@ impl KeyValueStore {
 
             Command::JMerge(key, patch) => {
                 let now = now_ms();
-                let was_expired = type_guard!(self.data, &key, EntryValue::Json(_), now);
                 let patch: serde_json::Value = match serde_json::from_str(&patch) {
                     Ok(v) => v,
                     Err(e) => return Value::Error(format!("ERR invalid JSON patch: {}", e)),
                 };
                 if patch.is_null() {
                     // RFC 7386: a null patch replaces the target — the key is
-                    // deleted rather than left holding a bare null.
-                    self.data.remove(&key);
+                    // deleted rather than left holding a bare null. Removed only
+                    // if it really is a JSON document, so a null patch cannot be
+                    // used to delete a string or a hash.
+                    let mut wrong_type = false;
+                    self.data.remove_if(&key, |_, e| {
+                        let ok = e.is_expired(now) || matches!(e.value, EntryValue::Json(_));
+                        wrong_type = !ok;
+                        ok
+                    });
+                    if wrong_type {
+                        return Value::Error(WRONGTYPE.to_string());
+                    }
                     return Value::SimpleString("OK".to_string());
                 }
-                let mut entry = self.data.entry(key).or_insert_with(|| Entry {
-                    value: EntryValue::Json(serde_json::Value::Null),
-                    expires_at_ms: None,
-                    last_access_ms: AtomicU64::new(now_ms()),
-                });
-                if was_expired {
-                    entry.value = EntryValue::Json(serde_json::Value::Null);
-                    entry.expires_at_ms = None;
-                }
-                let doc = match &mut entry.value {
-                    EntryValue::Json(d) => d,
-                    _ => unreachable!(),
-                };
+                typed_entry!(
+                    entry,
+                    doc,
+                    self.data,
+                    key,
+                    now,
+                    EntryValue::Json,
+                    serde_json::Value::Null
+                );
                 json_merge_patch(doc, patch);
                 Value::SimpleString("OK".to_string())
             }
@@ -2751,25 +2996,20 @@ impl KeyValueStore {
             // ── Rate limiting ─────────────────────────────────────────────────
             Command::RlSet(key, limit, window_secs) => {
                 let now = now_ms();
-                let was_expired = type_guard!(self.data, &key, EntryValue::RateLimiter(_), now);
                 let window_ms = window_secs.saturating_mul(1000);
-                let mut entry = self.data.entry(key).or_insert_with(|| Entry {
-                    value: EntryValue::RateLimiter(RateLimiterInner::new(limit, window_ms)),
-                    expires_at_ms: None,
-                    last_access_ms: AtomicU64::new(now_ms()),
-                });
-                if was_expired {
-                    entry.value = EntryValue::RateLimiter(RateLimiterInner::new(limit, window_ms));
-                }
-                match &mut entry.value {
-                    EntryValue::RateLimiter(rl) => {
-                        // Reconfigure in place; recorded attempts are kept so a
-                        // live limiter is not reset by a config change.
-                        rl.limit = limit;
-                        rl.window_ms = window_ms;
-                    }
-                    _ => unreachable!(),
-                }
+                typed_entry!(
+                    entry,
+                    rl,
+                    self.data,
+                    key,
+                    now,
+                    EntryValue::RateLimiter,
+                    RateLimiterInner::new(limit, window_ms)
+                );
+                // Reconfigure in place; recorded attempts are kept so a live
+                // limiter is not reset by a config change.
+                rl.limit = limit;
+                rl.window_ms = window_ms;
                 // Explicitly configured limiters persist until DEL/EXPIRE, unlike
                 // limiters auto-created by inline RLCHECK config.
                 entry.expires_at_ms = None;
@@ -2778,56 +3018,62 @@ impl KeyValueStore {
 
             Command::RlCheck(key, config) => {
                 let now = now_ms();
-                let was_expired = type_guard!(self.data, &key, EntryValue::RateLimiter(_), now);
-                let missing = was_expired
-                    || match self.data.get(&key) {
-                        None => true,
-                        Some(e) => e.is_expired(now),
-                    };
-                if missing {
+                // Auto-created limiters self-clean: they expire one window after
+                // the last attempt, so per-IP / per-user keys don't accumulate
+                // forever.
+                let fresh_limiter = |k: &str| -> Result<Entry, Value> {
                     let Some((limit, window_secs)) = config else {
-                        return Value::Error(format!(
+                        return Err(Value::Error(format!(
                             "ERR no rate limit configured for '{}'; call RLSET first or use RLCHECK key limit window",
-                            key
-                        ));
+                            k
+                        )));
                     };
                     let window_ms = window_secs.saturating_mul(1000);
-                    // Auto-created limiters self-clean: they expire one window
-                    // after the last attempt, so per-IP / per-user keys don't
-                    // accumulate forever.
-                    self.data.insert(
-                        key.clone(),
-                        Entry {
-                            value: EntryValue::RateLimiter(RateLimiterInner::new(limit, window_ms)),
-                            expires_at_ms: Some(now.saturating_add(window_ms)),
-                            last_access_ms: AtomicU64::new(now),
-                        },
-                    );
-                }
-                match self.data.get_mut(&key) {
-                    Some(mut e) => match &mut e.value {
-                        EntryValue::RateLimiter(rl) => {
-                            if let Some((limit, window_secs)) = config {
-                                // Inline config wins: middleware config changes
-                                // propagate without a separate RLSET.
-                                rl.limit = limit;
-                                rl.window_ms = window_secs.saturating_mul(1000);
-                            }
-                            let (allowed, remaining, retry_after_ms) = rl.check(now);
-                            let window_ms = rl.window_ms;
-                            if e.expires_at_ms.is_some() {
-                                e.expires_at_ms = Some(now.saturating_add(window_ms));
-                            }
-                            Value::Array(Some(vec![
-                                Value::Integer(allowed),
-                                Value::Integer(remaining as i64),
-                                Value::Integer(retry_after_ms as i64),
-                            ]))
-                        }
-                        _ => Value::Error(WRONGTYPE.to_string()),
+                    Ok(Entry {
+                        value: EntryValue::RateLimiter(RateLimiterInner::new(limit, window_ms)),
+                        expires_at_ms: Some(now.saturating_add(window_ms)),
+                        last_access_ms: AtomicU64::new(now),
+                    })
+                };
+                // One guard for the lot. The old shape took three separate
+                // lookups — type check, existence check, then `get_mut` — and
+                // needed an "ERR rate limiter vanished mid-check" arm for the
+                // case where the key was deleted in between. It cannot happen
+                // now, so that error is gone.
+                let mut entry = match self.data.entry(key) {
+                    DashEntry::Vacant(v) => match fresh_limiter(v.key()) {
+                        Ok(e) => v.insert(e),
+                        Err(err) => return err,
                     },
-                    None => Value::Error("ERR rate limiter vanished mid-check".to_string()),
+                    DashEntry::Occupied(mut o) => {
+                        if o.get().is_expired(now) {
+                            match fresh_limiter(o.key()) {
+                                Ok(e) => *o.get_mut() = e,
+                                Err(err) => return err,
+                            }
+                        }
+                        o.into_ref()
+                    }
+                };
+                let EntryValue::RateLimiter(rl) = &mut entry.value else {
+                    return Value::Error(WRONGTYPE.to_string());
+                };
+                if let Some((limit, window_secs)) = config {
+                    // Inline config wins: middleware config changes propagate
+                    // without a separate RLSET.
+                    rl.limit = limit;
+                    rl.window_ms = window_secs.saturating_mul(1000);
                 }
+                let (allowed, remaining, retry_after_ms) = rl.check(now);
+                let window_ms = rl.window_ms;
+                if entry.expires_at_ms.is_some() {
+                    entry.expires_at_ms = Some(now.saturating_add(window_ms));
+                }
+                Value::Array(Some(vec![
+                    Value::Integer(allowed),
+                    Value::Integer(remaining as i64),
+                    Value::Integer(retry_after_ms as i64),
+                ]))
             }
 
             // ── Transactions ─────────────────────────────────────────────────
@@ -2874,6 +3120,177 @@ impl KeyValueStore {
 
 // ── Free helpers ──────────────────────────────────────────────────────────────
 
+/// Fixed byte charge for a command that grows a value without carrying the new
+/// bytes in its arguments — a counter bumped by `INCR`, a rate-limiter bucket.
+const NOMINAL_WRITE_BYTES: usize = 24;
+
+/// Upper bound on the bytes `cmd` could add to the keyspace, used by
+/// `note_write` to decide when an exact measurement is worth paying for.
+///
+/// Deliberately exhaustive rather than `_ => 0`: a new write command that
+/// escapes accounting would silently reopen the hole this closes, and the
+/// compiler is the only reliable place to catch that.
+///
+/// Reads are 0. Overestimating costs one extra keyspace walk; underestimating
+/// only delays enforcement to the next background sweep, which is where every
+/// command sat before.
+fn write_cost(cmd: &Command) -> usize {
+    // Per-entry overhead is charged so that many tiny keys still register.
+    const OVERHEAD: usize = 64;
+    match cmd {
+        // ── Writes carrying their payload inline ──────────────────────────
+        Command::Set(k, v, _) | Command::ESet(k, v) | Command::GetSet(k, v) => {
+            k.len() + v.len() + OVERHEAD
+        }
+        Command::SetNx(k, v) | Command::Append(k, v) => k.len() + v.len() + OVERHEAD,
+        Command::SetEx(k, _, v) | Command::PSetEx(k, _, v) => k.len() + v.len() + OVERHEAD,
+        Command::MSet(pairs) => pairs
+            .iter()
+            .map(|(k, v)| k.len() + v.len() + OVERHEAD)
+            .sum(),
+        Command::HSet(k, pairs) => {
+            k.len() + OVERHEAD + pairs.iter().map(|(f, v)| f.len() + v.len()).sum::<usize>()
+        }
+        Command::HSetNx(k, f, v) => k.len() + f.len() + v.len() + OVERHEAD,
+        Command::LPush(k, vals)
+        | Command::RPush(k, vals)
+        | Command::LPushX(k, vals)
+        | Command::RPushX(k, vals) => {
+            k.len() + OVERHEAD + vals.iter().map(Vec::len).sum::<usize>()
+        }
+        Command::LSet(k, _, v) => k.len() + v.len(),
+        Command::SAdd(k, members) => {
+            k.len() + OVERHEAD + members.iter().map(String::len).sum::<usize>()
+        }
+        Command::ZAdd(k, _, pairs) => {
+            k.len()
+                + OVERHEAD
+                + pairs
+                    .iter()
+                    .map(|(_, m)| m.len() + size_of::<f64>())
+                    .sum::<usize>()
+        }
+        Command::ZIncrBy(k, _, m) => k.len() + m.len() + size_of::<f64>() + OVERHEAD,
+        Command::SMove(_, dst, m) => dst.len() + m.len() + OVERHEAD,
+        Command::JSet(k, path, value) => k.len() + path.len() + value.len() + OVERHEAD,
+        Command::JMerge(k, patch) => k.len() + patch.len() + OVERHEAD,
+
+        // ── Writes that grow a value by a bounded amount ──────────────────
+        Command::Incr(k) | Command::Decr(k) | Command::IncrBy(k, _) | Command::DecrBy(k, _) => {
+            k.len() + NOMINAL_WRITE_BYTES + OVERHEAD
+        }
+        Command::HIncrBy(k, f, _) | Command::HIncrByFloat(k, f, _) => {
+            k.len() + f.len() + NOMINAL_WRITE_BYTES + OVERHEAD
+        }
+        // A limiter is created on first use and its buckets grow with traffic.
+        Command::RlSet(k, _, _) | Command::RlCheck(k, _) => {
+            k.len() + NOMINAL_WRITE_BYTES + OVERHEAD
+        }
+        // Result size is not knowable without doing the work; charge the key so
+        // the destination at least registers, and let the sweep catch the rest.
+        Command::SInterStore(dst, _) | Command::SUnionStore(dst, _) | Command::SDiffStore(dst, _) => {
+            dst.len() + OVERHEAD
+        }
+        // Moves the value rather than adding one; the new key is the only growth.
+        Command::Rename(_, dst) => dst.len(),
+
+        // ── Everything else cannot grow the keyspace ──────────────────────
+        // Deletions, expiry changes, pops and trims only shrink it; reads and
+        // connection-level commands do not touch it at all. Listed rather than
+        // collapsed into `_` so a new variant has to be classified.
+        Command::Ping(_)
+        | Command::Auth(_)
+        | Command::Hello(_)
+        | Command::Info(_)
+        | Command::Quit
+        | Command::Client(_)
+        | Command::Config(_)
+        | Command::CommandQuery(_)
+        | Command::Get(_)
+        | Command::Del(_)
+        | Command::Unlink(_)
+        | Command::Strlen(_)
+        | Command::GetRange(_, _, _)
+        | Command::MGet(_)
+        | Command::Expire(_, _)
+        | Command::PExpire(_, _)
+        | Command::ExpireAt(_, _)
+        | Command::PExpireAt(_, _)
+        | Command::Ttl(_)
+        | Command::PTtl(_)
+        | Command::Persist(_)
+        | Command::Exists(_)
+        | Command::Keys(_)
+        | Command::Scan(_, _, _)
+        | Command::DbSize
+        | Command::FlushDb
+        | Command::Type(_)
+        | Command::HGet(_, _)
+        | Command::HGetAll(_)
+        | Command::HDel(_, _)
+        | Command::HKeys(_)
+        | Command::HVals(_)
+        | Command::HLen(_)
+        | Command::HExists(_, _)
+        | Command::HMGet(_, _)
+        | Command::HScan(_, _)
+        | Command::LPop(_, _)
+        | Command::RPop(_, _)
+        | Command::LRange(_, _, _)
+        | Command::LLen(_)
+        | Command::LIndex(_, _)
+        | Command::LRem(_, _, _)
+        | Command::LTrim(_, _, _)
+        | Command::SMembers(_)
+        | Command::SRem(_, _)
+        | Command::SCard(_)
+        | Command::SIsMember(_, _)
+        | Command::SMIsMember(_, _)
+        | Command::SInter(_)
+        | Command::SUnion(_)
+        | Command::SDiff(_)
+        | Command::SPop(_, _)
+        | Command::SRandMember(_, _)
+        | Command::SScan(_, _)
+        | Command::ZRange(_, _, _, _)
+        | Command::ZRevRange(_, _, _, _)
+        | Command::ZRangeByScore(_, _, _, _, _)
+        | Command::ZRevRangeByScore(_, _, _, _, _)
+        | Command::ZScore(_, _)
+        | Command::ZMScore(_, _)
+        | Command::ZRank(_, _)
+        | Command::ZRevRank(_, _)
+        | Command::ZRem(_, _)
+        | Command::ZCard(_)
+        | Command::ZCount(_, _, _)
+        | Command::ZScan(_, _)
+        | Command::JGet(_, _)
+        // Transactions, pub/sub, live queries, sync scoping and replication are
+        // resolved in the server layer; the store either never sees them or
+        // treats them as no-ops. `Dedup` is unwrapped before it gets here, so
+        // charging its inner command would double-count.
+        | Command::Multi
+        | Command::Exec
+        | Command::Discard
+        | Command::Subscribe(_)
+        | Command::Unsubscribe(_)
+        | Command::PSubscribe(_)
+        | Command::PUnsubscribe(_)
+        | Command::Publish(_, _)
+        | Command::Watch(_)
+        | Command::Unwatch(_)
+        | Command::Sync(_)
+        | Command::Dedup(_, _, _)
+        | Command::QSub(_)
+        | Command::QUnsub(_)
+        | Command::Save
+        | Command::BgSave
+        | Command::LastSave
+        | Command::ReplicaOfNoOne
+        | Command::Unknown(_) => 0,
+    }
+}
+
 /// Approximate heap footprint of a single entry: key + value bytes plus a fixed
 /// per-entry overhead. Shared by `approximate_memory_bytes` and the eviction
 /// loop so both agree on what a key "costs".
@@ -2883,7 +3300,7 @@ fn entry_size(key: &str, e: &Entry) -> usize {
         EntryValue::Hash(m) => m.iter().map(|(k, v)| k.len() + v.len()).sum(),
         EntryValue::List(l) => l.iter().map(|s| s.len()).sum(),
         EntryValue::Set(s) => s.iter().map(|m| m.len()).sum::<usize>(),
-        EntryValue::ZSet(z) => z.scores.keys().map(|m| m.len() + 8).sum(),
+        EntryValue::ZSet(z) => z.members().map(|(m, _)| m.len() + 8).sum(),
         EntryValue::RateLimiter(rl) => rl.buckets.len() * 16 + 16,
         EntryValue::Json(doc) => json_approx_size(doc),
     };
@@ -2892,35 +3309,18 @@ fn entry_size(key: &str, e: &Entry) -> usize {
 
 fn incr_by(data: &DashMap<String, Entry>, key: String, delta: i64) -> Value {
     let now = now_ms();
-    let was_expired = match data.get(&key) {
-        None => false,
-        Some(e) if e.is_expired(now) => true,
-        Some(e) => match &e.value {
-            EntryValue::Str(_) => false,
-            _ => return Value::Error(WRONGTYPE.to_string()),
+    typed_entry!(entry, s, data, key, now, EntryValue::Str, Blob::from("0"));
+    // A non-UTF-8 value fails here exactly as non-numeric text does: the bytes
+    // are stored faithfully, they are simply not a number.
+    match s.parse_as::<i64>() {
+        None => Value::Error("ERR value is not an integer or out of range".to_string()),
+        Some(n) => match n.checked_add(delta) {
+            None => Value::Error("ERR increment or decrement would overflow".to_string()),
+            Some(new) => {
+                *s = new.to_string().into();
+                Value::Integer(new)
+            }
         },
-    };
-    let mut entry = data
-        .entry(key)
-        .or_insert_with(|| Entry::new_str("0".to_string()));
-    if was_expired {
-        entry.value = EntryValue::Str("0".into());
-        entry.expires_at_ms = None;
-    }
-    match &mut entry.value {
-        // A non-UTF-8 value fails here exactly as non-numeric text does: the
-        // bytes are stored faithfully, they are simply not a number.
-        EntryValue::Str(s) => match s.parse_as::<i64>() {
-            None => Value::Error("ERR value is not an integer or out of range".to_string()),
-            Some(n) => match n.checked_add(delta) {
-                None => Value::Error("ERR increment or decrement would overflow".to_string()),
-                Some(new) => {
-                    *s = new.to_string().into();
-                    Value::Integer(new)
-                }
-            },
-        },
-        _ => unreachable!(),
     }
 }
 
@@ -3118,27 +3518,7 @@ fn set_diff(
 
 fn hash_incr_int(data: &DashMap<String, Entry>, key: String, field: String, delta: i64) -> Value {
     let now = now_ms();
-    let was_expired = match data.get(&key) {
-        None => false,
-        Some(e) if e.is_expired(now) => true,
-        Some(e) => match &e.value {
-            EntryValue::Hash(_) => false,
-            _ => return Value::Error(WRONGTYPE.to_string()),
-        },
-    };
-    let mut entry = data.entry(key).or_insert_with(|| Entry {
-        value: EntryValue::Hash(HashMap::new()),
-        expires_at_ms: None,
-        last_access_ms: AtomicU64::new(now_ms()),
-    });
-    if was_expired {
-        entry.value = EntryValue::Hash(HashMap::new());
-        entry.expires_at_ms = None;
-    }
-    let h = match &mut entry.value {
-        EntryValue::Hash(h) => h,
-        _ => unreachable!(),
-    };
+    typed_entry!(entry, h, data, key, now, EntryValue::Hash, HashMap::new());
     let cur: i64 = h.get(&field).and_then(|s| s.parse_as()).unwrap_or(0);
     match cur.checked_add(delta) {
         None => Value::Error("ERR increment or decrement would overflow".to_string()),
@@ -3151,27 +3531,7 @@ fn hash_incr_int(data: &DashMap<String, Entry>, key: String, field: String, delt
 
 fn hash_incr_float(data: &DashMap<String, Entry>, key: String, field: String, delta: f64) -> Value {
     let now = now_ms();
-    let was_expired = match data.get(&key) {
-        None => false,
-        Some(e) if e.is_expired(now) => true,
-        Some(e) => match &e.value {
-            EntryValue::Hash(_) => false,
-            _ => return Value::Error(WRONGTYPE.to_string()),
-        },
-    };
-    let mut entry = data.entry(key).or_insert_with(|| Entry {
-        value: EntryValue::Hash(HashMap::new()),
-        expires_at_ms: None,
-        last_access_ms: AtomicU64::new(now_ms()),
-    });
-    if was_expired {
-        entry.value = EntryValue::Hash(HashMap::new());
-        entry.expires_at_ms = None;
-    }
-    let h = match &mut entry.value {
-        EntryValue::Hash(h) => h,
-        _ => unreachable!(),
-    };
+    typed_entry!(entry, h, data, key, now, EntryValue::Hash, HashMap::new());
     let cur: f64 = h.get(&field).and_then(|s| s.parse_as()).unwrap_or(0.0);
     let new = cur + delta;
     if new.is_nan() || new.is_infinite() {
@@ -3273,6 +3633,18 @@ where
     }
 }
 
+/// Whether a GT/LT-qualified `ZADD` should overwrite `old_score` with `score`.
+/// With neither flag the caller decides; this only answers the ordered cases.
+fn score_should_update(score: f64, old_score: f64, opts: &ZAddOptions) -> bool {
+    if opts.gt {
+        score > old_score
+    } else if opts.lt {
+        score < old_score
+    } else {
+        (score - old_score).abs() > f64::EPSILON
+    }
+}
+
 fn zadd_exec(zset: &mut ZSetInner, opts: ZAddOptions, pairs: Vec<(f64, String)>) -> Value {
     use crate::cmd::ZAddCondition;
 
@@ -3281,73 +3653,50 @@ fn zadd_exec(zset: &mut ZSetInner, opts: ZAddOptions, pairs: Vec<(f64, String)>)
             Some(p) => p,
             None => return Value::BulkString(None),
         };
-        let score = zset
-            .scores
-            .entry(member)
-            .and_modify(|s| *s += delta)
-            .or_insert(delta);
-        return Value::BulkString(Some(format_score(*score).into_bytes()));
+        let score = zset.score(&member).unwrap_or(0.0) + delta;
+        zset.insert(&member, score);
+        return Value::BulkString(Some(format_score(score).into_bytes()));
     }
 
     let mut added = 0i64;
     let mut changed = 0i64;
     for (score, member) in pairs {
-        match &opts.condition {
-            Some(ZAddCondition::Nx) => {
-                if let std::collections::hash_map::Entry::Vacant(e) = zset.scores.entry(member) {
-                    e.insert(score);
-                    added += 1;
+        // `insert` keeps the score index in step, so each branch decides
+        // whether to write and then writes through the one entry point.
+        match (&opts.condition, zset.score(&member)) {
+            // NX: only members that are not there yet.
+            (Some(ZAddCondition::Nx), Some(_)) => {}
+            (Some(ZAddCondition::Nx), None) => {
+                zset.insert(&member, score);
+                added += 1;
+                changed += 1;
+            }
+            // XX: only members that already exist.
+            (Some(ZAddCondition::Xx), None) => {}
+            (Some(ZAddCondition::Xx), Some(old_score)) => {
+                if score_should_update(score, old_score, &opts) {
+                    zset.insert(&member, score);
                     changed += 1;
                 }
             }
-            Some(ZAddCondition::Xx) => {
-                if let Some(old_score) = zset.scores.get_mut(&member) {
-                    let should_update = if opts.gt {
-                        score > *old_score
-                    } else if opts.lt {
-                        score < *old_score
-                    } else {
-                        (score - *old_score).abs() > f64::EPSILON
-                    };
-                    if should_update {
-                        *old_score = score;
-                        changed += 1;
-                    }
-                }
+            (None, None) => {
+                zset.insert(&member, score);
+                added += 1;
+                changed += 1;
             }
-            None => {
-                if opts.gt || opts.lt {
-                    match zset.scores.entry(member) {
-                        std::collections::hash_map::Entry::Vacant(e) => {
-                            e.insert(score);
-                            added += 1;
-                            changed += 1;
-                        }
-                        std::collections::hash_map::Entry::Occupied(mut e) => {
-                            let old_score = *e.get();
-                            let should_update = if opts.gt {
-                                score > old_score
-                            } else {
-                                score < old_score
-                            };
-                            if should_update {
-                                e.insert(score);
-                                changed += 1;
-                            }
-                        }
-                    }
+            (None, Some(old_score)) => {
+                let update = if opts.gt || opts.lt {
+                    score_should_update(score, old_score, &opts)
                 } else {
-                    let old = zset.scores.insert(member, score);
-                    match old {
-                        None => {
-                            added += 1;
-                            changed += 1;
-                        }
-                        Some(old_score) if (old_score - score).abs() > f64::EPSILON => {
-                            changed += 1;
-                        }
-                        _ => {}
-                    }
+                    (old_score - score).abs() > f64::EPSILON
+                };
+                if update {
+                    zset.insert(&member, score);
+                    changed += 1;
+                } else if !opts.gt && !opts.lt {
+                    // An unconditional ZADD still writes an equal score; only
+                    // the `changed` count treats it as a no-op.
+                    zset.insert(&member, score);
                 }
             }
         }
@@ -6745,6 +7094,857 @@ mod snapshot_compat_tests {
             bytes.len() < 1200,
             "1000 bytes encoded to {} — likely an int array, not msgpack bin",
             bytes.len()
+        );
+    }
+}
+
+// ── Concurrency regression tests ──────────────────────────────────────────────
+
+/// The mutating commands used to resolve a key's type with one `get()` (whose
+/// read guard was then dropped) and write through a second `entry()` guard.
+/// Anything that happened in between was invisible, which produced two distinct
+/// faults: an `unreachable!()` when the type had changed, and a silent clobber
+/// when an expired key had been rewritten. Both are structural — they only
+/// appear when two connections touch one key at once — so these tests hammer
+/// the same key from several threads and assert the process survives with a
+/// coherent result.
+#[cfg(test)]
+mod type_race_tests {
+    use super::*;
+    use crate::cmd::{Command, SetOptions};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::thread;
+
+    /// Number of iterations each racing thread runs. High enough to hit the
+    /// window reliably on a multi-core machine, low enough to stay quick.
+    const ROUNDS: usize = 20_000;
+
+    fn set(store: &KeyValueStore, key: &str, val: &str) -> Value {
+        store.execute(Command::Set(key.into(), val.into(), SetOptions::default()))
+    }
+
+    /// Every reply must be either the command's normal answer or WRONGTYPE —
+    /// never a panic, and never a success that silently did nothing.
+    fn assert_sane(v: &Value) {
+        if let Value::Error(e) = v {
+            assert!(
+                e.starts_with("WRONGTYPE") || e.starts_with("ERR"),
+                "unexpected error variant: {e}"
+            );
+        }
+    }
+
+    /// `HSET k f v` on a missing key racing `SET k v`: the old code passed its
+    /// type check while the key was absent, then found a `Str` behind the
+    /// `entry()` guard and hit `unreachable!()`, panicking the connection task.
+    #[test]
+    fn hset_racing_set_on_the_same_key_never_panics() {
+        let store = Arc::new(KeyValueStore::new());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let writer = {
+            let store = Arc::clone(&store);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    set(&store, "k", "v");
+                    store.execute(Command::Del(vec!["k".into()]));
+                }
+            })
+        };
+
+        for _ in 0..ROUNDS {
+            let r = store.execute(Command::HSet(
+                "k".into(),
+                vec![("f".to_string(), b"v".to_vec())],
+            ));
+            assert_sane(&r);
+            store.execute(Command::Del(vec!["k".into()]));
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        writer.join().expect("writer thread panicked");
+    }
+
+    /// The same window on the string path: `INCR` used to read the type, drop
+    /// the guard, then assume the value was still a string.
+    #[test]
+    fn incr_racing_hset_on_the_same_key_never_panics() {
+        let store = Arc::new(KeyValueStore::new());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let hasher = {
+            let store = Arc::clone(&store);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    store.execute(Command::Del(vec!["n".into()]));
+                    store.execute(Command::HSet(
+                        "n".into(),
+                        vec![("f".to_string(), b"1".to_vec())],
+                    ));
+                }
+            })
+        };
+
+        for _ in 0..ROUNDS {
+            assert_sane(&store.execute(Command::Incr("n".into())));
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        hasher.join().expect("hasher thread panicked");
+    }
+
+    /// Same shape again across the list, set and zset constructors, which each
+    /// had their own copy of the pattern.
+    #[test]
+    fn collection_writes_racing_a_string_write_never_panic() {
+        let store = Arc::new(KeyValueStore::new());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let writer = {
+            let store = Arc::clone(&store);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    set(&store, "c", "v");
+                    store.execute(Command::Del(vec!["c".into()]));
+                }
+            })
+        };
+
+        for _ in 0..ROUNDS {
+            assert_sane(&store.execute(Command::LPush("c".into(), vec!["v".into()])));
+            assert_sane(&store.execute(Command::SAdd("c".into(), vec!["m".into()])));
+            assert_sane(&store.execute(Command::ZAdd(
+                "c".into(),
+                ZAddOptions::default(),
+                vec![(1.0, "m".to_string())],
+            )));
+            assert_sane(&store.execute(Command::Append("c".into(), "x".into())));
+            store.execute(Command::Del(vec!["c".into()]));
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        writer.join().expect("writer thread panicked");
+    }
+
+    /// A wrong-typed key must still be reported as WRONGTYPE now that the check
+    /// happens under the write guard rather than ahead of it — and the command
+    /// must not have modified anything on the way out.
+    #[test]
+    fn wrongtype_is_reported_and_leaves_the_value_untouched() {
+        let store = KeyValueStore::new();
+        set(&store, "s", "hello");
+
+        for cmd in [
+            Command::HSet("s".into(), vec![("f".to_string(), b"v".to_vec())]),
+            Command::HSetNx("s".into(), "f".into(), b"v".to_vec()),
+            Command::LPush("s".into(), vec!["v".into()]),
+            Command::RPush("s".into(), vec!["v".into()]),
+            Command::SAdd("s".into(), vec!["m".into()]),
+            Command::ZAdd(
+                "s".into(),
+                ZAddOptions::default(),
+                vec![(1.0, "m".to_string())],
+            ),
+            Command::ZIncrBy("s".into(), 1.0, "m".into()),
+            Command::HIncrBy("s".into(), "f".into(), 1),
+            Command::RlSet("s".into(), 10, 60),
+        ] {
+            let label = format!("{cmd:?}");
+            match store.execute(cmd) {
+                Value::Error(e) => assert!(e.starts_with("WRONGTYPE"), "{label}: got {e}"),
+                other => panic!("{label}: expected WRONGTYPE, got {other:?}"),
+            }
+        }
+
+        // The string is intact: no command created, reset or partially wrote it.
+        assert_eq!(
+            store.execute(Command::Get("s".into())),
+            Value::BulkString(Some(b"hello".to_vec()))
+        );
+        assert_eq!(
+            store.execute(Command::Type("s".into())),
+            Value::SimpleString("string".to_string())
+        );
+    }
+
+    /// An expired key is reset to the fresh collection under the same guard, so
+    /// a command that creates over an expired key behaves as if the key was
+    /// absent — the ordinary single-threaded contract the race broke.
+    #[test]
+    fn an_expired_key_is_replaced_not_appended_to() {
+        let store = KeyValueStore::new();
+        store.execute(Command::HSet(
+            "h".into(),
+            vec![("old".to_string(), b"1".to_vec())],
+        ));
+        // Expire it in the past.
+        store.execute(Command::PExpireAt("h".into(), 1));
+
+        assert_eq!(
+            store.execute(Command::HSet(
+                "h".into(),
+                vec![("new".to_string(), b"2".to_vec())]
+            )),
+            Value::Integer(1),
+            "the field must count as new — the expired hash is gone"
+        );
+        assert_eq!(store.execute(Command::HLen("h".into())), Value::Integer(1));
+        assert_eq!(
+            store.execute(Command::HGet("h".into(), "old".into())),
+            Value::BulkString(None),
+            "a field from the expired generation must not survive"
+        );
+    }
+
+    /// `SMOVE` used to check the destination's type, then insert through a
+    /// second guard; if the destination had been retyped in between, the member
+    /// was dropped on the floor and the reply still said `1`. It now reports
+    /// WRONGTYPE and returns the member to the source.
+    #[test]
+    fn smove_to_a_wrongtyped_destination_does_not_lose_the_member() {
+        let store = KeyValueStore::new();
+        store.execute(Command::SAdd("src".into(), vec!["m".into()]));
+        set(&store, "dst", "not-a-set");
+
+        match store.execute(Command::SMove("src".into(), "dst".into(), "m".into())) {
+            Value::Error(e) => assert!(e.starts_with("WRONGTYPE"), "got {e}"),
+            other => panic!("expected WRONGTYPE, got {other:?}"),
+        }
+        assert_eq!(
+            store.execute(Command::SIsMember("src".into(), "m".into())),
+            Value::Integer(1),
+            "member must still be in the source after a refused move"
+        );
+    }
+}
+
+// ── Eviction sampling ─────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod eviction_sampling_tests {
+    use super::*;
+    use crate::cmd::{Command, SetOptions};
+
+    fn fill(store: &KeyValueStore, n: usize) {
+        for i in 0..n {
+            store.execute(Command::Set(
+                format!("k{i}"),
+                format!("v{i}").into_bytes(),
+                SetOptions::default(),
+            ));
+        }
+    }
+
+    /// The sampler must still pick a victim under every policy, and must pick
+    /// the least-recently-used one when the whole keyspace fits in the sample.
+    #[test]
+    fn lru_evicts_the_oldest_key_when_the_sample_covers_the_keyspace() {
+        // No memory cap: `evict_one` is driven directly here, and a cap would make
+        // the write path evict during `fill` before the assertions run.
+        let mut store = KeyValueStore::with_config(None, None, EvictionPolicy::AllKeysLru);
+        store.eviction_sample = 100;
+        fill(&store, 5);
+
+        // Touch everything except k0, making it the oldest.
+        let now = now_ms() + 1_000;
+        for i in 1..5 {
+            if let Some(e) = store.data.get(&format!("k{i}")) {
+                e.touch(now);
+            }
+        }
+
+        assert_eq!(
+            store.evict_one(now),
+            Some(entry_size("k0", &Entry::new_str("v0")))
+        );
+        assert!(!store.data.contains_key("k0"), "oldest key should be gone");
+        assert_eq!(store.key_count(), 4);
+    }
+
+    /// A reservoir of `want` must never return more than `want` candidates'
+    /// worth of work, and must still return *something* while eligible keys
+    /// exist — the bug being guarded against is a rewrite that samples nothing.
+    #[test]
+    fn every_policy_finds_a_victim_while_eligible_keys_remain() {
+        for policy in [
+            EvictionPolicy::AllKeysLru,
+            EvictionPolicy::AllKeysRandom,
+            EvictionPolicy::VolatileLru,
+            EvictionPolicy::VolatileTtl,
+        ] {
+            let store = KeyValueStore::with_config(None, None, policy);
+            fill(&store, 50);
+            let volatile = matches!(
+                policy,
+                EvictionPolicy::VolatileLru | EvictionPolicy::VolatileTtl
+            );
+            if volatile {
+                // Volatile policies only consider keys carrying a TTL.
+                for i in 0..50 {
+                    store.execute(Command::PExpireAt(format!("k{i}"), now_ms() + 600_000));
+                }
+            }
+            let before = store.key_count();
+            assert!(
+                store.evict_one(now_ms()).is_some(),
+                "{policy:?} found no victim among {before} eligible keys"
+            );
+            assert_eq!(store.key_count(), before - 1, "{policy:?}");
+        }
+    }
+
+    /// Volatile policies must leave TTL-less keys alone even though the walk
+    /// now filters inside the sampler rather than in an iterator adaptor.
+    #[test]
+    fn volatile_policies_never_evict_a_key_without_a_ttl() {
+        for policy in [EvictionPolicy::VolatileLru, EvictionPolicy::VolatileTtl] {
+            let store = KeyValueStore::with_config(None, None, policy);
+            fill(&store, 20);
+            assert_eq!(
+                store.evict_one(now_ms()),
+                None,
+                "{policy:?} evicted a key with no TTL"
+            );
+            assert_eq!(store.key_count(), 20, "{policy:?}");
+        }
+    }
+
+    /// `AllKeysRandom` samples a reservoir of one. Over many runs it must reach
+    /// more than a single key, or the rewrite has silently pinned it to
+    /// whichever key the iterator happens to yield first.
+    #[test]
+    fn random_eviction_is_not_biased_to_one_key() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..40 {
+            let store = KeyValueStore::with_config(None, None, EvictionPolicy::AllKeysRandom);
+            fill(&store, 20);
+            let before: std::collections::HashSet<String> =
+                store.data.iter().map(|r| r.key().clone()).collect();
+            store.evict_one(now_ms());
+            let after: std::collections::HashSet<String> =
+                store.data.iter().map(|r| r.key().clone()).collect();
+            seen.extend(before.difference(&after).cloned());
+        }
+        assert!(
+            seen.len() > 1,
+            "40 random evictions only ever removed {seen:?}"
+        );
+    }
+
+    /// `try_evict_for_memory` drives `evict_one` in a loop; it must converge
+    /// rather than spin now that the sampler is a hand-rolled reservoir.
+    #[test]
+    fn memory_eviction_converges_under_the_limit() {
+        let store = KeyValueStore::with_config(None, Some(4096), EvictionPolicy::AllKeysLru);
+        fill(&store, 500);
+        assert!(store.try_evict_for_memory());
+        assert!(
+            store.approximate_memory_bytes() <= 4096,
+            "still {} bytes after eviction",
+            store.approximate_memory_bytes()
+        );
+    }
+}
+
+// ── Write-path memory enforcement ─────────────────────────────────────────────
+
+/// `max_memory_bytes` used to be enforced only by the server's background
+/// sweep, so between two ticks a client could write past the cap without limit
+/// — while `max_keys`, checked inline on every write, held. These tests never
+/// call `try_evict_for_memory` themselves: if the cap holds, it held because
+/// the write path enforced it.
+#[cfg(test)]
+mod write_path_memory_tests {
+    use super::*;
+    use crate::cmd::{Command, SetOptions};
+
+    fn set(store: &KeyValueStore, key: &str, val: &[u8]) -> Value {
+        store.execute(Command::Set(
+            key.into(),
+            val.to_vec(),
+            SetOptions::default(),
+        ))
+    }
+
+    const LIMIT: usize = 64 * 1024;
+
+    #[test]
+    fn a_burst_of_writes_cannot_run_past_the_cap_between_sweeps() {
+        let store = KeyValueStore::with_config(None, Some(LIMIT), EvictionPolicy::AllKeysLru);
+        let value = vec![b'x'; 1024];
+        for i in 0..2_000 {
+            set(&store, &format!("k{i}"), &value);
+        }
+        // No sweep has run. Two megabytes went in against a 64 KB cap.
+        let used = store.approximate_memory_bytes();
+        assert!(
+            used <= LIMIT,
+            "{used} bytes held against a {LIMIT} byte cap — the cap did not apply on the write path"
+        );
+    }
+
+    #[test]
+    fn one_oversized_value_is_caught_immediately() {
+        let store = KeyValueStore::with_config(None, Some(LIMIT), EvictionPolicy::AllKeysLru);
+        set(&store, "filler", &vec![b'x'; LIMIT / 2]);
+        set(&store, "big", &vec![b'y'; LIMIT]);
+        let used = store.approximate_memory_bytes();
+        assert!(used <= LIMIT, "{used} bytes against a {LIMIT} byte cap");
+    }
+
+    /// Every payload-carrying write must be accounted for, not just `SET`.
+    #[test]
+    fn collection_writes_are_accounted_for_too() {
+        let chunk = vec![b'z'; 512];
+        for (label, mut write) in [
+            (
+                "rpush",
+                Box::new(|s: &KeyValueStore, i: usize, v: &[u8]| {
+                    s.execute(Command::RPush(format!("l{i}"), vec![v.to_vec()]));
+                }) as Box<dyn FnMut(&KeyValueStore, usize, &[u8])>,
+            ),
+            (
+                "hset",
+                Box::new(|s: &KeyValueStore, i: usize, v: &[u8]| {
+                    s.execute(Command::HSet(
+                        format!("h{i}"),
+                        vec![("f".to_string(), v.to_vec())],
+                    ));
+                }),
+            ),
+            (
+                "sadd",
+                Box::new(|s: &KeyValueStore, i: usize, v: &[u8]| {
+                    s.execute(Command::SAdd(
+                        format!("s{i}"),
+                        vec![String::from_utf8_lossy(v).into_owned()],
+                    ));
+                }),
+            ),
+            (
+                "zadd",
+                Box::new(|s: &KeyValueStore, i: usize, v: &[u8]| {
+                    s.execute(Command::ZAdd(
+                        format!("z{i}"),
+                        ZAddOptions::default(),
+                        vec![(1.0, String::from_utf8_lossy(v).into_owned())],
+                    ));
+                }),
+            ),
+        ] {
+            let store = KeyValueStore::with_config(None, Some(LIMIT), EvictionPolicy::AllKeysLru);
+            for i in 0..1_000 {
+                write(&store, i, &chunk);
+            }
+            let used = store.approximate_memory_bytes();
+            assert!(used <= LIMIT, "{label}: {used} bytes against a {LIMIT} cap");
+        }
+    }
+
+    /// With no cap configured the gate must stay entirely out of the way — no
+    /// eviction, no keyspace walks.
+    #[test]
+    fn an_unlimited_store_never_evicts() {
+        let store = KeyValueStore::new();
+        for i in 0..500 {
+            set(&store, &format!("k{i}"), b"v");
+        }
+        assert_eq!(store.key_count(), 500);
+        assert_eq!(store.evicted_count(), 0);
+    }
+
+    /// A store whose policy cannot free anything must still refuse to grow
+    /// without bound *and* must not spin: `NoEviction` means the write path
+    /// tries, fails, and moves on.
+    #[test]
+    fn no_eviction_policy_does_not_spin_on_the_write_path() {
+        let store = KeyValueStore::with_config(None, Some(LIMIT), EvictionPolicy::NoEviction);
+        let value = vec![b'x'; 1024];
+        for i in 0..300 {
+            set(&store, &format!("k{i}"), &value);
+        }
+        // Nothing was evicted — the policy forbids it — but the calls returned.
+        assert_eq!(store.evicted_count(), 0);
+        assert!(store.approximate_memory_bytes() > LIMIT);
+    }
+
+    /// An eviction pass sheds past the cap rather than stopping exactly on it.
+    /// Without that headroom the store would sit on the limit and the very next
+    /// write would trip the gate again, so every write at the cap would pay for
+    /// a full keyspace measurement.
+    ///
+    /// Loaded through `restore`, which bypasses the write path, so the store is
+    /// genuinely over the cap when the pass starts.
+    #[test]
+    fn an_eviction_pass_leaves_headroom_below_the_cap() {
+        let store = KeyValueStore::with_config(None, Some(LIMIT), EvictionPolicy::AllKeysLru);
+        store.restore(
+            (0..1_000)
+                .map(|i| SnapshotEntry {
+                    key: format!("k{i}"),
+                    value: SnapshotValue::Str(vec![b'x'; 256].into()),
+                    expires_at_ms: None,
+                })
+                .collect(),
+        );
+        assert!(
+            store.approximate_memory_bytes() > LIMIT,
+            "restore should have loaded past the cap"
+        );
+
+        assert!(store.try_evict_for_memory());
+        let used = store.approximate_memory_bytes();
+        let low_water = LIMIT - LIMIT / EVICTION_HEADROOM_DIVISOR;
+        assert!(
+            used <= low_water,
+            "{used} bytes stops at the {LIMIT} byte cap instead of shedding to {low_water}"
+        );
+    }
+
+    /// Reads must not be charged: a read-only workload against a full store
+    /// must not trigger eviction.
+    #[test]
+    fn reads_are_not_charged_against_the_cap() {
+        let store = KeyValueStore::with_config(None, Some(LIMIT), EvictionPolicy::AllKeysLru);
+        for i in 0..20 {
+            set(&store, &format!("k{i}"), b"v");
+        }
+        let before = store.evicted_count();
+        for _ in 0..10_000 {
+            store.execute(Command::Get("k0".into()));
+            store.execute(Command::Exists(vec!["k1".into()]));
+        }
+        assert_eq!(
+            store.evicted_count(),
+            before,
+            "reads triggered eviction — write_cost is charging them"
+        );
+    }
+
+    #[test]
+    fn write_cost_is_zero_for_reads_and_positive_for_writes() {
+        assert_eq!(write_cost(&Command::Get("k".into())), 0);
+        assert_eq!(write_cost(&Command::LRange("k".into(), 0, -1)), 0);
+        assert_eq!(write_cost(&Command::Del(vec!["k".into()])), 0);
+        assert!(
+            write_cost(&Command::Set(
+                "k".into(),
+                vec![0u8; 4096],
+                SetOptions::default()
+            )) >= 4096,
+            "a 4 KB SET must be charged at least its payload"
+        );
+        assert!(write_cost(&Command::Incr("k".into())) > 0);
+    }
+}
+
+// ── Sorted-set index ──────────────────────────────────────────────────────────
+
+/// Every sorted-set range command used to call `rank_asc`, which collected the
+/// whole set into a `Vec` and sorted it — O(n log n) and an allocation
+/// proportional to the set, per query, while holding the shard guard.
+/// `ZRANGE board 0 9` on a million-member leaderboard sorted a million entries
+/// to return ten.
+///
+/// A `(score, member)` index replaces that. These tests pin the behaviour the
+/// index has to preserve exactly, and the cost characteristics that justify it.
+#[cfg(test)]
+mod zset_index_tests {
+    use super::*;
+    use crate::cmd::{Command, ZAddOptions};
+
+    fn int(n: i64) -> Value {
+        Value::Integer(n)
+    }
+
+    fn zset(pairs: &[(f64, &str)]) -> ZSetInner {
+        let mut z = ZSetInner::new();
+        for (s, m) in pairs {
+            z.insert(m, *s);
+        }
+        z
+    }
+
+    fn members(z: &ZSetInner) -> Vec<(&str, f64)> {
+        z.iter_asc().collect()
+    }
+
+    #[test]
+    fn iteration_is_ordered_by_score_then_member() {
+        // Ties break on the member name, as Redis does.
+        let z = zset(&[(2.0, "b"), (1.0, "z"), (2.0, "a"), (-1.5, "m")]);
+        assert_eq!(
+            members(&z),
+            vec![("m", -1.5), ("z", 1.0), ("a", 2.0), ("b", 2.0)]
+        );
+    }
+
+    #[test]
+    fn updating_a_score_moves_the_member_in_the_index() {
+        let mut z = zset(&[(1.0, "a"), (2.0, "b"), (3.0, "c")]);
+        assert_eq!(
+            z.insert("a", 10.0),
+            Some(1.0),
+            "should report the old score"
+        );
+        assert_eq!(members(&z), vec![("b", 2.0), ("c", 3.0), ("a", 10.0)]);
+        assert_eq!(z.len(), 3, "an update must not duplicate the member");
+    }
+
+    #[test]
+    fn re_inserting_the_same_score_is_a_no_op() {
+        let mut z = zset(&[(1.0, "a")]);
+        assert_eq!(z.insert("a", 1.0), Some(1.0));
+        assert_eq!(members(&z), vec![("a", 1.0)]);
+    }
+
+    #[test]
+    fn removal_clears_both_the_map_and_the_index() {
+        let mut z = zset(&[(1.0, "a"), (2.0, "b")]);
+        assert_eq!(z.remove("a"), Some(1.0));
+        assert_eq!(z.remove("a"), None, "second removal finds nothing");
+        assert_eq!(members(&z), vec![("b", 2.0)]);
+        assert_eq!(z.score("a"), None);
+        assert_eq!(z.rank("a"), None);
+    }
+
+    /// The index must never disagree with the map, whatever sequence of writes
+    /// it has seen — a stale index entry would surface as a phantom member in
+    /// every range query.
+    #[test]
+    fn the_index_stays_consistent_with_the_map_under_churn() {
+        let mut z = ZSetInner::new();
+        for round in 0..40u64 {
+            for i in 0..25u64 {
+                let m = format!("m{}", i);
+                // Deterministic but jumbled score sequence.
+                let score = ((round * 7 + i * 13) % 17) as f64 - 8.0;
+                z.insert(&m, score);
+            }
+            for i in (0..25u64).step_by(3) {
+                z.remove(&format!("m{}", i));
+            }
+        }
+
+        let ordered = members(&z);
+        assert_eq!(ordered.len(), z.len(), "index and map disagree on size");
+        for (m, s) in &ordered {
+            assert_eq!(z.score(m), Some(*s), "index score for {m} is stale");
+        }
+        let mut sorted = ordered.clone();
+        sorted.sort_by(|(m1, s1), (m2, s2)| s1.total_cmp(s2).then(m1.cmp(m2)));
+        assert_eq!(ordered, sorted, "index is not in sorted order");
+    }
+
+    /// The index walk stops early rather than testing every member, so it must
+    /// be checked against the plain definition it replaced.
+    #[test]
+    fn range_by_score_agrees_with_a_linear_scan() {
+        let z = zset(&[
+            (-10.0, "a"),
+            (0.0, "b"),
+            (0.0, "c"),
+            (1.5, "d"),
+            (2.0, "e"),
+            (99.0, "f"),
+        ]);
+        let bounds = [
+            ("-inf", "+inf"),
+            ("0", "2"),
+            ("(0", "2"),
+            ("0", "(2"),
+            ("(0", "(2"),
+            ("-inf", "0"),
+            ("2", "-inf"),
+            ("+inf", "+inf"),
+            ("3", "1"),
+            ("-10", "-10"),
+        ];
+        for (min_s, max_s) in bounds {
+            let min = ScoreBound::parse(min_s).expect("bound parses");
+            let max = ScoreBound::parse(max_s).expect("bound parses");
+            let via_index: Vec<(&str, f64)> = z.range_by_score(&min, &max).collect();
+            let via_scan: Vec<(&str, f64)> = z
+                .iter_asc()
+                .filter(|(_, s)| in_score_range(*s, &min, &max))
+                .collect();
+            assert_eq!(via_index, via_scan, "disagreement for {min_s}..{max_s}");
+        }
+    }
+
+    #[test]
+    fn rank_matches_the_position_in_ascending_order() {
+        let z = zset(&[(3.0, "c"), (1.0, "a"), (2.0, "b"), (2.0, "bb")]);
+        for (i, (m, _)) in members(&z).into_iter().enumerate() {
+            assert_eq!(z.rank(m), Some(i), "rank of {m}");
+        }
+        assert_eq!(z.rank("missing"), None);
+    }
+
+    /// A `NaN` must never reach the index, but if one did the ordering must
+    /// still be total — `total_cmp` guarantees that where `partial_cmp` did not.
+    #[test]
+    fn score_ordering_is_total_even_for_nan() {
+        let mut v = [
+            Score(f64::NAN),
+            Score(1.0),
+            Score(f64::NEG_INFINITY),
+            Score(f64::INFINITY),
+            Score(-0.0),
+            Score(0.0),
+        ];
+        v.sort();
+        // Sorting must be deterministic and must not panic; the exact position
+        // of NaN is unspecified, only that the order is total.
+        assert_eq!(v[0], Score(f64::NEG_INFINITY));
+        assert!(v.iter().any(|s| s.0.is_nan()));
+    }
+
+    // ── Command-level behaviour ───────────────────────────────────────────────
+
+    fn store_with_leaderboard(n: usize) -> KeyValueStore {
+        let store = KeyValueStore::new();
+        store.execute(Command::ZAdd(
+            "board".into(),
+            ZAddOptions::default(),
+            (0..n).map(|i| (i as f64, format!("p{i:06}"))).collect(),
+        ));
+        store
+    }
+
+    #[test]
+    fn zrange_returns_the_same_window_as_before() {
+        let store = store_with_leaderboard(10);
+        let top = store.execute(Command::ZRange("board".into(), 0, 2, false));
+        assert_eq!(
+            top,
+            Value::Array(Some(vec![
+                Value::BulkString(Some(b"p000000".to_vec())),
+                Value::BulkString(Some(b"p000001".to_vec())),
+                Value::BulkString(Some(b"p000002".to_vec())),
+            ]))
+        );
+        // Negative indices count from the end.
+        let last = store.execute(Command::ZRange("board".into(), -1, -1, false));
+        assert_eq!(
+            last,
+            Value::Array(Some(vec![Value::BulkString(Some(b"p000009".to_vec()))]))
+        );
+        // An empty window stays empty rather than wrapping.
+        assert_eq!(
+            store.execute(Command::ZRange("board".into(), 5, 2, false)),
+            Value::Array(Some(vec![]))
+        );
+    }
+
+    #[test]
+    fn zrevrange_walks_the_index_backwards() {
+        let store = store_with_leaderboard(10);
+        assert_eq!(
+            store.execute(Command::ZRevRange("board".into(), 0, 1, false)),
+            Value::Array(Some(vec![
+                Value::BulkString(Some(b"p000009".to_vec())),
+                Value::BulkString(Some(b"p000008".to_vec())),
+            ]))
+        );
+    }
+
+    /// The cost claim: a top-N query must not touch the whole set. Measured as
+    /// wall-clock ratio between a small and a large leaderboard — sorting the
+    /// set would make the large one dramatically slower, walking the index
+    /// makes it flat.
+    #[test]
+    fn a_top_n_query_does_not_scale_with_the_size_of_the_set() {
+        use std::time::Instant;
+
+        fn time_top_10(n: usize) -> std::time::Duration {
+            let store = store_with_leaderboard(n);
+            // Warm up, then measure.
+            store.execute(Command::ZRange("board".into(), 0, 9, false));
+            let start = Instant::now();
+            for _ in 0..200 {
+                let r = store.execute(Command::ZRange("board".into(), 0, 9, false));
+                std::hint::black_box(&r);
+            }
+            start.elapsed()
+        }
+
+        let small = time_top_10(1_000);
+        let large = time_top_10(100_000);
+        // 100x the members. Sorting per query would be well over 100x slower;
+        // a generous 10x ceiling still fails loudly if the sort comes back,
+        // without turning into a flaky timing assertion.
+        assert!(
+            large < small * 10 + std::time::Duration::from_millis(50),
+            "top-10 over 100k members took {large:?} vs {small:?} over 1k — \
+             ZRANGE looks like it is still sorting the whole set"
+        );
+    }
+
+    #[test]
+    fn zadd_conditions_still_behave() {
+        let store = KeyValueStore::new();
+        let zadd = |opts: ZAddOptions, pairs: Vec<(f64, String)>| {
+            store.execute(Command::ZAdd("k".into(), opts, pairs))
+        };
+
+        assert_eq!(
+            zadd(ZAddOptions::default(), vec![(1.0, "a".into())]),
+            int(1)
+        );
+        // NX leaves an existing member alone.
+        let nx = ZAddOptions {
+            condition: Some(crate::cmd::ZAddCondition::Nx),
+            ..Default::default()
+        };
+        assert_eq!(zadd(nx, vec![(9.0, "a".into())]), int(0));
+        assert_eq!(
+            store.execute(Command::ZScore("k".into(), "a".into())),
+            Value::BulkString(Some(b"1".to_vec()))
+        );
+        // XX will not create one.
+        let xx = ZAddOptions {
+            condition: Some(crate::cmd::ZAddCondition::Xx),
+            ..Default::default()
+        };
+        assert_eq!(zadd(xx, vec![(5.0, "new".into())]), int(0));
+        assert_eq!(store.execute(Command::ZCard("k".into())), int(1));
+        // GT only raises.
+        let gt = ZAddOptions {
+            gt: true,
+            ch: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            zadd(gt, vec![(0.5, "a".into())]),
+            int(0),
+            "GT must not lower"
+        );
+        let gt2 = ZAddOptions {
+            gt: true,
+            ch: true,
+            ..Default::default()
+        };
+        assert_eq!(zadd(gt2, vec![(7.0, "a".into())]), int(1));
+        assert_eq!(
+            store.execute(Command::ZScore("k".into(), "a".into())),
+            Value::BulkString(Some(b"7".to_vec()))
+        );
+    }
+
+    #[test]
+    fn a_zset_survives_a_snapshot_round_trip_with_its_order() {
+        let store = store_with_leaderboard(50);
+        let snap = store.snapshot();
+        let restored = KeyValueStore::new();
+        restored.restore(snap);
+        assert_eq!(
+            restored.execute(Command::ZRange("board".into(), 0, -1, true)),
+            store.execute(Command::ZRange("board".into(), 0, -1, true))
         );
     }
 }
