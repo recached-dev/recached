@@ -51,6 +51,44 @@ update_package_json "$ROOT/wasm-edge/package.json"
 update_package_json "$ROOT/sdks/recached-react/package.json"
 update_package_json "$ROOT/sdks/recached-vue/package.json"
 
+# Update the Homebrew formula: version, download URLs, and — deliberately —
+# reset the checksums to placeholders.
+#
+# This file used to be bumped by hand, so it wasn't: it sat at 0.1.8 with valid
+# 0.1.8 URLs and checksums while the project shipped 0.2.x, and `brew install`
+# quietly served the old binary. Resetting the sums means the formula cannot
+# install anything until `scripts/update-formula-checksums.sh v$NEW_VERSION` has
+# been run against the real release artifacts.
+python3 - "$ROOT/Formula/recached.rb" "$NEW_VERSION" <<'EOF'
+import re, sys
+path, version = sys.argv[1], sys.argv[2]
+content = open(path).read()
+
+content, n = re.subn(r'^(  version )"[^"]+"', rf'\1"{version}"', content, count=1, flags=re.MULTILINE)
+if n == 0:
+    sys.exit("error: could not find the version line in " + path)
+
+content, n = re.subn(r'/releases/download/v[^/]+/', f'/releases/download/v{version}/', content)
+if n == 0:
+    sys.exit("error: could not find any release download URL in " + path)
+urls = n
+
+# Any real checksum becomes a placeholder again; existing placeholders are left
+# alone. A sha256 line is 64 hex chars.
+content, x86 = re.subn(r'(on_intel do.*?sha256 )"[0-9a-f]{64}"',
+                       r'\1"REPLACE_WITH_AMD64_SHA256"', content, flags=re.DOTALL)
+content, arm = re.subn(r'(on_arm do.*?sha256 )"[0-9a-f]{64}"',
+                       r'\1"REPLACE_WITH_ARM64_SHA256"', content, flags=re.DOTALL)
+
+open(path, 'w').write(content)
+print(f"Bumped {version} in {path} ({urls} URL(s); reset {x86 + arm} checksum(s) to placeholders)")
+EOF
+
+echo
+echo "NOTE: Formula/recached.rb now carries placeholder checksums."
+echo "      After the v$NEW_VERSION release artifacts are published, run:"
+echo "        scripts/update-formula-checksums.sh v$NEW_VERSION"
+
 # Verify the workspace resolves cleanly.
 echo "Verifying workspace..."
 cargo check --workspace --exclude wasm-edge --quiet
