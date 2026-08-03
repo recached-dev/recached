@@ -31,8 +31,10 @@ The same Rust cache engine runs natively on your server (RESP on port 6379 — a
 # Docker
 docker run -p 6379:6379 -p 6380:6380 ghcr.io/recached-dev/recached:latest
 
-# Homebrew (macOS)
-brew tap recached-dev/recached && brew install recached && recached-server
+# Homebrew (macOS) — the tap is this repo, and Homebrew 6+ wants third-party taps trusted
+brew tap recached-dev/recached https://github.com/recached-dev/recached
+brew trust recached-dev/recached   # Homebrew 6.0+ only; older versions do not have it
+brew install recached && recached-server
 
 # Cargo (from source — the crate is not on crates.io yet)
 cargo install --git https://github.com/recached-dev/recached recached && recached-server

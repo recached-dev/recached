@@ -2,7 +2,13 @@
 name    = "wasm-edge"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+# Spelled out rather than inherited: wasm-pack parses this manifest itself, and
+# every field it reads ends up in the generated npm package.json. `description`
+# and `repository` were absent, so the published recached-edge package carried
+# neither — wasm-pack warns about exactly this on every build.
+license = "Apache-2.0"
+description = "The Recached cache engine compiled to WebAssembly: a Redis-compatible store that runs inside the browser and syncs with a Recached server."
+repository.workspace = true
 
 [lib]
 crate-type = ["cdylib", "rlib"]
