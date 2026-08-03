@@ -4,6 +4,159 @@ All notable changes to Recached are documented here.
 
 ---
 
+## [0.2.5] — Unreleased
+
+### Added
+
+- **`MEMORY USAGE key [SAMPLES count]`.** Recached enforces `maxmemory` and evicts against
+  it, but an operator who hit the limit had no command that answered "which key is eating
+  it?" — `INFO memory` gives one total and nothing per key. The reply is the same figure the
+  eviction loop bills the key for, computed by the same function, so "what is this costing me"
+  and "what gets evicted next" cannot drift apart the way two separate estimators would.
+  A missing or expired key reports nil, not zero: "no such key" and "an empty key" are
+  different facts. `SAMPLES` is parsed and its count discarded — Redis uses it to bound how
+  much of a nested value it walks before extrapolating, and Recached always walks all of it,
+  so the reply is never less accurate than what was asked for. `MEMORY DOCTOR`, `STATS`,
+  `PURGE` and `MALLOC-STATS` are refused with a reason: they describe an allocator arena that
+  Recached does not manage and cannot honestly report on.
+
+- **`PUBSUB CHANNELS [pattern]`, `PUBSUB NUMSUB [channel ...]`, `PUBSUB NUMPAT`.** Pub/sub has
+  shipped since the first release with no way to see any of it — `PUBLISH` returned a delivery
+  count and that was the only observable, so "is anything actually subscribed?" could only be
+  answered by publishing and watching the number. The subscriber hub already held both
+  registries; these are a read of state that existed all along. `CHANNELS` lists only channels
+  with a live subscriber and drops one the moment its last subscriber leaves, `NUMSUB` reports
+  a zero for a channel nobody is on rather than omitting it so the reply can be read by
+  position, and `NUMPAT` counts distinct patterns, not subscribers. Verified reply-for-reply
+  against redis-server 7.2.5. `PUBSUB` is classified as an admin command, so it is refused on
+  scope-limited WebSocket connections: a scoped connection may still `SUBSCRIBE` to any channel
+  it can name, but naming one and enumerating everyone else's are different powers, the same
+  line `GET` and `KEYS` sit on.
+
+- **`MODULE LIST`.** An empty array, which is the answer a stock `redis-server` with no modules
+  gives, and which lets a tool tell "no modules" apart from "cannot ask". `MODULE LOAD`,
+  `LOADEX` and `UNLOAD` are refused rather than answered `+OK`.
+
+- **`INFO` now reports the `# Cluster` section** — `cluster_enabled:0`, in the default set, so a
+  bare `INFO` carries it. This is how a cluster-aware client actually learns it is talking to a
+  single node, and Recached had no way to say so.
+
+### Changed
+
+- **`CLUSTER` is now refused with Redis's own sentence** — `ERR This instance has cluster support
+  disabled` — instead of `ERR unknown command`. Measuring beat assuming here: a `redis-server`
+  not started in cluster mode does **not** answer `CLUSTER INFO` with `cluster_enabled:0`, it
+  rejects the whole container with that error and publishes the flag through `INFO`. So the fix
+  was not to implement `CLUSTER INFO` — implementing it would have made Recached *less* like
+  Redis — but to copy the refusal and add the `INFO` section. `unknown command` was the one
+  reply a client cannot act on, because it reads as "too old to ask" rather than "not a cluster".
+
+- **`PUBSUB SHARDCHANNELS` and `SHARDNUMSUB` are refused**, where a standalone Redis answers both
+  with an empty array. The one deliberate divergence in this batch: Redis's empty array sits next
+  to a working `SSUBSCRIBE`, and Recached implements neither `SSUBSCRIBE` nor `SPUBLISH`, so the
+  same reply would invite a follow-up call that fails.
+
+### Added
+
+- **`RECACHED_PORT` and `RECACHED_WS_PORT`.** The RESP and WebSocket ports were compiled in, so two
+  instances could not share a host — a replica beside its primary was impossible — and there was no
+  way off 6379, the first port any commodity scanner probes. Defaults are unchanged, so no existing
+  deployment needs to do anything. The port is not itself a security control (`RECACHED_BIND`, the
+  password, TLS and the allowlists are), which is why exposing it is safe; what is *not* safe is a
+  typo falling back to the default, so an unparseable value, `0`, or the two ports being equal is a
+  startup error rather than a silent 6379. Ports below 1024 still require root, enforced by the OS.
+  The startup warnings about the sync port now name the port actually in use instead of a hardcoded
+  6380, and `INFO`'s `tcp_port`/`recached_ws_port` report the real values.
+
+### Fixed
+
+- **`RECACHED_METRICS_PORT=0` now disables the exporter, as the reference has always said it did.**
+  `0` parsed fine and `bind("host:0")` hands the listener an OS-assigned ephemeral port, so an
+  operator switching metrics *off* got them served on an unpredictable port instead — the opposite
+  of the request, and unlikely to be noticed until something scraped it. A collision on this port
+  also aborted startup with a bare `panic!` and a backtrace note, which reads like a bug in Recached
+  rather than two servers wanting one port; it is now an error that names the conflict and points at
+  the three port variables. An unparseable value is a startup error.
+
+- **`INCR` and friends no longer clear a key's TTL on the replica, in the AOF, or in synced
+  browsers.** Counters propagate by value — `SET key <new value>` — so that a replica which missed a
+  frame converges on the primary's number instead of compounding its own. But a bare `SET` also
+  clears the expiry, and Redis's `INCR` leaves it untouched, so the single most common expiring
+  counter idiom — `INCR key` followed by `EXPIRE key window` — replayed as a key with no expiry at
+  all. The rate-limit bucket, the per-minute quota and the retry counter each became permanent
+  everywhere but on the primary, and the window never reset because the key it keyed on never went
+  away. They now propagate as `SET <value> KEEPTTL`, which keeps the by-value convergence while
+  leaving the deadline where the primary has it. `GETSET` still propagates a bare `SET`, because
+  `GETSET` really does clear the TTL.
+
+- **`TTL` rounds to the nearest second instead of truncating.** `SET k v EX 100` followed immediately
+  by `TTL k` answered 99: the microseconds spent between the two commands took the remainder just
+  below 100 000 ms, and integer division discarded the rest. Every reading was up to a second short,
+  which breaks a ported test suite asserting the value it just set and makes any client that renews
+  below a threshold renew early on every pass. Now `(remaining_ms + 500) / 1000`, matching Redis.
+  `PTTL` is unchanged — it reports milliseconds and has nothing to round.
+
+- **`PUBLISH` may be used inside `MULTI`.** Redis allows it, and announcing a change atomically with
+  the write that caused it is an ordinary reason to open a transaction at all, but Recached refused
+  it alongside `SUBSCRIBE` and `WATCH`. Simply letting it queue would have been worse than the
+  refusal: delivery lives in the connection loop and the store's `PUBLISH` is a stub that answers 0
+  and sends nothing, so the message would have been swallowed silently and `EXEC` would have reported
+  a plausible zero. `EXEC` now dispatches queued publishes to the subscriber hub itself, so the reply
+  is the real delivery count and subscribers actually receive the message. `SUBSCRIBE`, `PSUBSCRIBE`
+  and `WATCH` remain unqueueable, which is correct.
+
+- **The binary is `recached-server` and the crate is `recached`, as the docs have always claimed.**
+  The package was `server-native` and produced a `server-native` binary, so `cargo install recached`
+  installed nothing — the name was not even registered — and `cargo build --bin recached-server`,
+  the command in the contributing guide, failed outright. Only Docker and Homebrew worked, because
+  both rename the artefact as they copy it. The directory keeps its name; it describes the role,
+  while the package describes the product. CI, the release workflow and the Dockerfile follow.
+
+- **Expiries now propagate as absolute deadlines, so a restart no longer resurrects a key that
+  should have died during it.** Every write leaves the server as one RESP frame that the AOF, the
+  replication log and the browser sync fan-out all consume, and a relative TTL (`SET k v PX 5000`,
+  `PEXPIRE k 5000`) was written into that frame verbatim. Each consumer then re-based the deadline
+  onto *its own* clock at *its own* arrival time, so the key's lifetime silently restarted on every
+  hop. At AOF replay this was total: a key written with `EX 5` and replayed an hour later came back
+  alive with a fresh five seconds — a revoked session, an abandoned lock, a spent idempotency key or
+  a rate-limit window, all restored by the restart that was supposed to be transparent. Replicas
+  expired their copy later than the primary by the replication delay, and a reconnecting browser
+  reset the TTL of every key the sync socket replayed to it. Relative expiries are now converted
+  against the propagation timestamp and travel as `PXAT`/`PEXPIREAT`, which is what Redis does and
+  what the already-correct `EXAT`/`PXAT`/`EXPIREAT`/`PEXPIREAT` arms beside them already did. An
+  absolute deadline is idempotent under replay: applying it once or a thousand times, now or after
+  an hour of downtime, names the same instant, and one already in the past needs no special case —
+  the store reads such an entry as expired and the sweeper reaps it. The snapshot path was never
+  affected; it has always stored absolute expiries, which is why `SAVE` and the AOF disagreed about
+  whether a key still existed.
+
+- **`EXEC` no longer runs the rest of a transaction after a command failed to queue.** Redis
+  refuses an unrecognised verb at queue time and poisons the transaction, so `EXEC` replies
+  `EXECABORT Transaction discarded because of previous errors.` and runs nothing. Recached parses an
+  unrecognised verb into an internal `Unknown` command, which queued happily behind a `+QUEUED` and
+  only errored while executing — leaving every *other* command in the transaction applied. On a
+  server that implements a deliberate subset of Redis that is a live hazard rather than a corner
+  case: `MULTI; ZPOPMIN q; LPUSH processing x; EXEC` pushed onto `processing` without ever popping
+  `q`, silently, and MULTI is exactly the construct a caller reaches for to prevent that. Anything
+  that fails to queue now sets the abort flag — an unknown verb, a frame that will not parse (bad
+  arity, malformed argument), a command not allowed inside a transaction, and a queue over
+  `RECACHED_MAX_MULTI_QUEUE` — and the unknown-verb rejection is delivered at queue time with the
+  same wording the store gives outside a transaction. `MULTI` and `DISCARD` clear the flag, so a
+  poisoned transaction does not wedge later ones on the same connection. The CAS abort is
+  deliberately left distinct: a `WATCH` conflict still replies with a nil array, because "retry me"
+  and "fix your request" are different answers and a retry loop must be able to tell them apart.
+  Fixed on both the TCP and WebSocket command paths.
+
+- **The command reference no longer claims Recached exports latency histograms.** `INFO`'s "not
+  implemented" note said per-command latency was on the Prometheus endpoint instead — it is not,
+  and never was. Recached has no latency instrumentation at all: `recached_commands_total` counts
+  calls and `recached_command_errors_total` counts failures, and neither says how long anything
+  took. The docs now say so plainly and point at the bounded reads (`HSCAN`, `SSCAN`, `ZSCAN`,
+  `GETRANGE`) as the way to avoid the slow paths, since there is no way to catch them after the
+  fact. `SLOWLOG` and latency histograms remain unimplemented.
+
+---
+
 ## [0.2.4] — 2026-08-02
 
 ### Added

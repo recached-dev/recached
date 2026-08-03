@@ -1,8 +1,21 @@
 [package]
-name    = "server-native"
+# The crate is `recached` and the binary it installs is `recached-server`, which
+# is what the README, the Homebrew formula and the Docker image have always
+# said. The package was `server-native` and produced a `server-native` binary,
+# so `cargo install recached` installed nothing (the name was unregistered) and
+# `cargo build --bin recached-server` failed outright; only Docker and brew
+# worked, because both rename the artefact as they copy it. The directory keeps
+# its name — it describes the role, the package describes the product.
+name    = "recached"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "A Rust cache server that runs on your backend and inside the browser."
+repository.workspace = true
+
+[[bin]]
+name = "recached-server"
+path = "src/main.rs"
 
 [dependencies]
 core-engine.workspace              = true

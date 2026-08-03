@@ -1,0 +1,1214 @@
+//! Turning an executed command into the frame that reaches the AOF, replicas
+//! and browser sync clients — and the watch notifications that go with it.
+
+use crate::*;
+
+pub(crate) fn is_write_command(cmd: &Command) -> bool {
+    if let Command::Dedup(_, _, inner) = cmd {
+        return is_write_command(inner);
+    }
+    matches!(
+        cmd,
+        Command::Set(..)
+            | Command::ESet(..)
+            | Command::Del(..)
+            | Command::Unlink(..)
+            | Command::Append(..)
+            | Command::GetSet(..)
+            | Command::MSet(..)
+            | Command::SetNx(..)
+            | Command::SetEx(..)
+            | Command::PSetEx(..)
+            | Command::Incr(..)
+            | Command::Decr(..)
+            | Command::IncrBy(..)
+            | Command::DecrBy(..)
+            | Command::Expire(..)
+            | Command::PExpire(..)
+            | Command::ExpireAt(..)
+            | Command::PExpireAt(..)
+            | Command::Persist(..)
+            | Command::FlushDb
+            | Command::Rename(..)
+            | Command::HSet(..)
+            | Command::HDel(..)
+            | Command::HIncrBy(..)
+            | Command::HIncrByFloat(..)
+            | Command::HSetNx(..)
+            | Command::LPush(..)
+            | Command::RPush(..)
+            | Command::LPushX(..)
+            | Command::RPushX(..)
+            | Command::LPop(..)
+            | Command::RPop(..)
+            | Command::LSet(..)
+            | Command::LRem(..)
+            | Command::LTrim(..)
+            | Command::SAdd(..)
+            | Command::SRem(..)
+            | Command::SInterStore(..)
+            | Command::SUnionStore(..)
+            | Command::SDiffStore(..)
+            | Command::SPop(..)
+            | Command::SMove(..)
+            | Command::ZAdd(..)
+            | Command::ZRem(..)
+            | Command::ZIncrBy(..)
+            | Command::RlSet(..)
+            | Command::RlCheck(..)
+            | Command::JSet(..)
+            | Command::JMerge(..)
+    )
+}
+
+// ── Save conditions ───────────────────────────────────────────────────────────
+
+/// Extract the key(s) that `cmd` writes to, without inspecting the response.
+/// Used together with `broadcast_for()` — only call this when `broadcast_for`
+/// already confirmed a mutation occurred.
+pub(crate) fn primary_keys(cmd: &Command) -> Vec<String> {
+    match cmd {
+        Command::ESet(k, _)
+        | Command::Set(k, _, _)
+        | Command::Append(k, _)
+        | Command::GetSet(k, _)
+        | Command::SetNx(k, _)
+        | Command::SetEx(k, _, _)
+        | Command::PSetEx(k, _, _)
+        | Command::Incr(k)
+        | Command::Decr(k)
+        | Command::IncrBy(k, _)
+        | Command::DecrBy(k, _)
+        | Command::Expire(k, _)
+        | Command::PExpire(k, _)
+        | Command::ExpireAt(k, _)
+        | Command::PExpireAt(k, _)
+        | Command::Persist(k)
+        | Command::HSet(k, _)
+        | Command::HDel(k, _)
+        | Command::HSetNx(k, _, _)
+        | Command::HIncrBy(k, _, _)
+        | Command::HIncrByFloat(k, _, _)
+        | Command::LPush(k, _)
+        | Command::RPush(k, _)
+        | Command::LPushX(k, _)
+        | Command::RPushX(k, _)
+        | Command::LPop(k, _)
+        | Command::RPop(k, _)
+        | Command::LSet(k, _, _)
+        | Command::LRem(k, _, _)
+        | Command::LTrim(k, _, _)
+        | Command::SAdd(k, _)
+        | Command::SRem(k, _)
+        | Command::SPop(k, _)
+        | Command::SInterStore(k, _)
+        | Command::SUnionStore(k, _)
+        | Command::SDiffStore(k, _)
+        | Command::ZAdd(k, _, _)
+        | Command::ZRem(k, _)
+        | Command::ZIncrBy(k, _, _)
+        | Command::RlSet(k, _, _)
+        | Command::JSet(k, _, _)
+        | Command::JMerge(k, _) => vec![k.clone()],
+        Command::Del(keys) | Command::Unlink(keys) => keys.clone(),
+        Command::MSet(pairs) => pairs.iter().map(|(k, _)| k.clone()).collect(),
+        Command::Rename(src, dst) | Command::SMove(src, dst, _) => {
+            vec![src.clone(), dst.clone()]
+        }
+        _ => vec![],
+    }
+}
+
+pub(crate) fn encode_keychange(key: &str, value: &Value) -> Vec<u8> {
+    Value::Array(Some(vec![
+        Value::BulkString(Some(b"keychange".to_vec())),
+        Value::BulkString(Some(key.as_bytes().to_vec())),
+        value.clone(),
+    ]))
+    .serialize()
+}
+
+/// Push keychange notifications for a *confirmed* mutation. Callers must have
+/// already established that `cmd` mutated the store (via `broadcast_for`).
+pub(crate) async fn notify_watchers(
+    registry: &WatchRegistry,
+    cmd: &Command,
+    store: &KeyValueStore,
+) {
+    if registry.is_empty() {
+        return;
+    }
+    let keys = primary_keys(cmd);
+    if keys.is_empty() {
+        return;
+    }
+    // Fetch current values from DashMap *before* acquiring the registry lock
+    // to avoid holding two locks simultaneously.
+    let key_values: Vec<(String, Value)> = keys
+        .iter()
+        .map(|k| (k.clone(), store.get_current(k)))
+        .collect();
+    if registry.watched_keys.load(Ordering::Relaxed) > 0 {
+        let mut reg = registry.map.lock().await;
+        for (key, value) in &key_values {
+            if let Some(subs) = reg.get_mut(key) {
+                subs.retain(|(_, tx)| tx.send((key.clone(), value.clone())).is_ok());
+                if subs.is_empty() {
+                    reg.remove(key);
+                }
+            }
+        }
+        registry.sync_len(&reg);
+    }
+    // Live queries: any registered glob pattern matching a touched key gets
+    // the same keychange notification.
+    if registry.watched_patterns.load(Ordering::Relaxed) > 0 {
+        let mut pats = registry.patterns.lock().await;
+        let mut emptied = false;
+        for (pattern, subs) in pats.iter_mut() {
+            for (key, value) in &key_values {
+                if core_engine::store::glob_match(pattern, key) {
+                    subs.retain(|(_, tx)| tx.send((key.clone(), value.clone())).is_ok());
+                }
+            }
+            emptied |= subs.is_empty();
+        }
+        if emptied {
+            pats.retain(|_, subs| !subs.is_empty());
+        }
+        registry.sync_patterns_len(&pats);
+    }
+}
+
+/// Announce a `FLUSHDB` to live queries.
+///
+/// Emitting a keychange per deleted key would mean one frame per key in the
+/// keyspace — potentially millions — for a single command. Instead each
+/// registered pattern receives one sentinel, delivered as a keychange whose key
+/// is the pattern and whose value is nil. Subscribers treat it as "every key
+/// matching this pattern is gone", which is exactly what happened, at O(patterns)
+/// instead of O(keys).
+///
+/// Explicitly `WATCH`ed keys are notified individually — that set is bounded by
+/// the connection limit and callers expect per-key precision there.
+pub(crate) async fn notify_flushdb(registry: &WatchRegistry, watched_before: Vec<String>) {
+    if registry.watched_keys.load(Ordering::Relaxed) > 0 && !watched_before.is_empty() {
+        let mut reg = registry.map.lock().await;
+        for key in &watched_before {
+            if let Some(subs) = reg.get_mut(key) {
+                subs.retain(|(_, tx)| tx.send((key.clone(), Value::BulkString(None))).is_ok());
+            }
+        }
+        registry.sync_len(&reg);
+    }
+    if registry.watched_patterns.load(Ordering::Relaxed) > 0 {
+        let mut pats = registry.patterns.lock().await;
+        let mut emptied = false;
+        for (pattern, subs) in pats.iter_mut() {
+            let sentinel = pattern.clone();
+            subs.retain(|(_, tx)| tx.send((sentinel.clone(), Value::BulkString(None))).is_ok());
+            emptied |= subs.is_empty();
+        }
+        if emptied {
+            pats.retain(|_, subs| !subs.is_empty());
+        }
+        registry.sync_patterns_len(&pats);
+    }
+}
+
+/// Post-write fan-out shared by the TCP and WS command paths: WebSocket sync
+/// broadcast, AOF/replication log, and watch notifications. Structured so that
+/// with no WS clients, no replicas, no AOF, and no watched keys — the common
+/// standalone-server case — a write costs zero locks and zero allocations here.
+pub(crate) async fn apply_write_effects(
+    cmd: &Command,
+    response: &Value,
+    tx: &broadcast::Sender<SyncMsg>,
+    origin: u64,
+    state: &ServerState,
+    watch_registry: &WatchRegistry,
+    store: &KeyValueStore,
+) {
+    let has_ws = tx.receiver_count() > 0;
+    let needs_log = state.needs_write_log();
+    let has_watch = !watch_registry.is_empty();
+    if !has_ws && !needs_log && !has_watch {
+        return;
+    }
+    // Read once, after the early-out above, so a standalone server with nothing
+    // listening still pays no clock read per write.
+    let Some(msg) = broadcast_for(cmd, response, now_unix_ms()) else {
+        return;
+    };
+    if needs_log {
+        state.on_write(&msg).await;
+    }
+    if has_watch {
+        if matches!(cmd, Command::FlushDb) {
+            // primary_keys() is empty for FLUSHDB, so the generic notifier has
+            // nothing to announce — subscribers would silently miss the wipe.
+            let watched: Vec<String> = {
+                let reg = watch_registry.map.lock().await;
+                reg.keys().cloned().collect()
+            };
+            notify_flushdb(watch_registry, watched).await;
+        } else {
+            notify_watchers(watch_registry, cmd, store).await;
+        }
+    }
+    if has_ws {
+        let _ = tx.send(Arc::new(SyncPush {
+            origin,
+            keys: primary_keys(cmd),
+            resp: msg,
+        }));
+    }
+}
+
+/// Encodes a list of string parts as a RESP3 Push frame for WebSocket fan-out.
+/// Uses `>` prefix so clients can distinguish server-initiated pushes from command responses.
+/// Build a RESP3 Push frame from raw byte arguments.
+///
+/// Bytes rather than `&str` because these frames carry stored values, which may
+/// be arbitrary binary. Building them as a `String` would have required a lossy
+/// conversion — silently corrupting the replicated, AOF-logged and
+/// browser-synced copy of a value the store itself holds faithfully.
+pub(crate) fn resp_push(parts: &[&[u8]]) -> Vec<u8> {
+    let mut out = format!(">{}\r\n", parts.len()).into_bytes();
+    for part in parts {
+        out.extend_from_slice(format!("${}\r\n", part.len()).as_bytes());
+        out.extend_from_slice(part);
+        out.extend_from_slice(b"\r\n");
+    }
+    out
+}
+
+/// Returns the RESP-encoded mutation to broadcast to WebSocket peers, or `None`
+/// if the command mutated nothing (read-only or conditional-and-failed).
+///
+/// `now_ms` is the propagation timestamp, and every *relative* TTL is rewritten
+/// against it into an absolute `PXAT`/`PEXPIREAT` deadline.
+///
+/// That rewrite is load-bearing, because this one buffer is what the AOF, the
+/// replication log and the browser sync fan-out all receive. Propagating the
+/// relative form meant each of them re-based the TTL onto *its own* clock at
+/// *its own* arrival time, so a key's lifetime silently restarted on every hop:
+///
+/// - **AOF** — replay happens at startup, so a key written with `EX 5` and
+///   replayed an hour later came back alive with a fresh 5 seconds. A revoked
+///   session, a distributed lock or an idempotency key that had long since
+///   expired was resurrected by a restart.
+/// - **Replicas** — a replica's copy expired later than the primary's by the
+///   replication delay, and the gap reopened on every re-send.
+/// - **Browsers** — the sync socket delivers on connect *and* on outbox replay,
+///   so a reconnecting tab reset the TTL of every key it received.
+///
+/// An absolute deadline is idempotent under replay: applying it once or a
+/// thousand times, now or after an hour of downtime, yields the same instant.
+/// A deadline already in the past is not a special case — the store treats such
+/// an entry as expired on read and the sweeper reaps it, which is precisely the
+/// "it should already be gone" behaviour that was missing.
+///
+/// The deadline is computed from `now_ms` rather than read back out of the
+/// store: the store's own expiry was computed microseconds earlier from the
+/// same clock, and re-reading it would cost a lookup per write and still race
+/// another thread overwriting the key. This is also what Redis does — it
+/// rewrites relative expiries to absolute ones at propagation time.
+pub(crate) fn broadcast_for(cmd: &Command, response: &Value, now_ms: u64) -> Option<Vec<u8>> {
+    match cmd {
+        // Replays as SET: a replica has no connection to scope the lifetime to,
+        // and the owning server broadcasts the DEL when the connection closes.
+        Command::ESet(k, v) => Some(resp_push(&[b"SET", k.as_bytes(), v.as_slice()])),
+        Command::Set(k, v, opts) => {
+            // Without GET: nil response means NX/XX condition failed — don't broadcast.
+            // With GET: nil means key didn't exist before, but SET still happened.
+            let set_happened = opts.get || !matches!(response, Value::BulkString(None));
+            if !set_happened {
+                return None;
+            }
+            match &opts.expiry {
+                None => Some(resp_push(&[b"SET", k.as_bytes(), v.as_slice()])),
+                // Relative → absolute: see the note on `broadcast_for`.
+                Some(SetExpiry::Ex(s)) => {
+                    let pxat = now_ms.saturating_add(s.saturating_mul(1000)).to_string();
+                    Some(resp_push(&[
+                        b"SET",
+                        k.as_bytes(),
+                        v.as_slice(),
+                        b"PXAT",
+                        pxat.as_bytes(),
+                    ]))
+                }
+                Some(SetExpiry::Px(ms)) => {
+                    let pxat = now_ms.saturating_add(*ms).to_string();
+                    Some(resp_push(&[
+                        b"SET",
+                        k.as_bytes(),
+                        v.as_slice(),
+                        b"PXAT",
+                        pxat.as_bytes(),
+                    ]))
+                }
+                Some(SetExpiry::Exat(ts)) => {
+                    let pxat = ts.saturating_mul(1000).to_string();
+                    Some(resp_push(&[
+                        b"SET",
+                        k.as_bytes(),
+                        v.as_slice(),
+                        b"PXAT",
+                        pxat.as_bytes(),
+                    ]))
+                }
+                Some(SetExpiry::Pxat(ts)) => {
+                    let ts_s = ts.to_string();
+                    Some(resp_push(&[
+                        b"SET",
+                        k.as_bytes(),
+                        v.as_slice(),
+                        b"PXAT",
+                        ts_s.as_bytes(),
+                    ]))
+                }
+                Some(SetExpiry::KeepTtl) => {
+                    Some(resp_push(&[b"SET", k.as_bytes(), v.as_slice(), b"KEEPTTL"]))
+                }
+            }
+        }
+        Command::Del(keys) | Command::Unlink(keys) => {
+            let mut parts: Vec<&[u8]> = vec![b"DEL"];
+            let key_refs: Vec<&[u8]> = keys.iter().map(|s| s.as_bytes()).collect();
+            parts.extend_from_slice(&key_refs);
+            Some(resp_push(&parts))
+        }
+        Command::MSet(pairs) => {
+            let mut parts: Vec<&[u8]> = vec![b"MSET"];
+            let flat: Vec<Vec<u8>> = pairs
+                .iter()
+                .flat_map(|(k, v)| [k.as_bytes().to_vec(), v.clone()])
+                .collect();
+            let flat_refs: Vec<&[u8]> = flat.iter().map(|s| s.as_slice()).collect();
+            parts.extend_from_slice(&flat_refs);
+            Some(resp_push(&parts))
+        }
+        Command::SetNx(k, v) => match response {
+            Value::Integer(1) => Some(resp_push(&[b"SET", k.as_bytes(), v.as_slice()])),
+            _ => None,
+        },
+        Command::SetEx(k, secs, v) => {
+            let pxat = now_ms.saturating_add(secs.saturating_mul(1000)).to_string();
+            Some(resp_push(&[
+                b"SET",
+                k.as_bytes(),
+                v.as_slice(),
+                b"PXAT",
+                pxat.as_bytes(),
+            ]))
+        }
+        Command::PSetEx(k, ms, v) => {
+            let pxat = now_ms.saturating_add(*ms).to_string();
+            Some(resp_push(&[
+                b"SET",
+                k.as_bytes(),
+                v.as_slice(),
+                b"PXAT",
+                pxat.as_bytes(),
+            ]))
+        }
+        Command::Append(k, v) => match response {
+            Value::Integer(_) => Some(resp_push(&[b"APPEND", k.as_bytes(), v.as_slice()])),
+            _ => None,
+        },
+        // GETSET clears any TTL, as in Redis, so a bare SET is the faithful
+        // replay — unlike the counters below.
+        Command::GetSet(k, v) => Some(resp_push(&[b"SET", k.as_bytes(), v.as_slice()])),
+        // Counters replay as `SET <new value> KEEPTTL`.
+        //
+        // A counter is propagated by value rather than as `INCR`, so that a
+        // replica that missed a frame converges on the primary's number instead
+        // of compounding its own. But a bare `SET` also *clears* the TTL, and
+        // `INCR` in Redis leaves it untouched — so the single most common
+        // expiring-counter idiom, `INCR key` + `EXPIRE key window`, replayed as
+        // a key with no expiry at all. The rate-limit bucket, the per-minute
+        // quota and the retry counter all became permanent on the replica, in
+        // the AOF and in every synced browser, and the next window never reset
+        // because the key it keyed on never went away. `KEEPTTL` keeps the
+        // by-value convergence while leaving the deadline where the primary
+        // has it.
+        Command::Incr(k) | Command::Decr(k) | Command::IncrBy(k, _) | Command::DecrBy(k, _) => {
+            match response {
+                Value::Integer(n) => {
+                    let s = n.to_string();
+                    Some(resp_push(&[b"SET", k.as_bytes(), s.as_bytes(), b"KEEPTTL"]))
+                }
+                _ => None,
+            }
+        }
+        // Relative → absolute: see the note on `broadcast_for`.
+        Command::Expire(k, secs) => match response {
+            Value::Integer(1) => {
+                let ts = now_ms.saturating_add(secs.saturating_mul(1000)).to_string();
+                Some(resp_push(&[b"PEXPIREAT", k.as_bytes(), ts.as_bytes()]))
+            }
+            _ => None,
+        },
+        Command::PExpire(k, ms) => match response {
+            Value::Integer(1) => {
+                let ts = now_ms.saturating_add(*ms).to_string();
+                Some(resp_push(&[b"PEXPIREAT", k.as_bytes(), ts.as_bytes()]))
+            }
+            _ => None,
+        },
+        Command::ExpireAt(k, ts) => match response {
+            Value::Integer(1) => {
+                let ts_ms = ts.saturating_mul(1000).to_string();
+                Some(resp_push(&[b"PEXPIREAT", k.as_bytes(), ts_ms.as_bytes()]))
+            }
+            _ => None,
+        },
+        Command::PExpireAt(k, ts) => match response {
+            Value::Integer(1) => {
+                let ts_s = ts.to_string();
+                Some(resp_push(&[b"PEXPIREAT", k.as_bytes(), ts_s.as_bytes()]))
+            }
+            _ => None,
+        },
+        Command::Persist(k) => match response {
+            Value::Integer(1) => Some(resp_push(&[b"PERSIST", k.as_bytes()])),
+            _ => None,
+        },
+        Command::FlushDb => Some(resp_push(&[b"FLUSHDB"])),
+        Command::Rename(src, dst) => match response {
+            Value::Error(_) => None,
+            _ => Some(resp_push(&[b"RENAME", src.as_bytes(), dst.as_bytes()])),
+        },
+
+        // ── Hash ─────────────────────────────────────────────────────────────
+        Command::HSet(k, pairs) => {
+            let mut parts: Vec<Vec<u8>> = vec![b"HSET".to_vec(), k.as_bytes().to_vec()];
+            for (f, v) in pairs {
+                parts.push(f.as_bytes().to_vec());
+                parts.push(v.clone());
+            }
+            let refs: Vec<&[u8]> = parts.iter().map(|s| s.as_slice()).collect();
+            Some(resp_push(&refs))
+        }
+        Command::HDel(k, fields) => match response {
+            Value::Integer(n) if *n > 0 => {
+                let mut parts: Vec<&[u8]> = vec![b"HDEL", k.as_bytes()];
+                let field_refs: Vec<&[u8]> = fields.iter().map(|s| s.as_bytes()).collect();
+                parts.extend_from_slice(&field_refs);
+                Some(resp_push(&parts))
+            }
+            _ => None,
+        },
+        Command::HIncrBy(k, f, _) => match response {
+            Value::Integer(n) => {
+                let s = n.to_string();
+                Some(resp_push(&[
+                    b"HSET",
+                    k.as_bytes(),
+                    f.as_bytes(),
+                    s.as_bytes(),
+                ]))
+            }
+            _ => None,
+        },
+        Command::HIncrByFloat(k, f, _) => match response {
+            Value::BulkString(Some(data)) => {
+                let s = String::from_utf8_lossy(data);
+                Some(resp_push(&[
+                    b"HSET",
+                    k.as_bytes(),
+                    f.as_bytes(),
+                    s.as_bytes(),
+                ]))
+            }
+            _ => None,
+        },
+        Command::HSetNx(k, f, v) => match response {
+            Value::Integer(1) => Some(resp_push(&[
+                b"HSET",
+                k.as_bytes(),
+                f.as_bytes(),
+                v.as_slice(),
+            ])),
+            _ => None,
+        },
+
+        // ── List ─────────────────────────────────────────────────────────────
+        Command::LPush(k, vals) | Command::RPush(k, vals) => {
+            let cmd_name = if matches!(cmd, Command::LPush(_, _)) {
+                "LPUSH"
+            } else {
+                "RPUSH"
+            };
+            let mut parts: Vec<&[u8]> = vec![cmd_name.as_bytes(), k.as_bytes()];
+            let val_refs: Vec<&[u8]> = vals.iter().map(|v| v.as_slice()).collect();
+            parts.extend_from_slice(&val_refs);
+            Some(resp_push(&parts))
+        }
+        Command::LPushX(k, vals) | Command::RPushX(k, vals) => match response {
+            Value::Integer(n) if *n > 0 => {
+                let cmd_name = if matches!(cmd, Command::LPushX(_, _)) {
+                    "LPUSH"
+                } else {
+                    "RPUSH"
+                };
+                let mut parts: Vec<&[u8]> = vec![cmd_name.as_bytes(), k.as_bytes()];
+                let val_refs: Vec<&[u8]> = vals.iter().map(|v| v.as_slice()).collect();
+                parts.extend_from_slice(&val_refs);
+                Some(resp_push(&parts))
+            }
+            _ => None,
+        },
+        Command::LPop(k, count) => match response {
+            Value::BulkString(None) => None,
+            Value::Array(Some(items)) if items.is_empty() => None,
+            _ => {
+                let n = count.map(|c| c.to_string());
+                match &n {
+                    Some(ns) => Some(resp_push(&[b"LPOP", k.as_bytes(), ns.as_bytes()])),
+                    None => Some(resp_push(&[b"LPOP", k.as_bytes()])),
+                }
+            }
+        },
+        Command::RPop(k, count) => match response {
+            Value::BulkString(None) => None,
+            Value::Array(Some(items)) if items.is_empty() => None,
+            _ => {
+                let n = count.map(|c| c.to_string());
+                match &n {
+                    Some(ns) => Some(resp_push(&[b"RPOP", k.as_bytes(), ns.as_bytes()])),
+                    None => Some(resp_push(&[b"RPOP", k.as_bytes()])),
+                }
+            }
+        },
+        Command::LSet(k, idx, v) => match response {
+            Value::SimpleString(_) => {
+                let idx_s = idx.to_string();
+                Some(resp_push(&[
+                    b"LSET",
+                    k.as_bytes(),
+                    idx_s.as_bytes(),
+                    v.as_slice(),
+                ]))
+            }
+            _ => None,
+        },
+        Command::LRem(k, count, elem) => match response {
+            Value::Integer(n) if *n > 0 => {
+                let count_s = count.to_string();
+                Some(resp_push(&[
+                    b"LREM",
+                    k.as_bytes(),
+                    count_s.as_bytes(),
+                    elem.as_slice(),
+                ]))
+            }
+            _ => None,
+        },
+        Command::LTrim(k, start, stop) => {
+            let start_s = start.to_string();
+            let stop_s = stop.to_string();
+            Some(resp_push(&[
+                b"LTRIM",
+                k.as_bytes(),
+                start_s.as_bytes(),
+                stop_s.as_bytes(),
+            ]))
+        }
+
+        // ── Set ───────────────────────────────────────────────────────────────
+        Command::SAdd(k, members) => match response {
+            Value::Integer(n) if *n > 0 => {
+                let mut parts: Vec<&[u8]> = vec![b"SADD", k.as_bytes()];
+                let m_refs: Vec<&[u8]> = members.iter().map(|s| s.as_bytes()).collect();
+                parts.extend_from_slice(&m_refs);
+                Some(resp_push(&parts))
+            }
+            _ => None,
+        },
+        Command::SRem(k, members) => match response {
+            Value::Integer(n) if *n > 0 => {
+                let mut parts: Vec<&[u8]> = vec![b"SREM", k.as_bytes()];
+                let m_refs: Vec<&[u8]> = members.iter().map(|s| s.as_bytes()).collect();
+                parts.extend_from_slice(&m_refs);
+                Some(resp_push(&parts))
+            }
+            _ => None,
+        },
+        Command::SPop(k, count) => {
+            let popped: Vec<String> = match response {
+                Value::BulkString(Some(data)) => {
+                    vec![String::from_utf8_lossy(data).into_owned()]
+                }
+                Value::Array(Some(items)) => items
+                    .iter()
+                    .filter_map(|v| {
+                        if let Value::BulkString(Some(d)) = v {
+                            Some(String::from_utf8_lossy(d).into_owned())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+                _ => vec![],
+            };
+            if popped.is_empty() {
+                let _ = count;
+                None
+            } else {
+                let mut parts: Vec<&[u8]> = vec![b"SREM", k.as_bytes()];
+                let m_refs: Vec<&[u8]> = popped.iter().map(|s| s.as_bytes()).collect();
+                parts.extend_from_slice(&m_refs);
+                Some(resp_push(&parts))
+            }
+        }
+        Command::SMove(src, dst, member) => match response {
+            Value::Integer(1) => Some(resp_push(&[
+                b"SMOVE",
+                src.as_bytes(),
+                dst.as_bytes(),
+                member.as_bytes(),
+            ])),
+            _ => None,
+        },
+        Command::SInterStore(dst, keys) => {
+            let mut parts: Vec<&[u8]> = vec![b"SINTERSTORE", dst.as_bytes()];
+            let k_refs: Vec<&[u8]> = keys.iter().map(|s| s.as_bytes()).collect();
+            parts.extend_from_slice(&k_refs);
+            Some(resp_push(&parts))
+        }
+        Command::SUnionStore(dst, keys) => {
+            let mut parts: Vec<&[u8]> = vec![b"SUNIONSTORE", dst.as_bytes()];
+            let k_refs: Vec<&[u8]> = keys.iter().map(|s| s.as_bytes()).collect();
+            parts.extend_from_slice(&k_refs);
+            Some(resp_push(&parts))
+        }
+        Command::SDiffStore(dst, keys) => {
+            let mut parts: Vec<&[u8]> = vec![b"SDIFFSTORE", dst.as_bytes()];
+            let k_refs: Vec<&[u8]> = keys.iter().map(|s| s.as_bytes()).collect();
+            parts.extend_from_slice(&k_refs);
+            Some(resp_push(&parts))
+        }
+
+        // ── Sorted Set ────────────────────────────────────────────────────────
+        Command::ZAdd(k, opts, pairs) => {
+            let mut parts: Vec<String> = vec!["ZADD".into(), k.clone()];
+            if let Some(cond) = &opts.condition {
+                parts.push(match cond {
+                    ZAddCondition::Nx => "NX".into(),
+                    ZAddCondition::Xx => "XX".into(),
+                });
+            }
+            if opts.ch {
+                parts.push("CH".into());
+            }
+            if opts.incr {
+                parts.push("INCR".into());
+            }
+            for (score, member) in pairs {
+                parts.push(format_f64_score(*score));
+                parts.push(member.clone());
+            }
+            let refs: Vec<&[u8]> = parts.iter().map(|s| s.as_bytes()).collect();
+            Some(resp_push(&refs))
+        }
+        Command::ZRem(k, members) => match response {
+            Value::Integer(n) if *n > 0 => {
+                let mut parts: Vec<&[u8]> = vec![b"ZREM", k.as_bytes()];
+                let m_refs: Vec<&[u8]> = members.iter().map(|s| s.as_bytes()).collect();
+                parts.extend_from_slice(&m_refs);
+                Some(resp_push(&parts))
+            }
+            _ => None,
+        },
+        Command::ZIncrBy(k, delta, member) => {
+            let delta_s = format_f64_score(*delta);
+            Some(resp_push(&[
+                b"ZINCRBY",
+                k.as_bytes(),
+                delta_s.as_bytes(),
+                member.as_bytes(),
+            ]))
+        }
+
+        // ── JSON ─────────────────────────────────────────────────────────────
+        // Replayable as-is on replicas, AOF, and browser stores. Only
+        // successful writes replicate (errors reply -ERR, not +OK).
+        Command::JSet(k, path, value) => match response {
+            Value::SimpleString(_) => Some(resp_push(&[
+                b"JSET",
+                k.as_bytes(),
+                path.as_bytes(),
+                value.as_bytes(),
+            ])),
+            _ => None,
+        },
+        Command::JMerge(k, patch) => match response {
+            Value::SimpleString(_) => Some(resp_push(&[b"JMERGE", k.as_bytes(), patch.as_bytes()])),
+            _ => None,
+        },
+
+        // ── Rate limiting ────────────────────────────────────────────────────
+        // RLSET replicates so limiter *config* survives AOF replay / reaches
+        // replicas. RLCHECK is deliberately not replicated: attempt state is
+        // transient and high-frequency — streaming every check would flood the
+        // AOF and the sync fan-out for state that expires within one window.
+        Command::RlSet(k, limit, window_secs) => {
+            let limit_s = limit.to_string();
+            let window_s = window_secs.to_string();
+            Some(resp_push(&[
+                b"RLSET",
+                k.as_bytes(),
+                limit_s.as_bytes(),
+                window_s.as_bytes(),
+            ]))
+        }
+
+        // Pub/Sub and transactions carry no store state — no broadcast needed.
+        _ => None,
+    }
+}
+
+pub(crate) fn format_f64_score(s: f64) -> String {
+    if s == f64::INFINITY {
+        "inf".into()
+    } else if s == f64::NEG_INFINITY {
+        "-inf".into()
+    } else if s.fract() == 0.0 && s.abs() < 1e15 {
+        format!("{}", s as i64)
+    } else {
+        format!("{}", s)
+    }
+}
+
+/// `broadcast_for` emits one buffer that the AOF, the replication log and the
+/// browser sync fan-out all consume. It used to propagate *relative* TTLs
+/// (`PX 5000`), so each consumer re-based the deadline onto its own clock at its
+/// own arrival time and a key's lifetime silently restarted on every hop — most
+/// visibly at AOF replay, where a long-dead key came back with a full fresh TTL.
+///
+/// These tests pin the replacement contract: relative in, absolute out.
+#[cfg(test)]
+mod expiry_propagation_tests {
+    use super::*;
+    use core_engine::cmd::SetOptions;
+    use core_engine::store::KeyValueStore;
+
+    fn tmp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("recached_test_{name}_{}", std::process::id()))
+    }
+
+    /// Decode a broadcast frame into its argument strings.
+    fn parts(frame: &[u8]) -> Vec<String> {
+        let (v, n) = Value::parse(frame).expect("frame must parse");
+        assert_eq!(n, frame.len(), "frame must be exactly one value");
+        let items = match v {
+            Value::Push(items) | Value::Array(Some(items)) => items,
+            other => panic!("expected an aggregate, got {other:?}"),
+        };
+        items
+            .into_iter()
+            .map(|i| match i {
+                Value::BulkString(Some(b)) => String::from_utf8_lossy(&b).into_owned(),
+                other => panic!("expected a bulk string, got {other:?}"),
+            })
+            .collect()
+    }
+
+    fn frame_of(cmd: &Command, now_ms: u64) -> Vec<String> {
+        let f = broadcast_for(cmd, &Value::SimpleString("OK".into()), now_ms)
+            .expect("command must propagate");
+        parts(&f)
+    }
+
+    const NOW: u64 = 1_700_000_000_000;
+
+    #[test]
+    fn relative_set_expiries_propagate_as_an_absolute_deadline() {
+        let set = |exp| {
+            Command::Set(
+                "k".into(),
+                "v".into(),
+                SetOptions {
+                    expiry: Some(exp),
+                    ..Default::default()
+                },
+            )
+        };
+        // EX seconds and PX milliseconds both land on the same instant.
+        for (cmd, want) in [
+            (set(SetExpiry::Ex(5)), NOW + 5_000),
+            (set(SetExpiry::Px(1_500)), NOW + 1_500),
+            (Command::SetEx("k".into(), 5, "v".into()), NOW + 5_000),
+            (Command::PSetEx("k".into(), 1_500, "v".into()), NOW + 1_500),
+        ] {
+            let p = frame_of(&cmd, NOW);
+            assert_eq!(p[0], "SET", "{p:?}");
+            assert_eq!(
+                p[3], "PXAT",
+                "a relative TTL must not reach the log as PX: {p:?}"
+            );
+            assert_eq!(p[4], want.to_string(), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn relative_expire_commands_propagate_as_an_absolute_deadline() {
+        for (cmd, want) in [
+            (Command::Expire("k".into(), 30), NOW + 30_000),
+            (Command::PExpire("k".into(), 250), NOW + 250),
+        ] {
+            let f = broadcast_for(&cmd, &Value::Integer(1), NOW).expect("must propagate");
+            let p = parts(&f);
+            assert_eq!(p[0], "PEXPIREAT", "{p:?}");
+            assert_eq!(p[2], want.to_string(), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn absolute_expiries_are_still_passed_through_unchanged() {
+        // These arms were already correct; the rewrite must not double-convert
+        // them by adding `now` to a stamp that is already absolute.
+        let set = |exp| {
+            Command::Set(
+                "k".into(),
+                "v".into(),
+                SetOptions {
+                    expiry: Some(exp),
+                    ..Default::default()
+                },
+            )
+        };
+        let p = frame_of(&set(SetExpiry::Pxat(999)), NOW);
+        assert_eq!((p[3].as_str(), p[4].as_str()), ("PXAT", "999"), "{p:?}");
+        let p = frame_of(&set(SetExpiry::Exat(999)), NOW);
+        assert_eq!((p[3].as_str(), p[4].as_str()), ("PXAT", "999000"), "{p:?}");
+
+        let f = broadcast_for(
+            &Command::PExpireAt("k".into(), 999),
+            &Value::Integer(1),
+            NOW,
+        )
+        .expect("must propagate");
+        assert_eq!(parts(&f)[2], "999");
+        let f = broadcast_for(&Command::ExpireAt("k".into(), 999), &Value::Integer(1), NOW)
+            .expect("must propagate");
+        assert_eq!(parts(&f)[2], "999000");
+    }
+
+    #[test]
+    fn a_write_without_an_expiry_still_carries_none() {
+        // A plain SET clears any TTL, and KEEPTTL defers to whatever the
+        // receiving store already holds — neither may gain a deadline.
+        let p = frame_of(
+            &Command::Set("k".into(), "v".into(), SetOptions::default()),
+            NOW,
+        );
+        assert_eq!(p, vec!["SET", "k", "v"], "{p:?}");
+
+        let p = frame_of(
+            &Command::Set(
+                "k".into(),
+                "v".into(),
+                SetOptions {
+                    expiry: Some(SetExpiry::KeepTtl),
+                    ..Default::default()
+                },
+            ),
+            NOW,
+        );
+        assert_eq!(p, vec!["SET", "k", "v", "KEEPTTL"], "{p:?}");
+    }
+
+    #[test]
+    fn the_propagated_frame_is_a_command_the_replay_path_can_parse() {
+        // The frame is fed straight back through `Command::from_value` on AOF
+        // replay and on replicas, so an encoding no parser accepts would be a
+        // silent data-loss bug rather than a compile error.
+        for cmd in [
+            Command::Set(
+                "k".into(),
+                "v".into(),
+                SetOptions {
+                    expiry: Some(SetExpiry::Ex(5)),
+                    ..Default::default()
+                },
+            ),
+            Command::SetEx("k".into(), 5, "v".into()),
+            Command::PSetEx("k".into(), 5_000, "v".into()),
+        ] {
+            let f = broadcast_for(&cmd, &Value::SimpleString("OK".into()), NOW).unwrap();
+            let (v, _) = Value::parse(&f).unwrap();
+            let arr = match v {
+                Value::Push(i) | Value::Array(Some(i)) => Value::Array(Some(i)),
+                other => panic!("unexpected {other:?}"),
+            };
+            let parsed = Command::from_value(arr).expect("replay must parse the frame");
+            assert!(
+                matches!(&parsed, Command::Set(_, _, o) if matches!(o.expiry, Some(SetExpiry::Pxat(_)))),
+                "replayed command lost its absolute deadline: {parsed:?}"
+            );
+        }
+
+        let f = broadcast_for(&Command::Expire("k".into(), 5), &Value::Integer(1), NOW).unwrap();
+        let (v, _) = Value::parse(&f).unwrap();
+        let arr = match v {
+            Value::Push(i) => Value::Array(Some(i)),
+            other => panic!("unexpected {other:?}"),
+        };
+        assert!(matches!(
+            Command::from_value(arr).unwrap(),
+            Command::PExpireAt(_, _)
+        ));
+    }
+
+    /// The property the whole change exists for: the deadline is a point in
+    /// time, so *when* the frame is applied cannot change *when* it expires.
+    #[test]
+    fn replaying_the_same_write_later_does_not_extend_the_key() {
+        let cmd = Command::SetEx("k".into(), 60, "v".into());
+        let frame = broadcast_for(&cmd, &Value::SimpleString("OK".into()), NOW).unwrap();
+
+        // Same write, propagated a full hour later, is a *different* deadline —
+        // but any single frame carries exactly one, whenever it is applied.
+        let later =
+            broadcast_for(&cmd, &Value::SimpleString("OK".into()), NOW + 3_600_000).unwrap();
+        assert_ne!(frame, later);
+        assert_eq!(parts(&frame)[4], (NOW + 60_000).to_string());
+        assert_eq!(parts(&later)[4], (NOW + 3_600_000 + 60_000).to_string());
+    }
+
+    /// The bug, end to end through the real AOF path: a key whose deadline has
+    /// already passed must stay dead when the log is replayed.
+    #[tokio::test]
+    async fn an_expired_key_is_not_resurrected_by_aof_replay() {
+        let path = tmp_path("expiry_replay.aof");
+        let _ = tokio::fs::remove_file(&path).await;
+        let aof = AofWriter::open(path.clone(), AofSync::No).await.unwrap();
+
+        // A write whose 5-second TTL elapsed long ago — the shape of any
+        // short-lived key written before a restart that outlasted it.
+        let long_ago = now_unix_ms() - 3_600_000;
+        let frame = broadcast_for(
+            &Command::SetEx("session:revoked".into(), 5, "tok".into()),
+            &Value::SimpleString("OK".into()),
+            long_ago,
+        )
+        .unwrap();
+        aof.append(&frame).await;
+        // A live key, to prove replay still works at all.
+        let live = broadcast_for(
+            &Command::SetEx("session:live".into(), 600, "tok".into()),
+            &Value::SimpleString("OK".into()),
+            now_unix_ms(),
+        )
+        .unwrap();
+        aof.append(&live).await;
+        aof.flush().await;
+
+        let store = KeyValueStore::new();
+        assert_eq!(replay_aof(&store, &path).await, 2);
+
+        assert_eq!(
+            store.execute(Command::Get("session:revoked".into())),
+            Value::BulkString(None),
+            "a key dead for an hour was resurrected by replay"
+        );
+        assert_eq!(
+            store.execute(Command::Exists(vec!["session:revoked".into()])),
+            Value::Integer(0)
+        );
+        assert_eq!(
+            store.execute(Command::Ttl("session:revoked".into())),
+            Value::Integer(-2)
+        );
+        // ...while the key that had not expired survives with its remaining TTL.
+        assert_eq!(
+            store.execute(Command::Get("session:live".into())),
+            Value::BulkString(Some(b"tok".to_vec()))
+        );
+        assert!(
+            matches!(
+                store.execute(Command::Ttl("session:live".into())),
+                Value::Integer(n) if (0..=600).contains(&n)
+            ),
+            "a live key must keep its original deadline, not gain a fresh one"
+        );
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// EXPIRE has the same shape as SET..EX and the same failure mode.
+    #[tokio::test]
+    async fn an_elapsed_expire_does_not_extend_the_key_on_replay() {
+        let path = tmp_path("expiry_replay_expire.aof");
+        let _ = tokio::fs::remove_file(&path).await;
+        let aof = AofWriter::open(path.clone(), AofSync::No).await.unwrap();
+
+        aof.append(b">3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
+            .await;
+        let long_ago = now_unix_ms() - 3_600_000;
+        let frame = broadcast_for(
+            &Command::Expire("k".into(), 30),
+            &Value::Integer(1),
+            long_ago,
+        )
+        .unwrap();
+        aof.append(&frame).await;
+        aof.flush().await;
+
+        let store = KeyValueStore::new();
+        replay_aof(&store, &path).await;
+        assert_eq!(
+            store.execute(Command::Get("k".into())),
+            Value::BulkString(None),
+            "an EXPIRE that elapsed before the restart was re-armed by replay"
+        );
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+}
+
+// ── Transaction abort ─────────────────────────────────────────────────────────
+
+/// Counters propagate by value, but must not clear the key's deadline.
+///
+/// `INCR` is replicated as `SET key <new value>` so a replica that missed a
+/// frame converges on the primary's number rather than compounding its own —
+/// but a bare `SET` also clears the TTL, and Redis's `INCR` leaves it alone.
+/// The single most common expiring-counter idiom, `INCR key` + `EXPIRE key
+/// window`, therefore replayed as a key with *no* expiry: the rate-limit
+/// bucket, the per-minute quota and the retry counter all became permanent on
+/// the replica, in the AOF and in every synced browser, and the window never
+/// reset because the key it keyed on never went away.
+#[cfg(test)]
+mod counter_ttl_propagation_tests {
+    use super::*;
+    use core_engine::cmd::{SetExpiry, SetOptions};
+    use core_engine::store::KeyValueStore;
+
+    fn tmp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("recached_test_{name}_{}", std::process::id()))
+    }
+
+    fn frame_args(cmd: &Command, response: &Value) -> Vec<String> {
+        let f = broadcast_for(cmd, response, 0).expect("counter must propagate");
+        let (v, _) = Value::parse(&f).unwrap();
+        let items = match v {
+            Value::Push(i) | Value::Array(Some(i)) => i,
+            other => panic!("unexpected {other:?}"),
+        };
+        items
+            .into_iter()
+            .map(|i| match i {
+                Value::BulkString(Some(b)) => String::from_utf8_lossy(&b).into_owned(),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_counter_propagates_with_keepttl() {
+        for cmd in [
+            Command::Incr("c".into()),
+            Command::Decr("c".into()),
+            Command::IncrBy("c".into(), 5),
+            Command::DecrBy("c".into(), 5),
+        ] {
+            let args = frame_args(&cmd, &Value::Integer(7));
+            assert_eq!(
+                args,
+                vec!["SET", "c", "7", "KEEPTTL"],
+                "{} must not clear the key's deadline",
+                command_name(&cmd)
+            );
+        }
+    }
+
+    #[test]
+    fn a_counter_that_did_not_run_still_propagates_nothing() {
+        // INCR on a non-numeric value errors and changes nothing; replaying a
+        // SET for it would invent a value the primary never stored.
+        assert!(
+            broadcast_for(
+                &Command::Incr("c".into()),
+                &Value::Error("ERR not an integer".into()),
+                0
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn getset_still_clears_the_ttl() {
+        // GETSET *does* clear the TTL in Redis, so it must keep propagating a
+        // bare SET — the KEEPTTL change applies to counters only.
+        let args = frame_args(
+            &Command::GetSet("k".into(), "v".into()),
+            &Value::BulkString(None),
+        );
+        assert_eq!(args, vec!["SET", "k", "v"]);
+    }
+
+    /// The behaviour, through the real replay path: `INCR` + `EXPIRE` survives
+    /// a restart still holding its deadline.
+    #[tokio::test]
+    async fn an_expiring_counter_keeps_its_deadline_across_aof_replay() {
+        let path = tmp_path("counter_ttl.aof");
+        let _ = tokio::fs::remove_file(&path).await;
+        let aof = AofWriter::open(path.clone(), AofSync::No).await.unwrap();
+
+        // The rate-limiter idiom: create with a window, then count into it.
+        let now = now_unix_ms();
+        for frame in [
+            broadcast_for(
+                &Command::Set(
+                    "rate:user:42".into(),
+                    "1".into(),
+                    SetOptions {
+                        expiry: Some(SetExpiry::Ex(60)),
+                        ..Default::default()
+                    },
+                ),
+                &Value::SimpleString("OK".into()),
+                now,
+            ),
+            broadcast_for(
+                &Command::Incr("rate:user:42".into()),
+                &Value::Integer(2),
+                now,
+            ),
+            broadcast_for(
+                &Command::Incr("rate:user:42".into()),
+                &Value::Integer(3),
+                now,
+            ),
+        ] {
+            aof.append(&frame.unwrap()).await;
+        }
+        aof.flush().await;
+
+        let store = KeyValueStore::new();
+        replay_aof(&store, &path).await;
+
+        assert_eq!(
+            store.execute(Command::Get("rate:user:42".into())),
+            Value::BulkString(Some(b"3".to_vec())),
+            "the counter must converge on the primary's value"
+        );
+        match store.execute(Command::Ttl("rate:user:42".into())) {
+            Value::Integer(n) => assert!(
+                (1..=60).contains(&n),
+                "the rate-limit window was lost on replay — TTL is {n}, so the \
+                 bucket would never reset"
+            ),
+            other => panic!("expected an integer, got {other:?}"),
+        }
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+}
+
+// ── Port configuration ────────────────────────────────────────────────────────

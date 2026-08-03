@@ -59,7 +59,7 @@ jobs:
       # functions (scope classification, wire encoding, config parsing), not to
       # chase a number the I/O layer cannot reach.
       - name: Enforce server-native coverage floor (65%)
-        run: cargo llvm-cov -p server-native --summary-only --fail-under-lines 65 -- --include-ignored
+        run: cargo llvm-cov -p recached --summary-only --fail-under-lines 65 -- --include-ignored
 
   # ---------------------------------------------------------------------------
   # Browser tests — the IndexedDB persistence layer and the engine's behaviour
@@ -119,7 +119,7 @@ jobs:
           shared-key: "recached-ci-cache"
 
       - name: Run load & chaos tests
-        run: cargo test -p server-native -- --include-ignored
+        run: cargo test -p recached -- --include-ignored
         timeout-minutes: 5
 
   typecheck-js:

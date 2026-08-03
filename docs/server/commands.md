@@ -14,6 +14,8 @@ Recached implements the subset of RESP commands that most applications use. Comm
 | `CLIENT <subcommand>` | Connection introspection. See [CLIENT](#client) below. |
 | `CONFIG GET parameter [parameter ...]` | Reports configuration parameters, matched by glob. See [CONFIG](#config) below. |
 | `COMMAND [COUNT\|LIST\|INFO\|DOCS]` | Reports the command catalog. See [COMMAND](#command) below. |
+| `CLUSTER <subcommand>` | Refused: Recached is standalone. The flag is in `INFO`. See [CLUSTER and MODULE](#cluster-and-module) below. |
+| `MODULE LIST` | An empty array — there is no module API. See [CLUSTER and MODULE](#cluster-and-module) below. |
 
 ---
 
@@ -65,6 +67,30 @@ Recached has no ACL system and no subcommand tree, so the ACL-categories, tips, 
 
 ---
 
+## CLUSTER and MODULE
+
+Recached is a single node with no module API. Both facts are reported the way Redis reports them, which for one of the two is not the obvious way.
+
+| Command | Description |
+|---|---|
+| `CLUSTER <any subcommand>` | Refused with `ERR This instance has cluster support disabled`. |
+| `MODULE LIST` | An empty array. |
+| `MODULE LOAD \| LOADEX \| UNLOAD` | Refused. |
+
+**Cluster support is advertised through `INFO`, not through `CLUSTER`.** A `redis-server` that was not started in cluster mode rejects the entire `CLUSTER` container with that exact sentence — it does *not* answer `CLUSTER INFO` with `cluster_enabled:0`, which is a common assumption and a wrong one. The flag lives in `INFO`'s `# Cluster` section, which is where every cluster-aware client actually reads it. Recached now emits that section, in the default set, so a bare `INFO` carries it:
+
+```bash
+redis-cli -p 6379 INFO cluster
+# Cluster
+cluster_enabled:0
+```
+
+Copying Redis's refusal verbatim matters more than it looks. Recached previously answered `ERR unknown command`, and that is the one reply a client cannot interpret: "unknown command" reads as *this server is too old to ask*, which is a different branch from *this server is not a cluster*. The sentence above puts a client on the same path it takes against the server it was written for.
+
+`MODULE LIST` returning an empty array is not a workaround — it is the same answer a stock `redis-server` with no modules loaded gives, and it lets a tool distinguish "no modules" from "cannot ask". `LOAD` and `UNLOAD` are refused rather than answered `+OK`, because an operator who believes a module loaded has a harder problem to debug than one who was told no.
+
+---
+
 ## INFO
 
 `INFO` reports the server's own state — uptime, client counts, memory, replication topology — in the same line format Redis uses, so `redis-cli info`, monitoring agents, and client library ready-checks all parse it unmodified.
@@ -85,6 +111,7 @@ redis-cli -p 6379 INFO server memory
 | `persistence` | `loading`, `rdb_changes_since_last_save`, `rdb_last_save_time`, `rdb_bgsave_in_progress`, `aof_enabled` |
 | `stats` | `total_connections_received`, `total_commands_processed`, `keyspace_hits`, `keyspace_misses`, `evicted_keys` |
 | `replication` | `role`, `connected_slaves`, `connected_replicas`, `recached_replication_queue_depth`, `recached_replication_lag_frames` |
+| `cluster` | `cluster_enabled:0` — always, see [CLUSTER and MODULE](#cluster-and-module) |
 | `keyspace` | `db0:keys=N,expires=N,avg_ttl=0` — omitted entirely when the keyspace is empty, as in Redis |
 | `recached` | `live_queries`, `watched_keys` — Recached-specific, no Redis equivalent |
 
@@ -101,7 +128,9 @@ redis-cli -p 6379 INFO server memory
 
 ### Not implemented
 
-`INFO` does not report the `cpu`, `commandstats`, `latencystats`, `cluster`, or `errorstats` sections. Per-command counters, error counts, and latency histograms are exported to [Prometheus](/server/operations#metrics-endpoint) on port 9091 instead, which is where they belong for dashboards and alerting. `INFO` is for the operator at a terminal and for client ready-checks.
+`INFO` does not report the `cpu`, `commandstats`, `latencystats`, or `errorstats` sections. Per-command call counts and error counts are exported to [Prometheus](/server/operations#metrics-endpoint) on port 9091 instead, which is where they belong for dashboards and alerting. `INFO` is for the operator at a terminal and for client ready-checks.
+
+**Recached does not measure command latency anywhere** — not in `INFO`, and not on the metrics endpoint. `recached_commands_total` counts calls, `recached_command_errors_total` counts failures, and neither says how long anything took. So there is currently no way to see a slow command, which matters most for the commands that clone a whole collection under a shard guard: prefer the bounded reads (`HSCAN`, `SSCAN`, `ZSCAN`, `GETRANGE`) over `HGETALL` and `SMEMBERS` on large keys rather than expecting to catch the problem after the fact. Latency histograms and `SLOWLOG` are not implemented.
 
 ### Access
 
@@ -161,6 +190,24 @@ The most common data type. Values are always stored as byte strings; numeric ope
 | `SCAN cursor [MATCH pattern] [COUNT count]` | Iterates keys incrementally, returning at most `COUNT` keys per call (default 10) plus the next cursor. Start with cursor `0` and continue until the returned cursor is `0`. `MATCH` filters results by glob pattern. As in Redis, keys inserted or deleted mid-iteration may be missed or returned twice. |
 | `DBSIZE` | Returns the total number of keys in the store. |
 | `FLUSHDB [ASYNC]` | Removes all keys from the store. `ASYNC` is accepted but does not change behavior (the flush is always synchronous). |
+| `MEMORY USAGE key [SAMPLES count]` | Approximate bytes held by one key — the key name, its value, and a fixed per-entry overhead. Returns nil when the key does not exist or has expired. `SAMPLES` is accepted and ignored. |
+
+### MEMORY USAGE
+
+The figure is the same one the eviction loop bills the key for, not a second estimate written alongside it. That is the point: "which key is eating my `maxmemory`" and "which key gets evicted next" are answered from one measurement, so they cannot disagree.
+
+```bash
+redis-cli -p 6379 MEMORY USAGE session:8f21
+(integer) 4162
+```
+
+It counts the bytes Recached stores — key name, value contents, and 64 bytes of per-entry overhead — not the allocator's true footprint, which Recached does not manage and cannot see. Treat it as a way to compare keys against each other and to find the fat one, not as an exact resident-set contribution.
+
+Redis's `SAMPLES` bounds how much of a nested value it walks before extrapolating. Recached always walks all of it, so the option parses (a client that sends it is not broken) and the count is discarded. The reply is never less accurate than what was asked for.
+
+The other `MEMORY` subcommands — `DOCTOR`, `STATS`, `PURGE`, `MALLOC-STATS` — are refused. They describe an allocator arena that Recached has no equivalent of: it holds Rust values in a concurrent map and has nothing to defragment or free on demand. `INFO memory` reports what it can actually measure.
+
+`MEMORY USAGE` reads a key, so it is scoped like one: a WebSocket connection granted `cart:*` may measure `cart:42` and not `session:8f21`. See [Sync Scoping](/server/sync-scopes).
 
 ---
 
@@ -456,6 +503,15 @@ Pub/Sub works over both TCP (port 6379) and WebSocket (port 6380).
 | `PSUBSCRIBE pattern [pattern ...]` | Subscribes to channels matching a glob pattern. `*` matches any sequence of bytes, `?` matches exactly one byte. **Character classes (`[abc]`) are not supported** — brackets match literally. Patterns are capped at 1,024 bytes. |
 | `PUNSUBSCRIBE [pattern ...]` | Unsubscribes from pattern subscriptions. With no arguments, unsubscribes from all patterns. |
 | `PUBLISH channel message` | Publishes a message to all subscribers of the given channel and all clients with matching pattern subscriptions. Returns the number of clients that received the message. |
+| `PUBSUB CHANNELS [pattern]` | Channels with at least one subscriber. Without a pattern, all of them; with one, those whose name matches. Pattern subscriptions are never listed here — nobody is subscribed to a channel named `news.*`. |
+| `PUBSUB NUMSUB [channel ...]` | Flat `[channel, count, channel, count, ...]`. A channel with no subscribers reports `0` rather than being dropped, so the reply can be read by position against the channels you asked about. Pattern subscribers are not counted; that is `NUMPAT`'s job. |
+| `PUBSUB NUMPAT` | The number of **distinct** patterns under subscription. Two clients on `news.*` are one pattern, not two. |
+
+`PUBSUB` answers from the live subscriber registry, so it sees exactly what `PUBLISH` would deliver to. A channel disappears from `CHANNELS` when its last subscriber leaves — there is no lingering empty channel, because a channel is nothing more than its subscribers.
+
+`PUBSUB SHARDCHANNELS` and `PUBSUB SHARDNUMSUB` are refused. This is the one place these commands deliberately diverge from Redis, which answers both with an empty array even in standalone mode. It can afford to: `SSUBSCRIBE` and `SPUBLISH` work there, so an empty array honestly means "no shard channels are subscribed yet". Recached implements neither, so the same empty array would invite a client to call `SSUBSCRIBE` and fail. An error says what is true — the question does not apply here.
+
+`PUBSUB` enumerates what every other connection is subscribed to, so it is treated as an admin command and rejected on scope-limited WebSocket connections — the same line `KEYS` sits on. A scoped connection can still `SUBSCRIBE` and `PUBLISH` freely; channels are outside the scope system. Naming a channel and listing them all are different powers.
 
 ### Example
 

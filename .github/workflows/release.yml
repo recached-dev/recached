@@ -116,13 +116,13 @@ jobs:
           shared-key: "recached-release-${{ matrix.target }}"
 
       - name: Build release binary
-        run: cargo build --release --package server-native --target ${{ matrix.target }}
+        run: cargo build --release --package recached --target ${{ matrix.target }}
 
       - name: Upload binary to GitHub Release
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: target/${{ matrix.target }}/release/server-native${{ matrix.binary_suffix || '' }}
+          file: target/${{ matrix.target }}/release/recached-server${{ matrix.binary_suffix || '' }}
           asset_name: ${{ matrix.artifact }}
           tag: ${{ github.ref }}
           overwrite: true

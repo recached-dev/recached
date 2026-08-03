@@ -1508,6 +1508,18 @@ impl KeyValueStore {
             Command::CommandQuery(_) => Value::Error(
                 "ERR COMMAND is handled by the connection layer, not the store".to_string(),
             ),
+            Command::Cluster(_) => Value::Error(
+                "ERR CLUSTER is handled by the connection layer, not the store".to_string(),
+            ),
+            Command::Module(_) => Value::Error(
+                "ERR MODULE is handled by the connection layer, not the store".to_string(),
+            ),
+            Command::PubSub(_) => Value::Error(
+                "ERR PUBSUB is handled by the connection layer, not the store".to_string(),
+            ),
+            Command::Memory(_) => Value::Error(
+                "ERR MEMORY is handled by the connection layer, not the store".to_string(),
+            ),
 
             // ── Strings ───────────────────────────────────────────────────────
             Command::Set(key, val, opts) => {
@@ -1770,7 +1782,19 @@ impl KeyValueStore {
                     Some(e) if e.is_expired(now) => Value::Integer(-2),
                     Some(e) => match e.expires_at_ms {
                         None => Value::Integer(-1),
-                        Some(exp) => Value::Integer((exp.saturating_sub(now) / 1000) as i64),
+                        // Rounded to nearest, not truncated, matching Redis.
+                        // Truncating meant `SET k v EX 100` followed
+                        // immediately by `TTL k` answered 99: the handful of
+                        // microseconds spent between the two commands took the
+                        // remainder just below 100_000 ms, and `/ 1000` threw
+                        // the rest away. Every TTL read was up to a second
+                        // short, which breaks ported test suites asserting the
+                        // value they just set and makes any client that renews
+                        // at a threshold renew early, forever.
+                        Some(exp) => {
+                            let remaining_ms = exp.saturating_sub(now);
+                            Value::Integer((remaining_ms.saturating_add(500) / 1000) as i64)
+                        }
                     },
                 }
             }
@@ -1904,6 +1928,17 @@ impl KeyValueStore {
                         Value::SimpleString(e.value.type_name().to_string())
                     }
                     _ => Value::SimpleString("none".to_string()),
+                }
+            }
+            Command::MemoryUsage(key) => {
+                let now = now_ms();
+                match self.data.get(&key) {
+                    // The same figure the eviction loop bills the key for, so
+                    // "which key is eating my maxmemory" and "which key gets
+                    // evicted next" are answered from one measurement rather
+                    // than two that can disagree.
+                    Some(e) if !e.is_expired(now) => Value::Integer(entry_size(&key, &e) as i64),
+                    _ => Value::BulkString(None),
                 }
             }
 
@@ -3364,6 +3399,11 @@ fn write_cost(cmd: &Command) -> usize {
         | Command::Dedup(_, _, _)
         | Command::QSub(_)
         | Command::QUnsub(_)
+        | Command::Cluster(_)
+        | Command::Module(_)
+        | Command::PubSub(_)
+        | Command::Memory(_)
+        | Command::MemoryUsage(_)
         | Command::Save
         | Command::BgSave
         | Command::LastSave
@@ -6817,6 +6857,76 @@ mod metrics_tests {
         ));
         assert!(s.approximate_memory_bytes() >= empty + 4096);
     }
+
+    #[test]
+    fn memory_usage_reports_a_key_and_nil_for_one_that_is_not_there() {
+        let s = KeyValueStore::new();
+        // Redis answers a missing key with a nil bulk string, not zero: "no
+        // such key" and "an empty key" are different facts.
+        assert_eq!(
+            s.execute(Command::MemoryUsage("ghost".into())),
+            Value::BulkString(None)
+        );
+
+        // Equal-length key names, so the only difference the reply can reflect
+        // is the value.
+        s.execute(Command::Set("k1".into(), "x".into(), SetOptions::default()));
+        s.execute(Command::Set(
+            "k2".into(),
+            "x".repeat(4096).into(),
+            SetOptions::default(),
+        ));
+
+        let (Value::Integer(small), Value::Integer(big)) = (
+            s.execute(Command::MemoryUsage("k1".into())),
+            s.execute(Command::MemoryUsage("k2".into())),
+        ) else {
+            panic!("MEMORY USAGE should report an integer for a live key");
+        };
+        assert!(small > 0, "a stored key costs something");
+        // Exact, not "bigger": the whole point of the reply is that the number
+        // moves with the value by the amount the value grew (4096 bytes minus
+        // the one byte the small key already held).
+        assert_eq!(
+            big - small,
+            4095,
+            "the reported size must track the value: {small} vs {big}"
+        );
+    }
+
+    #[test]
+    fn memory_usage_agrees_with_what_eviction_bills_the_key() {
+        // The point of reusing `entry_size` rather than writing a second
+        // estimator: the answer to "what is this key costing me" and the number
+        // eviction acts on cannot drift apart.
+        let s = KeyValueStore::new();
+        let empty = s.approximate_memory_bytes();
+        s.execute(Command::HSet(
+            "h".into(),
+            vec![("f".into(), "y".repeat(1024).into())],
+        ));
+        let Value::Integer(reported) = s.execute(Command::MemoryUsage("h".into())) else {
+            panic!("expected an integer");
+        };
+        assert_eq!(
+            s.approximate_memory_bytes() - empty,
+            reported as usize,
+            "MEMORY USAGE must be the same measurement the eviction loop uses"
+        );
+    }
+
+    #[test]
+    fn memory_usage_treats_an_expired_key_as_absent() {
+        let s = KeyValueStore::new();
+        s.execute(Command::Set("k".into(), "v".into(), SetOptions::default()));
+        s.execute(Command::PExpire("k".into(), 1));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(
+            s.execute(Command::MemoryUsage("k".into())),
+            Value::BulkString(None),
+            "a key past its TTL is gone, and its footprint with it"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -8166,5 +8276,118 @@ mod zset_index_tests {
             restored.execute(Command::ZRange("board".into(), 0, -1, true)),
             store.execute(Command::ZRange("board".into(), 0, -1, true))
         );
+    }
+}
+
+// ── TTL rounding ──────────────────────────────────────────────────────────────
+
+/// `TTL` reports whole seconds rounded to nearest, as Redis does.
+///
+/// It used to truncate, so `SET k v EX 100` followed immediately by `TTL k`
+/// answered 99: the microseconds between the two commands took the remainder
+/// just below 100_000 ms and `/ 1000` discarded the rest. Every reading was up
+/// to a second short, which breaks a ported test suite asserting the value it
+/// just set, and makes a client that renews below a threshold renew early on
+/// every pass. `PTTL` is unaffected — it reports milliseconds and has nothing
+/// to round.
+#[cfg(test)]
+mod ttl_rounding_tests {
+    use super::*;
+    use crate::cmd::{SetExpiry, SetOptions};
+
+    fn store_with_expiry_in(ms: u64) -> KeyValueStore {
+        let s = KeyValueStore::new();
+        s.execute(Command::Set(
+            "k".into(),
+            "v".into(),
+            SetOptions {
+                expiry: Some(SetExpiry::Px(ms)),
+                ..Default::default()
+            },
+        ));
+        s
+    }
+
+    fn ttl(s: &KeyValueStore) -> i64 {
+        match s.execute(Command::Ttl("k".into())) {
+            Value::Integer(n) => n,
+            other => panic!("expected an integer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_freshly_set_ttl_reads_back_as_the_value_that_was_set() {
+        // The regression that motivated this: the number a caller just wrote
+        // must be the number they read back.
+        //
+        // The sleep is load-bearing. In-process, SET and TTL can land in the
+        // same millisecond, and with a remainder of exactly `secs * 1000` even
+        // truncation answers correctly — so without a gap this test passes
+        // against the bug it exists to catch. A single millisecond of real
+        // elapsed time is what separates the two: truncation then answers
+        // `secs - 1`, rounding still answers `secs`. Over TCP the gap is always
+        // there, which is why the bug showed up against a live server first.
+        for secs in [1u64, 10, 100, 3600] {
+            let s = KeyValueStore::new();
+            s.execute(Command::Set(
+                "k".into(),
+                "v".into(),
+                SetOptions {
+                    expiry: Some(SetExpiry::Ex(secs)),
+                    ..Default::default()
+                },
+            ));
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            assert_eq!(
+                ttl(&s),
+                secs as i64,
+                "SET k v EX {secs} then TTL k must answer {secs}"
+            );
+        }
+    }
+
+    #[test]
+    fn remainders_round_to_the_nearest_second() {
+        // 1600 ms is nearer 2 s than 1 s; 1400 ms is nearer 1 s. Truncation
+        // answered 1 for both.
+        assert_eq!(ttl(&store_with_expiry_in(1_600)), 2);
+        assert_eq!(ttl(&store_with_expiry_in(1_400)), 1);
+        // Exactly half a second rounds up, matching Redis's `(ttl + 500) / 1000`.
+        assert_eq!(ttl(&store_with_expiry_in(2_500)), 3);
+        assert_eq!(ttl(&store_with_expiry_in(600)), 1);
+    }
+
+    #[test]
+    fn a_sub_second_remainder_still_reports_a_live_key_not_zero_or_minus_two() {
+        // A key with 400 ms left is alive. Reporting -2 would say "no such key"
+        // and 0 is only correct once it is nearly gone.
+        let s = store_with_expiry_in(400);
+        assert_eq!(ttl(&s), 0, "400 ms rounds down to 0 whole seconds");
+        assert_eq!(
+            s.execute(Command::Get("k".into())),
+            Value::BulkString(Some(b"v".to_vec())),
+            "the key is still readable while TTL reports 0"
+        );
+    }
+
+    #[test]
+    fn the_sentinels_are_unchanged() {
+        let s = KeyValueStore::new();
+        assert_eq!(s.execute(Command::Ttl("ghost".into())), Value::Integer(-2));
+        s.execute(Command::Set("k".into(), "v".into(), SetOptions::default()));
+        assert_eq!(s.execute(Command::Ttl("k".into())), Value::Integer(-1));
+    }
+
+    #[test]
+    fn pttl_still_reports_exact_milliseconds() {
+        // Rounding belongs to TTL alone; PTTL must not gain a half-second bias.
+        let s = store_with_expiry_in(1_600);
+        match s.execute(Command::PTtl("k".into())) {
+            Value::Integer(ms) => assert!(
+                (1_400..=1_600).contains(&ms),
+                "PTTL should be ~1600 ms, got {ms}"
+            ),
+            other => panic!("expected an integer, got {other:?}"),
+        }
     }
 }

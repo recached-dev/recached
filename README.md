@@ -97,6 +97,9 @@ port beyond localhost, work through
 [recached.dev/server/security](https://recached.dev/server/security): a default server has no
 password, no TLS, and no restriction on which web pages may open the sync socket.
 
+`6379` and `6380` are defaults, not fixtures — set `RECACHED_PORT` and `RECACHED_WS_PORT` (plus
+`RECACHED_METRICS_PORT`) to move them, which is also what running two instances on one host takes.
+
 ---
 
 ## Benchmarks
@@ -152,11 +155,6 @@ Open an issue before large features or architectural changes. Areas where contri
 See [recached.dev/roadmap](https://recached.dev/roadmap) for what's planned.
 
 Reach out: [dennis@thinkgrid.dev](mailto:dennis@thinkgrid.dev)
-
-
-## Support Recached
-
-Recached is free and open-source, maintained by one person. If it saves you infrastructure cost or development time, [sponsoring on GitHub](https://github.com/sponsors/thinkgrid-labs) directly funds continued development: more Redis commands, RESP3, cluster support, and performance work.
 
 ## License
 
