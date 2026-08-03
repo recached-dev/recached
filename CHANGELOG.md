@@ -4,7 +4,7 @@ All notable changes to Recached are documented here.
 
 ---
 
-## [0.2.5] — Unreleased
+## [0.3.0] — 2026-08-03
 
 ### Added
 

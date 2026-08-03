@@ -18,6 +18,8 @@ The same Rust cache engine runs natively on your server (RESP on port 6379 — a
 
 > [!NOTE]
 > Recached is not a full Redis replacement. It covers the subset most applications actually need: strings, expiry, counters, all collection types, transactions, pub/sub, and observable keys. Best fit: reactive UIs, session caches, browser-side API response caching, and rate limiting.
+>
+> Notably absent: **Lua scripting (`EVAL`)**, **blocking operations** (`BLPOP`, `BRPOP`, `LMOVE`) and **streams** (`XADD`). Your Redis *client* will connect unchanged, but libraries built on those primitives — BullMQ, node-redlock, rate-limiter-flexible — ship Lua and will not run. `RLCHECK`/`RLSET` cover rate limiting natively instead. Run `COMMAND COUNT` against a live server for the exact surface (123 commands today).
 
 **→ Full documentation, use cases, API reference, and guides at [recached.dev](https://recached.dev)**
 
@@ -32,8 +34,8 @@ docker run -p 6379:6379 -p 6380:6380 ghcr.io/recached-dev/recached:latest
 # Homebrew (macOS)
 brew tap recached-dev/recached && brew install recached && recached-server
 
-# Cargo
-cargo install recached && recached-server
+# Cargo (from source — the crate is not on crates.io yet)
+cargo install --git https://github.com/recached-dev/recached recached && recached-server
 ```
 
 ```bash
@@ -42,16 +44,8 @@ npm install recached-edge
 ```
 
 > [!IMPORTANT]
-> **`recached-edge` 0.1.1 – 0.2.0 do not work in the browser.** `core-engine` read the clock via
-> `std::time::SystemTime::now()`, which panics on `wasm32-unknown-unknown`. The clock is read on
-> nearly every operation, so **no store write completes** on those versions — and a client whose
-> write-ahead log passed the compaction threshold erased its own persisted cache before the
-> replacement snapshot was written.
->
-> Fixed in **0.2.1** — install `recached-edge@^0.2.1` or later.
->
-> **The server is unaffected.** It runs on a native target where the clock works normally; this is
-> browser/WASM only.
+> **0.3.0 is the first stable release.** Install `recached-edge@^0.3.0`; earlier versions are not
+> recommended.
 
 ---
 
@@ -104,7 +98,7 @@ password, no TLS, and no restriction on which web pages may open the sync socket
 
 ## Benchmarks
 
-Measured with `redis-benchmark` (100k requests, 50 connections, 64-byte values, randomized keys, persistence disabled on all servers) on a 4-core Intel i5-8259U laptop, July 2026 — Recached v0.1.8 vs Redis 7.2.5 vs Valkey 9.1.0, one server at a time. Current release is v0.2.4; these command paths were A/B tested across the v0.2.4 changes and moved within run-to-run noise, but the three-way suite has not been re-run since v0.1.8.
+Measured with `redis-benchmark` (100k requests, 50 connections, 64-byte values, randomized keys, persistence disabled on all servers) on a 4-core Intel i5-8259U laptop, July 2026 — Recached v0.1.8 vs Redis 7.2.5 vs Valkey 9.1.0, one server at a time. Current release is v0.3.0; these command paths were A/B tested across the v0.2.4 changes and spot-checked again on v0.3.0 (SET 455k, GET 518k, INCR 526k pipelined on the same laptop), moving within run-to-run noise each time — but the three-way suite has not been re-run since v0.1.8.
 
 Pipelined (`-P 16`) — raw command throughput, requests/sec, **bold** = best per row:
 
