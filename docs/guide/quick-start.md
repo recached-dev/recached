@@ -17,7 +17,14 @@ Port 6379 is the RESP TCP port (Redis-compatible). Port 6380 is the WebSocket sy
 ### Homebrew (macOS)
 
 ```bash
-brew tap recached-dev/recached
+# The tap is the main repo rather than a separate homebrew-recached
+# repository, so the URL has to be given explicitly.
+brew tap recached-dev/recached https://github.com/recached-dev/recached
+
+# Homebrew 6.0 refuses to load formulae from an untrusted third-party tap.
+# Skip this on older Homebrew, which has no `trust` subcommand.
+brew trust recached-dev/recached
+
 brew install recached
 recached-server
 ```

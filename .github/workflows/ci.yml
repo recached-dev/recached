@@ -89,6 +89,14 @@ jobs:
 
       - name: Install wasm-pack
         uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          # Pinned deliberately. Left unset, the action resolves "latest" through
+          # the GitHub API and silently falls back to a much older wasm-pack when
+          # that call is rate-limited — and versions before workspace inheritance
+          # cannot parse `license.workspace = true`, failing the build with
+          # "invalid type: map, expected a string for key `package.license`".
+          # That is why this passed for months and then broke on an unrelated run.
+          version: 'v0.15.0'
 
       # The runner ships Chrome and a matching chromedriver on PATH. Letting
       # wasm-pack download its own risks a version mismatch with the installed
