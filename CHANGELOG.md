@@ -4,6 +4,70 @@ All notable changes to Recached are documented here.
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **`MEMORY USAGE key [SAMPLES count]`.** Recached enforces `maxmemory` and evicts against
+  it, but an operator who hit the limit had no command that answered "which key is eating
+  it?" — `INFO memory` gives one total and nothing per key. The reply is the same figure the
+  eviction loop bills the key for, computed by the same function, so "what is this costing me"
+  and "what gets evicted next" cannot drift apart the way two separate estimators would.
+  A missing or expired key reports nil, not zero: "no such key" and "an empty key" are
+  different facts. `SAMPLES` is parsed and its count discarded — Redis uses it to bound how
+  much of a nested value it walks before extrapolating, and Recached always walks all of it,
+  so the reply is never less accurate than what was asked for. `MEMORY DOCTOR`, `STATS`,
+  `PURGE` and `MALLOC-STATS` are refused with a reason: they describe an allocator arena that
+  Recached does not manage and cannot honestly report on.
+
+- **`PUBSUB CHANNELS [pattern]`, `PUBSUB NUMSUB [channel ...]`, `PUBSUB NUMPAT`.** Pub/sub has
+  shipped since the first release with no way to see any of it — `PUBLISH` returned a delivery
+  count and that was the only observable, so "is anything actually subscribed?" could only be
+  answered by publishing and watching the number. The subscriber hub already held both
+  registries; these are a read of state that existed all along. `CHANNELS` lists only channels
+  with a live subscriber and drops one the moment its last subscriber leaves, `NUMSUB` reports
+  a zero for a channel nobody is on rather than omitting it so the reply can be read by
+  position, and `NUMPAT` counts distinct patterns, not subscribers. Verified reply-for-reply
+  against redis-server 7.2.5. `PUBSUB` is classified as an admin command, so it is refused on
+  scope-limited WebSocket connections: a scoped connection may still `SUBSCRIBE` to any channel
+  it can name, but naming one and enumerating everyone else's are different powers, the same
+  line `GET` and `KEYS` sit on.
+
+- **`MODULE LIST`.** An empty array, which is the answer a stock `redis-server` with no modules
+  gives, and which lets a tool tell "no modules" apart from "cannot ask". `MODULE LOAD`,
+  `LOADEX` and `UNLOAD` are refused rather than answered `+OK`.
+
+- **`INFO` now reports the `# Cluster` section** — `cluster_enabled:0`, in the default set, so a
+  bare `INFO` carries it. This is how a cluster-aware client actually learns it is talking to a
+  single node, and Recached had no way to say so.
+
+### Changed
+
+- **`CLUSTER` is now refused with Redis's own sentence** — `ERR This instance has cluster support
+  disabled` — instead of `ERR unknown command`. Measuring beat assuming here: a `redis-server`
+  not started in cluster mode does **not** answer `CLUSTER INFO` with `cluster_enabled:0`, it
+  rejects the whole container with that error and publishes the flag through `INFO`. So the fix
+  was not to implement `CLUSTER INFO` — implementing it would have made Recached *less* like
+  Redis — but to copy the refusal and add the `INFO` section. `unknown command` was the one
+  reply a client cannot act on, because it reads as "too old to ask" rather than "not a cluster".
+
+- **`PUBSUB SHARDCHANNELS` and `SHARDNUMSUB` are refused**, where a standalone Redis answers both
+  with an empty array. The one deliberate divergence in this batch: Redis's empty array sits next
+  to a working `SSUBSCRIBE`, and Recached implements neither `SSUBSCRIBE` nor `SPUBLISH`, so the
+  same reply would invite a follow-up call that fails.
+
+### Fixed
+
+- **The command reference no longer claims Recached exports latency histograms.** `INFO`'s "not
+  implemented" note said per-command latency was on the Prometheus endpoint instead — it is not,
+  and never was. Recached has no latency instrumentation at all: `recached_commands_total` counts
+  calls and `recached_command_errors_total` counts failures, and neither says how long anything
+  took. The docs now say so plainly and point at the bounded reads (`HSCAN`, `SSCAN`, `ZSCAN`,
+  `GETRANGE`) as the way to avoid the slow paths, since there is no way to catch them after the
+  fact. `SLOWLOG` and latency histograms remain unimplemented.
+
+---
+
 ## [0.2.4] — 2026-08-02
 
 ### Added

@@ -178,6 +178,10 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::Client(_) => "client",
         Command::Config(_) => "config",
         Command::CommandQuery(_) => "command",
+        Command::Cluster(_) => "cluster",
+        Command::Module(_) => "module",
+        Command::PubSub(_) => "pubsub",
+        Command::Memory(_) | Command::MemoryUsage(_) => "memory",
         Command::Get(_) => "get",
         Command::ESet(_, _) => "eset",
         Command::Set(_, _, _) => "set",
@@ -2132,6 +2136,14 @@ fn command_scope(cmd: &Command) -> CommandScope {
         | Command::Quit
         | Command::Client(_)
         | Command::CommandQuery(_)
+        // CLUSTER and MODULE answer the same sentence to everyone — "not a
+        // cluster", "no modules" — and describe no state a scope could protect.
+        | Command::Cluster(_)
+        | Command::Module(_)
+        // Every MEMORY subcommand other than USAGE is refused outright, so
+        // there is nothing here to scope either. USAGE reads a key and is
+        // classified with the key commands below.
+        | Command::Memory(_)
         | Command::Unknown(_) => CommandScope::KeyLess,
 
         Command::Keys(_)
@@ -2148,6 +2160,13 @@ fn command_scope(cmd: &Command) -> CommandScope {
         // CONFIG reports server-wide limits and whether auth is on. Same
         // reasoning as INFO: not for a connection scoped to a few keys.
         | Command::Config(_)
+        // PUBSUB enumerates every channel every other client is subscribed to.
+        // A scoped connection can already SUBSCRIBE to any channel it can name
+        // — channels are outside the scope system entirely — but naming and
+        // listing are different powers, the same way GET is scoped and KEYS is
+        // Admin. NUMSUB and NUMPAT ride along rather than splitting the family
+        // across two scopes for one subcommand's worth of difference.
+        | Command::PubSub(_)
         | Command::ReplicaOfNoOne => CommandScope::Admin,
 
         Command::ESet(k, _)
@@ -2172,6 +2191,7 @@ fn command_scope(cmd: &Command) -> CommandScope {
         | Command::PTtl(k)
         | Command::Persist(k)
         | Command::Type(k)
+        | Command::MemoryUsage(k)
         | Command::HSet(k, _)
         | Command::HGet(k, _)
         | Command::HGetAll(k)
@@ -2379,6 +2399,44 @@ impl PubSubHub {
             !v.is_empty()
         });
         self.pattern_subs.retain(|(_, id, _)| *id != conn_id);
+    }
+
+    /// Channels with at least one live subscriber, for `PUBSUB CHANNELS`.
+    ///
+    /// `unsubscribe` and `unsubscribe_all` remove a channel's entry once its
+    /// last subscriber leaves, and `publish` drops senders whose receiver has
+    /// closed, so a key in `channel_subs` implies a live subscriber. The
+    /// `is_empty` guard covers the one window where it does not: a connection
+    /// that died between the last publish and its close handler.
+    fn active_channels(&self) -> impl Iterator<Item = &String> {
+        self.channel_subs
+            .iter()
+            .filter(|(_, subs)| !subs.is_empty())
+            .map(|(channel, _)| channel)
+    }
+
+    /// Subscribers to one exact channel, for `PUBSUB NUMSUB`. Pattern
+    /// subscribers are deliberately not counted, matching Redis: a `PSUBSCRIBE`
+    /// is reported by `NUMPAT`, and counting it here would double-count a
+    /// client that holds both.
+    fn subscriber_count(&self, channel: &str) -> i64 {
+        self.channel_subs
+            .get(channel)
+            .map(|subs| subs.len() as i64)
+            .unwrap_or(0)
+    }
+
+    /// Distinct patterns under subscription, for `PUBSUB NUMPAT`. Distinct is
+    /// the Redis definition: two clients on `news.*` are one pattern, not two.
+    fn pattern_count(&self) -> i64 {
+        let mut seen: Vec<&str> = self
+            .pattern_subs
+            .iter()
+            .map(|(p, _, _)| p.as_str())
+            .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        seen.len() as i64
     }
 
     /// Deliver to all matching subscribers; returns the count delivered.
@@ -2814,6 +2872,7 @@ const DEFAULT_INFO_SECTIONS: &[&str] = &[
     "persistence",
     "stats",
     "replication",
+    "cluster",
     "keyspace",
     "recached",
 ];
@@ -3102,6 +3161,129 @@ fn handle_config_command(args: &[String], facts: &ServerFacts, store: &KeyValueS
     }
 }
 
+/// Handle `CLUSTER <subcommand>`.
+///
+/// Recached does not cluster, and this reports that the way Redis does. A
+/// `redis-server` that was not started in cluster mode does **not** answer
+/// `CLUSTER INFO` with `cluster_enabled:0` — it rejects the whole `CLUSTER`
+/// container with this exact sentence, and publishes the flag in `INFO`'s
+/// `# Cluster` section instead. Copying the sentence rather than inventing a
+/// slot map means a client's "am I clustered" branch takes the same path here
+/// as against the server it was written for, and `ERR unknown command` (which
+/// is what Recached said before) is the one answer that reads as "too old to
+/// ask" rather than "not a cluster".
+fn handle_cluster_command(_args: &[String]) -> Value {
+    Value::Error("ERR This instance has cluster support disabled".to_string())
+}
+
+/// Handle `MODULE <subcommand>`.
+///
+/// There is no module API, so the loaded-module list is empty — which is a
+/// real answer, and the same one a stock `redis-server` gives. `LOAD`,
+/// `LOADEX` and `UNLOAD` are refused rather than answered `+OK`, because an
+/// operator who believes a module loaded has a harder problem than one who
+/// was told no.
+fn handle_module_command(args: &[String]) -> Value {
+    match (args[0].to_uppercase().as_str(), args.len()) {
+        ("LIST", 1) => Value::Array(Some(vec![])),
+        ("HELP", 1) => Value::Array(Some(
+            [
+                "MODULE <subcommand>",
+                "LIST -- Return a list of loaded modules. Recached loads none.",
+            ]
+            .iter()
+            .map(|l| Value::SimpleString((*l).to_string()))
+            .collect(),
+        )),
+        _ => unknown_subcommand("MODULE", &args.join(" ")),
+    }
+}
+
+/// Handle `PUBSUB <subcommand> [arg ...]` against the live subscriber hub.
+///
+/// Recached has shipped `SUBSCRIBE`, `PSUBSCRIBE` and `PUBLISH` from the start
+/// with no way to see any of it: `PUBLISH` returns a delivery count, and that
+/// was the only observable. The hub already holds both registries, so these
+/// three answers are a read of state that existed all along.
+///
+/// `SHARDCHANNELS` and `SHARDNUMSUB` are refused rather than answered with the
+/// empty array a standalone `redis-server` gives. This is a deliberate
+/// divergence: Redis's empty array means "no shard channels are subscribed" on
+/// a server where `SSUBSCRIBE` works, and a client reading it would reasonably
+/// follow up with one. Recached has no `SSUBSCRIBE` or `SPUBLISH` at all, so
+/// the honest answer is that the question does not apply here.
+fn handle_pubsub_command(args: &[String], hub: &PubSubHub) -> Value {
+    match (args[0].to_uppercase().as_str(), args.len()) {
+        // No pattern means every active channel. Redis matches the pattern
+        // against channel names with the same globber it uses for keys, and so
+        // does this — `glob_match` is the one Recached already applies to
+        // PSUBSCRIBE, so a pattern selects here exactly what it would there.
+        ("CHANNELS", 1) => Value::Array(Some(
+            hub.active_channels()
+                .map(|c| Value::BulkString(Some(c.as_bytes().to_vec())))
+                .collect(),
+        )),
+        ("CHANNELS", 2) => Value::Array(Some(
+            hub.active_channels()
+                .filter(|c| core_engine::store::glob_match(&args[1], c))
+                .map(|c| Value::BulkString(Some(c.as_bytes().to_vec())))
+                .collect(),
+        )),
+        // Flat [channel, count, channel, count, ...]. A channel nobody is
+        // subscribed to reports 0 rather than being dropped, so a caller that
+        // asked about N channels can index the reply by position.
+        ("NUMSUB", _) => {
+            let mut out = Vec::with_capacity((args.len() - 1) * 2);
+            for channel in &args[1..] {
+                out.push(Value::BulkString(Some(channel.as_bytes().to_vec())));
+                out.push(Value::Integer(hub.subscriber_count(channel)));
+            }
+            Value::Array(Some(out))
+        }
+        ("NUMPAT", 1) => Value::Integer(hub.pattern_count()),
+        ("HELP", 1) => Value::Array(Some(
+            [
+                "PUBSUB <subcommand>",
+                "CHANNELS [pattern] -- Return the currently active channels.",
+                "NUMSUB [channel ...] -- Return the subscriber count per channel.",
+                "NUMPAT -- Return the number of distinct subscribed patterns.",
+            ]
+            .iter()
+            .map(|l| Value::SimpleString((*l).to_string()))
+            .collect(),
+        )),
+        _ => unknown_subcommand("PUBSUB", &args.join(" ")),
+    }
+}
+
+/// Handle `MEMORY <subcommand>` for everything except `USAGE`, which is a key
+/// read and goes to the store.
+///
+/// `DOCTOR`, `STATS`, `PURGE` and `MALLOC-STATS` all describe an allocator
+/// Recached does not manage — it holds Rust values in a `DashMap` and has no
+/// arena to report on or free. Saying so beats a fabricated report.
+fn handle_memory_command(args: &[String]) -> Value {
+    match (args[0].to_uppercase().as_str(), args.len()) {
+        ("HELP", 1) => Value::Array(Some(
+            [
+                "MEMORY <subcommand>",
+                "USAGE <key> [SAMPLES <count>] -- Bytes held by one key. SAMPLES is accepted \
+                 and ignored: the estimate always covers every element.",
+            ]
+            .iter()
+            .map(|l| Value::SimpleString((*l).to_string()))
+            .collect(),
+        )),
+        ("DOCTOR" | "STATS" | "PURGE" | "MALLOC-STATS", 1) => Value::Error(format!(
+            "ERR MEMORY {} is not supported: Recached does not manage its own allocator, \
+             so it has nothing to report or free. MEMORY USAGE and INFO memory are the \
+             measurements it can make.",
+            args[0].to_uppercase()
+        )),
+        _ => unknown_subcommand("MEMORY", &args.join(" ")),
+    }
+}
+
 /// `COMMAND INFO`'s per-command reply: name, arity, flags, key positions.
 fn command_info_entry(spec: &catalog::CommandSpec) -> Value {
     Value::Array(Some(vec![
@@ -3375,6 +3557,13 @@ fn render_info(
                     )
                 }
             }
+            // How a cluster-aware client actually learns it is talking to a
+            // single node. `CLUSTER INFO` is not that channel: a `redis-server`
+            // built for standalone answers it with an error, not with
+            // `cluster_enabled:0`, so this line is the only place the answer
+            // exists. Reporting it costs one line and stops a client from
+            // guessing.
+            "cluster" => "cluster_enabled:0\r\n".to_string(),
             // Recached-specific: the live-query machinery has no Redis analogue,
             // so it gets its own section rather than being smuggled into one.
             "recached" => {
@@ -5087,6 +5276,26 @@ async fn handle_tcp<S>(
                                                     if writer.write_all(&resp).await.is_err() { break 'outer; }
                                                     continue 'parse;
                                                 }
+                                                Command::Cluster(args) => {
+                                                    let resp = handle_cluster_command(args).serialize();
+                                                    if writer.write_all(&resp).await.is_err() { break 'outer; }
+                                                    continue 'parse;
+                                                }
+                                                Command::Module(args) => {
+                                                    let resp = handle_module_command(args).serialize();
+                                                    if writer.write_all(&resp).await.is_err() { break 'outer; }
+                                                    continue 'parse;
+                                                }
+                                                Command::Memory(args) => {
+                                                    let resp = handle_memory_command(args).serialize();
+                                                    if writer.write_all(&resp).await.is_err() { break 'outer; }
+                                                    continue 'parse;
+                                                }
+                                                Command::PubSub(args) => {
+                                                    let resp = handle_pubsub_command(args, &*pubsub.lock().await).serialize();
+                                                    if writer.write_all(&resp).await.is_err() { break 'outer; }
+                                                    continue 'parse;
+                                                }
                                                 Command::ReplicaOfNoOne => {
                                                     state.promote_to_primary();
                                                     if writer.write_all(b"+OK\r\n").await.is_err() { break 'outer; }
@@ -5768,6 +5977,22 @@ async fn handle_ws<S>(
                                         // The WebSocket transport is RESP3-only,
                                         // so the catalog always replies as a map.
                                         ws_send!(&handle_command_query(args, 3).serialize());
+                                        continue 'outer;
+                                    }
+                                    Command::Cluster(args) => {
+                                        ws_send!(&handle_cluster_command(args).serialize());
+                                        continue 'outer;
+                                    }
+                                    Command::Module(args) => {
+                                        ws_send!(&handle_module_command(args).serialize());
+                                        continue 'outer;
+                                    }
+                                    Command::Memory(args) => {
+                                        ws_send!(&handle_memory_command(args).serialize());
+                                        continue 'outer;
+                                    }
+                                    Command::PubSub(args) => {
+                                        ws_send!(&handle_pubsub_command(args, &*pubsub.lock().await).serialize());
                                         continue 'outer;
                                     }
                                     Command::ReplicaOfNoOne => {
@@ -7301,6 +7526,44 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn integration_ws_reaches_the_introspection_commands_too() {
+        // `handle_tcp` and `handle_ws` are two hand-maintained copies of one
+        // command loop, so the standing hazard when adding a server-level
+        // command is wiring it into one and not the other — which compiles, and
+        // fails only over the transport nobody checked. Every command added
+        // outside the store belongs in a test like this one.
+        let srv = spawn_ws_server().await;
+        let mut c = WsClient::connect(srv.tcp_addr).await;
+
+        assert_eq!(c.cmd(&["SET", "k", "hello"]).await, ok());
+        let usage = c.cmd(&["MEMORY", "USAGE", "k"]).await;
+        assert!(
+            matches!(usage, Value::Integer(n) if n > 0),
+            "MEMORY USAGE over WS: {usage:?}"
+        );
+        assert_eq!(
+            c.cmd(&["MEMORY", "USAGE", "ghost"]).await,
+            Value::BulkString(None)
+        );
+        assert!(matches!(
+            c.cmd(&["MEMORY", "DOCTOR"]).await,
+            Value::Error(_)
+        ));
+
+        assert_eq!(c.cmd(&["MODULE", "LIST"]).await, Value::Array(Some(vec![])));
+        assert!(matches!(c.cmd(&["CLUSTER", "INFO"]).await, Value::Error(_)));
+
+        // No subscribers on this connection, so the registry is empty — the
+        // point is that the command is answered at all rather than falling
+        // through to the store's "handled by the connection layer" refusal.
+        assert_eq!(
+            c.cmd(&["PUBSUB", "CHANNELS"]).await,
+            Value::Array(Some(vec![]))
+        );
+        assert_eq!(c.cmd(&["PUBSUB", "NUMPAT"]).await, Value::Integer(0));
+    }
+
     #[tokio::test]
     async fn replication_lag_counts_unacknowledged_frames() {
         // A replica that receives frames but never acknowledges them is exactly
@@ -8498,6 +8761,11 @@ mod tests {
                 Expect::Admin,
             ),
             (Command::CommandQuery(vec![]), Expect::KeyLess),
+            (Command::Cluster(vec!["INFO".into()]), Expect::KeyLess),
+            (Command::Module(vec!["LIST".into()]), Expect::KeyLess),
+            (Command::Memory(vec!["DOCTOR".into()]), Expect::KeyLess),
+            (Command::MemoryUsage("k".into()), Expect::Keys(&["k"])),
+            (Command::PubSub(vec!["CHANNELS".into()]), Expect::Admin),
             (Command::Unknown("X".into()), Expect::KeyLess),
         ]
     }
@@ -8923,6 +9191,224 @@ mod tests {
                 "pattern {pat:?} vs channel {ch:?}"
             );
         }
+    }
+
+    // ── Introspection: PUBSUB / CLUSTER / MODULE / MEMORY ─────────────────────
+
+    /// A hub with `channels` subscribed and `patterns` psubscribed. The senders
+    /// are kept alive by the returned vector — dropping them would close the
+    /// receivers and make the hub look empty.
+    fn hub_with(
+        channels: &[(u64, &str)],
+        patterns: &[(u64, &str)],
+    ) -> (PubSubHub, Vec<mpsc::UnboundedReceiver<PubSubMsg>>) {
+        let mut hub = PubSubHub::new();
+        let mut keepalive = Vec::new();
+        for (id, ch) in channels {
+            let (tx, rx) = mpsc::unbounded_channel();
+            hub.subscribe(*id, ch, tx);
+            keepalive.push(rx);
+        }
+        for (id, pat) in patterns {
+            let (tx, rx) = mpsc::unbounded_channel();
+            hub.psubscribe(*id, pat, tx);
+            keepalive.push(rx);
+        }
+        (hub, keepalive)
+    }
+
+    fn bulk_strings(v: &Value) -> Vec<String> {
+        match v {
+            Value::Array(Some(items)) => items
+                .iter()
+                .map(|i| match i {
+                    Value::BulkString(Some(b)) => String::from_utf8_lossy(b).into_owned(),
+                    other => panic!("expected a bulk string, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected an array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pubsub_channels_lists_only_channels_with_subscribers() {
+        let (hub, _keep) = hub_with(&[(1, "news"), (2, "news"), (3, "sports")], &[(4, "news.*")]);
+
+        let mut all = bulk_strings(&handle_pubsub_command(&["CHANNELS".into()], &hub));
+        all.sort();
+        assert_eq!(all, vec!["news".to_string(), "sports".to_string()]);
+
+        // A pattern subscriber is not a channel. Redis reports `news.*` under
+        // NUMPAT and never under CHANNELS, because nobody is subscribed to a
+        // channel by that name.
+        assert!(!all.contains(&"news.*".to_string()));
+
+        let filtered = bulk_strings(&handle_pubsub_command(
+            &["CHANNELS".into(), "spo*".into()],
+            &hub,
+        ));
+        assert_eq!(filtered, vec!["sports".to_string()]);
+    }
+
+    #[test]
+    fn pubsub_numsub_counts_per_channel_and_keeps_the_caller_s_order() {
+        let (hub, _keep) = hub_with(&[(1, "news"), (2, "news"), (3, "sports")], &[(4, "news.*")]);
+
+        let reply = handle_pubsub_command(
+            &[
+                "NUMSUB".into(),
+                "sports".into(),
+                "news".into(),
+                "nobody-here".into(),
+            ],
+            &hub,
+        );
+        assert_eq!(
+            reply,
+            Value::Array(Some(vec![
+                Value::BulkString(Some(b"sports".to_vec())),
+                Value::Integer(1),
+                Value::BulkString(Some(b"news".to_vec())),
+                // Two subscribers, and the `news.*` pattern subscriber is not
+                // one of them: NUMPAT's job, counted here would be double.
+                Value::Integer(2),
+                Value::BulkString(Some(b"nobody-here".to_vec())),
+                // Present with a zero rather than omitted, so a caller can read
+                // the reply by position against the channels it asked about.
+                Value::Integer(0),
+            ]))
+        );
+
+        // No channels named is a legal call and an empty reply, not an error.
+        assert_eq!(
+            handle_pubsub_command(&["NUMSUB".into()], &hub),
+            Value::Array(Some(vec![]))
+        );
+    }
+
+    #[test]
+    fn pubsub_numpat_counts_distinct_patterns_not_subscribers() {
+        let (hub, _keep) = hub_with(&[], &[(1, "news.*"), (2, "news.*"), (3, "sports.*")]);
+        assert_eq!(
+            handle_pubsub_command(&["NUMPAT".into()], &hub),
+            Value::Integer(2),
+            "two clients on one pattern are one pattern"
+        );
+    }
+
+    #[test]
+    fn pubsub_channels_forgets_a_channel_once_its_last_subscriber_leaves() {
+        let (mut hub, _keep) = hub_with(&[(1, "news"), (2, "news")], &[]);
+        hub.unsubscribe(1, "news");
+        assert_eq!(
+            bulk_strings(&handle_pubsub_command(&["CHANNELS".into()], &hub)),
+            vec!["news".to_string()]
+        );
+        hub.unsubscribe(2, "news");
+        assert!(
+            bulk_strings(&handle_pubsub_command(&["CHANNELS".into()], &hub)).is_empty(),
+            "an abandoned channel is not an active channel"
+        );
+    }
+
+    #[test]
+    fn pubsub_refuses_the_sharded_subcommands() {
+        let (hub, _keep) = hub_with(&[], &[]);
+        // A standalone redis-server answers these with an empty array, and this
+        // is the one place Recached deliberately does not match it: there, the
+        // empty array sits next to a working SSUBSCRIBE. Here there is none, so
+        // "no shard channels are subscribed" would invite a call that fails.
+        for sub in ["SHARDCHANNELS", "SHARDNUMSUB"] {
+            assert!(
+                matches!(
+                    handle_pubsub_command(&[sub.to_string()], &hub),
+                    Value::Error(_)
+                ),
+                "{sub} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn cluster_is_refused_the_way_a_standalone_redis_refuses_it() {
+        // Verified against redis-server 7.2.5: a server not started in cluster
+        // mode rejects the whole CLUSTER container with this sentence. It does
+        // *not* answer INFO with cluster_enabled:0 — that lives in `INFO`.
+        for sub in ["INFO", "NODES", "SLOTS", "MYID", "SHARDS"] {
+            assert_eq!(
+                handle_cluster_command(&[sub.to_string()]),
+                Value::Error("ERR This instance has cluster support disabled".to_string()),
+                "CLUSTER {sub}"
+            );
+        }
+    }
+
+    #[test]
+    fn info_publishes_the_cluster_flag_that_cluster_info_cannot() {
+        let store = KeyValueStore::new();
+        let body = render_info(
+            &["cluster".to_string()],
+            server_facts(),
+            &store,
+            sampled_keyspace(&store),
+            false,
+            ReplInfo::default(),
+            0,
+            0,
+            0,
+        );
+        assert!(body.contains("# Cluster\r\n"), "section header: {body:?}");
+        assert!(body.contains("cluster_enabled:0"), "{body:?}");
+
+        // And it is in the default set, so a client that sends a bare INFO —
+        // which is what every cluster-aware client actually sends — sees it.
+        let default = render_info(
+            &[],
+            server_facts(),
+            &store,
+            sampled_keyspace(&store),
+            false,
+            ReplInfo::default(),
+            0,
+            0,
+            0,
+        );
+        assert!(default.contains("cluster_enabled:0"), "{default:?}");
+    }
+
+    #[test]
+    fn module_list_is_empty_and_loading_is_refused() {
+        assert_eq!(
+            handle_module_command(&["LIST".to_string()]),
+            Value::Array(Some(vec![])),
+            "no modules is an answer, not an error"
+        );
+        for sub in ["LOAD", "LOADEX", "UNLOAD"] {
+            assert!(
+                matches!(
+                    handle_module_command(&[sub.to_string(), "/tmp/x.so".to_string()]),
+                    Value::Error(_)
+                ),
+                "MODULE {sub} should be refused rather than answered +OK"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_allocator_subcommands_are_refused_with_a_reason() {
+        for sub in ["DOCTOR", "STATS", "PURGE", "MALLOC-STATS"] {
+            let Value::Error(msg) = handle_memory_command(&[sub.to_string()]) else {
+                panic!("MEMORY {sub} should be refused");
+            };
+            assert!(
+                msg.contains("MEMORY USAGE"),
+                "the refusal should name what does work: {msg}"
+            );
+        }
+        assert!(matches!(
+            handle_memory_command(&["HELP".to_string()]),
+            Value::Array(Some(_))
+        ));
     }
 
     // ── Wire encoding ─────────────────────────────────────────────────────────

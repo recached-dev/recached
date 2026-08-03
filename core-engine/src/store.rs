@@ -1508,6 +1508,18 @@ impl KeyValueStore {
             Command::CommandQuery(_) => Value::Error(
                 "ERR COMMAND is handled by the connection layer, not the store".to_string(),
             ),
+            Command::Cluster(_) => Value::Error(
+                "ERR CLUSTER is handled by the connection layer, not the store".to_string(),
+            ),
+            Command::Module(_) => Value::Error(
+                "ERR MODULE is handled by the connection layer, not the store".to_string(),
+            ),
+            Command::PubSub(_) => Value::Error(
+                "ERR PUBSUB is handled by the connection layer, not the store".to_string(),
+            ),
+            Command::Memory(_) => Value::Error(
+                "ERR MEMORY is handled by the connection layer, not the store".to_string(),
+            ),
 
             // ── Strings ───────────────────────────────────────────────────────
             Command::Set(key, val, opts) => {
@@ -1904,6 +1916,17 @@ impl KeyValueStore {
                         Value::SimpleString(e.value.type_name().to_string())
                     }
                     _ => Value::SimpleString("none".to_string()),
+                }
+            }
+            Command::MemoryUsage(key) => {
+                let now = now_ms();
+                match self.data.get(&key) {
+                    // The same figure the eviction loop bills the key for, so
+                    // "which key is eating my maxmemory" and "which key gets
+                    // evicted next" are answered from one measurement rather
+                    // than two that can disagree.
+                    Some(e) if !e.is_expired(now) => Value::Integer(entry_size(&key, &e) as i64),
+                    _ => Value::BulkString(None),
                 }
             }
 
@@ -3364,6 +3387,11 @@ fn write_cost(cmd: &Command) -> usize {
         | Command::Dedup(_, _, _)
         | Command::QSub(_)
         | Command::QUnsub(_)
+        | Command::Cluster(_)
+        | Command::Module(_)
+        | Command::PubSub(_)
+        | Command::Memory(_)
+        | Command::MemoryUsage(_)
         | Command::Save
         | Command::BgSave
         | Command::LastSave
@@ -6816,6 +6844,76 @@ mod metrics_tests {
             SetOptions::default(),
         ));
         assert!(s.approximate_memory_bytes() >= empty + 4096);
+    }
+
+    #[test]
+    fn memory_usage_reports_a_key_and_nil_for_one_that_is_not_there() {
+        let s = KeyValueStore::new();
+        // Redis answers a missing key with a nil bulk string, not zero: "no
+        // such key" and "an empty key" are different facts.
+        assert_eq!(
+            s.execute(Command::MemoryUsage("ghost".into())),
+            Value::BulkString(None)
+        );
+
+        // Equal-length key names, so the only difference the reply can reflect
+        // is the value.
+        s.execute(Command::Set("k1".into(), "x".into(), SetOptions::default()));
+        s.execute(Command::Set(
+            "k2".into(),
+            "x".repeat(4096).into(),
+            SetOptions::default(),
+        ));
+
+        let (Value::Integer(small), Value::Integer(big)) = (
+            s.execute(Command::MemoryUsage("k1".into())),
+            s.execute(Command::MemoryUsage("k2".into())),
+        ) else {
+            panic!("MEMORY USAGE should report an integer for a live key");
+        };
+        assert!(small > 0, "a stored key costs something");
+        // Exact, not "bigger": the whole point of the reply is that the number
+        // moves with the value by the amount the value grew (4096 bytes minus
+        // the one byte the small key already held).
+        assert_eq!(
+            big - small,
+            4095,
+            "the reported size must track the value: {small} vs {big}"
+        );
+    }
+
+    #[test]
+    fn memory_usage_agrees_with_what_eviction_bills_the_key() {
+        // The point of reusing `entry_size` rather than writing a second
+        // estimator: the answer to "what is this key costing me" and the number
+        // eviction acts on cannot drift apart.
+        let s = KeyValueStore::new();
+        let empty = s.approximate_memory_bytes();
+        s.execute(Command::HSet(
+            "h".into(),
+            vec![("f".into(), "y".repeat(1024).into())],
+        ));
+        let Value::Integer(reported) = s.execute(Command::MemoryUsage("h".into())) else {
+            panic!("expected an integer");
+        };
+        assert_eq!(
+            s.approximate_memory_bytes() - empty,
+            reported as usize,
+            "MEMORY USAGE must be the same measurement the eviction loop uses"
+        );
+    }
+
+    #[test]
+    fn memory_usage_treats_an_expired_key_as_absent() {
+        let s = KeyValueStore::new();
+        s.execute(Command::Set("k".into(), "v".into(), SetOptions::default()));
+        s.execute(Command::PExpire("k".into(), 1));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(
+            s.execute(Command::MemoryUsage("k".into())),
+            Value::BulkString(None),
+            "a key past its TTL is gone, and its footprint with it"
+        );
     }
 }
 

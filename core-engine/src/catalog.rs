@@ -1165,6 +1165,52 @@ pub const CATALOG: &[CommandSpec] = &[
         "core",
         "Reports the command catalog: COUNT, LIST, INFO and DOCS.",
     ),
+    // Container rows carry the key positions Redis reports for the container
+    // itself, which are 0/0/0 even for `MEMORY`, whose `USAGE` subcommand does
+    // take a key at position 2. Redis publishes that through the subcommand
+    // tree, which Recached does not implement; copying the container row keeps
+    // a proxy reading the same numbers here as from the server it was built
+    // against, and Recached has no shards to route to in any case.
+    spec(
+        "cluster",
+        -2,
+        &["stale"],
+        0,
+        0,
+        0,
+        "core",
+        "Cluster topology. Recached is standalone: the container is refused, and INFO reports cluster_enabled:0.",
+    ),
+    spec(
+        "memory",
+        -2,
+        &["readonly"],
+        0,
+        0,
+        0,
+        "keys",
+        "MEMORY USAGE reports the approximate bytes one key holds. The allocator subcommands are refused.",
+    ),
+    spec(
+        "module",
+        -2,
+        &["admin", "noscript"],
+        0,
+        0,
+        0,
+        "core",
+        "Lists loaded modules. Recached has no module API, so the list is always empty.",
+    ),
+    spec(
+        "pubsub",
+        -2,
+        &["pubsub", "loading", "stale"],
+        0,
+        0,
+        0,
+        "pub/sub",
+        "Introspects the pub/sub system: CHANNELS, NUMSUB and NUMPAT.",
+    ),
     // ── Recached-only ─────────────────────────────────────────────────────
     // No Redis counterpart, so these rows are declared rather than transcribed.
     spec(

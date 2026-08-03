@@ -110,6 +110,22 @@ pub enum Command {
     Config(Vec<String>),
     /// `COMMAND [subcommand] [arg ...]` — the command catalog.
     CommandQuery(Vec<String>),
+    /// `CLUSTER <subcommand> [arg ...]` — cluster topology. Recached is always
+    /// standalone, so the answer is fixed; it still has to be sayable, because
+    /// a client that cannot ask assumes the worst rather than assuming none.
+    Cluster(Vec<String>),
+    /// `MODULE <subcommand> [arg ...]` — loaded modules. Recached has no module
+    /// API at all, which makes the list empty rather than unanswerable.
+    Module(Vec<String>),
+    /// `PUBSUB <subcommand> [arg ...]` — pub/sub introspection. Connection-level
+    /// for the same reason as CLIENT: the subscriber hub lives in the server,
+    /// and the store has never heard of a channel.
+    PubSub(Vec<String>),
+    /// `MEMORY <subcommand> [arg ...]` for every subcommand except `USAGE`,
+    /// which is [`Command::MemoryUsage`]. Split because the two are not the
+    /// same kind of command: `USAGE` reads one key and is scoped like any other
+    /// key read, while the rest describe the allocator and are not.
+    Memory(Vec<String>),
     // ── Strings ──────────────────────────────────────────────────────────────
     Set(String, Vec<u8>, SetOptions),
     Get(String),
@@ -151,6 +167,10 @@ pub enum Command {
     FlushDb,
     Rename(String, String),
     Type(String),
+    /// `MEMORY USAGE key [SAMPLES n]` — approximate bytes held by one key.
+    /// A key read, and scoped like one: it reports on a key's contents, so a
+    /// connection that may not read the key may not measure it either.
+    MemoryUsage(String),
     // ── Hash ─────────────────────────────────────────────────────────────────
     HSet(String, Vec<(String, Vec<u8>)>),
     HGet(String, String),
@@ -362,6 +382,51 @@ impl Command {
                         Ok(Command::Config(collect_strings(&mut arr[1..])))
                     }
                     "COMMAND" => Ok(Command::CommandQuery(collect_strings(&mut arr[1..]))),
+                    "CLUSTER" => {
+                        need!(2);
+                        Ok(Command::Cluster(collect_strings(&mut arr[1..])))
+                    }
+                    "MODULE" => {
+                        need!(2);
+                        Ok(Command::Module(collect_strings(&mut arr[1..])))
+                    }
+                    "PUBSUB" => {
+                        need!(2);
+                        Ok(Command::PubSub(collect_strings(&mut arr[1..])))
+                    }
+                    "MEMORY" => {
+                        need!(2);
+                        let sub = extract_string(&arr[1]).unwrap_or_default().to_uppercase();
+                        if sub != "USAGE" {
+                            return Ok(Command::Memory(collect_strings(&mut arr[1..])));
+                        }
+                        need!(3);
+                        let key = take_key(&mut arr[2])?;
+                        // Redis accepts `SAMPLES n` to bound how much of a
+                        // nested value it walks. Recached walks all of it —
+                        // `entry_size` is the same measurement the eviction
+                        // loop runs, and there is no cheaper approximation to
+                        // fall back to — so the option is accepted and the
+                        // count ignored. The reply is never less accurate than
+                        // what was asked for, only more.
+                        match arr.len() {
+                            3 => {}
+                            5 if extract_string(&arr[3])
+                                .unwrap_or_default()
+                                .eq_ignore_ascii_case("SAMPLES") =>
+                            {
+                                // Redis answers a negative SAMPLES with a plain
+                                // syntax error rather than a range error;
+                                // verified against 7.2.5 rather than assumed.
+                                let n = extract_int(&arr[4])?;
+                                if n < 0 {
+                                    return Err("ERR syntax error".to_string());
+                                }
+                            }
+                            _ => return Err("ERR syntax error".to_string()),
+                        }
+                        Ok(Command::MemoryUsage(key))
+                    }
 
                     // ── Strings ───────────────────────────────────────────────
                     "SET" => {
@@ -2060,6 +2125,75 @@ mod tests {
         // CLIENT and CONFIG need a subcommand; the arity check is the parser's.
         assert!(Command::from_value(array(&["CLIENT"])).is_err());
         assert!(Command::from_value(array(&["CONFIG"])).is_err());
+    }
+
+    #[test]
+    fn memory_usage_parses_as_a_key_read_and_the_rest_as_a_container() {
+        assert_eq!(
+            Command::from_value(array(&["MEMORY", "USAGE", "k"])).unwrap(),
+            Command::MemoryUsage("k".into())
+        );
+        // SAMPLES is accepted and its count discarded — the measurement always
+        // walks the whole value, so there is nothing for the count to bound.
+        assert_eq!(
+            Command::from_value(array(&["MEMORY", "usage", "k", "samples", "5"])).unwrap(),
+            Command::MemoryUsage("k".into())
+        );
+        assert_eq!(
+            Command::from_value(array(&["MEMORY", "USAGE", "k", "SAMPLES", "0"])).unwrap(),
+            Command::MemoryUsage("k".into())
+        );
+        // Every other subcommand stays a container command, answered by the
+        // server layer, so that MEMORY HELP and MEMORY DOCTOR get their own
+        // replies instead of a parse error naming the wrong thing.
+        assert_eq!(
+            Command::from_value(array(&["MEMORY", "DOCTOR"])).unwrap(),
+            Command::Memory(vec!["DOCTOR".into()])
+        );
+        assert!(Command::from_value(array(&["MEMORY"])).is_err());
+    }
+
+    #[test]
+    fn memory_usage_rejects_what_redis_rejects() {
+        // Each of these is `ERR syntax error` on redis-server 7.2.5, including
+        // the negative SAMPLES — which is a syntax error there, not a range
+        // error, so it is one here too.
+        for bad in [
+            vec!["MEMORY", "USAGE"],
+            vec!["MEMORY", "USAGE", "k", "SAMPLES"],
+            vec!["MEMORY", "USAGE", "k", "SAMPLES", "-1"],
+            vec!["MEMORY", "USAGE", "k", "BOGUS", "1"],
+            vec!["MEMORY", "USAGE", "k", "SAMPLES", "1", "EXTRA"],
+        ] {
+            assert!(
+                Command::from_value(array(&bad)).is_err(),
+                "{bad:?} should not parse"
+            );
+        }
+        assert_eq!(
+            Command::from_value(array(&["MEMORY", "USAGE", "k", "SAMPLES", "-1"])).unwrap_err(),
+            "ERR syntax error"
+        );
+    }
+
+    #[test]
+    fn cluster_module_and_pubsub_parse_as_containers() {
+        assert_eq!(
+            Command::from_value(array(&["CLUSTER", "INFO"])).unwrap(),
+            Command::Cluster(vec!["INFO".into()])
+        );
+        assert_eq!(
+            Command::from_value(array(&["MODULE", "LIST"])).unwrap(),
+            Command::Module(vec!["LIST".into()])
+        );
+        assert_eq!(
+            Command::from_value(array(&["PUBSUB", "NUMSUB", "a", "b"])).unwrap(),
+            Command::PubSub(vec!["NUMSUB".into(), "a".into(), "b".into()])
+        );
+        // A bare container is an arity error, as it is for CLIENT and CONFIG.
+        assert!(Command::from_value(array(&["CLUSTER"])).is_err());
+        assert!(Command::from_value(array(&["MODULE"])).is_err());
+        assert!(Command::from_value(array(&["PUBSUB"])).is_err());
     }
 
     #[test]
