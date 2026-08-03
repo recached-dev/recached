@@ -53,12 +53,12 @@ jobs:
       - name: Enforce core-engine coverage floor (90%)
         run: cargo llvm-cov -p core-engine --summary-only --fail-under-lines 90
 
-      # server-native is mostly async I/O drivers — accept loops, TLS handshakes,
+      # The server crate is mostly async I/O drivers — accept loops, TLS handshakes,
       # replication streams — which are exercised by the socket-driven tests
       # rather than unit tests. The floor is set to protect the pure decision
       # functions (scope classification, wire encoding, config parsing), not to
       # chase a number the I/O layer cannot reach.
-      - name: Enforce server-native coverage floor (65%)
+      - name: Enforce recached (server) coverage floor (65%)
         run: cargo llvm-cov -p recached --summary-only --fail-under-lines 65 -- --include-ignored
 
   # ---------------------------------------------------------------------------
