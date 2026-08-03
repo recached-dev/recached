@@ -124,7 +124,7 @@ dependencies = [
 
 [[package]]
 name = "core-engine"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "dashmap",
  "indexmap",
@@ -854,6 +854,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "recached"
+version = "0.2.5"
+dependencies = [
+ "base64",
+ "core-engine",
+ "futures-util",
+ "hmac",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "num_cpus",
+ "rand",
+ "rmp-serde",
+ "serde",
+ "sha2",
+ "socket2 0.5.10",
+ "tikv-jemallocator",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1057,30 +1081,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "server-native"
-version = "0.2.4"
-dependencies = [
- "base64",
- "core-engine",
- "futures-util",
- "hmac",
- "metrics",
- "metrics-exporter-prometheus",
- "num_cpus",
- "rand",
- "rmp-serde",
- "serde",
- "sha2",
- "socket2 0.5.10",
- "tikv-jemallocator",
- "tokio",
- "tokio-rustls",
- "tokio-tungstenite",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "sha1"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1195,7 +1195,7 @@ dependencies = [
 
 [[package]]
 name = "sync-client"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "core-engine",
 ]
@@ -1581,7 +1581,7 @@ checksum = "60238e5b4b1b295701d6f9a66d2a126fe19990348f5fb9dae3b623a370119d94"
 
 [[package]]
 name = "wasm-edge"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "core-engine",
  "getrandom 0.3.4",

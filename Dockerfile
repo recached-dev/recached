@@ -25,7 +25,7 @@ RUN mkdir -p core-engine/src server-native/src sync-client/src wasm-edge/src && 
     echo "" > core-engine/src/lib.rs && \
     echo "" > sync-client/src/lib.rs && \
     echo "" > wasm-edge/src/lib.rs && \
-    cargo build --release --package server-native && \
+    cargo build --release --package recached && \
     rm -rf core-engine/src server-native/src
 
 # Now copy real source and do the real build (only changed crates recompile).
@@ -36,7 +36,7 @@ COPY server-native/src server-native/src
 # above — cargo would then consider the crates unchanged and ship the dummy
 # binary. Touch the roots so both crates always recompile.
 RUN touch core-engine/src/lib.rs server-native/src/main.rs && \
-    cargo build --release --package server-native
+    cargo build --release --package recached
 
 # ── Stage 2: Runtime ─────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
@@ -45,7 +45,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/server-native /usr/local/bin/recached-server
+COPY --from=builder /app/target/release/recached-server /usr/local/bin/recached-server
 
 EXPOSE 6379
 EXPOSE 6380

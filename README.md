@@ -97,6 +97,9 @@ port beyond localhost, work through
 [recached.dev/server/security](https://recached.dev/server/security): a default server has no
 password, no TLS, and no restriction on which web pages may open the sync socket.
 
+`6379` and `6380` are defaults, not fixtures — set `RECACHED_PORT` and `RECACHED_WS_PORT` (plus
+`RECACHED_METRICS_PORT`) to move them, which is also what running two instances on one host takes.
+
 ---
 
 ## Benchmarks
