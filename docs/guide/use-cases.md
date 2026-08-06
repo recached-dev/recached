@@ -17,6 +17,12 @@ If **yes**, you are currently paying for that in one of three ways: polling, a b
 layer, or a second client-side cache you invalidate by hand. Removing that cost is the entire
 reason Recached exists.
 
+There is a third answer the question does not cover: **no, and there is no server involved at all.**
+The browser client is a complete cache on its own — see
+[no server at all](#no-server-at-all-the-client-cache-on-its-own) below. That is a narrower pitch
+than the one this page is mostly about, and it is judged against `Map`, IndexedDB wrappers and
+React Query rather than against Redis.
+
 ## Where the difference actually shows up
 
 ### Live dashboards and counters
@@ -63,6 +69,57 @@ are unreachable when the network is down, by definition.
 
 Multiple tabs of the same app share mutations through BroadcastChannel without any server round-trip.
 With Redis this is either polling per tab or a `storage` event protocol you write yourself.
+
+### No server at all — the client cache on its own
+
+Omit `connect` and `recached-edge` never opens a socket. Nothing else changes: the same
+`core-engine` state machine that runs on the server runs in WASM in the tab, so you get the full
+local command surface with no backend of any kind.
+
+```typescript
+const cache = await createCache({
+  persistence: true,            // IndexedDB WAL — survives refresh
+  broadcastChannel: 'my-app',   // cross-tab — needs no server
+})                              // no `connect` — nothing is networked
+```
+
+**What you get without a server:** reads and writes (`get`/`set`/`del`, `getJSON`/`setJSON`),
+TTL that expires on its own, `incr`/`decr`, JSON documents with path writes and merge patches
+(`jset`/`jget`/`jmerge`), glob snapshots over the keyspace (`getMatching`), change notification via
+`onMutation`, refresh-survival through the IndexedDB WAL, and cross-tab fan-out through
+BroadcastChannel.
+
+**What is inert without a server**, because it has nothing to talk to — these do not throw, they
+simply do nothing:
+
+| API | Why it needs a server |
+|---|---|
+| `publish` / `subscribe` / `unsubscribe` / `onMessage` | Pub/sub is brokered by the server; there is no local loopback, and messages do **not** travel over BroadcastChannel |
+| `liveQuery` | The initial state snapshot and the change stream are both server-sent |
+| `syncToken` / `syncScopes` | Scope grants are a server-side authorization decision |
+| `pendingWrites` / `onOutboxFull` | They describe a replay queue for a server that will never connect |
+
+Cross-*device* sync is the other obvious absence: two browsers with no server between them share
+nothing.
+
+**Where this earns its place.** A TTL cache in front of `fetch` (the pattern in
+[Getting Started](/browser/getting-started#without-a-server-local-only-cache)) is the common one —
+declaring expiry once at write time instead of hand-rolling `fetchedAt` comparisons in a Zustand or
+Redux store. Beyond that: state that must survive a refresh without you writing an IndexedDB schema,
+tabs that must agree without a `storage`-event protocol, and read-heavy derived state where a
+local map lookup per render is the point.
+
+**Where it does not.** If you only need a request cache with revalidation, React Query and SWR do
+that with far less machinery and no WebAssembly to load. `recached-edge` ships a ~550 KB `.wasm`
+binary; that cost buys Redis semantics, and if you are not using them it buys nothing. The honest
+framing: pick local-only Recached when you want the *data model* — TTLs, counters, JSON paths, glob
+queries — not merely somewhere to park fetched JSON.
+
+**One wart to know about.** With `persistence: true` and no `connect`, every write still records an
+outbox row in IndexedDB for a replay that cannot happen, and after 10,000 of them you will see
+`offline write queue full` warnings in the console. It is wasted I/O and a misleading message, not
+data loss — the local store and its WAL are unaffected. Pass `persistence: false`, or ignore the
+warning, until this is fixed.
 
 ## Where you should reach for something else
 

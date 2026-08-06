@@ -43,7 +43,7 @@ Recached is a good fit when:
 
 - **Your frontend reads the same data your backend writes.** User sessions, feature flags, live counters, cart state, active user lists — anything your backend mutates that the UI needs to display instantly.
 - **You want live UI without polling.** The WebSocket sync replaces a polling loop without requiring you to build a separate SSE or WebSocket server.
-- **You want a frontend-only cache with TTL.** The WASM module works entirely without a server. Call `createCache()` without `connect()` and you get a local in-memory cache with built-in TTL — no Recached server, no Redis, no backend changes required.
+- **You want a frontend-only cache with TTL.** The WASM module works entirely without a server. Call `createCache()` without `connect` and you get a local cache with TTLs, counters, JSON documents, glob queries, optional IndexedDB persistence and cross-tab sync — no Recached server, no Redis, no backend changes required. Pub/sub, live queries and cross-device sync are what you give up; see [no server at all](/guide/use-cases#no-server-at-all-the-client-cache-on-its-own) for the full boundary.
 - **You need cross-tab sync.** BroadcastChannel support means all open tabs in the same browser share mutations automatically.
 - **You want a drop-in Redis replacement** for the subset of commands most applications actually use (strings, expiry, counters, collections, transactions, pub/sub).
 

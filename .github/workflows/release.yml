@@ -207,21 +207,36 @@ jobs:
           node-version: "20.x"
           registry-url: "https://registry.npmjs.org"
 
+      # `--out-name recached_edge` is not cosmetic: sdk.ts imports
+      # `./pkg/recached_edge.js`, and the crate is named wasm-edge, so the
+      # default output (wasm_edge.js) would not match the import.
       - name: Build Wasm package
-        run: wasm-pack build wasm-edge --target web --release --out-name recached-edge
+        run: wasm-pack build wasm-edge --target web --release --out-name recached_edge
+
+      # wasm-pack writes pkg/.gitignore containing "*". npm honours a nested
+      # .gitignore even inside a directory listed in "files", so leaving it
+      # here publishes an SDK with no WebAssembly in it.
+      - name: Drop wasm-pack's pkg/.gitignore
+        run: rm -f wasm-edge/pkg/.gitignore
+
+      - name: Build the TypeScript SDK
+        # The published entrypoint is sdk.js — the `createCache`/`Cache` API every
+        # doc example and both framework SDKs import. Releases up to 0.3.0
+        # published wasm-edge/pkg instead, which exports only the low-level
+        # `RecachedCache` binding, so the documented API was never on npm at all.
+        run: cd wasm-edge && npm install && npx tsc
 
       - name: Copy LICENSE + NOTICE into package
-        run: cp LICENSE.md NOTICE wasm-edge/pkg/
+        run: cp LICENSE.md NOTICE wasm-edge/
 
-      - name: Set package name and version
-        # wasm-pack derives the npm name and version from the crate — patch both so the
-        # published package always matches the git tag (e.g. v0.1.5 → 0.1.5).
+      - name: Set package version
+        # The npm name lives in wasm-edge/package.json already; only the version
+        # is patched, so it always matches the git tag (e.g. v0.3.1 → 0.3.1).
         run: |
           node -e "
             const fs = require('fs');
-            const path = 'wasm-edge/pkg/package.json';
+            const path = 'wasm-edge/package.json';
             const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
-            pkg.name = 'recached-edge';
             pkg.version = process.env.TAG_VERSION.replace(/^v/, '');
             fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
             console.log('Package:', pkg.name, pkg.version);
@@ -229,10 +244,16 @@ jobs:
         env:
           TAG_VERSION: ${{ github.ref_name }}
 
+      # Packs a real tarball and imports it from outside the tree: proves the
+      # snippets/ glue resolves and that `createCache` is actually exported.
+      # Every release from 0.1.3 to 0.3.0 failed both and shipped anyway.
+      - name: Verify the package is installable
+        run: cd wasm-edge && npm run verify
+
       - name: Publish to NPM
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: cd wasm-edge/pkg && npm publish --access public
+        run: cd wasm-edge && npm publish --access public
 
   npm-sdks:
     name: Publish @recached/${{ matrix.package }} to NPM

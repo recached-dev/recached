@@ -1,7 +1,7 @@
 {
   "name": "@recached/vue",
-  "version": "0.3.0",
-  "description": "Official Vue 3 composables for Recached \u2014 zero-latency reactive cache",
+  "version": "0.3.1",
+  "description": "Official Vue 3 composables for Recached — zero-latency reactive cache",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -25,7 +25,7 @@
   },
   "peerDependencies": {
     "vue": ">=3",
-    "recached-edge": ">=0.1.4"
+    "recached-edge": ">=0.3.1"
   },
   "devDependencies": {
     "@vue/runtime-core": "^3",

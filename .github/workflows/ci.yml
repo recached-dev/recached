@@ -110,6 +110,46 @@ jobs:
       - name: Run browser tests
         run: wasm-pack test --headless --chrome wasm-edge
 
+  # Builds the npm package the way the release does, packs a tarball, and
+  # imports it from outside the working tree. Typecheck and unit tests both
+  # pass against a tree where `pkg/snippets/` sits on disk, so neither can see
+  # that it never ships — which is how 0.1.3 through 0.3.0 all published a
+  # package that threw ERR_MODULE_NOT_FOUND on import.
+  npm-package:
+    name: Package Installability (recached-edge)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "recached-wasm-cache"
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          # Pinned for the same reason as browser-tests above.
+          version: 'v0.15.0'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+
+      - name: Build the package
+        run: cd wasm-edge && npm install && npm run build
+
+      - name: Verify the tarball is installable
+        run: cd wasm-edge && npm run verify
+
   integration-load-chaos:
     name: Load & Chaos Tests
     runs-on: ubuntu-latest

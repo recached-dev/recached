@@ -46,8 +46,9 @@ npm install recached-edge
 ```
 
 > [!IMPORTANT]
-> **0.3.0 is the first stable release.** Install `recached-edge@^0.3.0`; earlier versions are not
-> recommended.
+> **Install `recached-edge@^0.3.1`.** Every published version from 0.1.3 to 0.3.0 shipped without
+> wasm-pack's `snippets/` directory and failed to import at all; 0.3.1 is the first release that
+> installs from npm. See the [changelog](CHANGELOG.md) for details.
 
 ---
 
@@ -95,6 +96,18 @@ password, no TLS, and no restriction on which web pages may open the sync socket
 
 `6379` and `6380` are defaults, not fixtures — set `RECACHED_PORT` and `RECACHED_WS_PORT` (plus
 `RECACHED_METRICS_PORT`) to move them, which is also what running two instances on one host takes.
+
+**The browser half also runs alone.** Drop `connect` and `recached-edge` never opens a socket — the
+same engine runs in WASM as a standalone client cache with TTLs, counters, JSON documents, glob
+queries, IndexedDB persistence and cross-tab sync, with no Recached server and no backend changes:
+
+```typescript
+const cache = await createCache({ persistence: true, broadcastChannel: 'my-app' });
+cache.setJSON('user:42', user, 60); // expires on its own, survives a refresh
+```
+
+What you give up is what needs a peer: pub/sub, live queries and cross-device sync. See
+[use cases: no server at all](https://recached.dev/guide/use-cases#no-server-at-all-the-client-cache-on-its-own).
 
 ---
 

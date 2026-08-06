@@ -68,3 +68,17 @@ cache.onMutation(() => {
 ```
 
 No polling. No extra state management library. No round-trips for reads. The server is your backend's cache; the WASM module is your frontend's cache; the WebSocket is the invisible sync layer between them.
+
+### Or just the browser half
+
+The sync layer is optional. Omit `connect` and no socket is opened: `recached-edge` becomes a
+standalone client cache — TTLs, counters, JSON documents, glob queries, IndexedDB persistence and
+cross-tab sync — with no Recached server anywhere and no changes to your backend.
+
+```typescript
+const cache = await createCache({ persistence: true, broadcastChannel: 'my-app' })
+cache.setJSON('user:42', user, 60) // expires on its own, survives a refresh
+```
+
+Pub/sub, live queries and cross-device sync are the parts that need a server. See
+[no server at all](/guide/use-cases#no-server-at-all-the-client-cache-on-its-own).
