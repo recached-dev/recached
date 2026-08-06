@@ -4,6 +4,90 @@ All notable changes to Recached are documented here.
 
 ---
 
+## [0.3.1] — 2026-08-06
+
+A packaging-only release. No engine, server or SDK behaviour changed — but every
+`recached-edge` version before this one was impossible to install, so in practice this is the
+first usable browser release.
+
+### Fixed — the npm package could not be imported (0.1.3 – 0.3.0)
+
+- **`snippets/` was never published.** The wasm-bindgen glue opens with
+  `import { openRecachedDb, … } from './snippets/<crate-hash>/inline0.js'` — the IndexedDB
+  helpers behind `enable_persistence`. That directory was in neither the tarball nor the `files`
+  array wasm-pack generates, so `npm install recached-edge` followed by any import died with
+  `ERR_MODULE_NOT_FOUND` before a line of application code ran. It bundles statically, so
+  webpack, Turbopack and Vite all failed at build time, not at runtime. Fourteen consecutive
+  releases shipped this way: the break dates from 0.1.3, when the IndexedDB helpers were added.
+
+- **The documented API was not the published one.** The release workflow published
+  `wasm-edge/pkg` — raw wasm-pack output, whose only exports are `RecachedCache`, `initSync` and
+  a default init. `createCache`, `Cache`, `onMutation`, `getJSON` and the ref-counted `liveQuery`
+  live in `sdk.js`, which was never published. Every example in the README and docs imported a
+  symbol that did not exist on npm, and both framework SDKs peer-depend on it. The release now
+  publishes the `wasm-edge` package itself, with `pkg/` nested inside it.
+
+- **`sdk.ts` imported a filename no build produced.** It loads `./pkg/recached_edge.js`, but the
+  crate is named `wasm-edge` (default output `wasm_edge.js`) and the release built with
+  `--out-name recached-edge` (output `recached-edge.js`). Both build paths now pass
+  `--out-name recached_edge`, matching the import and the stub CI already generated.
+
+- **`pkg/.gitignore` would have silently emptied the fixed package.** wasm-pack writes one
+  containing `*`, and npm applies a nested `.gitignore` even to a directory listed in `files` —
+  so simply switching the publish directory would have shipped an SDK with no WebAssembly in it.
+  `npm run build:wasm` deletes it, and the release deletes it again before packing.
+
+### Added — a release gate that would have caught all of the above
+
+- **`wasm-edge/scripts/verify-package.mjs`**, run by a new `npm-package` CI job on every push and
+  by the release workflow immediately before `npm publish`. It packs a real tarball, extracts it
+  outside the working tree, walks the import graph from `sdk.js` through the glue to `snippets/`,
+  and imports the result in Node to assert `createCache`, `Cache` and `init` are exported. It
+  also runs from `prepack`, so a manual `npm publish` cannot bypass it.
+
+  The gap this closes: typecheck, unit tests and `wasm-pack test` all pass against a working tree
+  where `snippets/` is present on disk. None of them can observe what `files` excludes. Only
+  packing and importing from outside the tree can, and nothing did that.
+
+- `LICENSE.md` and `NOTICE` now ship inside the npm package (`files`), and the meaningless
+  `licenseFile: "../LICENSE.md"` key — which pointed outside the package — was dropped.
+
+### Documentation — running the client with no server
+
+Local-only mode was supported in code and mentioned in passing, but never documented as a mode with
+edges. It now is, because "can I use this as a client cache without running the server?" has a
+sharper answer than the docs were giving:
+
+- **New [use case: no server at all](docs/guide/use-cases.md)** — what works standalone, and a table
+  of what is *inert* rather than broken. `publish`/`subscribe`/`onMessage`, `liveQuery`,
+  `syncToken`/`syncScopes` and `pendingWrites`/`onOutboxFull` do not throw without a connection; they
+  silently do nothing, and pub/sub in particular does **not** fall back to BroadcastChannel. Also
+  states where local-only Recached is the wrong choice: against React Query or SWR for a plain
+  request cache, a ~550 KB `.wasm` buys Redis semantics and nothing else.
+- **The "one-sentence test"** framed Recached as pointless unless a client reads backend-written
+  data. It now names the third answer — no server in the picture at all.
+- **[Getting Started (Browser)](docs/browser/getting-started.md)** gained the same works/inert split
+  next to its local-only example.
+- **Known wart, now written down:** with `persistence: true` and no `connect`, every write still
+  records an IndexedDB outbox row for a replay that cannot happen, and warns `offline write queue
+  full` past 10,000 writes. Nothing is lost; it is wasted I/O and a misleading message.
+  (`wasm-edge/src/lib.rs` — `queue_write` skips the outbox only when there is neither a URL *nor*
+  persistence.)
+- **The Next.js (App Router) example was a no-op** — a provider that returned its children untouched
+  and imported a symbol it never used. Replaced with the real client-only pattern: `RecachedProvider`
+  in a `'use client'` boundary, plus the plain `useEffect` version. Documents that the provider
+  renders `null` until `createCache()` resolves in an effect, so wrapping the whole app opts the page
+  out of SSR.
+
+### Changed
+
+- `@recached/react` and `@recached/vue` raise their `recached-edge` peer floor from `>=0.1.4` to
+  `>=0.3.1`. The old range was satisfiable only by versions that cannot be imported.
+- `wasm-edge/tsconfig.json` adds `ESNext.Disposable` to `lib`: wasm-bindgen 0.2.120 emits
+  `[Symbol.dispose]()` on the generated class, which ES2020's lib does not declare.
+
+---
+
 ## [0.3.0] — 2026-08-03
 
 ### Added

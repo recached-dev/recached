@@ -1,14 +1,21 @@
 # Getting Started (Browser)
 
-::: danger recached-edge 0.1.1 – 0.2.0 are broken in the browser
-`core-engine` read the clock via `std::time::SystemTime::now()`, which **panics** on
-`wasm32-unknown-unknown`. The clock is read on nearly every operation, so **no store write
-completes** on those versions — and a client whose write-ahead log passed the compaction threshold
-erased its own persisted cache before the replacement snapshot was written.
+::: danger Install `recached-edge@^0.3.1` — every earlier version is unusable
+Two separate defects, both fixed as of **0.3.1**:
 
-Fixed in **0.2.1**. Install `recached-edge@^0.2.1` or later.
+**Packaging (0.1.3 – 0.3.0).** The published tarball omitted wasm-pack's `snippets/` directory,
+which the generated glue imports on its first line, and published wasm-pack's `pkg/` output instead
+of the SDK — so `npm install recached-edge` failed at module resolution before any application code
+ran, and `createCache` was never on npm at all. Fixed by publishing the SDK package (with
+`snippets/`) and gating every release on a tarball that is packed and imported in CI.
 
-The Recached **server is unaffected**: it runs on a native target where the clock works normally.
+**Clock panic (0.1.1 – 0.2.0).** `core-engine` read the clock via `std::time::SystemTime::now()`,
+which **panics** on `wasm32-unknown-unknown`. The clock is read on nearly every operation, so **no
+store write completes** on those versions — and a client whose write-ahead log passed the compaction
+threshold erased its own persisted cache before the replacement snapshot was written. Fixed in 0.2.1.
+
+The Recached **server is unaffected** by both: it runs on a native target where the clock works
+normally, and it ships as a binary rather than through npm.
 :::
 
 The `recached-edge` package is the TypeScript SDK for the browser WASM client. It gives you a `Cache` class backed by the same `core-engine` as the server, with optional WebSocket sync to a Recached server instance.
@@ -198,6 +205,30 @@ See the [Vue composables docs](/vue/getting-started) for the full guide.
 
 Do not pass `connect` to `createCache()`. The WASM module runs as a pure in-memory cache with TTL — no server, no WebSocket, no backend changes required.
 
+This is a supported mode, not a degraded one: the same `core-engine` that runs on the server runs in
+the tab, so the local command surface is identical either way.
+
+```typescript
+const cache = await createCache({
+  persistence: true,            // IndexedDB WAL — survives refresh, no server needed
+  broadcastChannel: 'my-app',   // cross-tab fan-out — no server needed
+})                              // no `connect` — nothing is networked
+```
+
+**Works with no server:** `get`/`set`/`del`, `getJSON`/`setJSON`, `getBytes`/`setBytes`, `setEx` and
+TTL expiry, `exists`/`ttl`, `incr`/`decr`, `jset`/`jget`/`jmerge`, `getMatching`, `onMutation`,
+`persistence`, `broadcastChannel`.
+
+**Silently does nothing with no server** — these do not throw, they have nowhere to send to:
+`publish`, `subscribe`/`unsubscribe`/`onMessage` (pub/sub is server-brokered and does *not* fall back
+to BroadcastChannel), `liveQuery`, `syncToken`/`syncScopes`, and `pendingWrites`/`onOutboxFull`.
+
+::: warning `persistence: true` with no `connect`
+Every write still records an outbox row in IndexedDB for a replay that can never happen, and past
+10,000 writes the console shows `offline write queue full`. Wasted I/O and a misleading warning —
+your data and the WAL are fine. Use `persistence: false` if the noise matters to you.
+:::
+
 ```typescript
 import { createCache } from 'recached-edge'
 
@@ -286,20 +317,67 @@ export default defineConfig({
 
 ### Next.js (App Router)
 
-```typescript
+The cache is browser-only: `createCache()` is async, fetches a `.wasm` file, and touches
+`indexedDB` and `BroadcastChannel`. So it must be created in a client component after hydration,
+never at module scope in anything the server renders.
+
+`@recached/react` does this for you — its provider builds the cache in an effect:
+
+```tsx
 // app/providers.tsx
 'use client'
 
-import { createCache } from 'recached-edge'
-import { cache as cacheRef } from '../lib/cache'
+import { RecachedProvider } from '@recached/react'
 
-export function CacheProvider({ children }: { children: React.ReactNode }) {
-  // WASM must be initialized in a client component (after hydration)
-  return <>{children}</>
+export function Providers({ children }: { children: React.ReactNode }) {
+  return (
+    // Local-only: drop `connect` and no socket is ever opened.
+    <RecachedProvider options={{ persistence: true, broadcastChannel: 'my-app' }}>
+      {children}
+    </RecachedProvider>
+  )
 }
 ```
 
-Use `@recached/react` for the recommended Next.js App Router integration — it wraps WASM init and the cache lifecycle automatically.
+```tsx
+// app/layout.tsx — a server component; only Providers is client-side
+import { Providers } from './providers'
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en">
+      <body><Providers>{children}</Providers></body>
+    </html>
+  )
+}
+```
+
+::: warning The provider renders `null` until the cache is ready
+`createCache()` resolves in an effect, which does not run during SSR — so anything inside
+`<RecachedProvider>` is absent from the server-rendered HTML and appears on hydration. Wrapping your
+entire app therefore opts the whole page out of SSR. Mount it around the subtree that actually reads
+the cache, and keep content you need server-rendered (or indexed) outside it.
+:::
+
+Without the React SDK, do the same thing by hand — build the cache in `useEffect`, or reach for
+`next/dynamic` with `ssr: false` on the component that uses it:
+
+```tsx
+'use client'
+
+import { useEffect, useState } from 'react'
+import { createCache, type Cache } from 'recached-edge'
+
+export function useLocalCache(): Cache | null {
+  const [cache, setCache] = useState<Cache | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    createCache({ persistence: true }).then((c) => !cancelled && setCache(c))
+    return () => { cancelled = true }
+  }, [])
+  return cache
+}
+```
 
 ### webpack
 

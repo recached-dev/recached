@@ -1,7 +1,7 @@
 {
   "name": "recached-edge",
-  "description": "Browser and edge WebAssembly client for Recached \u2014 zero-latency local cache with automatic server sync",
-  "version": "0.3.0",
+  "description": "Browser and edge WebAssembly client for Recached — zero-latency local cache with automatic server sync",
+  "version": "0.3.1",
   "type": "module",
   "main": "sdk.js",
   "module": "sdk.js",
@@ -17,10 +17,15 @@
     "sdk.js",
     "sdk.d.ts",
     "sdk.d.ts.map",
-    "pkg/"
+    "pkg/",
+    "LICENSE.md",
+    "NOTICE"
   ],
   "scripts": {
-    "build": "wasm-pack build --target web --out-dir pkg && tsc",
+    "build": "npm run build:wasm && tsc",
+    "build:wasm": "rm -rf pkg && wasm-pack build --target web --out-dir pkg --out-name recached_edge && rm -f pkg/.gitignore",
+    "prepack": "node scripts/verify-package.mjs --pre",
+    "verify": "node scripts/verify-package.mjs",
     "typecheck": "tsc --noEmit",
     "version:patch": "npm version patch --no-git-tag-version",
     "version:minor": "npm version minor --no-git-tag-version",
@@ -52,6 +57,5 @@
     "browser-cache",
     "zero-latency"
   ],
-  "license": "Apache-2.0",
-  "licenseFile": "../LICENSE.md"
+  "license": "Apache-2.0"
 }
