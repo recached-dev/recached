@@ -81,4 +81,4 @@ cache.setJSON('user:42', user, 60) // expires on its own, survives a refresh
 ```
 
 Pub/sub, live queries and cross-device sync are the parts that need a server. See
-[no server at all](/guide/use-cases#no-server-at-all-the-client-cache-on-its-own).
+[no server at all](/guide/use-cases#no-server-at-all).

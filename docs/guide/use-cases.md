@@ -19,7 +19,7 @@ reason Recached exists.
 
 There is a third answer the question does not cover: **no, and there is no server involved at all.**
 The browser client is a complete cache on its own — see
-[no server at all](#no-server-at-all-the-client-cache-on-its-own) below. That is a narrower pitch
+[no server at all](#no-server-at-all) below. That is a narrower pitch
 than the one this page is mostly about, and it is judged against `Map`, IndexedDB wrappers and
 React Query rather than against Redis.
 
@@ -70,9 +70,9 @@ are unreachable when the network is down, by definition.
 Multiple tabs of the same app share mutations through BroadcastChannel without any server round-trip.
 With Redis this is either polling per tab or a `storage` event protocol you write yourself.
 
-### No server at all — the client cache on its own
+### No server at all
 
-Omit `connect` and `recached-edge` never opens a socket. Nothing else changes: the same
+The client cache on its own. Omit `connect` and `recached-edge` never opens a socket. Nothing else changes: the same
 `core-engine` state machine that runs on the server runs in WASM in the tab, so you get the full
 local command surface with no backend of any kind.
 

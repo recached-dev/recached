@@ -107,13 +107,13 @@ cache.setJSON('user:42', user, 60); // expires on its own, survives a refresh
 ```
 
 What you give up is what needs a peer: pub/sub, live queries and cross-device sync. See
-[use cases: no server at all](https://recached.dev/guide/use-cases#no-server-at-all-the-client-cache-on-its-own).
+[use cases: no server at all](https://recached.dev/guide/use-cases#no-server-at-all).
 
 ---
 
 ## Benchmarks
 
-Measured with `redis-benchmark` (100k requests, 50 connections, 64-byte values, randomized keys, persistence disabled on all servers) on a 4-core Intel i5-8259U laptop, July 2026 — Recached v0.1.8 vs Redis 7.2.5 vs Valkey 9.1.0, one server at a time. Current release is v0.3.0; these command paths were A/B tested across the v0.2.4 changes and spot-checked again on v0.3.0 (SET 455k, GET 518k, INCR 526k pipelined on the same laptop), moving within run-to-run noise each time — but the three-way suite has not been re-run since v0.1.8.
+Measured with `redis-benchmark` (100k requests, 50 connections, 64-byte values, randomized keys, persistence disabled on all servers) on a 4-core Intel i5-8259U laptop, July 2026 — Recached v0.1.8 vs Redis 7.2.5 vs Valkey 9.1.0, one server at a time. Current release is v0.3.1 (packaging only — no engine change since v0.3.0); these command paths were A/B tested across the v0.2.4 changes and spot-checked again on v0.3.0 (SET 455k, GET 518k, INCR 526k pipelined on the same laptop), moving within run-to-run noise each time — but the three-way suite has not been re-run since v0.1.8.
 
 Pipelined (`-P 16`) — raw command throughput, requests/sec, **bold** = best per row:
 
