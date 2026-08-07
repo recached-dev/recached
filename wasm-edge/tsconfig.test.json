@@ -1,0 +1,7 @@
+// Typechecks the test suite, which `tsconfig.json` deliberately excludes so
+// nothing under test ever lands in the published package. Run by `npm test`.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "noEmit": true, "skipLibCheck": true, "types": ["node"] },
+  "include": ["sdk.ts", "sdk.test.ts", "vitest.config.ts"]
+}

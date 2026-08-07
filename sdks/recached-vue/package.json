@@ -1,7 +1,7 @@
 {
   "name": "@recached/vue",
   "version": "0.3.2",
-  "description": "Official Vue 3 composables for Recached \u2014 zero-latency reactive cache",
+  "description": "Official Vue 3 composables for Recached — zero-latency reactive cache",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -23,15 +23,21 @@
     "typecheck": "tsc --noEmit",
     "version:patch": "npm version patch --no-git-tag-version",
     "version:minor": "npm version minor --no-git-tag-version",
-    "version:major": "npm version major --no-git-tag-version"
+    "version:major": "npm version major --no-git-tag-version",
+    "test": "tsc --noEmit -p tsconfig.test.json && vitest run",
+    "test:watch": "vitest"
   },
   "peerDependencies": {
-    "vue": ">=3",
-    "recached-edge": ">=0.3.1"
+    "recached-edge": ">=0.3.1",
+    "vue": ">=3"
   },
   "devDependencies": {
+    "@types/node": "^26.1.2",
     "@vue/runtime-core": "^3",
+    "@vue/test-utils": "^2.4.11",
+    "jsdom": "^30.0.1",
     "typescript": "^5.9.3",
+    "vitest": "^3.2.7",
     "vue": "^3"
   },
   "keywords": [

@@ -3,6 +3,13 @@
 target/
 debug/
 
+# npm dependencies.
+#
+# There was no rule here, and only sdks/* carried their own — so
+# `wasm-edge/node_modules` (all of TypeScript, 135 files) was committed by
+# accident. Nothing in this repo vendors its dependencies.
+node_modules/
+
 # Wasm-pack generated output
 # We ignore the pkg directory because it is automatically generated during the build
 /wasm-edge/pkg/

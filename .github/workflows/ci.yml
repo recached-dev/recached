@@ -154,6 +154,12 @@ jobs:
       - name: Typecheck against generated bindings
         run: cd wasm-edge && npm run typecheck:bindings
 
+      # The SDK unit tests run here rather than in typecheck-js because this is
+      # the job with a real wasm-pack build: their typecheck pass resolves the
+      # generated bindings, not the stub .d.ts that job fabricates.
+      - name: Test recached-edge SDK
+        run: cd wasm-edge && npm test
+
       - name: Verify the tarball is installable and works
         run: cd wasm-edge && npm run verify
 
@@ -178,7 +184,7 @@ jobs:
         timeout-minutes: 5
 
   typecheck-js:
-    name: Typecheck @recached/react and @recached/vue
+    name: Typecheck & Test @recached/react and @recached/vue
     runs-on: ubuntu-latest
 
     steps:
@@ -209,8 +215,17 @@ jobs:
       - name: Typecheck @recached/react
         run: cd sdks/recached-react && npm run typecheck
 
+      # The hooks need no wasm — the suite fakes `Cache` and aliases the
+      # `recached-edge` peer to a stub, so it runs in this job rather than the
+      # one that builds the engine.
+      - name: Test @recached/react
+        run: cd sdks/recached-react && npm test
+
       - name: Install @recached/vue dependencies
         run: cd sdks/recached-vue && npm install --legacy-peer-deps
 
       - name: Typecheck @recached/vue
         run: cd sdks/recached-vue && npm run typecheck
+
+      - name: Test @recached/vue
+        run: cd sdks/recached-vue && npm test

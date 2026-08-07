@@ -1,6 +1,6 @@
 {
   "name": "recached-edge",
-  "description": "Browser and edge WebAssembly client for Recached \u2014 zero-latency local cache with automatic server sync",
+  "description": "Browser and edge WebAssembly client for Recached — zero-latency local cache with automatic server sync",
   "version": "0.3.2",
   "type": "module",
   "main": "sdk.js",
@@ -30,10 +30,14 @@
     "typecheck:bindings": "tsc -p tsconfig.bindings.json",
     "version:patch": "npm version patch --no-git-tag-version",
     "version:minor": "npm version minor --no-git-tag-version",
-    "version:major": "npm version major --no-git-tag-version"
+    "version:major": "npm version major --no-git-tag-version",
+    "test": "tsc --noEmit -p tsconfig.test.json && vitest run",
+    "test:watch": "vitest"
   },
   "devDependencies": {
-    "typescript": "^5.9.3"
+    "@types/node": "^26.1.2",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
   },
   "repository": {
     "type": "git",

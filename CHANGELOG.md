@@ -38,6 +38,49 @@ Why nothing caught it, and what now does:
   bytes, `del` — against the extracted **tarball**, not the working tree. Reintroducing the bug
   fails it with the exact `TypeError` — verified.
 
+### Fixed — `useKeyJSON` and `useKeyBytes` crashed the component tree
+
+Both hooks read through `useSyncExternalStore`, which compares snapshots with `Object.is` and
+re-reads on every render. `getJSON` parses a **fresh object** and `getBytes` copies a **fresh
+array** out of wasm on every call, so each read looked like a change, which forced another render,
+which read again. React caught the loop and threw:
+
+```
+Maximum update depth exceeded.
+```
+
+That happened on mount for **any key that existed** — the hooks worked only while their key was
+missing. `useKeys` already guarded against exactly this (it memoises on content), and the guard
+simply had not been applied to the single-key hooks.
+
+Both now hold their last snapshot and re-read only when a mutation has actually occurred, tracked
+by a counter incremented in the store subscription. `useKeyJSON` additionally compares the stored
+string before re-parsing and `useKeyBytes` compares bytes, so a write to an *unrelated* key no
+longer changes either hook's identity — which matters for `useKeyBytes`, where a new buffer means
+every downstream `URL.createObjectURL` is rebuilt.
+
+Found by the new test suite below, on the first run.
+
+### Added — TypeScript test suites (71 tests)
+
+The TS side had no tests at all. Three suites now run in CI on every push:
+
+- **`recached-edge` (36 tests)** — the SDK wrapper against a fake `RawCache`: null mapping, JSON
+  handling and parse failures, `setJSON` TTL routing, `del`'s boolean, the bigint marshalling above,
+  `jset`/`jmerge` error propagation, mutation and per-channel pub/sub listener bookkeeping,
+  live-query ref-counting (shared patterns, repeated stops, re-subscription), and the order
+  `createCache` applies persistence → broadcast → connect → auth → token/scopes → reconnect.
+- **`@recached/react` (19 tests)** — provider lifecycle (including that children do not render until
+  `createCache` resolves, the reason wrapping a whole app opts it out of SSR), re-render on
+  mutation, snapshot identity, live-query start/stop across pattern changes, and pub/sub handler
+  identity not forcing a resubscribe.
+- **`@recached/vue` (16 tests)** — ref updates, `onUnmounted` releasing every subscription, plugin
+  provide/inject and its error when uninstalled.
+
+The fakes are deliberately faithful where it matters: `getBytes` allocates a new array per call, as
+the real binding does. A fake returning one shared instance is what would have hidden the crash
+above.
+
 ### Fixed — packaging
 
 - `@recached/react` and `@recached/vue` shipped without `NOTICE`. The release copies it into both

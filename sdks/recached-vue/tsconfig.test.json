@@ -1,0 +1,7 @@
+// Typechecks the test suite. `tsconfig.json` builds only `src` (rootDir), so
+// tests are never emitted into dist/ or published. Run by `npm test`.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "noEmit": true, "rootDir": "." },
+  "include": ["src", "test", "vitest.config.ts"]
+}

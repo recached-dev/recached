@@ -1,5 +1,38 @@
-import { useSyncExternalStore } from 'react';
+import { useCallback, useRef, useSyncExternalStore } from 'react';
 import { useRecached } from './context';
+
+/**
+ * Subscribe to store mutations, counting them.
+ *
+ * `useSyncExternalStore` compares snapshots with `Object.is` and re-reads on
+ * every render, so a `getSnapshot` that allocates — `getJSON` parses a fresh
+ * object, `getBytes` copies a fresh array out of wasm — reports a change every
+ * single time and re-renders forever. Counting mutations gives those hooks a
+ * cheap way to answer "has anything happened since I last read?" without
+ * touching the value, which is what makes a stable snapshot possible.
+ *
+ * Returns the subscribe function plus the counter ref.
+ */
+function useMutationVersion(cache: ReturnType<typeof useRecached>) {
+  const version = useRef(0);
+  const subscribe = useCallback(
+    (onStoreChange: () => void) =>
+      cache.onMutation(() => {
+        version.current += 1;
+        onStoreChange();
+      }),
+    [cache],
+  );
+  return { subscribe, version };
+}
+
+/** Byte-wise equality, so an unchanged binary value keeps its identity. */
+function sameBytes(a: Uint8Array | null, b: Uint8Array | null): boolean {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
 
 /**
  * Reactively read a string key from the Recached store.
@@ -64,9 +97,23 @@ export function useKey(key: string): string | null {
  */
 export function useKeyBytes(key: string): Uint8Array | null {
   const cache = useRecached();
+  const { subscribe, version } = useMutationVersion(cache);
+  const memo = useRef<{ key: string; version: number; value: Uint8Array | null }>(undefined);
+
   return useSyncExternalStore(
-    (cb) => cache.onMutation(cb),
-    () => cache.getBytes(key),
+    subscribe,
+    () => {
+      const prev = memo.current;
+      // Nothing has happened since the last read: hand back the same array.
+      if (prev && prev.key === key && prev.version === version.current) return prev.value;
+
+      const next = cache.getBytes(key);
+      // A mutation elsewhere in the store must not hand this component a new
+      // buffer identity — that would rebuild every object URL downstream.
+      const value = prev && prev.key === key && sameBytes(prev.value, next) ? prev.value : next;
+      memo.current = { key, version: version.current, value };
+      return value;
+    },
     () => null,
   );
 }
@@ -89,9 +136,35 @@ export function useKeyBytes(key: string): Uint8Array | null {
  */
 export function useKeyJSON<T>(key: string): T | null {
   const cache = useRecached();
+  const { subscribe, version } = useMutationVersion(cache);
+  const memo = useRef<{ key: string; version: number; raw: string | null; value: T | null }>(
+    undefined,
+  );
+
   return useSyncExternalStore(
-    (cb) => cache.onMutation(cb),
-    () => cache.getJSON<T>(key),
+    subscribe,
+    () => {
+      const prev = memo.current;
+      if (prev && prev.key === key && prev.version === version.current) return prev.value;
+
+      // Compare the stored text before parsing: a mutation to some other key
+      // must not produce a new object identity here. `get` throws on a binary
+      // value, which is not JSON by definition — that is a miss, not an error.
+      let raw: string | null;
+      try {
+        raw = cache.get(key);
+      } catch {
+        raw = null;
+      }
+      if (prev && prev.key === key && prev.raw === raw) {
+        memo.current = { ...prev, version: version.current };
+        return prev.value;
+      }
+
+      const value = cache.getJSON<T>(key);
+      memo.current = { key, version: version.current, raw, value };
+      return value;
+    },
     () => null,
   );
 }
