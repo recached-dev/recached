@@ -1,12 +1,13 @@
 class Recached < Formula
   desc "Blazing fast, multi-core drop-in replacement for Redis"
   homepage "https://github.com/recached-dev/recached"
-  version "0.3.1"
+  version "0.3.2"
   license "Apache-2.0"
 
-  # The checksums below are placeholders until the v0.2.4 release artifacts
-  # exist. Fill them with `scripts/update-formula-checksums.sh v0.2.4`, which
-  # downloads the published binaries and rewrites this file.
+  # The checksums below are placeholders until this version's release artifacts
+  # exist. Fill them with `scripts/update-formula-checksums.sh v<version>`
+  # (matching the `version` above), which downloads the published binaries and
+  # rewrites this file.
   #
   # `scripts/bump-version.sh` resets them to placeholders on every bump, and
   # that is deliberate: this formula sat at 0.1.8 with *valid* 0.1.8 URLs and
@@ -16,11 +17,11 @@ class Recached < Formula
   # placeholder makes brew fail loudly, which is the far better failure.
   on_macos do
     on_intel do
-      url "https://github.com/recached-dev/recached/releases/download/v0.3.1/recached-macos-amd64"
+      url "https://github.com/recached-dev/recached/releases/download/v0.3.2/recached-macos-amd64"
       sha256 "REPLACE_WITH_AMD64_SHA256"
     end
     on_arm do
-      url "https://github.com/recached-dev/recached/releases/download/v0.3.1/recached-macos-arm64"
+      url "https://github.com/recached-dev/recached/releases/download/v0.3.2/recached-macos-arm64"
       sha256 "REPLACE_WITH_ARM64_SHA256"
     end
   end

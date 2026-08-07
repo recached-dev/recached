@@ -1,0 +1,10 @@
+// Type-checks sdk.ts against the REAL generated bindings in pkg/.
+// Requires `npm run build:wasm` first — the stub .d.ts that CI's typecheck-js
+// job writes is an empty class and would make this vacuous.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": ["sdk.ts", "types-check.ts"]
+}

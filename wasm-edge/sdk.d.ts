@@ -53,7 +53,7 @@ export interface CacheOptions {
      */
     connect?: ConnectOptions;
 }
-interface RawCache {
+export interface RawCache {
     enable_persistence(): Promise<void>;
     clear_persistence(): Promise<void>;
     broadcast(channel_name: string): void;
@@ -65,7 +65,8 @@ interface RawCache {
     get(key: string): string | undefined;
     getBytes(key: string): Uint8Array | undefined;
     del(key: string): number;
-    incr_by(key: string, delta: number): number;
+    /** `i64` on the Rust side, so wasm-bindgen marshals it as `bigint`. */
+    incr_by(key: string, delta: bigint): bigint;
     disconnect(): void;
     set_auto_reconnect(enabled: boolean): void;
     ttl(key: string): number;
@@ -259,6 +260,9 @@ export declare class Cache {
      * increments from other clients when the connection returns — nobody's
      * counts are lost (PN-counter semantics). Throws if the key holds a
      * non-integer value.
+     *
+     * Counters are 64-bit on the wire; the returned `number` is exact up to
+     * `Number.MAX_SAFE_INTEGER` (2^53 - 1) and loses precision beyond it.
      */
     incr(key: string, by?: number): number;
     /** Decrement an integer counter. See {@link incr}. */
@@ -413,5 +417,4 @@ export declare function init(): Promise<void>;
  * ```
  */
 export declare function createCache(options?: CacheOptions): Promise<Cache>;
-export {};
 //# sourceMappingURL=sdk.d.ts.map

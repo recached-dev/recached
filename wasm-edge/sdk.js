@@ -271,13 +271,16 @@ export class Cache {
      * increments from other clients when the connection returns — nobody's
      * counts are lost (PN-counter semantics). Throws if the key holds a
      * non-integer value.
+     *
+     * Counters are 64-bit on the wire; the returned `number` is exact up to
+     * `Number.MAX_SAFE_INTEGER` (2^53 - 1) and loses precision beyond it.
      */
     incr(key, by = 1) {
-        return this.raw.incr_by(key, by);
+        return Number(this.raw.incr_by(key, BigInt(by)));
     }
     /** Decrement an integer counter. See {@link incr}. */
     decr(key, by = 1) {
-        return this.raw.incr_by(key, -by);
+        return Number(this.raw.incr_by(key, BigInt(-by)));
     }
     /**
      * Close the server connection and stop reconnecting. Local reads and writes

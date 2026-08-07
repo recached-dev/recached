@@ -1,7 +1,7 @@
 {
   "name": "recached-edge",
-  "description": "Browser and edge WebAssembly client for Recached — zero-latency local cache with automatic server sync",
-  "version": "0.3.1",
+  "description": "Browser and edge WebAssembly client for Recached \u2014 zero-latency local cache with automatic server sync",
+  "version": "0.3.2",
   "type": "module",
   "main": "sdk.js",
   "module": "sdk.js",
@@ -27,6 +27,7 @@
     "prepack": "node scripts/verify-package.mjs --pre",
     "verify": "node scripts/verify-package.mjs",
     "typecheck": "tsc --noEmit",
+    "typecheck:bindings": "tsc -p tsconfig.bindings.json",
     "version:patch": "npm version patch --no-git-tag-version",
     "version:minor": "npm version minor --no-git-tag-version",
     "version:major": "npm version major --no-git-tag-version"

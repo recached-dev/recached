@@ -95,6 +95,76 @@ function checkTree(root, label) {
   return { sdkPath, gluePath };
 }
 
+/**
+ * Call the public `Cache` API against the packaged wasm.
+ *
+ * Importing proves the files resolve; it does not prove a single method works.
+ * `incr`/`decr` shipped broken for several releases because Rust's `i64` makes
+ * wasm-bindgen emit `bigint` while the SDK passed a `number` — a `TypeError` on
+ * every call, in every runtime, that no test could see: the Rust-side browser
+ * tests never cross the JS boundary, and `sdk.js` has no unit tests.
+ *
+ * `initSync` takes the wasm bytes directly, so this needs no fetchable URL and
+ * no browser. Persistence and pub/sub are skipped — they need IndexedDB and a
+ * socket. Everything here is local-only, the mode with no external dependency.
+ */
+async function checkBehaviour(glue, sdk, pkgDir) {
+  const wasm = readdirSync(pkgDir).find((f) => f.endsWith('.wasm'));
+  let cache;
+  try {
+    glue.initSync({ module: readFileSync(path.join(pkgDir, wasm)) });
+    cache = new sdk.Cache(new glue.RecachedCache());
+  } catch (e) {
+    fail(`tarball: could not instantiate the wasm — ${e.message.split('\n')[0]}`);
+    return;
+  }
+
+  const check = (label, fn, expected) => {
+    let actual;
+    try {
+      actual = fn();
+    } catch (e) {
+      fail(`tarball: ${label} threw ${e.constructor.name}: ${e.message.split('\n')[0]}`);
+      return;
+    }
+    const got = JSON.stringify(actual);
+    if (got !== JSON.stringify(expected)) {
+      fail(`tarball: ${label} returned ${got}, expected ${JSON.stringify(expected)}`);
+    }
+  };
+
+  cache.set('k', 'v');
+  check('get after set', () => cache.get('k'), 'v');
+  check('exists', () => cache.exists('k'), true);
+  check('get on a missing key', () => cache.get('nope'), null);
+  check('ttl on a missing key', () => cache.ttl('nope'), -2);
+
+  cache.setJSON('u', { id: 42 });
+  check('getJSON round-trip', () => cache.getJSON('u').id, 42);
+
+  cache.setEx('s', 'tok', 60);
+  check('ttl after setEx', () => cache.ttl('s'), 60);
+
+  // The regression that motivated this function.
+  check('incr', () => cache.incr('n'), 1);
+  check('incr by 5', () => cache.incr('n', 5), 6);
+  check('decr by 2', () => cache.decr('n', 2), 4);
+  check('incr returns a number', () => typeof cache.incr('n'), 'number');
+
+  cache.jset('d', '$', { title: 'a', draft: true });
+  cache.jmerge('d', { title: 'b', draft: null });
+  check('jget after jmerge', () => cache.jget('d'), { title: 'b' });
+
+  cache.set('p:1', 'x');
+  check('getMatching', () => cache.getMatching('p:*'), [['p:1', 'x']]);
+
+  cache.setBytes('b', new Uint8Array([1, 2, 3]));
+  check('getBytes round-trip', () => Array.from(cache.getBytes('b')), [1, 2, 3]);
+
+  check('del', () => cache.del('k'), true);
+  check('get after del', () => cache.get('k'), null);
+}
+
 // ── working-tree checks (also run from prepack) ───────────────────────────────
 
 if (existsSync(path.join(PKG_ROOT, 'pkg', '.gitignore'))) {
@@ -131,17 +201,17 @@ if (!PRE && problems.length === 0) {
     const found = checkTree(extracted, 'tarball');
 
     if (found) {
-      // Resolution is the thing that broke, so import both modules for real.
-      // The glue only defines bindings at import time — instantiating the wasm
-      // needs a fetchable URL, which is a browser concern, so we stop here.
+      // Resolution is the thing that broke first, so import both modules for real.
+      let glue;
       try {
-        await import(pathToFileURL(found.gluePath).href);
+        glue = await import(pathToFileURL(found.gluePath).href);
       } catch (e) {
         fail(`tarball: importing the wasm glue failed — ${e.code ?? ''} ${e.message.split('\n')[0]}`);
       }
 
+      let sdk;
       try {
-        const sdk = await import(pathToFileURL(found.sdkPath).href);
+        sdk = await import(pathToFileURL(found.sdkPath).href);
         for (const name of ['createCache', 'init', 'Cache']) {
           if (!(name in sdk)) {
             fail(
@@ -153,6 +223,8 @@ if (!PRE && problems.length === 0) {
       } catch (e) {
         fail(`tarball: importing sdk.js failed — ${e.code ?? ''} ${e.message.split('\n')[0]}`);
       }
+
+      if (glue && sdk) await checkBehaviour(glue, sdk, path.dirname(found.gluePath));
     }
   } finally {
     rmSync(tmp, { recursive: true, force: true });

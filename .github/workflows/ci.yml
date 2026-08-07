@@ -147,7 +147,14 @@ jobs:
       - name: Build the package
         run: cd wasm-edge && npm install && npm run build
 
-      - name: Verify the tarball is installable
+      # Checks sdk.ts against the REAL generated bindings. The typecheck-js job
+      # cannot do this — it stubs pkg/*.d.ts because wasm-pack isn't installed
+      # there — and `createCache` casts through `unknown`, so nothing else does
+      # either. That blind spot shipped `incr`/`decr` broken for six releases.
+      - name: Typecheck against generated bindings
+        run: cd wasm-edge && npm run typecheck:bindings
+
+      - name: Verify the tarball is installable and works
         run: cd wasm-edge && npm run verify
 
   integration-load-chaos:

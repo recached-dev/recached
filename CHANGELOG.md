@@ -4,6 +4,55 @@ All notable changes to Recached are documented here.
 
 ---
 
+## [0.3.2] — 2026-08-07
+
+### Fixed — `cache.incr()` and `cache.decr()` threw on every call
+
+`incr_by` takes an `i64` in Rust, so wasm-bindgen marshals it as a **`bigint`** —
+`incr_by(key: string, delta: bigint): bigint`. The SDK's hand-written `RawCache`
+interface declared `number` and `sdk.js` passed one, so every call died with:
+
+```
+TypeError: Cannot convert 1 to a BigInt
+```
+
+Runtime-independent — the same failure in the browser as in Node. The SDK now converts at the
+boundary (`BigInt` in, `Number` out); counters stay 64-bit on the wire and the returned `number`
+is exact to `Number.MAX_SAFE_INTEGER`.
+
+The bug dates back to at least 0.2.4 but was **unreachable until 0.3.1**, because no release from
+0.1.3 to 0.3.0 could be imported at all (see below). Fixing the packaging is what exposed it.
+`incr`/`decr` are the PN-counter primitives the offline-merge documentation is built on, so this
+was the worst possible method to have broken.
+
+Why nothing caught it, and what now does:
+
+- **`createCache` casts the module through `unknown`** (`as unknown as RawCache`), which switches
+  off type checking at exactly the boundary that drifted. New **`types-check.ts`** asserts
+  `RecachedCache extends RawCache` against the real generated `.d.ts`, run by
+  `npm run typecheck:bindings` in both CI and the release. Reverting the fix now fails compilation
+  naming `incr_by` — verified.
+- **No test ever called the SDK.** The `wasm-pack` browser tests are Rust-side and never cross the
+  JS boundary; `sdk.js` had no tests. `verify-package.mjs` now `initSync`s the packaged wasm and
+  exercises the public `Cache` API — `get`/`set`, TTL, `incr`/`decr`, JSON documents, `getMatching`,
+  bytes, `del` — against the extracted **tarball**, not the working tree. Reintroducing the bug
+  fails it with the exact `TypeError` — verified.
+
+### Fixed — packaging
+
+- `@recached/react` and `@recached/vue` shipped without `NOTICE`. The release copies it into both
+  package directories, but their `files` array was `["dist/"]`, so it was excluded — `LICENSE.md`
+  only survived because npm includes it automatically. Apache-2.0 §4(d) expects the NOTICE to
+  propagate; both now list it explicitly.
+
+### Note on 0.3.1
+
+0.3.1 fixed the packaging correctly — `snippets/` ships, `createCache` is exported, the tarball
+installs — and that is what made this `incr` bug reachable for the first time. If you installed
+0.3.1 and use counters, upgrade.
+
+---
+
 ## [0.3.1] — 2026-08-06
 
 A packaging-only release. No engine, server or SDK behaviour changed — but every

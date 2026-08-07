@@ -244,10 +244,16 @@ jobs:
         env:
           TAG_VERSION: ${{ github.ref_name }}
 
-      # Packs a real tarball and imports it from outside the tree: proves the
-      # snippets/ glue resolves and that `createCache` is actually exported.
-      # Every release from 0.1.3 to 0.3.0 failed both and shipped anyway.
-      - name: Verify the package is installable
+      # sdk.ts vs the real generated bindings. `createCache` casts through
+      # `unknown`, so this is the only thing that checks that boundary.
+      - name: Typecheck against generated bindings
+        run: cd wasm-edge && npm run typecheck:bindings
+
+      # Packs a real tarball, imports it from outside the tree, and calls the
+      # public API against the packaged wasm: proves the snippets/ glue
+      # resolves, that `createCache` is exported, and that the methods actually
+      # run. Releases 0.1.3–0.3.0 failed the first two; 0.3.1 failed the third.
+      - name: Verify the package is installable and works
         run: cd wasm-edge && npm run verify
 
       - name: Publish to NPM

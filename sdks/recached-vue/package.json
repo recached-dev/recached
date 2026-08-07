@@ -1,7 +1,7 @@
 {
   "name": "@recached/vue",
-  "version": "0.3.1",
-  "description": "Official Vue 3 composables for Recached — zero-latency reactive cache",
+  "version": "0.3.2",
+  "description": "Official Vue 3 composables for Recached \u2014 zero-latency reactive cache",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -14,7 +14,9 @@
     }
   },
   "files": [
-    "dist/"
+    "dist/",
+    "LICENSE.md",
+    "NOTICE"
   ],
   "scripts": {
     "build": "tsc",
