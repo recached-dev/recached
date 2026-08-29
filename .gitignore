@@ -50,6 +50,7 @@ scripts/*
 !scripts/bump-version.sh
 !scripts/benchmark.sh
 !scripts/update-formula-checksums.sh
+!scripts/update-deps.sh
 
 # Cache snapshots / AOF written by a server started in the repo root
 # (e.g. while running scripts/benchmark.sh). Never artifacts to commit.

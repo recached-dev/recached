@@ -99,8 +99,22 @@ should.
   always plaintext and has no allowlist of its own. Bumped to 0.4.19 in `Cargo.lock`.
 - **Every third-party action is SHA-pinned**, across all three workflows, with the tag it
   came from in a trailing comment. A tag is mutable; a commit is not.
-- **`.github/dependabot.yml`** for cargo, actions and the three npm roots. This is what makes
-  SHA pinning safe rather than a way to freeze a known-vulnerable action forever.
+- **`scripts/update-deps.sh`** — a local, batched dependency routine: advisories first, then
+  semver-compatible updates, then the full gate, with `--majors` to surface what it declined and
+  `--actions` to re-resolve the pinned Action SHAs against their tags.
+
+  This started as `.github/dependabot.yml` and was **removed within the hour**. The config was
+  wrong for this repo in three compounding ways: the three npm roots were ungrouped, so every
+  dev-dependency got its own PR; `open-pull-requests-limit` was set only on the cargo entry, so
+  each npm root defaulted to a further five; and the cargo group covered only `minor`/`patch`, so
+  every major broke out on its own. Sixteen pull requests, each queueing the full CI matrix.
+  Several could not have passed — `typescript 5.9.3 → 7.0.2`, `vitest 3.2.7 → 4.1.11`,
+  `@types/react 18 → 19`, `rand 0.9 → 0.10`, `metrics-exporter-prometheus 0.16 → 0.18`.
+
+  Batching the same work locally costs one CI run instead of sixteen and lets a bump that breaks
+  the build be fixed before it is pushed. The cost is that **nothing moves the Action SHA pins on
+  its own** — a pin is immutable, so it never picks up an upstream fix. That is what
+  `--actions` is for, and it is now a thing someone has to remember to run.
 - **`SECURITY.md`** — private reporting, response times, and an explicit scope section
   listing what is a documented property rather than a defect, so a reporter is not left
   guessing.
