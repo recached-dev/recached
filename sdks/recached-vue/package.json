@@ -37,7 +37,7 @@
     "@vue/test-utils": "^2.4.11",
     "jsdom": "^30.0.1",
     "typescript": "^5.9.3",
-    "vitest": "^3.2.7",
+    "vitest": "^4.1.11",
     "vue": "^3"
   },
   "keywords": [
