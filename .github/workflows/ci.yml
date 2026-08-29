@@ -9,25 +9,55 @@ on:
   # re-declared subset that can drift out of step with this file.
   workflow_call:
 
+# Declared explicitly: with no `permissions` block a workflow inherits the
+# repository default, which may be write. Nothing in CI needs more than read.
+permissions:
+  contents: read
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  supply-chain:
+    name: Advisories, Licences, and Bans
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2
+        with:
+          tool: cargo-deny
+
+      # `cargo deny` covers what `cargo audit` does (RustSec advisories) and
+      # adds licence and duplicate-version policy, so it is the single gate
+      # rather than running both. Configured in deny.toml.
+      - name: cargo-deny
+        run: cargo deny --all-features check
+
   quality-checks:
     name: Lint, Format, and Test
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+        # Version, components and profile all come from rust-toolchain.toml,
+        # so CI cannot silently drift onto a newer compiler than the one
+        # this repo was linted against.
+        run: |
+          rustup show
+          rustc --version
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: "recached-ci-cache"
 
@@ -39,16 +69,39 @@ jobs:
         # here. Its browser-bound paths (WebSocket, IndexedDB, Closure plumbing)
         # are NOT covered by any automated test yet — the npm workflow only
         # builds the wasm package. See the roadmap for wasm-bindgen-test.
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --locked --workspace --all-features
+
+      # `recached-embed`'s live suite skips itself unless this is set, so
+      # without a server it silently tests nothing — which is exactly what it
+      # did when the crate first landed. Boot one and point it at the socket.
+      - name: Build the server for the embedded-client suite
+        run: cargo build --locked -p recached --bin recached-server
+
+      - name: Run the embedded-client suite against a live server
+        env:
+          RECACHED_EMBED_TEST_URL: ws://127.0.0.1:6380
+          RECACHED_SAVE_INTERVAL: "0"
+        run: |
+          ./target/debug/recached-server &
+          server=$!
+          trap 'kill $server 2>/dev/null || true' EXIT
+          for _ in $(seq 1 50); do
+            if nc -z 127.0.0.1 6380; then break; fi
+            sleep 0.2
+          done
+          nc -z 127.0.0.1 6380 || { echo "server never opened 6380"; exit 1; }
+          cargo test --locked -p recached-embed --test live
 
       # core-engine is the shared state machine: the same code evaluates commands
       # on the server and inside the browser via WASM, so a bug here reaches every
       # platform at once. Its coverage is gated rather than merely reported.
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2
+        with:
+          tool: cargo-llvm-cov
 
       - name: Enforce core-engine coverage floor (90%)
         run: cargo llvm-cov -p core-engine --summary-only --fail-under-lines 90
@@ -75,20 +128,24 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
+        # Version, components and profile all come from rust-toolchain.toml,
+        # so CI cannot silently drift onto a newer compiler than the one
+        # this repo was linted against.
+        run: |
+          rustup show
+          rustup target add wasm32-unknown-unknown
+          rustc --version
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: "recached-wasm-cache"
 
       - name: Install wasm-pack
-        uses: jetli/wasm-pack-action@v0.4.0
+        uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa # v0.4.0
         with:
           # Pinned deliberately. Left unset, the action resolves "latest" through
           # the GitHub API and silently falls back to a much older wasm-pack when
@@ -121,26 +178,30 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
+        # Version, components and profile all come from rust-toolchain.toml,
+        # so CI cannot silently drift onto a newer compiler than the one
+        # this repo was linted against.
+        run: |
+          rustup show
+          rustup target add wasm32-unknown-unknown
+          rustc --version
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: "recached-wasm-cache"
 
       - name: Install wasm-pack
-        uses: jetli/wasm-pack-action@v0.4.0
+        uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa # v0.4.0
         with:
           # Pinned for the same reason as browser-tests above.
           version: 'v0.15.0'
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22.x"
 
@@ -169,13 +230,18 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Version, components and profile all come from rust-toolchain.toml,
+        # so CI cannot silently drift onto a newer compiler than the one
+        # this repo was linted against.
+        run: |
+          rustup show
+          rustc --version
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: "recached-ci-cache"
 
@@ -189,7 +255,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # 22.x, not 20.x: jsdom 30 declares `node ^22.22.2 || ^24.15.0 || >=26`
       # and its bundled undici needs `>=22.19.0` for `markAsUncloneable`. npm
@@ -197,7 +263,7 @@ jobs:
       # suite died at import with `webidl.util.markAsUncloneable is not a
       # function`. Node 20 is also past end-of-life.
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22.x"
 

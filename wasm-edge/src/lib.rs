@@ -389,6 +389,17 @@ fn dispatch_incoming(sh: &WsShared, incoming: Incoming) {
             notify_mutation(&sh.on_mutation);
         }
         Incoming::Ignored => {}
+        // A frame we could not parse may have been a reply the server already
+        // counted, which would leave the inflight FIFO permanently one ahead —
+        // every later reply then retires the wrong outbox row. There is no way
+        // to resynchronise in place, so drop the socket and let the reconnect
+        // rebuild the FIFO from `on_open`, which clears it. The outbox is
+        // durable, so nothing queued is lost by doing this.
+        Incoming::Malformed => {
+            if let Some(ws) = sh.ws.borrow().as_ref() {
+                let _ = ws.close();
+            }
+        }
     }
 }
 

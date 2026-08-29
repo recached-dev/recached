@@ -37,6 +37,7 @@ export default defineConfig({
       { text: 'Browser', link: '/browser/getting-started' },
       { text: 'React', link: '/react/getting-started' },
       { text: 'Vue', link: '/vue/getting-started' },
+      { text: 'Rust', link: '/rust/getting-started' },
       { text: 'Roadmap', link: '/roadmap' },
     ],
 
@@ -94,6 +95,15 @@ export default defineConfig({
           items: [
             { text: 'Getting Started', link: '/vue/getting-started' },
             { text: 'Composables Reference', link: '/vue/composables-reference' },
+          ],
+        },
+      ],
+      '/rust/': [
+        {
+          text: 'Rust (Embedded)',
+          items: [
+            { text: 'Getting Started', link: '/rust/getting-started' },
+            { text: 'API Reference', link: '/rust/api-reference' },
           ],
         },
       ],

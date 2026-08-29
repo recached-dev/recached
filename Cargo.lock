@@ -124,7 +124,7 @@ dependencies = [
 
 [[package]]
 name = "core-engine"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "dashmap",
  "indexmap",
@@ -235,7 +235,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -351,9 +351,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.14"
+version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "171fefbc92fe4a4de27e0698d6a5b392d6a0e333506bc49133760b3bcf948733"
+checksum = "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -501,7 +501,7 @@ dependencies = [
  "hyper",
  "libc",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -855,7 +855,7 @@ dependencies = [
 
 [[package]]
 name = "recached"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "base64",
  "core-engine",
@@ -875,6 +875,19 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "recached-embed"
+version = "0.3.3"
+dependencies = [
+ "core-engine",
+ "futures-util",
+ "rand",
+ "sync-client",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
 ]
 
 [[package]]
@@ -1195,7 +1208,7 @@ dependencies = [
 
 [[package]]
 name = "sync-client"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "core-engine",
 ]
@@ -1581,7 +1594,7 @@ checksum = "60238e5b4b1b295701d6f9a66d2a126fe19990348f5fb9dae3b623a370119d94"
 
 [[package]]
 name = "wasm-edge"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "core-engine",
  "getrandom 0.3.4",
@@ -1625,7 +1638,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

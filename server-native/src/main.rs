@@ -639,25 +639,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // ── background eviction ───────────────────────────────────────────────
-    {
-        let store_sweep = Arc::clone(&store);
-        tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(tokio::time::Duration::from_secs(EVICTION_INTERVAL_SECS));
-            loop {
-                interval.tick().await;
-                store_sweep.sweep_expired();
-                store_sweep.try_evict_for_memory();
-            }
-        });
-    }
-
     // ── pub/sub hub ───────────────────────────────────────────────────────
     let pubsub: SharedPubSub = Arc::new(tokio::sync::Mutex::new(PubSubHub::new()));
 
     // ── watch registry ────────────────────────────────────────────────────
     let watch_registry: WatchRegistry = WatchHub::new();
+
+    // ── background expiry & eviction ──────────────────────────────────────
+    // Spawned after the watch registry because the sweep now has to announce
+    // what it removed. Expiry is the one removal no client commanded: reads
+    // only mask an expired entry, so this sweep is the sole remover, and
+    // without a keychange a replica keeps the key — with its last value —
+    // forever.
+    {
+        let store_sweep = Arc::clone(&store);
+        let registry_sweep = watch_registry.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(EVICTION_INTERVAL_SECS));
+            loop {
+                interval.tick().await;
+                // Only pay to collect the key names when something is
+                // listening for them; on a node with no watchers and no
+                // replicas that clone is per-sweep work for nobody.
+                if registry_sweep.is_empty() {
+                    store_sweep.sweep_expired();
+                } else {
+                    let expired = store_sweep.sweep_expired_reporting();
+                    notify_removed(&registry_sweep, &expired).await;
+                }
+                store_sweep.try_evict_for_memory();
+            }
+        });
+    }
 
     // ── Capacity & sync metrics ───────────────────────────────────────────
     // Traffic counters are event-driven, but capacity is a level, not an event:

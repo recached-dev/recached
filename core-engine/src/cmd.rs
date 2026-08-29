@@ -240,7 +240,7 @@ pub enum Command {
     // ── JSON ──────────────────────────────────────────────────────────────────
     /// JSET key path value — set JSON at a path (`$` = whole document).
     JSet(String, String, String),
-    /// JGET key [path] — read JSON at a path, serialized. Defaults to `$`.
+    /// `JGET key [path]` — read JSON at a path, serialized. Defaults to `$`.
     JGet(String, Option<String>),
     /// JMERGE key patch — RFC 7386 JSON Merge Patch against the whole document.
     JMerge(String, String),
@@ -280,7 +280,7 @@ pub enum Command {
     /// state of every key matching the glob pattern, and subsequent mutations
     /// to matching keys arrive as `keychange` pushes. Server-layer only.
     QSub(String),
-    /// QUNSUB [pattern] — drop one live query, or all of them without an
+    /// `QUNSUB [pattern]` — drop one live query, or all of them without an
     /// argument. Server-layer only.
     QUnsub(Option<String>),
     // ── Persistence ───────────────────────────────────────────────────────────
@@ -937,7 +937,7 @@ impl Command {
                         need!(2);
                         let key = extract_key(&arr[1])?;
                         let count = if arr.len() > 2 {
-                            Some(extract_int(&arr[2])? as u64)
+                            Some(extract_count(&arr[2])?)
                         } else {
                             None
                         };
@@ -947,7 +947,7 @@ impl Command {
                         need!(2);
                         let key = extract_key(&arr[1])?;
                         let count = if arr.len() > 2 {
-                            Some(extract_int(&arr[2])? as u64)
+                            Some(extract_count(&arr[2])?)
                         } else {
                             None
                         };
@@ -1073,7 +1073,7 @@ impl Command {
                         need!(2);
                         let key = extract_key(&arr[1])?;
                         let count = if arr.len() > 2 {
-                            Some(extract_int(&arr[2])? as u64)
+                            Some(extract_count(&arr[2])?)
                         } else {
                             None
                         };
@@ -1083,7 +1083,18 @@ impl Command {
                         need!(2);
                         let key = extract_key(&arr[1])?;
                         let count = if arr.len() > 2 {
-                            Some(extract_int(&arr[2])?)
+                            let n = extract_int(&arr[2])?;
+                            // A negative count means "with repetition", so it is
+                            // the one count the set's own size does not clamp:
+                            // |n| members are generated no matter how small the
+                            // set is. Cap it at what a RESP array can carry —
+                            // beyond that the reply is an allocation no client
+                            // could parse back anyway.
+                            if n < 0 && n.unsigned_abs() > crate::resp::MAX_ARRAY_ELEMENTS as u64 {
+                                return Err("ERR count is out of range in 'srandmember' command"
+                                    .to_string());
+                            }
+                            Some(n)
                         } else {
                             None
                         };
@@ -1500,6 +1511,19 @@ fn extract_int(val: &Value) -> Result<i64, String> {
         Value::Integer(i) => Ok(*i),
         _ => Err("ERR value is not an integer or out of range".to_string()),
     }
+}
+
+/// An element count that must not be negative.
+///
+/// `extract_int` yields `i64`, and casting that straight to `u64` turns `-1`
+/// into `u64::MAX`. Downstream that reads as "every element" — `SPOP key -1`
+/// emptied the whole set — or as a loop whose bound outlives the process.
+/// Redis answers a negative count here with an error, so this does too, and
+/// every other numeric argument in this parser already guards its sign the
+/// same way (`SET EX`, `SETEX`, the `EXPIRE` family, `RLSET`, `SCAN COUNT`).
+fn extract_count(val: &Value) -> Result<u64, String> {
+    let n = extract_int(val)?;
+    u64::try_from(n).map_err(|_| "ERR value is out of range, must be positive".to_string())
 }
 
 fn extract_float(val: &Value) -> Result<f64, String> {
@@ -2361,6 +2385,47 @@ mod tests {
             Command::from_value(array(&["LTRIM", "l", "0", "9"])).unwrap(),
             Command::LTrim("l".into(), 0, 9)
         );
+    }
+
+    // ── Negative counts ───────────────────────────────────────────────────────
+
+    #[test]
+    fn a_negative_pop_count_is_refused_rather_than_wrapped() {
+        // `extract_int` yields i64 and these three used to cast straight to
+        // u64, so `-1` arrived as 18446744073709551615. `SPOP key -1` then
+        // emptied the whole set and `LPOP key -1` span for centuries holding
+        // the shard guard. Redis answers all three with an error.
+        for cmd in ["LPOP", "RPOP", "SPOP"] {
+            let err = Command::from_value(array(&[cmd, "k", "-1"]))
+                .expect_err(&format!("{cmd} with a negative count must be refused"));
+            assert_eq!(err, "ERR value is out of range, must be positive");
+        }
+    }
+
+    #[test]
+    fn a_zero_pop_count_is_still_allowed() {
+        // Zero is not negative: Redis answers it with an empty array.
+        assert_eq!(
+            Command::from_value(array(&["LPOP", "k", "0"])).unwrap(),
+            Command::LPop("k".into(), Some(0))
+        );
+        assert_eq!(
+            Command::from_value(array(&["SPOP", "k", "0"])).unwrap(),
+            Command::SPop("k".into(), Some(0))
+        );
+    }
+
+    #[test]
+    fn srandmember_keeps_its_sign_but_not_an_unbounded_magnitude() {
+        // Negative is meaningful here — it means "with repetition" — so unlike
+        // the pop counts it is kept, and only its magnitude is capped.
+        assert_eq!(
+            Command::from_value(array(&["SRANDMEMBER", "s", "-3"])).unwrap(),
+            Command::SRandMember("s".into(), Some(-3))
+        );
+        let err = Command::from_value(array(&["SRANDMEMBER", "s", "-9223372036854775808"]))
+            .expect_err("a magnitude beyond a parseable reply must be refused");
+        assert_eq!(err, "ERR count is out of range in 'srandmember' command");
     }
 
     // ── Set (parsing) ─────────────────────────────────────────────────────────

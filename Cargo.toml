@@ -3,6 +3,7 @@ members = [
     "core-engine",
     "server-native",
     "sync-client",
+    "recached-embed",
     "wasm-edge",
 ]
 resolver = "2"
@@ -10,7 +11,7 @@ resolver = "2"
 # ── Single source of truth for all crate versions ────────────────────────────
 # Members inherit with:  version.workspace = true  /  edition.workspace = true
 [workspace.package]
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["ThinkGrid Labs"]
@@ -58,8 +59,51 @@ socket2           = { version = "0.5", features = ["all"] }
 num_cpus          = "1"
 tikv-jemallocator = "0.6"
 
+# ── Lints ─────────────────────────────────────────────────────────────────────
+# CI runs `cargo clippy --all-targets --all-features -D warnings`, so anything
+# set to `warn` here is a hard failure there. Only lints the workspace actually
+# satisfies are enabled; the rest are listed below as the ratchet, with their
+# real cost, rather than switched on to be immediately suppressed.
+#
+# Members inherit with `[lints] workspace = true`.
+[workspace.lints.rust]
+# Production code has none. The four test sites that legitimately need it (a
+# counting `GlobalAlloc`, and `env::set_var`, which edition 2024 made unsafe)
+# carry an explicit `#[allow(unsafe_code)]` with a reason — which is the point:
+# each one is now a decision on the record instead of an absence of policy.
+unsafe_code      = "deny"
+unused_must_use  = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all        = { level = "warn", priority = -1 }
+mem_forget = "deny"
+todo       = "warn"
+dbg_macro  = "warn"
+
+# ── The ratchet ───────────────────────────────────────────────────────────────
+# These are the rules this codebase already follows in production and cannot
+# yet enforce, because `[lints]` applies to tests too and the test suites use
+# every one of them deliberately. Measured on the 0.3.2 tree:
+#
+#   indexing_slicing            411   mostly `arr[1]` after a `need!(n)` guard
+#   unwrap_used / expect_used   417   overwhelmingly in tests
+#   panic                        99   test assertions
+#   cast_* family                78
+#
+# Turning them on means either 1,000 `#[allow]`s or a real audit of each site.
+# The audit is the plan — per crate, starting with `core-engine`, replacing
+# `arr[i]` with `get(i)` where the guard is not adjacent — and each crate flips
+# its own lint from `allow` to `warn` in `[lints.clippy]` as it lands. Enabling
+# them here first would only mean suppressing them everywhere, which enforces
+# nothing and hides the next real one.
+
 # ── Release profile ───────────────────────────────────────────────────────────
 [profile.release]
+# On by default only in debug builds, where an overflow panics and a release
+# build silently wraps — two behaviours from one line of code. A cache doing
+# arithmetic on client-supplied numbers wants the panic in both.
+overflow-checks = true
 opt-level     = 3
 lto           = "thin"
 codegen-units = 1

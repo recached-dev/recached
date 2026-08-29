@@ -353,6 +353,14 @@ pub(crate) fn parse_save_conditions(s: &str) -> Vec<SaveCondition> {
 // ── Replication server (primary side) ────────────────────────────────────────
 
 #[cfg(test)]
+// SAFETY: every `set_var`/`remove_var` below is serialised by this
+// module's `ENV_LOCK`, so no other thread in the process reads or writes
+// the same variable concurrently. Edition 2024 made these `unsafe`
+// precisely because of that race; the lock is what discharges it.
+#[allow(
+    unsafe_code,
+    reason = "process-global env mutation, serialised by ENV_LOCK"
+)]
 mod limit_config_tests {
     use super::*;
 
@@ -445,6 +453,14 @@ mod limit_config_tests {
 /// silently got 6379 believes a port is closed that is in fact serving the
 /// keyspace. So a bad value refuses to start.
 #[cfg(test)]
+// SAFETY: every `set_var`/`remove_var` below is serialised by this
+// module's `ENV_LOCK`, so no other thread in the process reads or writes
+// the same variable concurrently. Edition 2024 made these `unsafe`
+// precisely because of that race; the lock is what discharges it.
+#[allow(
+    unsafe_code,
+    reason = "process-global env mutation, serialised by ENV_LOCK"
+)]
 mod port_config_tests {
     use super::*;
 
@@ -539,6 +555,14 @@ mod port_config_tests {
 /// unpredictable port instead — the opposite of the request, and unlikely to be
 /// noticed until something scraped it.
 #[cfg(test)]
+// SAFETY: every `set_var`/`remove_var` below is serialised by this
+// module's `ENV_LOCK`, so no other thread in the process reads or writes
+// the same variable concurrently. Edition 2024 made these `unsafe`
+// precisely because of that race; the lock is what discharges it.
+#[allow(
+    unsafe_code,
+    reason = "process-global env mutation, serialised by ENV_LOCK"
+)]
 mod metrics_port_tests {
     use super::*;
 

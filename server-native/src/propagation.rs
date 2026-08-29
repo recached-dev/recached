@@ -148,9 +148,34 @@ pub(crate) async fn notify_watchers(
         .iter()
         .map(|k| (k.clone(), store.get_current(k)))
         .collect();
+    fan_out(registry, &key_values).await;
+}
+
+/// Announce keys the store removed on its own initiative rather than on a
+/// client's command — today, expiry.
+///
+/// Without this the removal is invisible to anything replicating the keyspace:
+/// no command ran, so no keychange was ever emitted, and a volatile key
+/// survives forever in every replica's local copy with its last value. A nil
+/// value is already how a delete is encoded, so this needs no new frame shape
+/// and existing clients apply it unchanged.
+pub(crate) async fn notify_removed(registry: &WatchRegistry, keys: &[String]) {
+    if registry.is_empty() || keys.is_empty() {
+        return;
+    }
+    let key_values: Vec<(String, Value)> = keys
+        .iter()
+        .map(|k| (k.clone(), Value::BulkString(None)))
+        .collect();
+    fan_out(registry, &key_values).await;
+}
+
+/// Deliver one batch of `(key, current value)` pairs to exact-key watchers and
+/// to every live query whose pattern matches.
+async fn fan_out(registry: &WatchRegistry, key_values: &[(String, Value)]) {
     if registry.watched_keys.load(Ordering::Relaxed) > 0 {
         let mut reg = registry.map.lock().await;
-        for (key, value) in &key_values {
+        for (key, value) in key_values {
             if let Some(subs) = reg.get_mut(key) {
                 subs.retain(|(_, tx)| tx.send((key.clone(), value.clone())).is_ok());
                 if subs.is_empty() {
@@ -166,7 +191,7 @@ pub(crate) async fn notify_watchers(
         let mut pats = registry.patterns.lock().await;
         let mut emptied = false;
         for (pattern, subs) in pats.iter_mut() {
-            for (key, value) in &key_values {
+            for (key, value) in key_values {
                 if core_engine::store::glob_match(pattern, key) {
                     subs.retain(|(_, tx)| tx.send((key.clone(), value.clone())).is_ok());
                 }
