@@ -1,5 +1,11 @@
 const MAX_ARRAY_DEPTH: usize = 16;
-const MAX_ARRAY_ELEMENTS: usize = 1_000_000;
+/// Most elements one aggregate reply may contain.
+///
+/// Public because it bounds replies the server *builds* as well as frames it
+/// parses: a command that can generate elements without an underlying
+/// collection to clamp it (`SRANDMEMBER key -<n>`) has to refuse anything a
+/// client could not parse back.
+pub const MAX_ARRAY_ELEMENTS: usize = 1_000_000;
 /// Elements reserved up front for an aggregate, however many its header claims.
 ///
 /// The header is attacker-controlled and arrives before any of the elements do,

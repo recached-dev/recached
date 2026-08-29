@@ -8,11 +8,12 @@
 
 use crate::error::{Error, Result};
 use core_engine::resp::Value;
+use core_engine::store::KeyValueStore;
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use sync_client::{Incoming, SyncClient, to_resp};
 use tokio::net::TcpStream;
@@ -23,6 +24,14 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 /// Buffered messages per pub/sub channel before a slow subscriber starts
 /// losing them. Lag is surfaced to the subscriber by `broadcast::Receiver`.
 const PUBSUB_BUFFER: usize = 256;
+
+/// How often the local store drops entries whose TTL has passed and, if a cap
+/// is configured, evicts down to it.
+///
+/// The server sweeps its own keyspace on the same cadence. Without a sweep
+/// here an expired entry is only *masked* on read, never removed, so a
+/// long-lived process accumulates dead keys for as long as it runs.
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsWrite = SplitSink<Ws, Message>;
@@ -51,6 +60,9 @@ pub(crate) enum Op {
 pub(crate) struct Shared {
     pub(crate) connected: AtomicBool,
     pub(crate) outbox_len: AtomicUsize,
+    /// Writes evicted from a full outbox, cumulative. Never resets, so a
+    /// caller polling it can tell "none yet" from "none since I last looked".
+    pub(crate) dropped_writes: AtomicU64,
 }
 
 pub(crate) struct Task {
@@ -69,6 +81,9 @@ pub(crate) struct Task {
     /// SDK re-subscribes itself), so the adapter owns re-subscription.
     channels: HashMap<String, broadcast::Sender<Vec<u8>>>,
     first_open: Option<oneshot::Sender<Result<()>>>,
+    /// Held for the periodic sweep. Reads do not come through here.
+    store: Arc<KeyValueStore>,
+    connect_timeout: Duration,
 }
 
 impl Task {
@@ -77,7 +92,9 @@ impl Task {
         shared: Arc<Shared>,
         url: String,
         first_open: oneshot::Sender<Result<()>>,
+        connect_timeout: Duration,
     ) -> Self {
+        let store = Arc::clone(client.store());
         Self {
             client,
             shared,
@@ -85,12 +102,33 @@ impl Task {
             waiters: VecDeque::new(),
             channels: HashMap::new(),
             first_open: Some(first_open),
+            store,
+            connect_timeout,
         }
     }
 
-    pub(crate) async fn run(mut self, mut ops: mpsc::UnboundedReceiver<Op>) {
+    /// Drop expired entries and evict down to any configured cap.
+    fn maintain(&self) {
+        self.store.sweep_expired();
+        self.store.try_evict_for_memory();
+    }
+
+    pub(crate) async fn run(mut self, mut ops: mpsc::Receiver<Op>) {
         loop {
-            match tokio_tungstenite::connect_async(self.url.as_str()).await {
+            // A TCP connect to a black-holed address otherwise hangs for the
+            // OS timeout — around two minutes — which the caller sees as
+            // `connect()` never returning.
+            let attempt = tokio::time::timeout(
+                self.connect_timeout,
+                tokio_tungstenite::connect_async(self.url.as_str()),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(tokio_tungstenite::tungstenite::Error::Io(
+                    std::io::ErrorKind::TimedOut.into(),
+                ))
+            });
+            match attempt {
                 Ok((ws, _)) => {
                     if let Some(tx) = self.first_open.take() {
                         let _ = tx.send(Ok(()));
@@ -121,7 +159,7 @@ impl Task {
 
     /// Serve one connection. Returns true when the caller should stop entirely
     /// (all `Cache` handles dropped), false to reconnect.
-    async fn serve(&mut self, ws: Ws, ops: &mut mpsc::UnboundedReceiver<Op>) -> bool {
+    async fn serve(&mut self, ws: Ws, ops: &mut mpsc::Receiver<Op>) -> bool {
         let (mut write, mut read) = ws.split();
 
         self.waiters.clear();
@@ -150,8 +188,12 @@ impl Task {
             }
         }
 
+        let mut upkeep = tokio::time::interval(MAINTENANCE_INTERVAL);
+        upkeep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
+                _ = upkeep.tick() => self.maintain(),
                 incoming = read.next() => {
                     match incoming {
                         Some(Ok(msg)) => {
@@ -209,6 +251,19 @@ impl Task {
             // A push applied to the local store, or a frame we do not model.
             // Neither consumes a reply slot.
             Incoming::Applied | Incoming::Ignored => {}
+            // A frame we could not parse may have been a reply the server has
+            // already counted, in which case both FIFOs are now one ahead of
+            // reality and every later reply resolves the wrong caller and
+            // retires the wrong outbox row. That cannot be repaired in place,
+            // so drop the socket: the reconnect rebuilds both from a cleared
+            // FIFO, and the outbox replays whatever was still queued.
+            Incoming::Malformed => {
+                tracing::warn!(
+                    "recached: unparseable frame from the server; dropping the socket to \
+                     resynchronise replies"
+                );
+                return false;
+            }
         }
 
         self.shared
@@ -222,6 +277,7 @@ impl Task {
         match op {
             Op::Write { encoded, ack } => {
                 let queued = self.client.enqueue_write(&encoded, true, true);
+                self.note_dropped(queued.dropped);
                 self.shared
                     .outbox_len
                     .store(self.client.outbox_len(), Ordering::Release);
@@ -291,18 +347,25 @@ impl Task {
     /// Without this a caller's `set()` would block for the whole outage
     /// instead of being queued — the outbox exists precisely so it does not
     /// have to.
-    async fn backoff(&mut self, ops: &mut mpsc::UnboundedReceiver<Op>) -> bool {
+    async fn backoff(&mut self, ops: &mut mpsc::Receiver<Op>) -> bool {
         let delay = Duration::from_millis(u64::from(self.client.on_close()));
         let deadline = tokio::time::sleep(delay);
         tokio::pin!(deadline);
+        let mut upkeep = tokio::time::interval(MAINTENANCE_INTERVAL);
+        upkeep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
                 _ = &mut deadline => return false,
+                // An outage is exactly when expired entries would otherwise
+                // pile up: nothing is arriving to trigger a read, and the
+                // sweep is the only thing that ever removes them.
+                _ = upkeep.tick() => self.maintain(),
                 op = ops.recv() => match op {
                     Some(Op::Write { encoded, ack }) => {
-                        // Queued durably; it replays on the next `on_open`.
-                        self.client.enqueue_write(&encoded, true, false);
+                        // Queued in memory; it replays on the next `on_open`.
+                        let queued = self.client.enqueue_write(&encoded, true, false);
+                        self.note_dropped(queued.dropped);
                         self.shared
                             .outbox_len
                             .store(self.client.outbox_len(), Ordering::Release);
@@ -327,6 +390,25 @@ impl Task {
                     None => return true,
                 }
             }
+        }
+    }
+
+    /// A full outbox evicts its oldest entry to make room. That write is gone
+    /// — it will never be replayed — so it has to be visible rather than
+    /// silently absent: `set()` documents the queue as unacknowledged, not
+    /// lost, and past the cap that stops being true.
+    fn note_dropped(&self, dropped: Option<u64>) {
+        if dropped.is_some() {
+            let total = self
+                .shared
+                .dropped_writes
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            tracing::warn!(
+                dropped_writes = total,
+                max_pending = self.client.max_pending(),
+                "recached: pending-write queue full — discarded the oldest queued write"
+            );
         }
     }
 

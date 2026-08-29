@@ -5152,7 +5152,7 @@ mod sweep_notification {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         // Exactly what the background task in main.rs does.
-        let expired = store.sweep_expired();
+        let expired = store.sweep_expired_reporting();
         assert_eq!(expired, vec!["fare:MNL-CEB".to_string()]);
         notify_removed(&registry, &expired).await;
 
@@ -5179,7 +5179,7 @@ mod sweep_notification {
         set_with_px(&store, "session:abc", "token", 1);
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
-        let expired = store.sweep_expired();
+        let expired = store.sweep_expired_reporting();
         notify_removed(&registry, &expired).await;
 
         let (key, value) = rx.try_recv().expect("WATCH-er was never told");
@@ -5196,7 +5196,7 @@ mod sweep_notification {
         set_with_px(&store, "session:abc", "token", 1);
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
-        let expired = store.sweep_expired();
+        let expired = store.sweep_expired_reporting();
         assert_eq!(expired, vec!["session:abc".to_string()]);
         notify_removed(&registry, &expired).await;
 
@@ -5218,7 +5218,7 @@ mod sweep_notification {
             SetOptions::default(),
         ));
 
-        let expired = store.sweep_expired();
+        let expired = store.sweep_expired_reporting();
         assert!(expired.is_empty());
         notify_removed(&registry, &expired).await;
 

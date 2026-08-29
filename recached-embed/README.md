@@ -75,25 +75,29 @@ let cache = Cache::builder("ws://cache.internal:6380")
 ```
 
 Reconnection is automatic with jittered exponential backoff. Writes issued while
-disconnected are queued in the outbox and replayed on reconnect (they return
-`Error::Disconnected` — unacknowledged, not lost). Local reads keep working
-throughout; they simply stop receiving updates, so check `is_connected()` if
-staleness during an outage matters to you.
+disconnected are queued **in memory** and replayed on reconnect (they return
+`Error::Disconnected` — unacknowledged, not lost). Two limits on that: the queue
+is capped by `max_pending`, and past the cap the *oldest* queued write is
+discarded, counted by `pending_dropped()` and logged at `WARN`; and the queue
+does not survive a process restart — the browser SDK backs the same queue with
+IndexedDB, this one has no equivalent.
+
+Local reads keep working throughout; they simply stop receiving updates, so
+check `is_connected()` if staleness during an outage matters to you. On
+reconnect each live query is re-hydrated from a fresh snapshot and keys the
+snapshot no longer carries are dropped locally, so a delete or expiry you missed
+while offline is not served afterwards.
 
 ## Known limitations
 
 These are upstream behaviours in the sync protocol, not choices this crate
-makes. Both affect `recached-edge` in the browser identically. Each has a
+makes. They affect `recached-edge` in the browser identically. Each has a
 regression test in `tests/live.rs`, marked `#[ignore]` with the details.
 
 - **TTLs converge within ~1s, not instantly.** A local copy does not expire on
   its own clock; it learns of the expiry when the server's once-per-second
   sweep removes the key and announces it as a delete. Fine for session caches;
   compare a stored deadline yourself if you need an exact instant.
-- **A client offline when a key expires keeps it.** `qstate` re-hydration adds
-  keys but never removes local keys absent from the snapshot, so a key that
-  expired or was deleted during a disconnect survives reconnection until
-  something writes to it again. Applies to `DEL` as much as to expiry.
 - **Collections do not hydrate on connect.** `qstate` sends collections as bare
   type-name markers rather than contents, and the client drops them. A hash,
   list, set, zset or JSON key written *before* you connect stays invisible until

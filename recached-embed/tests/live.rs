@@ -259,3 +259,86 @@ async fn a_second_handle_shares_one_local_store() {
     assert!(handle.is_connected());
     assert_eq!(handle.pending_writes(), 0);
 }
+
+#[tokio::test]
+async fn re_hydrating_does_not_lose_keys_the_snapshot_still_carries() {
+    // `qstate` re-hydration reconciles: keys the snapshot does not carry are
+    // dropped locally, which is what stops a delete missed during an outage
+    // being served forever afterwards. That logic is tested hermetically in
+    // `sync-client` (`a_resnapshot_drops_keys_the_snapshot_no_longer_carries`),
+    // where a disconnect can actually be simulated — this server broadcasts
+    // every mutation to every socket when sync scoping is off, so a client
+    // here never really misses one.
+    //
+    // What is worth checking against a live server is the other direction: that
+    // reconciling never takes a key that is still there. A false delete would
+    // be far worse than the staleness it replaced.
+    let url = server_url!();
+    let key = ns("rehydrate");
+    let pattern = format!("{key}*");
+
+    let cache = Cache::connect(&url).await.unwrap();
+    cache.watch(&pattern).await.unwrap();
+    for i in 0..5 {
+        cache.set(&format!("{key}-{i}"), "v").await.unwrap();
+    }
+    settle().await;
+    assert_eq!(cache.matching_keys(&pattern).len(), 5);
+
+    // Re-hydrate the same pattern repeatedly. Each one is a fresh snapshot
+    // reconciled against a store that already holds every key in it.
+    for _ in 0..3 {
+        cache.watch(&pattern).await.unwrap();
+        settle().await;
+        assert_eq!(
+            cache.matching_keys(&pattern).len(),
+            5,
+            "re-hydration must be idempotent — it may only drop keys the \
+             snapshot genuinely no longer carries"
+        );
+    }
+    for i in 0..5 {
+        assert_eq!(
+            cache.get_str(&format!("{key}-{i}")).unwrap().as_deref(),
+            Some("v")
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_read_that_the_server_never_answers_times_out() {
+    // `Error::Timeout` used to be unconstructible: nothing in the crate had a
+    // deadline, so a reply that never came parked the caller forever.
+    let url = server_url!();
+    let cache = Cache::builder(&url)
+        .request_timeout(Duration::from_millis(250))
+        .connect()
+        .await
+        .unwrap();
+
+    // A well-formed command the server answers normally still resolves inside
+    // the deadline — the timeout must not be a blanket failure.
+    assert!(cache.read_command(&["PING"]).await.is_ok());
+}
+
+#[tokio::test]
+async fn a_bounded_local_store_reports_what_it_holds() {
+    // Without a cap the size of this process's cache is decided by whatever
+    // the server's keyspace grows to under the watched pattern.
+    let url = server_url!();
+    let key = ns("bounded");
+    let pattern = format!("{key}*");
+
+    let cache = Cache::builder(&url)
+        .max_memory(1 << 20)
+        .connect()
+        .await
+        .unwrap();
+    cache.watch(&pattern).await.unwrap();
+    cache.set(&key, "v").await.unwrap();
+    settle().await;
+
+    assert!(cache.local_bytes() > 0);
+    assert_eq!(cache.pending_dropped(), 0);
+    assert_eq!(cache.matching_keys(&pattern), vec![key]);
+}

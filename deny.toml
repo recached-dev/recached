@@ -1,0 +1,45 @@
+# cargo-deny policy. Run by CI and reproducible locally with:
+#
+#     cargo deny --all-features check
+#
+# Four checks run: `advisories` (RustSec), `licenses`, `bans` (duplicate and
+# forbidden crates) and `sources` (where crates may come from).
+
+[graph]
+all-features = true
+
+[advisories]
+# Every known vulnerability fails the build. Accept one only by adding its
+# RustSec id here with a comment saying why it cannot reach us.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# The workspace ships under Apache-2.0; these are the licences it is willing to
+# link against. Anything else has to be reviewed before it lands.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Warn rather than deny: duplicate versions are usually a transitive
+# disagreement we cannot fix directly, and failing the build on one would make
+# an unrelated dependency bump block every PR. They still show up in the log.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

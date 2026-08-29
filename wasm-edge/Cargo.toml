@@ -55,3 +55,6 @@ wasm-opt = false
 
 [package.metadata.wasm-pack.profile.profiling]
 wasm-opt = false
+
+[lints]
+workspace = true

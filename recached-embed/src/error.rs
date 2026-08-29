@@ -2,9 +2,15 @@
 
 use std::fmt;
 
+/// `Result` with this crate's [`Error`] as its error type.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Everything the embedded cache can fail with.
+///
+/// `#[non_exhaustive]`: match with a `_` arm. New variants are expected as the
+/// crate grows, and adding one should not be a breaking change.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Error {
     /// The key is not covered by any live query, so the local store has no
     /// opinion about it.
@@ -14,25 +20,32 @@ pub enum Error {
     /// service would serve a confidently wrong answer for every key it forgot
     /// to [`watch`](crate::Cache::watch). Either watch a pattern covering the
     /// key, or use [`get_or_fetch`](crate::Cache::get_or_fetch).
-    NotHydrated { key: String },
+    NotHydrated {
+        /// The key that was read.
+        key: String,
+    },
 
     /// The key holds a collection but was read as a string (or vice versa).
-    WrongType { key: String },
+    WrongType {
+        /// The key that was read.
+        key: String,
+    },
 
-    /// The server replied with an error.
+    /// The server replied with an error. Carries the server's message.
     Server(String),
 
-    /// The socket is down. Writes are queued in the outbox and replayed on
+    /// The socket is down. Writes are queued in memory and replayed on
     /// reconnect; reads that need the network cannot proceed.
     Disconnected,
 
     /// The connection task has shut down — the `Cache` handle is dead.
     Closed,
 
-    /// A network round-trip did not complete in time.
+    /// A round-trip did not complete within
+    /// [`CacheBuilder::request_timeout`](crate::CacheBuilder::request_timeout).
     Timeout,
 
-    /// The initial connection could not be established.
+    /// The initial connection could not be established. Carries the reason.
     Connect(String),
 }
 

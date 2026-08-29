@@ -659,8 +659,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tokio::time::interval(tokio::time::Duration::from_secs(EVICTION_INTERVAL_SECS));
             loop {
                 interval.tick().await;
-                let expired = store_sweep.sweep_expired();
-                notify_removed(&registry_sweep, &expired).await;
+                // Only pay to collect the key names when something is
+                // listening for them; on a node with no watchers and no
+                // replicas that clone is per-sweep work for nobody.
+                if registry_sweep.is_empty() {
+                    store_sweep.sweep_expired();
+                } else {
+                    let expired = store_sweep.sweep_expired_reporting();
+                    notify_removed(&registry_sweep, &expired).await;
+                }
                 store_sweep.try_evict_for_memory();
             }
         });

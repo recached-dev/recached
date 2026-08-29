@@ -40,3 +40,6 @@ rand.workspace                     = true
 # so it is only pulled in off-MSVC; Windows MSVC uses the system allocator.
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator.workspace        = true
+
+[lints]
+workspace = true

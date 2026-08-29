@@ -32,6 +32,14 @@ struct CountingAlloc;
 // allocation of its own and so cannot re-enter. `try_with` rather than `with`
 // because TLS is unavailable during thread teardown, where the accounting simply
 // does not matter.
+// SAFETY: this allocator only counts and then forwards every call to
+// `System`, which upholds `GlobalAlloc`'s contract. It adds no assumptions of
+// its own: the counter is an atomic, and the pointer, layout and lifetime
+// rules are entirely `System`'s.
+#[allow(
+    unsafe_code,
+    reason = "a counting GlobalAlloc cannot be written in safe Rust"
+)]
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let _ = TRACKING.try_with(|tracking| {

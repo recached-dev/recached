@@ -326,6 +326,57 @@ fn qstate_applies_state_and_counts_as_reply() {
 }
 
 #[test]
+fn a_resnapshot_drops_keys_the_snapshot_no_longer_carries() {
+    // The gap this closes: `keychange` only reports changes seen while the
+    // socket was up, so a key deleted or expired during a disconnect had
+    // nothing to announce it. Re-hydration used to only ever *add*, leaving
+    // the key in local memory with its last value forever.
+    let mut c = client();
+    assert!(c.add_live_query("cart:*", false).is_none());
+    c.on_open();
+    c.handle_frame(
+        b"*6\r\n$6\r\nqstate\r\n$6\r\ncart:*\r\n$6\r\ncart:1\r\n$5\r\napple\r\n$6\r\ncart:2\r\n$4\r\npear\r\n",
+    );
+    assert_eq!(get(&c, "cart:1"), bulk("apple"));
+    assert_eq!(get(&c, "cart:2"), bulk("pear"));
+
+    // Reconnect. cart:2 went away while we were offline, so the fresh
+    // snapshot simply does not mention it.
+    c.on_open();
+    c.handle_frame(b"*4\r\n$6\r\nqstate\r\n$6\r\ncart:*\r\n$6\r\ncart:1\r\n$6\r\nbanana\r\n");
+    assert_eq!(get(&c, "cart:1"), bulk("banana"));
+    assert_eq!(get(&c, "cart:2"), Value::BulkString(None));
+}
+
+#[test]
+fn a_resnapshot_leaves_keys_outside_its_pattern_alone() {
+    // Reconciliation is scoped to the snapshot's own pattern; another live
+    // query's keys are not its business.
+    let mut c = client();
+    c.handle_frame(b"*3\r\n$9\r\nkeychange\r\n$6\r\nuser:1\r\n$3\r\nabc\r\n");
+    c.on_open();
+    c.handle_frame(b"*4\r\n$6\r\nqstate\r\n$6\r\ncart:*\r\n$6\r\ncart:1\r\n$5\r\napple\r\n");
+    assert_eq!(get(&c, "user:1"), bulk("abc"));
+    assert_eq!(get(&c, "cart:1"), bulk("apple"));
+}
+
+#[test]
+fn an_unparseable_frame_is_malformed_not_ignored() {
+    // `Ignored` means "understood, nothing to do" and consumes no reply slot,
+    // which is right for a push we do not model. A frame we could not parse
+    // may well have been a reply the server has already counted — treating it
+    // as `Ignored` leaves the inflight FIFO one ahead of reality forever, so
+    // every later reply retires the wrong outbox row. The adapter has to drop
+    // the socket instead, and only this variant tells it to.
+    let mut c = client();
+    assert_eq!(
+        c.handle_frame(b"*3\r\n$9\r\ntruncated"),
+        Incoming::Malformed
+    );
+    assert_eq!(c.handle_frame(b"not resp at all"), Incoming::Malformed);
+}
+
+#[test]
 fn keychange_sets_and_deletes() {
     let mut c = client();
     c.handle_frame(b"*3\r\n$9\r\nkeychange\r\n$1\r\nk\r\n$1\r\nv\r\n");

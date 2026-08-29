@@ -428,7 +428,7 @@ impl<'de> Deserialize<'de> for Blob {
         struct V;
         impl<'de> serde::de::Visitor<'de> for V {
             type Value = Blob;
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str("bytes or a string")
             }
             // Pre-0.2.2 snapshots stored values as msgpack strings.
@@ -1214,6 +1214,20 @@ impl KeyValueStore {
     /// `get_current` form (strings in full; collection types as type-name
     /// markers), capped at `limit` entries. Backs live-query (QSUB) initial
     /// state.
+    /// Every live key matching `pattern`, without materialising its value.
+    ///
+    /// `matching_key_values` clones each value, which is wasted work for a
+    /// caller that only needs to know *which* keys are present — reconciling a
+    /// live query's local copy against a fresh snapshot, for instance.
+    pub fn matching_keys(&self, pattern: &str) -> Vec<String> {
+        let now = now_ms();
+        self.data
+            .iter()
+            .filter(|e| !e.is_expired(now) && glob_match(pattern, e.key()))
+            .map(|e| e.key().clone())
+            .collect()
+    }
+
     pub fn matching_key_values(&self, pattern: &str, limit: usize) -> Vec<(String, Value)> {
         let now = now_ms();
         self.data
@@ -1235,17 +1249,32 @@ impl KeyValueStore {
             .collect()
     }
 
-    /// Drop every expired entry, returning the keys removed.
+    /// Drop every expired entry.
     ///
-    /// The keys are returned rather than discarded because expiry is the one
-    /// removal no client asked for: reads only *mask* an expired entry, so
-    /// this sweep is the sole remover, and a caller replicating the keyspace
-    /// has no other way to learn the key is gone. `server-native` feeds the
-    /// result to the watch registry; callers that do not replicate ignore it.
+    /// Reads only *mask* an expired entry, so this sweep is the only thing
+    /// that ever removes one. Use [`sweep_expired_reporting`] when the caller
+    /// needs to know *which* keys went.
     ///
-    /// `Vec::new` does not allocate, so a sweep that expires nothing is still
-    /// free.
-    pub fn sweep_expired(&self) -> Vec<String> {
+    /// [`sweep_expired_reporting`]: Self::sweep_expired_reporting
+    pub fn sweep_expired(&self) {
+        let now = now_ms();
+        self.data.retain(|_, e| !e.is_expired(now));
+    }
+
+    /// Drop every expired entry, naming the keys removed.
+    ///
+    /// Expiry is the one removal no client asked for, so it is also the one a
+    /// caller replicating the keyspace cannot learn about any other way: no
+    /// command ran, so no keychange was ever emitted, and the key would
+    /// survive in every replica with its last value forever.
+    ///
+    /// Separate from [`sweep_expired`] rather than a return value it can
+    /// ignore, because cloning every expired key name is real work on a
+    /// TTL-heavy cache and a node with nothing watching should not pay it.
+    /// Call this only when something is listening.
+    ///
+    /// [`sweep_expired`]: Self::sweep_expired
+    pub fn sweep_expired_reporting(&self) -> Vec<String> {
         let now = now_ms();
         let mut removed = Vec::new();
         self.data.retain(|key, e| {
@@ -1483,7 +1512,7 @@ impl KeyValueStore {
 
     /// Runs one command.
     ///
-    /// Wraps [`KeyValueStore::execute_inner`] so that `max_memory_bytes` is
+    /// Wraps the private `execute_inner` so that `max_memory_bytes` is
     /// enforced here, on the write path, and not only by the background sweep.
     pub fn execute(&self, cmd: Command) -> Value {
         let cost = write_cost(&cmd);
@@ -2272,11 +2301,16 @@ impl KeyValueStore {
                     Some(mut e) => match &mut e.value {
                         EntryValue::List(list) => {
                             if let Some(n) = count {
-                                let items: Vec<Value> = (0..n)
-                                    .filter_map(|_| {
-                                        list.pop_front()
-                                            .map(|v| Value::BulkString(Some(v.into_bytes())))
-                                    })
+                                // Bounded by the list, never by `n`. Asking for
+                                // more than exists is legitimate, but iterating
+                                // the shortfall pins this worker thread *and*
+                                // the shard guard for as long as the count says
+                                // — `LPOP key 9223372036854775807` measured out
+                                // at roughly 240 years on an empty list.
+                                let take = n.min(list.len() as u64) as usize;
+                                let items: Vec<Value> = list
+                                    .drain(..take)
+                                    .map(|v| Value::BulkString(Some(v.into_bytes())))
                                     .collect();
                                 Value::Array(Some(items))
                             } else {
@@ -2298,11 +2332,16 @@ impl KeyValueStore {
                     Some(mut e) => match &mut e.value {
                         EntryValue::List(list) => {
                             if let Some(n) = count {
-                                let items: Vec<Value> = (0..n)
-                                    .filter_map(|_| {
-                                        list.pop_back()
-                                            .map(|v| Value::BulkString(Some(v.into_bytes())))
-                                    })
+                                // Bounded by the list — see `LPop`. `.rev()`
+                                // keeps the reply in pop order (tail first),
+                                // which is what the repeated `pop_back` this
+                                // replaces produced.
+                                let take = n.min(list.len() as u64) as usize;
+                                let from = list.len() - take;
+                                let items: Vec<Value> = list
+                                    .drain(from..)
+                                    .rev()
+                                    .map(|v| Value::BulkString(Some(v.into_bytes())))
                                     .collect();
                                 Value::Array(Some(items))
                             } else {
@@ -2668,15 +2707,20 @@ impl KeyValueStore {
                     Some(e) if e.is_expired(now) => no_list_response(count),
                     Some(mut e) => match &mut e.value {
                         EntryValue::Set(s) => {
-                            let n = count.unwrap_or(1) as usize;
+                            // Compared as `u64` rather than cast to `usize`:
+                            // `usize` is 32-bit under wasm32, where this same
+                            // engine runs in the browser, so a count above
+                            // `u32::MAX` would truncate — potentially to zero.
+                            let n = count.unwrap_or(1);
                             let mut rng = rand::rng();
                             // SPOP removes *random* members, not iteration-order ones.
                             // swap_remove_index is O(1), so popping k members costs
                             // O(k) regardless of set size.
-                            let popped: Vec<String> = if n >= s.len() {
+                            let popped: Vec<String> = if n >= s.len() as u64 {
                                 s.drain(..).collect()
                             } else {
-                                (0..n)
+                                // `n < s.len()` here, so the narrowing is exact.
+                                (0..n as usize)
                                     .map(|_| {
                                         let idx = rng.random_range(0..s.len());
                                         s.swap_remove_index(idx).expect("index in range")
@@ -2727,7 +2771,10 @@ impl KeyValueStore {
                             Some(n) if n >= 0 => {
                                 // Positive count: up to n *distinct* random members.
                                 let mut rng = rand::rng();
-                                let amount = (n as usize).min(s.len());
+                                // `try_from` rather than `as`: `usize` is
+                                // 32-bit under wasm32, where a count above
+                                // `u32::MAX` would truncate instead of clamp.
+                                let amount = usize::try_from(n).unwrap_or(usize::MAX).min(s.len());
                                 let idxs = rand::seq::index::sample(&mut rng, s.len(), amount);
                                 Value::Array(Some(
                                     idxs.iter()
@@ -2741,7 +2788,13 @@ impl KeyValueStore {
                                     return Value::Array(Some(vec![]));
                                 }
                                 let mut rng = rand::rng();
-                                let abs = n.unsigned_abs() as usize;
+                                // The parser refuses a larger magnitude, but a
+                                // `Command` also arrives from AOF replay, a
+                                // replication frame or `sync-client`, none of
+                                // which pass through it.
+                                let abs = usize::try_from(n.unsigned_abs())
+                                    .unwrap_or(usize::MAX)
+                                    .min(crate::resp::MAX_ARRAY_ELEMENTS);
                                 Value::Array(Some(
                                     (0..abs)
                                         .map(|_| {
@@ -3863,6 +3916,125 @@ fn zadd_exec(zset: &mut ZSetInner, opts: ZAddOptions, pairs: Vec<(f64, String)>)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// Counts that a caller can ask for but the collection cannot satisfy.
+///
+/// These are execution-layer guards, deliberately duplicated with the parser's
+/// sign check: a `Command` also reaches `execute` from AOF replay, a
+/// replication frame and `sync-client`, none of which parse RESP.
+#[cfg(test)]
+mod oversized_count_tests {
+    use super::*;
+    use crate::cmd::Command;
+
+    fn list_of(n: usize) -> KeyValueStore {
+        let s = KeyValueStore::new();
+        s.execute(Command::RPush(
+            "l".into(),
+            (0..n).map(|i| format!("v{i}").into_bytes()).collect(),
+        ));
+        s
+    }
+
+    #[test]
+    fn lpop_asking_for_more_than_exists_returns_the_list_and_stops() {
+        let s = list_of(3);
+        // The bound that matters is the list's, not the count's: iterating the
+        // shortfall would hold the shard guard for ~240 years at i64::MAX.
+        let reply = s.execute(Command::LPop("l".into(), Some(i64::MAX as u64)));
+        assert_eq!(
+            reply,
+            Value::Array(Some(vec![
+                Value::BulkString(Some(b"v0".to_vec())),
+                Value::BulkString(Some(b"v1".to_vec())),
+                Value::BulkString(Some(b"v2".to_vec())),
+            ]))
+        );
+        assert_eq!(s.execute(Command::LLen("l".into())), Value::Integer(0));
+    }
+
+    #[test]
+    fn rpop_asking_for_more_than_exists_returns_the_list_in_pop_order() {
+        let s = list_of(3);
+        let reply = s.execute(Command::RPop("l".into(), Some(u64::MAX)));
+        assert_eq!(
+            reply,
+            Value::Array(Some(vec![
+                Value::BulkString(Some(b"v2".to_vec())),
+                Value::BulkString(Some(b"v1".to_vec())),
+                Value::BulkString(Some(b"v0".to_vec())),
+            ]))
+        );
+    }
+
+    #[test]
+    fn a_partial_rpop_still_pops_from_the_tail() {
+        let s = list_of(4);
+        assert_eq!(
+            s.execute(Command::RPop("l".into(), Some(2))),
+            Value::Array(Some(vec![
+                Value::BulkString(Some(b"v3".to_vec())),
+                Value::BulkString(Some(b"v2".to_vec())),
+            ]))
+        );
+        assert_eq!(s.execute(Command::LLen("l".into())), Value::Integer(2));
+    }
+
+    #[test]
+    fn a_partial_lpop_still_pops_from_the_head() {
+        let s = list_of(4);
+        assert_eq!(
+            s.execute(Command::LPop("l".into(), Some(2))),
+            Value::Array(Some(vec![
+                Value::BulkString(Some(b"v0".to_vec())),
+                Value::BulkString(Some(b"v1".to_vec())),
+            ]))
+        );
+        assert_eq!(s.execute(Command::LLen("l".into())), Value::Integer(2));
+    }
+
+    #[test]
+    fn popping_zero_takes_nothing() {
+        let s = list_of(2);
+        assert_eq!(
+            s.execute(Command::LPop("l".into(), Some(0))),
+            Value::Array(Some(vec![]))
+        );
+        assert_eq!(
+            s.execute(Command::RPop("l".into(), Some(0))),
+            Value::Array(Some(vec![]))
+        );
+        assert_eq!(s.execute(Command::LLen("l".into())), Value::Integer(2));
+    }
+
+    #[test]
+    fn spop_beyond_the_set_size_empties_it_exactly_once() {
+        let s = KeyValueStore::new();
+        s.execute(Command::SAdd(
+            "s".into(),
+            (0..100).map(|i| format!("m{i}")).collect(),
+        ));
+        let reply = s.execute(Command::SPop("s".into(), Some(u64::MAX)));
+        match reply {
+            Value::Array(Some(v)) => assert_eq!(v.len(), 100),
+            other => panic!("expected an array, got {other:?}"),
+        }
+        assert_eq!(s.execute(Command::SCard("s".into())), Value::Integer(0));
+    }
+
+    #[test]
+    fn srandmember_with_repetition_is_capped_at_what_a_reply_can_carry() {
+        let s = KeyValueStore::new();
+        s.execute(Command::SAdd("s".into(), vec!["only".into()]));
+        // The parser refuses this magnitude; reaching `execute` anyway (replay,
+        // replication) must clamp rather than allocate i64::MAX elements.
+        let reply = s.execute(Command::SRandMember("s".into(), Some(i64::MIN)));
+        match reply {
+            Value::Array(Some(v)) => assert_eq!(v.len(), crate::resp::MAX_ARRAY_ELEMENTS),
+            other => panic!("expected an array, got {other:?}"),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -5850,12 +6022,12 @@ mod capacity_tests {
         }
         std::thread::sleep(std::time::Duration::from_millis(15));
 
-        let mut removed = s.sweep_expired();
+        let mut removed = s.sweep_expired_reporting();
         removed.sort();
         assert_eq!(removed, vec!["dead-a".to_string(), "dead-b".to_string()]);
 
         // A sweep that expires nothing reports nothing.
-        assert!(s.sweep_expired().is_empty());
+        assert!(s.sweep_expired_reporting().is_empty());
     }
 
     // ── Memory accounting ─────────────────────────────────────────────────────

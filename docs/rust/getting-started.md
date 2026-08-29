@@ -188,6 +188,19 @@ These are behaviours of the sync protocol, not of this crate, and they affect
 `recached-edge` in the browser identically. Each has a regression test in
 `recached-embed/tests/live.rs`, marked `#[ignore]` with the diagnosis.
 
+::: tip A removal you miss while offline is reconciled on reconnect
+This used to be a limitation and is not any more. `qstate` re-hydration is a
+complete snapshot of its pattern, so a key held locally that the snapshot does
+not carry has been deleted or has expired — and nothing else would ever say so,
+because `keychange` only reports what happened while the socket was up. The
+client now drops those keys when it re-hydrates.
+
+The one edge: the server caps a snapshot at `RECACHED_MAX_QSUB_INITIAL_KEYS`
+(10,000). A pattern matching more than that is truncated, and reconciling
+against a truncated snapshot drops locally-held keys that do still exist — a
+sign the pattern is too broad to embed in the first place.
+:::
+
 ::: tip TTLs converge within about a second, not instantly
 A local copy does not expire on its own clock. The server masks an expired key
 on read but only *removes* it in a background sweep, and that removal is what
@@ -198,13 +211,6 @@ instant it expires.
 Fine for session caches and rate-limit tiers. If you need an exact expiry
 instant, compare a stored deadline yourself rather than relying on the key
 vanishing.
-:::
-
-::: warning A client offline when a key expires keeps it
-`qstate` re-hydration adds keys; it does not remove local keys that are absent
-from the snapshot. A key that expired — or was deleted — while you were
-disconnected therefore survives reconnection, until something writes to it
-again. Applies to `DEL` as much as to expiry.
 :::
 
 ::: danger Collections do not hydrate on connect

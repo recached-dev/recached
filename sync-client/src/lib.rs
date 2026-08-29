@@ -18,7 +18,7 @@
 use core_engine::cmd::Command;
 use core_engine::resp::Value;
 use core_engine::store::KeyValueStore;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 /// Cap on outbox entries. When full, the oldest is dropped (reported via
@@ -55,8 +55,24 @@ pub enum Incoming {
     /// A `qstate` frame: the reply to a QSUB (retire the row, if any) *and*
     /// state applied to the local store (notify UI subscribers).
     AppliedReply { retired: Option<u64> },
-    /// Unparseable or irrelevant — nothing to do.
+    /// A frame we understand but that asks for nothing — a push we do not
+    /// model. It consumes no reply slot, which is correct: the server did not
+    /// treat it as one either.
     Ignored,
+    /// The frame could not be parsed at all.
+    ///
+    /// This is *not* [`Ignored`](Self::Ignored), and the difference matters.
+    /// If the frame was a command reply, the server has consumed a command
+    /// that this client will never account for, so the inflight FIFO is now
+    /// one ahead of reality: every later reply acknowledges the wrong command,
+    /// resolves the wrong caller and retires the wrong outbox row. There is no
+    /// way to resynchronise in place — the adapter must drop the socket, which
+    /// [`on_open`](SyncClient::on_open) rebuilds from a cleared FIFO.
+    ///
+    /// It is reachable without an attacker: a `keychange` for a watched
+    /// collection larger than `resp::MAX_ARRAY_ELEMENTS` parses on the server
+    /// and fails here.
+    Malformed,
 }
 
 /// Result of queueing a write.
@@ -455,7 +471,7 @@ impl SyncClient {
             Ok(_) => Incoming::Reply {
                 retired: self.ack_reply(),
             },
-            Err(_) => Incoming::Ignored,
+            Err(_) => Incoming::Malformed,
         }
     }
 
@@ -543,7 +559,9 @@ impl SyncClient {
         match tag.as_str() {
             "hash" => {
                 let pairs: Vec<(String, Vec<u8>)> = raw
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| (as_text(&c[0]), c[1].clone()))
                     .collect();
                 if !pairs.is_empty() {
@@ -563,7 +581,9 @@ impl SyncClient {
             }
             "zset" => {
                 let members: Vec<(f64, String)> = raw
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .filter_map(|c| {
                         as_text(&c[1])
                             .parse::<f64>()
@@ -587,12 +607,37 @@ impl SyncClient {
         }
     }
 
+    /// Apply a `["qstate", pattern, k, v, ...]` snapshot, and reconcile the
+    /// local copy of `pattern` against it.
+    ///
+    /// Applying the snapshot alone is not enough. A snapshot is the complete
+    /// truth for its pattern, so a key held locally that the snapshot does not
+    /// carry has been deleted or has expired — and nothing else will ever say
+    /// so. `keychange` only reports changes that happened while the socket was
+    /// up, so a removal during a disconnect used to leave the key in local
+    /// memory, with its last value, forever. A browser tab hid this by
+    /// starting empty on reload; a server process holding the same cache for
+    /// months does not.
+    ///
+    /// One caveat, unchanged by this: the server caps a snapshot at
+    /// `RECACHED_MAX_QSUB_INITIAL_KEYS` (10,000). If a pattern matches more
+    /// than that, the snapshot is truncated and reconciling against it drops
+    /// locally-held keys that do still exist. That is a pattern too broad to
+    /// embed, and the resulting local copy at least matches the snapshot it
+    /// was given rather than being an ever-growing superset of two.
     fn apply_qstate(&self, items: &[Value]) {
-        for pair in items.get(2..).unwrap_or(&[]).chunks_exact(2) {
+        let pattern = match items.get(1) {
+            Some(Value::BulkString(Some(p))) => String::from_utf8_lossy(p).into_owned(),
+            _ => String::new(),
+        };
+
+        let mut present: HashSet<String> = HashSet::new();
+        for pair in items.get(2..).unwrap_or(&[]).as_chunks::<2>().0 {
             let Value::BulkString(Some(k)) = &pair[0] else {
                 continue;
             };
             let key = String::from_utf8_lossy(k).into_owned();
+            present.insert(key.clone());
             match &pair[1] {
                 Value::BulkString(Some(v)) => {
                     self.store
@@ -603,6 +648,19 @@ impl SyncClient {
                 Value::Array(Some(inner)) => self.apply_tagged(key, inner),
                 _ => {}
             }
+        }
+
+        if pattern.is_empty() {
+            return;
+        }
+        let stale: Vec<String> = self
+            .store
+            .matching_keys(&pattern)
+            .into_iter()
+            .filter(|k| !present.contains(k))
+            .collect();
+        if !stale.is_empty() {
+            self.store.execute(Command::Del(stale));
         }
     }
 }

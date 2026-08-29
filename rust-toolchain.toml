@@ -1,0 +1,9 @@
+# Pin the toolchain so CI, developers and releases agree on one compiler.
+#
+# CI runs `cargo clippy -D warnings`, which makes an unpinned toolchain a
+# scheduled outage: every stable release adds lints, so the build goes red on a
+# day nobody changed the code. Bump this deliberately, with the lint fixes in
+# the same commit.
+[toolchain]
+channel    = "1.98.0"
+components = ["rustfmt", "clippy"]

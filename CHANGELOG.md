@@ -4,7 +4,111 @@ All notable changes to Recached are documented here.
 
 ---
 
-## [Unreleased]
+## [0.3.3] [Unreleased]
+
+### Security — three unguarded sign casts on collection counts
+
+`LPOP`, `RPOP` and `SPOP` parsed their optional count with `extract_int(..)? as u64`.
+`extract_int` returns `i64`, so `-1` arrived as `18446744073709551615`, and the three
+commands diverged from Redis in three different ways:
+
+- **`LPOP key -1` / `RPOP key -1` hung the server.** The execution arm ran
+  `(0..n).filter_map(|_| list.pop_front())`, which keeps iterating after the list empties.
+  Measured in a release build at 10M iterations per 8.3ms, `u64::MAX` is about 484 years —
+  all of it holding the entry's DashMap shard guard, in a synchronous call on a Tokio
+  worker thread. One command per worker takes the runtime down; the shard's other keys are
+  blocked for the duration.
+- **`SPOP key -1` silently emptied the set.** The huge count took the `n >= s.len()`
+  branch, which drains everything. A 1,000-member set returned all 1,000 and `SCARD` went
+  to zero. Redis answers `ERR value is out of range, must be positive`.
+- **`SRANDMEMBER key -<huge>` allocated without bound.** A negative count means "with
+  repetition", so unlike a positive one it is not clamped by the set's size — `|n|`
+  elements are generated. This one is a *read*, so it needed no write scope.
+
+Fixed in two layers. `extract_count` refuses a negative count at parse, matching what every
+other numeric argument in the parser already did — `SET EX`, `SETEX`, the `EXPIRE` family,
+`RLSET`, and `SCAN COUNT`, whose comment already read *"casting it to usize here would wrap
+into one"*. And the execution arms now bound themselves by the collection rather than by the
+count, because a `Command` also reaches `execute` from AOF replay, a replication frame and
+`sync-client`, none of which parse RESP. `SRANDMEMBER`'s repetition count is capped at
+`resp::MAX_ARRAY_ELEMENTS` — beyond that the reply is an allocation no client could parse
+back. Two `as usize` casts on the same paths were replaced with checked conversions: `usize`
+is 32-bit under wasm32, where this same engine runs in the browser.
+
+Ten regression tests, split between the parser and the execution arms.
+
+### Fixed — a delete or expiry missed while disconnected survived reconnection
+
+`qstate` re-hydration only ever *added* keys. A snapshot is the complete truth for its
+pattern, so a key held locally that the snapshot does not carry has been removed — and
+nothing else would ever say so, because `keychange` reports only what happened while the
+socket was up. The key stayed in local memory, with its last value, for the life of the
+process. A browser tab hid this by starting empty on reload; a server process holding the
+same cache for months does not.
+
+`apply_qstate` now reconciles against the snapshot's own pattern. This was documented as a
+known limitation of `recached-embed` and `recached-edge`; it is no longer one. The
+remaining edge is unchanged: a pattern matching more than `RECACHED_MAX_QSUB_INITIAL_KEYS`
+(10,000) gets a truncated snapshot, and reconciling against a truncated snapshot drops keys
+that do still exist — which is a pattern too broad to embed.
+
+### Fixed — an unparseable frame silently mis-delivered every later reply
+
+`SyncClient::handle_frame` returned `Incoming::Ignored` both for a push it does not model
+and for a frame it could not parse. The two need opposite handling. A push consumes no
+reply slot, correctly. But an unparseable frame may have been a reply the server already
+counted, leaving the inflight FIFO permanently one ahead: every later reply then
+acknowledged the wrong command, resolved the wrong caller's future, and retired the wrong
+outbox row — dropping an unacknowledged write. It is reachable without an attacker, by a
+`keychange` for a watched collection larger than `resp::MAX_ARRAY_ELEMENTS`.
+
+New `Incoming::Malformed`. Both adapters now drop the socket on it; the reconnect rebuilds
+both FIFOs from `on_open`, which clears them, and the outbox replays what was queued.
+
+### Added — supply-chain and toolchain gates
+
+None of this existed. Each item was a way for the build to change without anyone deciding it
+should.
+
+- **`rust-toolchain.toml` pins 1.98.0.** CI installed `stable` and ran `clippy -D warnings`,
+  which makes an unpinned toolchain a scheduled outage: every stable release adds lints. It
+  had already happened — 1.98's `chunks_exact_to_as_chunks` fires three times in
+  `sync-client`, so the next CI run would have gone red with nobody having touched the code.
+  Those three are fixed, and the workspace declares `rust-version = "1.98"`.
+- **`deny.toml` + a `cargo deny` CI job** — RustSec advisories, licence allowlist, wildcard
+  ban, and registry allowlist. Chosen over `cargo audit` because it covers the advisories
+  *and* the licence and duplicate-version policy in one gate.
+
+  It earned its place on the first run: `h2 0.4.14` was live in the tree via
+  `metrics-exporter-prometheus` → `hyper-rustls` → `hyper`, carrying
+  [RUSTSEC-2026-0258](https://rustsec.org/advisories/RUSTSEC-2026-0258) — unbounded empty
+  `DATA` frames, a remote memory-exhaustion path in the Prometheus metrics listener, which is
+  always plaintext and has no allowlist of its own. Bumped to 0.4.19 in `Cargo.lock`.
+- **Every third-party action is SHA-pinned**, across all three workflows, with the tag it
+  came from in a trailing comment. A tag is mutable; a commit is not.
+- **`.github/dependabot.yml`** for cargo, actions and the three npm roots. This is what makes
+  SHA pinning safe rather than a way to freeze a known-vulnerable action forever.
+- **`SECURITY.md`** — private reporting, response times, and an explicit scope section
+  listing what is a documented property rather than a defect, so a reporter is not left
+  guessing.
+- **A workspace `[lints]` table** with `unsafe_code = "deny"`, `unused_must_use = "deny"`,
+  `clippy::all`, `mem_forget`, `todo` and `dbg_macro`. The four legitimate `unsafe` sites in
+  tests (a counting `GlobalAlloc`; `env::set_var`, which edition 2024 made unsafe) carry an
+  explicit `#[allow]` with a stated reason and a `// SAFETY:` note, which is the point — each
+  is now a decision on the record. `overflow-checks = true` in the release profile, so
+  arithmetic on client-supplied numbers panics rather than wrapping.
+
+  The panic and indexing family is *deliberately not enabled*: `[lints]` applies to tests
+  too, and they account for most of the 1,000 hits. Turning them on would mean a thousand
+  `#[allow]`s, which enforces nothing and hides the next real one. The table documents them
+  as a per-crate ratchet with real counts instead.
+
+### Changed — `sweep_expired` no longer allocates for nobody
+
+Splitting it into `sweep_expired` and `sweep_expired_reporting` puts the key-name clone
+behind the caller that actually needs it. The server now calls the reporting variant only
+when the watch registry is non-empty; on a node with no watchers and no replicas that was
+per-sweep work for nobody, on every sweep, forever.
 
 ### Added — `recached-embed`, an embedded Rust client
 
@@ -32,8 +136,39 @@ does not exist", which is exactly how an embedded cache serves confidently wrong
 nothing would keep it current.
 
 Not on crates.io: it depends on `core-engine` and `sync-client` by path, and neither is
-published. Depend on it by git until that changes. Docs at
-[recached.dev/rust](https://recached.dev/rust/getting-started).
+published (`publish = false` now says so explicitly). Depend on it by git until that changes.
+Docs at [recached.dev/rust](https://recached.dev/rust/getting-started).
+
+Hardened before it goes anywhere, in the same release:
+
+- **Nothing had a deadline.** `Error::Timeout` existed but was never constructed anywhere in
+  the crate: a reply the server never sent parked the caller's task forever, and a TCP connect
+  to a black-holed address hung for the OS timeout. `request_timeout` and `connect_timeout`
+  (both 10s by default) now bound every wait.
+- **A full pending queue discarded writes silently.** `Enqueued::dropped` was ignored, while
+  `set()` documented the queue as "not lost, only unacknowledged" — untrue past `max_pending`.
+  Dropped writes are now counted by `pending_dropped()` and logged at `WARN`, as the browser
+  SDK already did.
+- **"Queued durably" was not true here.** The outbox is `sync-client`'s in-memory `VecDeque`;
+  `restore_outbox` is never called and there is no persistence hook, so a process restart
+  loses it. The browser backs the same queue with IndexedDB. The docs now say in memory.
+- **The local store was unbounded in two ways.** It was built with `KeyValueStore::new()` — no
+  key cap, no memory cap, no eviction — so the server's keyspace decided how much heap your
+  service used. And nothing ever swept it, so expired entries accumulated for the life of the
+  process, because a read only *masks* one. `max_memory`, `max_keys` and `eviction_policy` are
+  now on the builder, and the connection task sweeps once a second, including through an
+  outage.
+- **`watch` and `unwatch` raced.** Each took the hydrated-pattern lock in a separate critical
+  section either side of its round-trip, so an `unwatch` finishing inside a slower `watch`
+  was overwritten by it — leaving a pattern marked hydrated that the server was no longer
+  tracking, and reads served as authoritative from then on. They now serialise on a dedicated
+  async lock that readers never touch.
+- **The op channel was unbounded**, so a caller outrunning the socket grew a queue instead of
+  waiting. Bounded at 1024, configurable via `max_queued_ops`.
+- `Error` is `#[non_exhaustive]`, builder methods are `#[must_use]`, and the crate carries
+  `#![forbid(unsafe_code)]`.
+- Five unit tests that need no server, plus three live ones — and CI now boots a server and
+  runs the live suite, which previously skipped itself in every run.
 
 ### Added — `SyncClient::session_command()`
 
@@ -71,9 +206,9 @@ inside `execute()` deep in `core-engine`, which has no access to the watch regis
 cannot report removals the way the sweep now does. Only affects deployments that set
 `maxmemory`.
 
-### Known — two sync-protocol gaps the live suite exposed
+### Known — one sync-protocol gap the live suite exposed
 
-Both pre-existing and affecting `recached-edge` identically. Neither is fixed here.
+Pre-existing and affecting `recached-edge` identically. Not fixed here.
 
 **Collections never hydrate on connect.** `matching_key_values` yields collections as bare
 `SimpleString("hash")` markers, but `apply_qstate` handles only `BulkString` and `Array` and
@@ -82,13 +217,6 @@ connects stays invisible until its next write. `keychange` uses `get_current` (f
 contents); `qstate` does not — and the comment in `apply_qstate` claiming "collections arrive
 type-tagged, so the initial state of a live query is complete" is false. Regression test in
 `recached-embed/tests/live.rs`, `#[ignore]`d with the diagnosis.
-
-**Removals during a disconnect are never reconciled.** `apply_qstate` only *adds* keys; it
-never removes local keys absent from the snapshot, and `on_open` does not clear the store. A
-key deleted or expired while a client was offline therefore survives its reconnect, until
-something writes to it again. This affects `DEL` as much as expiry, and is why the fix above
-does not help a client that was disconnected at the moment of expiry. Fixing it means deciding
-what to do about writes sitting in the offline outbox for keys the snapshot no longer contains.
 
 ---
 
