@@ -4,6 +4,94 @@ All notable changes to Recached are documented here.
 
 ---
 
+## [Unreleased]
+
+### Added — `recached-embed`, an embedded Rust client
+
+`recached-edge` lets a browser hold a local copy of the cache and receive pushes when it
+changes. There was no equivalent for a Rust service: `sdks/` shipped React and Vue only, so a
+Rust backend could talk RESP on 6379 and pay a network hop per read, but could not be a sync
+peer at all — `QSUB`/`SYNC`/`DEDUP` are WebSocket-only, and TCP clients are never sent
+keychange pushes.
+
+`recached-embed` closes that gap. It is a thin native adapter over the existing
+`sync-client` state machine — the same outbox, `DEDUP` envelopes, ordered-reply correlation
+and jittered backoff the browser uses — so merge semantics cannot drift between platforms.
+Reads hit the shared `Arc<KeyValueStore>` directly: no channel, no lock, no `await`.
+
+```rust
+let cache = Cache::connect("ws://127.0.0.1:6380").await?;
+cache.watch("fare:*").await?;              // hydrate + subscribe, returns when state lands
+let fare = cache.get("fare:MNL-CEB")?;     // local memory
+```
+
+The design decision worth calling out: **`get()` on a key no `watch()` pattern covers returns
+`Err(NotHydrated)`, never `None`.** A silent `None` there is indistinguishable from "the key
+does not exist", which is exactly how an embedded cache serves confidently wrong answers.
+`get_or_fetch()` is the escape hatch, and it deliberately does not cache what it fetches —
+nothing would keep it current.
+
+Not on crates.io: it depends on `core-engine` and `sync-client` by path, and neither is
+published. Depend on it by git until that changes. Docs at
+[recached.dev/rust](https://recached.dev/rust/getting-started).
+
+### Added — `SyncClient::session_command()`
+
+Registers a one-shot frame whose reply must occupy a reply slot but which is neither durable
+nor replayed on reconnect — a read-through `GET`, a `SUBSCRIBE`. Browser SDKs never needed it
+because they read only from the local store; a server-side adapter offering read-through does,
+or its reply would falsely acknowledge the oldest queued write. Four lines, delegating to the
+existing private `session_frame`.
+
+### Fixed — an expired key never disappeared from a replica
+
+A key with a TTL was set on the server, pushed to every watching browser and embedded client,
+and then **stayed there forever with its last value**. The server expired it correctly; nobody
+else ever found out.
+
+Two things had to be true at once. Reads only *mask* an expired entry rather than removing it,
+so the once-per-second background sweep is the sole remover — and that sweep called
+`data.retain(…)` and told nobody. No command ran, so no keychange was emitted, and the sync
+layer has no other way to learn a key is gone. Meanwhile `apply_keychange` applies
+`Command::Set(k, v, Default::default())` with no expiry, so a replica's copy never carried a
+TTL it could enforce itself.
+
+`sweep_expired()` now returns the keys it removed, and the background task announces them via
+the new `notify_removed()`. A nil value is already how a delete is encoded, so this needs **no
+new frame shape and no client change** — `recached-edge` picks the fix up from the server
+alone, at whatever version it is on.
+
+Convergence is bounded by the sweep interval (1s), not instant: a local copy still does not
+expire on its own clock. Carrying a relative TTL in the keychange frame would close that
+window, but it changes the frame shape, and every current client checks `items.len() != 3`
+and would silently drop the wider frame.
+
+**Not covered:** memory eviction has the same hole. `try_evict_for_memory` is called from
+inside `execute()` deep in `core-engine`, which has no access to the watch registry, so it
+cannot report removals the way the sweep now does. Only affects deployments that set
+`maxmemory`.
+
+### Known — two sync-protocol gaps the live suite exposed
+
+Both pre-existing and affecting `recached-edge` identically. Neither is fixed here.
+
+**Collections never hydrate on connect.** `matching_key_values` yields collections as bare
+`SimpleString("hash")` markers, but `apply_qstate` handles only `BulkString` and `Array` and
+silently drops the rest. A hash, list, set, sorted set or JSON key written *before* a client
+connects stays invisible until its next write. `keychange` uses `get_current` (full tagged
+contents); `qstate` does not — and the comment in `apply_qstate` claiming "collections arrive
+type-tagged, so the initial state of a live query is complete" is false. Regression test in
+`recached-embed/tests/live.rs`, `#[ignore]`d with the diagnosis.
+
+**Removals during a disconnect are never reconciled.** `apply_qstate` only *adds* keys; it
+never removes local keys absent from the snapshot, and `on_open` does not clear the store. A
+key deleted or expired while a client was offline therefore survives its reconnect, until
+something writes to it again. This affects `DEL` as much as expiry, and is why the fix above
+does not help a client that was disconnected at the moment of expiry. Fixing it means deciding
+what to do about writes sitting in the offline outbox for keys the snapshot no longer contains.
+
+---
+
 ## [0.3.2] — 2026-08-07
 
 ### Fixed — `cache.incr()` and `cache.decr()` threw on every call

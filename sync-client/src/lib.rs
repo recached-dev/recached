@@ -222,6 +222,18 @@ impl SyncClient {
         self.session_frame(frame, connected)
     }
 
+    /// Register a one-shot frame the adapter is about to send whose reply must
+    /// occupy a reply slot but which is neither durable nor replayed on
+    /// reconnect — a read-through `GET`, a `SUBSCRIBE`, an introspection
+    /// command. Returns the frame unchanged when connected, `None` otherwise.
+    ///
+    /// Browser SDKs never needed this: they read only from the local store. A
+    /// server-side adapter that offers read-through must still take a slot, or
+    /// its reply would falsely acknowledge the oldest queued write.
+    pub fn session_command(&mut self, frame: Vec<u8>, connected: bool) -> Option<Vec<u8>> {
+        self.session_frame(frame, connected)
+    }
+
     fn session_frame(&mut self, frame: Vec<u8>, connected: bool) -> Option<Vec<u8>> {
         if connected {
             self.inflight.push_back(None);

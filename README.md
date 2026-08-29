@@ -45,6 +45,11 @@ cargo install --git https://github.com/recached-dev/recached recached && recache
 npm install recached-edge
 ```
 
+```bash
+# Rust service (embedded client — reads come from local process memory)
+cargo add --git https://github.com/recached-dev/recached recached-embed
+```
+
 > [!IMPORTANT]
 > **Install `recached-edge@^0.3.1`.** Every published version from 0.1.3 to 0.3.0 shipped without
 > wasm-pack's `snippets/` directory and failed to import at all; 0.3.1 is the first release that
@@ -62,6 +67,8 @@ npm install recached-edge
 </p>
 
 Any mutation on the server is pushed to all connected browser instances automatically. Any write from the browser is pushed to the server and fanned out to other clients. Reads always come from local WASM memory — no network hop.
+
+A **Rust service** can be one of those connected clients too, via [`recached-embed`](https://recached.dev/rust/getting-started) — same engine, same sync protocol, holding its slice of the cache in its own heap instead of a tab's. Useful for config-shaped data read on every request: fare tables, feature flags, tenant settings, entitlement checks.
 
 ---
 
@@ -141,6 +148,8 @@ Being honest about where things stand:
 
 - **The cache server is production-ready for cache workloads** — persistence, replication with auto-failover, TLS, hardened parsers, metrics, and a load/chaos CI suite. Treat it as a cache, not a system of record.
 - **The sync layer (browser sync, live queries, offline outbox, scoped auth) is beta** — the invariants are [specified](https://recached.dev/server/protocol) and tested end-to-end, but the code is young and hasn't had real-world miles or third-party security review yet. Don't put the WebSocket port on the public internet for multi-tenant data without reading [Sync Scopes](https://recached.dev/server/sync-scopes) first.
+
+- **The embedded Rust client (`recached-embed`) is brand new and unpublished** — it works end-to-end against a live server and is covered by a live test suite, but it has no production miles, is not on crates.io, and inherits two known sync-protocol gaps: collections do not hydrate on connect, and a key deleted or expired while a client was disconnected survives its reconnect. Both are documented in [its docs](https://recached.dev/rust/getting-started#known-limitations) and affect the browser SDK identically.
 
 The road to 1.0 is hardening, not features. Bug reports from production-like use are the most valuable contribution right now.
 

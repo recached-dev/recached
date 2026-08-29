@@ -3,6 +3,7 @@ members = [
     "core-engine",
     "server-native",
     "sync-client",
+    "recached-embed",
     "wasm-edge",
 ]
 resolver = "2"

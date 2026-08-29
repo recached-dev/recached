@@ -1235,9 +1235,28 @@ impl KeyValueStore {
             .collect()
     }
 
-    pub fn sweep_expired(&self) {
+    /// Drop every expired entry, returning the keys removed.
+    ///
+    /// The keys are returned rather than discarded because expiry is the one
+    /// removal no client asked for: reads only *mask* an expired entry, so
+    /// this sweep is the sole remover, and a caller replicating the keyspace
+    /// has no other way to learn the key is gone. `server-native` feeds the
+    /// result to the watch registry; callers that do not replicate ignore it.
+    ///
+    /// `Vec::new` does not allocate, so a sweep that expires nothing is still
+    /// free.
+    pub fn sweep_expired(&self) -> Vec<String> {
         let now = now_ms();
-        self.data.retain(|_, e| !e.is_expired(now));
+        let mut removed = Vec::new();
+        self.data.retain(|key, e| {
+            if e.is_expired(now) {
+                removed.push(key.clone());
+                false
+            } else {
+                true
+            }
+        });
+        removed
     }
 
     /// Evict a single entry per the configured policy. Returns the number of
@@ -5809,6 +5828,34 @@ mod capacity_tests {
         assert_eq!(s.get_current("live"), bulk("v"));
         assert_eq!(s.get_current("dead"), Value::BulkString(None));
         assert_eq!(s.execute(Command::DbSize), Value::Integer(1));
+    }
+
+    #[test]
+    fn sweep_expired_reports_the_keys_it_removed() {
+        // Expiry is the one removal no client commanded, and reads only mask an
+        // expired entry rather than removing it — so this sweep is the sole
+        // remover, and its return value is the only way a caller replicating
+        // the keyspace can learn the key is gone.
+        let s = KeyValueStore::new();
+        set(&s, "live", "v");
+        for key in ["dead-a", "dead-b"] {
+            s.execute(Command::Set(
+                key.into(),
+                "v".into(),
+                SetOptions {
+                    expiry: Some(crate::cmd::SetExpiry::Px(1)),
+                    ..Default::default()
+                },
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+
+        let mut removed = s.sweep_expired();
+        removed.sort();
+        assert_eq!(removed, vec!["dead-a".to_string(), "dead-b".to_string()]);
+
+        // A sweep that expires nothing reports nothing.
+        assert!(s.sweep_expired().is_empty());
     }
 
     // ── Memory accounting ─────────────────────────────────────────────────────

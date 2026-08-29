@@ -878,6 +878,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "recached-embed"
+version = "0.3.2"
+dependencies = [
+ "core-engine",
+ "futures-util",
+ "rand",
+ "sync-client",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"

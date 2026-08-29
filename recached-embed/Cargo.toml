@@ -1,0 +1,20 @@
+[package]
+name        = "recached-embed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hold a live slice of a Recached cache in your Rust service's own memory. Reads are local; the socket carries only writes out and change notices in."
+
+[dependencies]
+core-engine.workspace = true
+sync-client.workspace = true
+
+tokio             = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util      = { workspace = true }
+rand              = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+core-engine.workspace = true

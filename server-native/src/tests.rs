@@ -5106,3 +5106,122 @@ mod publish_in_multi_tests {
 }
 
 // ── Metrics port ──────────────────────────────────────────────────────────────
+
+// ── Expiry sweep notification ─────────────────────────────────────────────────
+// Distinct from `propagation::expiry_propagation_tests`, which covers how an
+// expiry travels inside a replicated *write* frame. This covers the sweep that
+// removes a key nobody wrote to, and telling watchers it happened.
+
+mod sweep_notification {
+    use super::*;
+
+    /// Register one live-query subscriber and return its receiving end.
+    async fn subscribe_pattern(
+        registry: &WatchRegistry,
+        pattern: &str,
+    ) -> mpsc::UnboundedReceiver<WatchNotif> {
+        let (tx, rx) = mpsc::unbounded_channel::<WatchNotif>();
+        let mut pats = registry.patterns.lock().await;
+        pats.insert(pattern.to_string(), vec![(1, tx)]);
+        registry.sync_patterns_len(&pats);
+        rx
+    }
+
+    fn set_with_px(store: &KeyValueStore, key: &str, value: &str, px: u64) {
+        store.execute(Command::Set(
+            key.into(),
+            value.into(),
+            SetOptions {
+                expiry: Some(SetExpiry::Px(px)),
+                ..Default::default()
+            },
+        ));
+    }
+
+    /// The regression this guards: expiry removes a key behind every client's
+    /// back — no command ran, so no keychange was emitted — and a replica kept
+    /// the key, with its last value, forever. Volatile keys simply never
+    /// expired in a browser or embedded local copy.
+    #[tokio::test]
+    async fn an_expiry_sweep_tells_live_queries_the_key_is_gone() {
+        let store = KeyValueStore::new();
+        let registry: WatchRegistry = WatchHub::new();
+        let mut rx = subscribe_pattern(&registry, "fare:*").await;
+
+        set_with_px(&store, "fare:MNL-CEB", "1850", 1);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Exactly what the background task in main.rs does.
+        let expired = store.sweep_expired();
+        assert_eq!(expired, vec!["fare:MNL-CEB".to_string()]);
+        notify_removed(&registry, &expired).await;
+
+        let (key, value) = rx.try_recv().expect("live query was never told");
+        assert_eq!(key, "fare:MNL-CEB");
+        assert_eq!(
+            value,
+            Value::BulkString(None),
+            "nil is already the delete encoding, so existing clients apply it unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expiry_sweep_notifies_exact_key_watchers_too() {
+        let store = KeyValueStore::new();
+        let registry: WatchRegistry = WatchHub::new();
+        let (tx, mut rx) = mpsc::unbounded_channel::<WatchNotif>();
+        {
+            let mut map = registry.map.lock().await;
+            map.insert("session:abc".to_string(), vec![(1, tx)]);
+            registry.sync_len(&map);
+        }
+
+        set_with_px(&store, "session:abc", "token", 1);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let expired = store.sweep_expired();
+        notify_removed(&registry, &expired).await;
+
+        let (key, value) = rx.try_recv().expect("WATCH-er was never told");
+        assert_eq!(key, "session:abc");
+        assert_eq!(value, Value::BulkString(None));
+    }
+
+    #[tokio::test]
+    async fn a_pattern_that_does_not_match_is_left_alone() {
+        let store = KeyValueStore::new();
+        let registry: WatchRegistry = WatchHub::new();
+        let mut rx = subscribe_pattern(&registry, "fare:*").await;
+
+        set_with_px(&store, "session:abc", "token", 1);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let expired = store.sweep_expired();
+        assert_eq!(expired, vec!["session:abc".to_string()]);
+        notify_removed(&registry, &expired).await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a live query must not hear about keys outside its pattern"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sweep_that_expires_nothing_notifies_nobody() {
+        let store = KeyValueStore::new();
+        let registry: WatchRegistry = WatchHub::new();
+        let mut rx = subscribe_pattern(&registry, "fare:*").await;
+
+        store.execute(Command::Set(
+            "fare:MNL-CEB".into(),
+            "1850".into(),
+            SetOptions::default(),
+        ));
+
+        let expired = store.sweep_expired();
+        assert!(expired.is_empty());
+        notify_removed(&registry, &expired).await;
+
+        assert!(rx.try_recv().is_err(), "nothing expired, nothing to say");
+    }
+}
