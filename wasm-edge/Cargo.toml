@@ -43,7 +43,7 @@ features = [
 # getrandom v0.3 requires explicit opt-in for wasm32-unknown-unknown to use
 # the JS globalThis.crypto backend (pulled transitively via rand in core-engine).
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom = { version = "0.3", features = ["wasm_js"] }
+getrandom = { version = "0.4", features = ["wasm_js"] }
 
 # Browser-only tests: the IndexedDB persistence paths cannot run on a native
 # target. Run with `wasm-pack test --headless --chrome wasm-edge`.
