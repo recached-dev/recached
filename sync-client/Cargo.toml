@@ -3,6 +3,12 @@ name    = "sync-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+# Not publishable to crates.io: this crate depends on `core-engine` by path, and a
+# path dependency carries no version, which crates.io rejects. Stated rather than
+# left for `cargo publish` to discover. Does not affect `cargo install --git`,
+# which is how the server is distributed. Remove this — and give the workspace
+# path dependencies versions — if these are ever published.
+publish = false
 
 [dependencies]
 core-engine.workspace = true

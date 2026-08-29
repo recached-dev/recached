@@ -3,6 +3,12 @@ name    = "core-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+# Not publishable to crates.io: this crate is consumed by path from every other crate in the
+# workspace, none of which can publish, so publishing it alone serves nothing. Stated rather than
+# left for `cargo publish` to discover. Does not affect `cargo install --git`,
+# which is how the server is distributed. Remove this — and give the workspace
+# path dependencies versions — if these are ever published.
+publish = false
 
 [dependencies]
 dashmap.workspace = true

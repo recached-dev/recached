@@ -9,6 +9,11 @@ edition.workspace = true
 license = "Apache-2.0"
 description = "The Recached cache engine compiled to WebAssembly: a Redis-compatible store that runs inside the browser and syncs with a Recached server."
 repository.workspace = true
+# Publishes to **npm** as `recached-edge`, never to crates.io: it depends on
+# `core-engine` by path, and a path dependency carries no version, which
+# crates.io rejects. `wasm-pack` is unaffected — it reads the fields above and
+# does not consult `publish`.
+publish = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]

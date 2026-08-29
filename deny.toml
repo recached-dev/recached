@@ -37,7 +37,13 @@ confidence-threshold = 0.9
 # disagreement we cannot fix directly, and failing the build on one would make
 # an unrelated dependency bump block every PR. They still show up in the log.
 multiple-versions = "warn"
+# A wildcard version is a real hazard from crates.io and a false positive
+# inside a workspace: `core-engine.workspace = true` resolves to a version-less
+# path dependency, which cargo-deny reads as `*`. This exempts path
+# dependencies specifically, so an actual `foo = "*"` from a registry still
+# fails the build.
 wildcards = "deny"
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

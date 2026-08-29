@@ -79,6 +79,19 @@ should.
   ban, and registry allowlist. Chosen over `cargo audit` because it covers the advisories
   *and* the licence and duplicate-version policy in one gate.
 
+  Two config decisions worth recording. `multiple-versions = "warn"`, not deny: duplicate
+  versions are usually a transitive disagreement nobody here can fix, and failing on one would
+  let an unrelated dependency bump block every PR (5 are currently reported —
+  `hashbrown`, `socket2`, `thiserror`, `thiserror-impl`, `windows-sys`). And
+  `allow-wildcard-paths = true`, because `core-engine.workspace = true` resolves to a
+  version-less path dependency that cargo-deny reads as `*`; a genuine `foo = "*"` from a
+  registry still fails the build. That exemption only applies to crates marked
+  `publish = false`, which surfaced something worth stating outright: **no crate in this
+  workspace can go to crates.io** while `core-engine` is a path dependency, because a path
+  dependency carries no version and crates.io rejects that. All five now say so. Verified that
+  this changes nothing about how they are actually distributed — `cargo install --git` does not
+  consult `publish`, and `wasm-pack build` still produces a publishable `recached-edge`.
+
   It earned its place on the first run: `h2 0.4.14` was live in the tree via
   `metrics-exporter-prometheus` → `hyper-rustls` → `hyper`, carrying
   [RUSTSEC-2026-0258](https://rustsec.org/advisories/RUSTSEC-2026-0258) — unbounded empty
