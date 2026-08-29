@@ -25,7 +25,7 @@ core-engine = { path = "core-engine" }
 sync-client = { path = "sync-client" }
 dashmap        = "6"
 indexmap       = "2"
-rand           = { version = "0.9", features = ["thread_rng"] }
+rand           = { version = "0.10", features = ["thread_rng"] }
 
 # async runtime
 tokio          = { version = "1",     features = ["full"] }
