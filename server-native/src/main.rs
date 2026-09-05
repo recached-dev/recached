@@ -115,21 +115,68 @@ fn now_unix_ms() -> u64 {
         .as_millis() as u64
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// Builds the runtime, then hands off to [`run`].
+///
+/// This is a hand-rolled `#[tokio::main]`: the macro can only take a worker
+/// count as a literal, and `RECACHED_WORKER_THREADS` has to be read at startup.
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // All runtime configuration is via RECACHED_* env vars; the only flags are
     // --version/-V (required by e.g. the Homebrew formula's install test).
+    // Answered before the runtime is built so `--version` costs no threads.
     if std::env::args().any(|a| a == "--version" || a == "-V") {
         println!("recached-server {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 
+    // Validated before the subscriber exists, so this one message has to go to
+    // stderr directly rather than through `error!`.
+    let configured_workers = worker_threads().map_err(|e| {
+        eprintln!("Configuration error: {e}");
+        e
+    })?;
+
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    if let Some(n) = configured_workers {
+        builder.worker_threads(n);
+    }
+    let runtime = builder.build()?;
+
+    // `num_workers` reports what the runtime actually built, which is the
+    // number worth logging: when the variable is unset it is the only place
+    // the core count Tokio detected becomes visible. Inside a container that
+    // is the cgroup's CPU allowance, not the host's core count.
+    let active_workers = runtime.metrics().num_workers();
+    runtime.block_on(run(active_workers, configured_workers.is_some()))
+}
+
+async fn run(
+    active_workers: usize,
+    workers_pinned: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    // ── runtime ───────────────────────────────────────────────────────────
+    // Recached executes commands on every worker, which is the main structural
+    // difference from Redis and Valkey. Logging the count makes a throughput
+    // number attributable after the fact: a benchmark result without it cannot
+    // be told apart from the same server accidentally running on one core.
+    if workers_pinned {
+        info!(
+            "Command execution: {} worker threads (pinned by RECACHED_WORKER_THREADS)",
+            active_workers
+        );
+    } else {
+        info!(
+            "Command execution: {} worker threads (one per available core)",
+            active_workers
+        );
+    }
 
     // ── bind address ──────────────────────────────────────────────────────
     // Host/interface all listeners bind to. Defaults to 0.0.0.0 (all

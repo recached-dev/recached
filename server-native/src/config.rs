@@ -161,6 +161,47 @@ pub(crate) fn parse_env_metrics_port() -> Result<Option<u16>, String> {
     }
 }
 
+/// Upper bound on `RECACHED_WORKER_THREADS`.
+///
+/// Tokio panics outright above `1 << 15` worker threads. A value anywhere near
+/// that is a typo rather than an intent, and a panic during runtime
+/// construction happens before the tracing subscriber is installed — so the
+/// operator would get a bare backtrace with no clue which variable caused it.
+pub(crate) const MAX_WORKER_THREADS: usize = 1024;
+
+/// Worker threads in the Tokio runtime, or `None` to let Tokio decide (one per
+/// available core, which is what every release before this one did).
+///
+/// Exposed because it is the only honest way to A/B the threading model on one
+/// machine. `RECACHED_WORKER_THREADS=1` makes command execution single-threaded
+/// — the way Redis and Valkey run — so a benchmark can attribute a throughput
+/// difference to parallelism rather than to the hardware it happened to run on.
+/// It is also the escape hatch for an operator who wants Recached to share a
+/// box with something else and not claim every core.
+///
+/// A typo refuses to start rather than falling back, for the same reason
+/// [`parse_env_port`] does: silently running 8 threads for an operator who
+/// asked for 2 is a capacity decision made behind their back.
+pub(crate) fn worker_threads() -> Result<Option<usize>, String> {
+    const VAR: &str = "RECACHED_WORKER_THREADS";
+    match std::env::var(VAR) {
+        // Absent is the ordinary case: Tokio's default is a good one.
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{VAR}: value is not valid UTF-8.")),
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(0) | Err(_) => Err(format!(
+                "{VAR}: '{}' is not a thread count. Use 1-{MAX_WORKER_THREADS}, \
+                 or leave it unset for one per core.",
+                raw.trim()
+            )),
+            Ok(n) if n > MAX_WORKER_THREADS => Err(format!(
+                "{VAR}: {n} exceeds the maximum of {MAX_WORKER_THREADS}."
+            )),
+            Ok(n) => Ok(Some(n)),
+        },
+    }
+}
+
 /// True when `bind_host` can only be reached from this machine.
 ///
 /// A hostname that does not parse as an address is treated as public: the
@@ -379,6 +420,47 @@ mod limit_config_tests {
 
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn worker_threads_defaults_to_tokio_when_unset() {
+        let _guard = env_guard();
+        unsafe { std::env::remove_var("RECACHED_WORKER_THREADS") };
+        assert_eq!(worker_threads(), Ok(None));
+    }
+
+    #[test]
+    fn worker_threads_accepts_a_positive_count() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("RECACHED_WORKER_THREADS", " 4 ") };
+        assert_eq!(worker_threads(), Ok(Some(4)));
+        unsafe { std::env::set_var("RECACHED_WORKER_THREADS", "1") };
+        assert_eq!(worker_threads(), Ok(Some(1)), "1 is the Redis-shaped case");
+        unsafe { std::env::remove_var("RECACHED_WORKER_THREADS") };
+    }
+
+    #[test]
+    fn worker_threads_refuses_nonsense_rather_than_falling_back() {
+        let _guard = env_guard();
+        // Silently running one-per-core for an operator who asked for 2 is a
+        // capacity decision made behind their back — the same reasoning that
+        // makes a bad RECACHED_PORT refuse to start.
+        for bad in ["", "  ", "abc", "0", "-1", "1.5", "1025"] {
+            unsafe { std::env::set_var("RECACHED_WORKER_THREADS", bad) };
+            assert!(
+                worker_threads().is_err(),
+                "{bad:?} should refuse startup, not fall back"
+            );
+        }
+        unsafe { std::env::remove_var("RECACHED_WORKER_THREADS") };
+    }
+
+    #[test]
+    fn worker_threads_accepts_the_documented_maximum() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("RECACHED_WORKER_THREADS", MAX_WORKER_THREADS.to_string()) };
+        assert_eq!(worker_threads(), Ok(Some(MAX_WORKER_THREADS)));
+        unsafe { std::env::remove_var("RECACHED_WORKER_THREADS") };
     }
 
     #[test]

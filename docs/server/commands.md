@@ -2,6 +2,29 @@
 
 Recached implements the subset of RESP commands that most applications use. Commands work over both TCP (port 6379) and WebSocket (port 6380).
 
+## Concurrency model
+
+Recached executes commands on **every** CPU core. Redis and Valkey execute commands on one. That is the main structural difference between them, and it cuts both ways — it is where Recached's pipelined throughput advantage comes from, and it is the one place where Recached's semantics are genuinely weaker than Redis's.
+
+Concretely: the keyspace is a sharded map, and a command takes the lock for the shard its key lives in. Two commands on keys in different shards run at the same time on different threads.
+
+**What that guarantees**
+
+- **Every single-key command is atomic.** `INCR`, `APPEND`, `SETNX`, `GETSET`, `HINCRBY`, `LPUSH`, `ZADD` and the rest do their read-modify-write under one lock. Concurrent callers are serialised per key, exactly as on Redis.
+- **`WATCH` compare-and-swap is sound.** A watched key that changes before `EXEC` aborts the transaction, over both transports.
+- **No torn values.** A reader sees the value before a write or the value after it, never a mixture.
+
+**What it does not guarantee**
+
+- **Commands that span keys are not atomic across those keys.** `MSET` applies key by key; `SMOVE` removes from the source and then adds to the destination, so the member is briefly in neither set. A concurrent reader can catch either mid-flight. Redis, being single-threaded, cannot show you these states.
+- **`MULTI`/`EXEC` is not isolated.** The queued commands run as a batch, but another connection's write can interleave between two of them. See [Transactions](#transactions).
+
+**The rule of thumb:** if correctness depends on several keys changing together, `WATCH` the keys you read and retry on abort. Do not rely on `MULTI` alone for mutual exclusion. For a single key, nothing is required — it is already atomic.
+
+This is a deliberate trade, not an oversight. Restoring cross-key atomicity means a global lock, which is precisely the single-threaded design that costs Redis the throughput shown in the [benchmarks](/guide/benchmarks). Recached is a cache; the workloads it targets are overwhelmingly single-key.
+
+---
+
 ## Core
 
 | Command | Description |
@@ -146,9 +169,9 @@ The most common data type. Values are always stored as byte strings; numeric ope
 |---|---|
 | `SET key value [EX seconds] [PX ms] [EXAT timestamp] [PXAT ms-timestamp] [NX\|XX] [KEEPTTL] [GET]` | Set a key to a string value. `EX`/`PX`/`EXAT`/`PXAT` set expiry. `NX` only sets if key does not exist. `XX` only sets if key exists. `KEEPTTL` preserves the existing TTL. `GET` returns the old value before overwriting. |
 | `GET key` | Returns the value of a key, or nil if the key does not exist or has expired. |
-| `GETSET key value` | Sets the key to a new value and returns the old value atomically. Deprecated in Redis 6.2 — prefer `SET key value GET`. |
+| `GETSET key value` | Sets the key to a new value and returns the old value atomically — the read and the write happen under one lock, so two concurrent callers can never be handed the same old value. Deprecated in Redis 6.2 — prefer `SET key value GET`. |
 | `MGET key [key ...]` | Returns the values of multiple keys. Keys that do not exist return nil. |
-| `MSET key value [key value ...]` | Sets multiple keys to their respective values in a single atomic operation. |
+| `MSET key value [key value ...]` | Sets multiple keys to their respective values in one command. Applied key by key — see [Concurrency model](#concurrency-model): a concurrent reader can observe some keys updated and others not. |
 | `ESET key value` | **Ephemeral set.** Stores a string like `SET`, but the key's lifetime is bound to the connection that wrote it — when that connection closes, the server deletes the key and the deletion is pushed to live queries. Writing the same key again transfers ownership to the newest connection, so a second browser tab keeps presence alive when the first closes. Intended for presence, cursors, and "who is online"; use `SET` for anything that should outlive a connection. |
 | `SETNX key value` | Set a key only if it does not exist. Returns 1 if set, 0 if the key already existed. |
 | `SETEX key seconds value` | Set a key with an integer-second expiry. Equivalent to `SET key value EX seconds`. |
@@ -284,7 +307,7 @@ An unordered collection of unique string members. Supports set operations (inter
 | `SDIFFSTORE destination key [key ...]` | Stores the difference into `destination` and returns its size. |
 | `SPOP key [count]` | Removes and returns one or more random members from the set. |
 | `SRANDMEMBER key [count]` | Returns one or more random members without removing them. Positive `count`: unique members. Negative `count`: may repeat. |
-| `SMOVE source destination member` | Atomically moves a member from one set to another. Returns 1 on success, 0 if the member did not exist in source. |
+| `SMOVE source destination member` | Moves a member from one set to another. Returns 1 on success, 0 if the member did not exist in source. Removal and insertion are separate steps, so a concurrent reader can briefly see the member in neither set — see [Concurrency model](#concurrency-model). |
 | `SSCAN key cursor [MATCH pattern] [COUNT count]` | Iterates a set incrementally: returns the next cursor plus at most `COUNT` members (default 10). The bounded counterpart of `SMEMBERS`. |
 
 ---
@@ -465,7 +488,19 @@ client ignores the new shape.
 
 ## Transactions
 
-Transactions queue commands and execute them atomically. No other client can interleave commands between `MULTI` and `EXEC`. After `EXEC`, the full result set is broadcast to WebSocket clients.
+Transactions queue commands and run them as one batch at `EXEC`, with optimistic locking through `WATCH`. After `EXEC`, the full result set is broadcast to WebSocket clients.
+
+::: warning `EXEC` is a batch, not an isolated one
+Recached executes commands on every worker thread. Nothing holds a global lock across the `EXEC` loop, so a write from another connection **can** land between two queued commands. Redis gets that isolation for free by executing everything on one thread; Recached trades it for parallelism.
+
+What you still get is what most transaction code actually depends on:
+
+- **Nothing runs before `EXEC`.** Queued commands are held, not executed, so a partially-typed transaction never touches the keyspace.
+- **All or nothing on a queue error.** If any command fails to queue, `EXEC` runs none of them and returns `EXECABORT`.
+- **Full `WATCH` CAS.** If a watched key changed after `WATCH`, `EXEC` runs nothing and returns a nil array.
+
+So `WATCH`-based compare-and-swap is sound, and that is the right tool here. What is *not* sound is treating `MULTI`/`EXEC` alone as a critical section — for example queuing `GET k` then `SET k <derived>` and assuming no one else wrote `k` in between. Put the key under `WATCH` and the pattern is correct again.
+:::
 
 | Command | Description |
 |---|---|
