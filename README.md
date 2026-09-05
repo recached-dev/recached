@@ -1,8 +1,8 @@
 <div align="center">
   <img src="recached.jpg" alt="Recached" width="800" />
   <h1>Recached</h1>
-  <p><b>The multi-threaded cache that runs on your backend that also runs in the browser</b></p>
-  <p>One Rust engine — every core on your server, every tab in the browser.</p>
+  <p><b>A multi-threaded Rust cache that runs on your backend <em>and</em> inside the browser.</b></p>
+  <p>Every core on the server, every tab in the browser — one engine.</p>
 
   <a href="https://recached.dev"><img src="https://img.shields.io/badge/Docs-recached.dev-blue.svg" alt="Docs"></a>
   <a href="https://www.npmjs.com/package/recached-edge"><img src="https://img.shields.io/npm/v/recached-edge?label=npm" alt="npm"></a>
@@ -13,15 +13,13 @@
 
 ---
 
-Redis gives you one thread behind a network hop. Recached gives you **every core** — and for the browser, **no hop at all**.
+Every caching solution forces a choice: server-side caches like Redis mean every frontend read is a network round-trip; client-side state like Zustand or SWR means two caches — one on the server and one in every client, with manual staleness code gluing them together. **Recached removes the choice.**
 
-Two things follow from one engine written in Rust:
+The same Rust cache engine runs natively on your server (RESP on port 6379 — any Redis client works today, zero code changes) and as WebAssembly inside the browser. Reads always come from local WASM memory. The WebSocket is only a sync path, not a read path.
 
-**On the server, commands execute on every core.** Redis and Valkey run all command execution on a single thread; Recached runs it on as many threads as you have cores. Pipelined, that is [measurably faster](#benchmarks) on the same hardware — and it is thread scaling on a fixed CPU set that shows it, not a single number.
+**Multi-threaded is the default, not a flag.** Recached executes commands on every core, over a sharded keyspace, with no configuration. Redis and Valkey keep the command path on a single thread and offer *I/O* threading as an opt-in (`io-threads`, off by default) — a reasonable choice in C, where sharing mutable state across threads is checked by review rather than by the compiler. Rust's ownership model makes that checkable at build time, so threading the command path is a design decision rather than a risk to be opted into. You can [verify the scaling directly](#benchmarks) by varying the worker count and nothing else.
 
-**In the browser, there is no server.** The same engine compiles to WebAssembly and runs inside the tab. Reads come from local WASM memory at memory speed; the WebSocket is a sync path, not a read path. No server-side cache can do this, because the round-trip *is* the architecture.
-
-That combination is the point. Every other option forces a choice: a server-side cache like Redis means every frontend read is a network round-trip, while client-side state like Zustand or SWR means two caches — one on the server, one in every client — with manual staleness code gluing them together. **Recached removes the choice.** RESP on port 6379 means any Redis client works today, zero code changes.
+**And the round-trip is the part no server-side cache can answer.** Redis and Valkey can be tuned, sharded and scaled, and every frontend read still costs a network hop, because the hop *is* the architecture. That is the half of Recached with no equivalent.
 
 > [!NOTE]
 > Recached is not a full Redis replacement. It covers the subset most applications actually need: strings, expiry, counters, all collection types, transactions, pub/sub, and observable keys. Best fit: reactive UIs, session caches, browser-side API response caching, and rate limiting.
@@ -129,14 +127,16 @@ What you give up is what needs a peer: pub/sub, live queries and cross-device sy
 
 Measured with `redis-benchmark` (100k requests, 50 connections, 64-byte values, randomized keys, persistence disabled on all servers) on a 4-core Intel i5-8259U laptop, July 2026 — Recached v0.1.8 vs Redis 7.2.5 vs Valkey 9.1.0, one server at a time. Current release is v0.3.1 (packaging only — no engine change since v0.3.0); these command paths were A/B tested across the v0.2.4 changes and spot-checked again on v0.3.0 (SET 455k, GET 518k, INCR 526k pipelined on the same laptop), moving within run-to-run noise each time — but the three-way suite has not been re-run since v0.1.8.
 
-**Is it actually multi-threaded?** Same machine, same binary, same workload — only the worker-thread count changes. Pipelined, on Linux, server pinned to 4 cores:
+**Recached executes commands on every core**, not just one. Same machine, same binary, same workload — only the worker-thread count changes. Pipelined, on Linux, server pinned to 4 cores:
 
 | Worker threads | 1 | 2 | 4 |
 |---|---:|---:|---:|
 | Aggregate rps | 481,280 | 854,111 | **1,044,313** |
 | vs 1 thread | — | +77% | **+117%** |
 
-Every command in the suite gains; `INCR` more than triples. A single-threaded server is flat on this axis by construction — that is the difference, isolated. Reproduce with [`scripts/bench-scaling.sh`](scripts/bench-scaling.sh), which aborts if the server reports a worker count other than the one requested.
+Every command in the suite gains. Reproduce with [`scripts/bench-scaling.sh`](scripts/bench-scaling.sh), which aborts if the server reports a worker count other than the one requested.
+
+Do not read that as a throughput claim over Redis or Valkey. Both ship I/O threading (`io-threads`, off by default), and with it enabled a tuned Valkey is comfortably ahead of Recached on most commands — see [the tuned comparison](https://recached.dev/guide/benchmarks#with-io-threads-enabled). Recached threads command *execution* rather than just I/O, which shows up on compute-heavy commands like `ZADD` and not much else. The reason to pick Recached is the browser, not the server benchmark.
 
 Pipelined (`-P 16`) — raw command throughput, requests/sec, **bold** = best per row:
 
@@ -150,7 +150,7 @@ Pipelined (`-P 16`) — raw command throughput, requests/sec, **bold** = best pe
 | HSET | **408,163** | 324,675 | 287,356 |
 | ZADD | **414,938** | 197,628 | 221,239 |
 
-Recached's multi-threaded runtime spreads connections across all cores, while Redis executes commands on one — pipelined, Recached comes out ahead of Redis on 6 of 7 commands, on the same hardware. Valkey is the closer race: it swept 7 of 7 against Valkey 9.1.0 above, but a later Linux re-run against Valkey 9.1.2 — which threads its I/O — wins only 3 of 7, and that is the honest current picture. Unpipelined (one command per round-trip — the traffic shape of typical request-scoped cache calls), the localhost round-trip dominates and Recached runs at 46–96% of Redis with sub-millisecond p50 latency on every common command (GET 58.1k vs 61.6k rps; HSET is the weakest at 46%).
+Those figures are against **stock configurations**, where Redis and Valkey run single-threaded. That is how they ship, but it is not how you would tune them: with `io-threads` enabled both gain substantially and Valkey pulls ahead of Recached overall. The [benchmarks page](https://recached.dev/guide/benchmarks#with-io-threads-enabled) carries the tuned numbers rather than only the flattering ones. Unpipelined (one command per round-trip — the traffic shape of typical request-scoped cache calls), the localhost round-trip dominates and Recached runs at 46–96% of Redis with sub-millisecond p50 latency on every common command (GET 58.1k vs 61.6k rps; HSET is the weakest at 46%).
 
 **New in v0.2.4:** sorted sets gained a score-ordered index, so range reads no longer sort the whole set on every query. On a ~45k-member leaderboard, repeated `ZRANGE key 0 9` went from 244 to 133k rps (**546×**), and an alternating `ZADD` + `ZRANGE` loop from 65 s to 0.11 s (**597×**). `ZADD` gives up ~15% against a set that is actively being read; a write-only sorted set never builds the index and is unaffected. Measured as before/after ratios on a loaded machine — see the [benchmarks page](https://recached.dev/guide/benchmarks) for methodology.
 

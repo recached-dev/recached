@@ -9,9 +9,11 @@ For v0.2.4 those command paths were A/B tested against the previous release and 
 :::
 
 ::: tip TL;DR
-**Recached uses every core, and that is measurable.** Holding the machine, binary and workload fixed and varying only the worker-thread count, aggregate pipelined throughput rises **+117% from 1 thread to 4** — see [thread scaling](#thread-scaling). A single-threaded server is flat on that axis by construction.
+**Recached uses every core, and that is measurable.** Holding the machine, binary and workload fixed and varying only the worker-thread count, aggregate pipelined throughput rises **+117% from 1 thread to 4** — see [thread scaling](#thread-scaling).
 
-Pipelined (`-P 16`), Recached sustains **408k–546k requests/sec** — ahead of Redis on 6 of 7 commands and ahead of Valkey 9.1.0 on all 7, on the same 4-core machine. A [later Linux re-run](#a-linux-cross-check) still leads Redis 6 of 7, but Valkey 9.1.2 has closed most of the gap. Unpipelined — one command per round-trip, the traffic shape of typical application cache calls — Recached runs at 46–96% of Redis with **sub-millisecond p50 latency on every single-key command** (multi-element `LRANGE` reads are the exception, at 1.96–3.58 ms p50).
+**That is not a claim to be faster than Redis or Valkey.** Against stock configurations Recached leads on most pipelined commands, but stock means `io-threads 1` and neither project is meant to run that way. [Tuned](#with-io-threads-enabled), a Valkey with I/O threading is comfortably ahead of Recached, and Redis is a coin flip. Recached threads command *execution* rather than only I/O, which wins on compute-heavy commands like `ZADD` and little else.
+
+Unpipelined — one command per round-trip, the traffic shape of typical application cache calls — Recached runs at 46–96% of Redis with **sub-millisecond p50 latency on every single-key command** (multi-element `LRANGE` reads are the exception, at 1.96–3.58 ms p50).
 :::
 
 Recached's design goal is not to beat Redis at raw server throughput — it is to remove the network round-trip entirely for browser reads, which no server-side cache can do. These numbers cover the server half (`server-native`) so you know what to expect when you point existing Redis clients at it.
@@ -128,13 +130,36 @@ The tables above were measured natively on macOS in July 2026. In September 2026
 | HSET | 117,647 | 119,474 | **123,457** |
 | ZADD | **122,549** | 49,092 | 79,872 |
 
-Recached beats Redis on 6 of 7 (HSET is a 2% loss, inside noise). Against Valkey 9.1.2 it wins 3 of 7 — a real change from the 7-of-7 sweep against 9.1.0 above, and the clearest evidence that Valkey's threaded I/O is doing work. Recached's remaining wins are the write-heavy structured commands, `ZADD` most of all.
+Recached beats Redis on 6 of 7 (HSET is a 2% loss, inside noise). Against Valkey 9.1.2 it wins 3 of 7 — a real change from the 7-of-7 sweep against 9.1.0 above. But note that **all three servers here are single-threaded on the command path**: Redis and Valkey were left at their default `io-threads 1`. See [With `io-threads` enabled](#with-io-threads-enabled) for what happens when they are not, which is the comparison a tuned deployment should care about.
 
 ::: danger Do not run unpipelined benchmarks on Docker Desktop
 Docker Desktop for Mac and Windows emulates the network in userspace (gVisor). Measured with `redis-cli --latency` inside the VM, a round-trip costs **~0.82 ms**, against roughly 0.05 ms on a native loopback. Pipelining spreads that over 16 commands and survives; an unpipelined test pays it once per command, capping throughput at about 1,250 rps *per connection* no matter which server is running.
 
 That is exactly what happened: in the same run Redis measured 9,280 unpipelined SET/sec, roughly a sixth of its native figure. The harness now prints a warning on non-Linux hosts. The unpipelined table above stands as the native measurement; publishable unpipelined numbers need a native Linux host.
 :::
+
+## With `io-threads` enabled
+
+Every table above compares against **stock** Redis and Valkey. Both ship `io-threads 1` — single-threaded — and both have supported I/O threading for years (Redis since 6.0, reworked in Valkey 8). Benchmarking only the default is comparing against a configuration no tuned deployment runs, so here is the other half.
+
+Back-to-back on Linux, all three tuned, server pinned to 4 cores, `-P 16`. Requests/sec:
+
+| Command | Recached (4 workers) | Redis `io-threads 4` | Valkey `io-threads 4` |
+|---|---:|---:|---:|
+| SET | **104,058** | 75,358 | 79,365 |
+| GET | 166,113 | 202,429 | **228,833** |
+| INCR | 94,877 | 97,561 | **141,643** |
+| LPUSH | 72,569 | 125,156 | **373,134** |
+| SADD | 152,207 | 86,580 | **259,740** |
+| HSET | **110,375** | 101,833 | 106,383 |
+| ZADD | **153,846** | 67,568 | 104,167 |
+| **Aggregate** | 854,045 | 756,485 | **1,293,265** |
+
+**A tuned Valkey is faster than Recached at server-side throughput, and it is not close.** Recached against a tuned Redis is a coin flip — two runs of this table put Redis at 1,190,303 and 756,485, a 36% swing, which is the laptop this ran on rather than anything about Redis. Do not draw a conclusion from that row.
+
+What does survive is narrower than "multi-threaded". Redis and Valkey thread their *I/O* — sockets, parsing, reply writing — while still executing commands on one thread. Recached threads *execution* over a sharded keyspace. That only pays when execution cost dominates the command, which is why `ZADD` is Recached's one consistent win across every run, and why it loses on `GET` and `LPUSH`, where syscall and parsing cost dominate and I/O threading captures the win instead.
+
+So: use the [thread-scaling table](#thread-scaling) as evidence that Recached uses the cores you give it. Do not use it as evidence that Recached out-throughputs a tuned Valkey — it does not. The architectural claim that no amount of tuning answers is the [browser half](/guide/introduction), where the round-trip disappears entirely.
 
 ## What changed in v0.2.4
 

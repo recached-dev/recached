@@ -129,10 +129,12 @@ Being specific here is more useful than a feature grid.
 rate-limit counters read only by your API. Recached will do this correctly, but you would be adopting
 a young project to solve a problem two extremely mature ones already solve.
 
-**Raw single-node throughput above all → Redis.** Unpipelined, Recached runs at 46–96% of Redis
-depending on the command ([benchmarks](/guide/benchmarks)). It leads when pipelined, because it is
-multi-threaded, but if your bottleneck is a single node's ceiling on unpipelined `HSET`, Redis wins
-today.
+**Raw single-node throughput above all → Valkey, or Redis.** Unpipelined, Recached runs at 46–96% of
+Redis depending on the command. Pipelined, it leads both — but only against their stock
+single-threaded defaults; with `io-threads` enabled a tuned Valkey is comfortably ahead of Recached
+overall ([benchmarks](/guide/benchmarks#with-io-threads-enabled)). Recached threads command execution
+rather than only I/O, which wins on compute-heavy commands like `ZADD`. If server-side throughput is
+the thing you are optimising, that is not a reason to switch.
 
 **Pure memory-efficient blob caching at scale → Memcached.** Memcached's slab allocator and
 multi-threaded simplicity are excellent for large, uniform, ephemeral values. Recached is not
@@ -170,7 +172,7 @@ See [Concurrency model](/server/commands#concurrency-model).
 | Replication | Primary/replica + single-replica auto-failover | Primary/replica + Sentinel + Cluster | None |
 | Scripting | No (WASM scripting on roadmap) | Lua | No |
 | Cluster / sharding | No | Yes | Client-side sharding |
-| Threading | Multi-threaded — commands execute on every core | Single-threaded command execution | Multi-threaded |
+| Threading | Multi-threaded — commands execute on every core | Threaded I/O (`io-threads`, off by default); command execution on one thread | Multi-threaded |
 | Cross-key atomicity | Single-key only ([why](/server/commands#concurrency-model)) | Everything, including `MULTI`/`EXEC` | Single-key only |
 | Command coverage | ~106 | 250+ | ~15 |
 | Maturity | Young — server production-ready for cache workloads, sync layer beta | 15+ years | 20+ years |

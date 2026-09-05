@@ -4,7 +4,7 @@ All notable changes to Recached are documented here.
 
 ---
 
-## [0.3.3] [Unreleased]
+## [0.3.3] 2026-09-05
 
 ### Added
 
@@ -20,7 +20,7 @@ All notable changes to Recached are documented here.
 ### Documentation
 
 - New **Concurrency model** section: single-key commands are atomic, commands spanning keys are not, and `MULTI`/`EXEC` is a batch rather than an isolated section — `WATCH` remains the way to make multi-key updates safe. Corrects claims to the contrary for `MULTI`/`EXEC`, `MSET` and `SMOVE`.
-- Benchmarks gained a thread-scaling table (**+117% from 1 to 4 threads**) and a Linux cross-check. Notes that Valkey 8+ threads its I/O and has closed most of the gap, and that Docker Desktop's emulated network makes unpipelined results meaningless.
+- Benchmarks gained a thread-scaling table (**+117% from 1 to 4 threads**), a Linux cross-check, and a tuned comparison with `io-threads` enabled — where a tuned Valkey is ahead of Recached overall. The previous tables compared against stock single-threaded defaults. Also notes that Docker Desktop's emulated network makes unpipelined results meaningless.
 - Fixed stale build and run commands in the benchmark guide.
 
 ### Security — three unguarded sign casts on collection counts
