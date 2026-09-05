@@ -4,7 +4,24 @@ All notable changes to Recached are documented here.
 
 ---
 
-## [0.3.3] [Unreleased]
+## [0.3.3] 2026-09-05
+
+### Added
+
+- `RECACHED_WORKER_THREADS` — pin the number of threads that execute commands. Unset means one per available core; `1` makes execution single-threaded, the way Redis runs. Refuses to start on an invalid value, and logs the count it actually built.
+- `scripts/bench-scaling.sh` — varies the worker count and nothing else, to show thread scaling directly. No Docker required.
+- `scripts/bench-docker.sh` — three-way Recached / Redis / Valkey run on Linux, with the server and the load generator on disjoint CPU sets.
+
+### Fixed
+
+- **`GETSET` could lose an update.** The read and the write took separate locks, so two connections on two threads could be handed the same old value. Now one lock, with a regression test.
+- The Docker image stopped building when `recached-embed` joined the workspace.
+
+### Documentation
+
+- New **Concurrency model** section: single-key commands are atomic, commands spanning keys are not, and `MULTI`/`EXEC` is a batch rather than an isolated section — `WATCH` remains the way to make multi-key updates safe. Corrects claims to the contrary for `MULTI`/`EXEC`, `MSET` and `SMOVE`.
+- Benchmarks gained a thread-scaling table (**+117% from 1 to 4 threads**), a Linux cross-check, and a tuned comparison with `io-threads` enabled — where a tuned Valkey is ahead of Recached overall. The previous tables compared against stock single-threaded defaults. Also notes that Docker Desktop's emulated network makes unpipelined results meaningless.
+- Fixed stale build and run commands in the benchmark guide.
 
 ### Security — three unguarded sign casts on collection counts
 

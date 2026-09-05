@@ -12,18 +12,27 @@ WORKDIR /app
 
 # Cache dependencies separately so they aren't re-downloaded on every code change.
 COPY Cargo.toml Cargo.lock ./
-COPY core-engine/Cargo.toml   core-engine/Cargo.toml
-COPY server-native/Cargo.toml server-native/Cargo.toml
-COPY sync-client/Cargo.toml   sync-client/Cargo.toml
-COPY wasm-edge/Cargo.toml     wasm-edge/Cargo.toml
+COPY core-engine/Cargo.toml    core-engine/Cargo.toml
+COPY server-native/Cargo.toml  server-native/Cargo.toml
+COPY sync-client/Cargo.toml    sync-client/Cargo.toml
+COPY recached-embed/Cargo.toml recached-embed/Cargo.toml
+COPY wasm-edge/Cargo.toml      wasm-edge/Cargo.toml
 
 # Dummy source files so the dep-only build can resolve the workspace.
-# sync-client/src and wasm-edge/src are kept as stubs — Cargo parses every
-# workspace member even when only building server-native, so lib.rs must exist.
-RUN mkdir -p core-engine/src server-native/src sync-client/src wasm-edge/src && \
+# sync-client/src, recached-embed/src and wasm-edge/src are kept as stubs —
+# Cargo parses every workspace member even when only building server-native,
+# so each one's Cargo.toml and lib.rs must exist.
+#
+# Every new workspace member must be added to BOTH the manifest COPY block
+# above and the stub list below. Omitting one fails the build here with
+# "failed to load manifest for workspace member", which is how recached-embed
+# broke this image after it was added to Cargo.toml.
+RUN mkdir -p core-engine/src server-native/src sync-client/src \
+             recached-embed/src wasm-edge/src && \
     echo "fn main() {}" > server-native/src/main.rs && \
     echo "" > core-engine/src/lib.rs && \
     echo "" > sync-client/src/lib.rs && \
+    echo "" > recached-embed/src/lib.rs && \
     echo "" > wasm-edge/src/lib.rs && \
     cargo build --release --package recached && \
     rm -rf core-engine/src server-native/src
