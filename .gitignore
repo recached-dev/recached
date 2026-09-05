@@ -49,6 +49,8 @@ NOTES.md
 scripts/*
 !scripts/bump-version.sh
 !scripts/benchmark.sh
+!scripts/bench-docker.sh
+!scripts/bench-scaling.sh
 !scripts/update-formula-checksums.sh
 
 # Cache snapshots / AOF written by a server started in the repo root
@@ -56,3 +58,6 @@ scripts/*
 *.rdb
 *.aof
 *.msgpack
+
+# Benchmark output — scripts/bench-docker.sh and scripts/bench-scaling.sh
+bench-results/

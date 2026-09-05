@@ -1711,15 +1711,36 @@ impl KeyValueStore {
 
             Command::GetSet(key, new_val) => {
                 let now = now_ms();
-                let old = match self.data.get(&key) {
-                    Some(e) if !e.is_expired(now) => match &e.value {
-                        EntryValue::Str(s) => Value::BulkString(Some(s.clone().into_bytes())),
-                        _ => return Value::Error(WRONGTYPE.to_string()),
-                    },
-                    _ => Value::BulkString(None),
-                };
-                self.data.insert(key, Entry::new_str(new_val));
-                old
+                // Read the old value and install the new one under a single
+                // guard. Taking the old value through a separate `get` first
+                // (as this used to) released the shard between the read and
+                // the write, so two connections on two worker threads could
+                // both observe the same old value and both report it — a lost
+                // update in the one command whose entire purpose is an atomic
+                // read-and-replace. Redis gets that atomicity for free from
+                // executing on one thread; here it has to be asked for.
+                match self.data.entry(key) {
+                    DashEntry::Occupied(mut occupied) => {
+                        let old = if occupied.get().is_expired(now) {
+                            Value::BulkString(None)
+                        } else {
+                            match &occupied.get().value {
+                                EntryValue::Str(s) => {
+                                    Value::BulkString(Some(s.clone().into_bytes()))
+                                }
+                                // Leave the existing value in place: a type
+                                // error must not destroy the key.
+                                _ => return Value::Error(WRONGTYPE.to_string()),
+                            }
+                        };
+                        occupied.insert(Entry::new_str(new_val));
+                        old
+                    }
+                    DashEntry::Vacant(vacant) => {
+                        vacant.insert(Entry::new_str(new_val));
+                        Value::BulkString(None)
+                    }
+                }
             }
 
             Command::MGet(keys) => {
@@ -4534,6 +4555,62 @@ mod tests {
         // stub must return OK so the exhaustiveness arm is exercised here.
         let s = store();
         assert_eq!(s.execute(Command::Multi), ok());
+    }
+
+    #[test]
+    fn getset_does_not_lose_updates_under_concurrency() {
+        // GETSET exists to do one thing: hand back the old value and install a
+        // new one, indivisibly. Redis gets that from executing on one thread.
+        // Here the read and the write have to happen under one shard guard —
+        // with two guards, two worker threads could both observe the same old
+        // value, and one write would vanish from the returned history.
+        //
+        // The invariant that catches it: every value ever written is replaced
+        // exactly once, so no two callers may be handed the same old value.
+        use std::sync::Arc;
+
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 250;
+
+        let store = Arc::new(KeyValueStore::new());
+        store.execute(Command::Set(
+            "k".into(),
+            b"seed".to_vec(),
+            SetOptions::default(),
+        ));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    let mut seen = Vec::with_capacity(ROUNDS);
+                    for r in 0..ROUNDS {
+                        let mine = format!("t{t}-r{r}").into_bytes();
+                        if let Value::BulkString(Some(old)) =
+                            store.execute(Command::GetSet("k".into(), mine))
+                        {
+                            seen.push(old);
+                        }
+                    }
+                    seen
+                })
+            })
+            .collect();
+
+        let mut observed: Vec<Vec<u8>> = handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("a GETSET worker panicked"))
+            .collect();
+
+        let total = observed.len();
+        assert_eq!(total, THREADS * ROUNDS, "every GETSET returns a value");
+        observed.sort();
+        observed.dedup();
+        assert_eq!(
+            observed.len(),
+            total,
+            "the same old value was handed to two callers: GETSET lost an update"
+        );
     }
 
     #[test]

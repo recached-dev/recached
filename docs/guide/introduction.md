@@ -7,9 +7,18 @@ Recached is an in-memory cache server written in Rust. It speaks RESP (the Redis
 Values are binary-safe, as they are in Redis: a value is stored and returned as the exact bytes you
 sent. *Keys* and other identifiers must be text — see [Binary values](#binary-values).
 
-That is where the similarity with Redis ends.
+That is where the similarity with Redis ends — in two directions.
 
-The distinguishing feature is the `core-engine` crate: a pure Rust state machine with no network dependencies, no file I/O, and no OS-specific code. It compiles to native x86-64/ARM64 for the server **and** to `wasm32-unknown-unknown` for the browser. Both targets run the same cache logic from the same source. The WebSocket sync layer (port 6380) keeps the two sides consistent in real time.
+**Recached executes commands on every core.** Redis and Valkey run all command execution on a single
+thread. Recached runs it on one thread per core, over a sharded keyspace. Hold the machine, the
+binary and the workload fixed and vary only the worker count, and throughput moves with it — that
+curve, not any single number, is what makes the claim checkable. See
+[thread scaling](/guide/benchmarks#thread-scaling). The trade is real and documented: cross-key
+atomicity, which single-threaded execution gives away for free. See
+[Concurrency model](/server/commands#concurrency-model).
+
+**And the same engine runs where there is no server at all.** The distinguishing feature is the
+`core-engine` crate: a pure Rust state machine with no network dependencies, no file I/O, and no OS-specific code. It compiles to native x86-64/ARM64 for the server **and** to `wasm32-unknown-unknown` for the browser. Both targets run the same cache logic from the same source. The WebSocket sync layer (port 6380) keeps the two sides consistent in real time.
 
 The result: your backend caches data over RESP as it always has, and every connected browser instance holds a local copy of the cache in WASM memory. Frontend reads never leave the process — no network hop, no serialization, sub-microsecond in practice. Frontend writes propagate to the server and fan out to all other connected clients.
 
