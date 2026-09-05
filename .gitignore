@@ -61,3 +61,5 @@ scripts/*
 
 # Benchmark output — scripts/bench-docker.sh and scripts/bench-scaling.sh
 bench-results/
+
+brand
