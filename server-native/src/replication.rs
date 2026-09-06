@@ -2,6 +2,7 @@
 //! primary, and the authentication throttle guarding the handshake.
 
 use crate::*;
+use std::hash::{Hash, Hasher};
 
 pub(crate) type ReplSender = mpsc::Sender<Vec<u8>>;
 
@@ -26,7 +27,13 @@ pub(crate) struct ReplicaHandle {
 pub(crate) struct ReplHub {
     pub(crate) senders: tokio::sync::Mutex<Vec<ReplicaHandle>>,
     pub(crate) count: AtomicUsize,
+    /// Per-key ordering domains shared by client writes and full-sync
+    /// snapshots. Conflicting writes hold their guards until propagation has
+    /// completed; independent keys remain concurrent.
+    write_order: Vec<tokio::sync::Mutex<()>>,
 }
+
+const WRITE_ORDER_STRIPES: usize = 256;
 
 impl ReplHub {
     /// Deepest send queue across connected replicas, in frames.
@@ -88,7 +95,76 @@ impl ReplHub {
         Arc::new(ReplHub {
             senders: tokio::sync::Mutex::new(Vec::new()),
             count: AtomicUsize::new(0),
+            write_order: (0..WRITE_ORDER_STRIPES)
+                .map(|_| tokio::sync::Mutex::new(()))
+                .collect(),
         })
+    }
+
+    fn stripe_for(key: &str) -> usize {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        hasher.finish() as usize % WRITE_ORDER_STRIPES
+    }
+
+    /// Lock every ordering stripe touched by the supplied commands. Guards are
+    /// acquired in numeric order, which also makes multi-key writes deadlock
+    /// free. A global command such as FLUSHDB locks every stripe.
+    pub(crate) async fn lock_commands<'a>(
+        &'a self,
+        commands: &[Command],
+    ) -> Vec<tokio::sync::MutexGuard<'a, ()>> {
+        self.lock_commands_and_keys(commands, std::iter::empty::<&str>())
+            .await
+    }
+
+    /// Lock command ordering domains plus explicit keys. Transactions include
+    /// their WATCH set here before checking for invalidation, closing the gap
+    /// where a conflicting writer could otherwise land after the check but
+    /// before EXEC acquired its command barriers.
+    pub(crate) async fn lock_commands_and_keys<'a, 'k, I>(
+        &'a self,
+        commands: &[Command],
+        extra_keys: I,
+    ) -> Vec<tokio::sync::MutexGuard<'a, ()>>
+    where
+        I: IntoIterator<Item = &'k str>,
+    {
+        let mut stripes = Vec::new();
+        let mut lock_all = false;
+        for command in commands {
+            if !is_write_command(command) {
+                continue;
+            }
+            match ordering_keys(command) {
+                None => {
+                    lock_all = true;
+                    break;
+                }
+                Some(keys) => stripes.extend(keys.iter().map(|key| Self::stripe_for(key))),
+            }
+        }
+        if lock_all {
+            stripes = (0..WRITE_ORDER_STRIPES).collect();
+        } else {
+            stripes.extend(extra_keys.into_iter().map(Self::stripe_for));
+            stripes.sort_unstable();
+            stripes.dedup();
+        }
+
+        let mut guards = Vec::with_capacity(stripes.len());
+        for stripe in stripes {
+            guards.push(self.write_order[stripe].lock().await);
+        }
+        guards
+    }
+
+    pub(crate) async fn lock_all_writes(&self) -> Vec<tokio::sync::MutexGuard<'_, ()>> {
+        let mut guards = Vec::with_capacity(WRITE_ORDER_STRIPES);
+        for lock in &self.write_order {
+            guards.push(lock.lock().await);
+        }
+        guards
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -365,6 +441,11 @@ where
         socket.flush().await?;
     }
 
+    // Establish one exact snapshot/log boundary. Holding every write-order
+    // stripe ensures no mutation can commit between channel registration and
+    // snapshot capture; after the guards drop, every later mutation is queued.
+    let write_barrier = replicas.lock_all_writes().await;
+
     // 1. Register channel first so subsequent writes are buffered
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(repl_channel_capacity);
     let sent = Arc::new(AtomicU64::new(0));
@@ -382,6 +463,7 @@ where
     // 2. Take snapshot and send (writes since snapshot are in channel)
     let snap_bytes =
         rmp_serde::to_vec(&store.snapshot()).map_err(|e| std::io::Error::other(e.to_string()))?;
+    drop(write_barrier);
     let len = snap_bytes.len() as u32;
     socket.write_all(&len.to_le_bytes()).await?;
     socket.write_all(&snap_bytes).await?;
@@ -434,10 +516,14 @@ pub(crate) async fn run_repl_client(
     tls: Option<(TlsConnector, String)>,
 ) {
     let mut backoff_secs = 2u64;
-    let mut unreachable_since: Option<std::time::Instant> = None;
+    if failover_timeout_secs.is_some() {
+        warn!(
+            "RECACHED_FAILOVER_TIMEOUT is ignored: automatic promotion without quorum or fencing can create split brain; fence the old primary, then use REPLICAOF NO ONE"
+        );
+    }
 
     loop {
-        // Stop if already promoted (manual REPLICAOF NO ONE or earlier auto-promotion).
+        // Stop after an operator promotes this replica with REPLICAOF NO ONE.
         if !state.is_replica() {
             return;
         }
@@ -446,11 +532,8 @@ pub(crate) async fn run_repl_client(
         match TcpStream::connect(&primary_addr).await {
             Err(e) => {
                 warn!("Replica: connect failed: {}", e);
-                unreachable_since.get_or_insert_with(std::time::Instant::now);
             }
             Ok(socket) => {
-                // Primary is reachable — reset the unreachable timer.
-                unreachable_since = None;
                 backoff_secs = 2;
 
                 // TLS is what makes the primary's *identity* checked, not just
@@ -513,27 +596,8 @@ pub(crate) async fn run_repl_client(
 
                 if let Err(e) = result {
                     warn!("Replica: sync ended: {}", e);
-                    // Sync dropped — primary may be gone; start tracking if not already.
-                    unreachable_since.get_or_insert_with(std::time::Instant::now);
                 }
             }
-        }
-
-        // Auto-failover: promote if primary has been unreachable long enough.
-        if let (Some(timeout), Some(since)) = (failover_timeout_secs, unreachable_since) {
-            let elapsed = since.elapsed().as_secs();
-            if elapsed >= timeout {
-                warn!(
-                    "Replica: primary unreachable for {}s (timeout {}s) — auto-promoting to primary",
-                    elapsed, timeout
-                );
-                state.promote_to_primary();
-                return;
-            }
-            info!(
-                "Replica: primary unreachable for {}s / {}s before auto-failover",
-                elapsed, timeout
-            );
         }
 
         tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
@@ -583,7 +647,7 @@ where
     match rmp_serde::from_slice::<Vec<SnapshotEntry>>(&snap_bytes) {
         Ok(entries) => {
             let count = entries.len();
-            store.restore(entries);
+            store.replace(entries);
             info!("Replica: snapshot loaded ({} entries)", count);
         }
         Err(e) => {
@@ -659,3 +723,67 @@ pub(crate) fn ct_eq_bytes(a: &[u8], b: &[u8]) -> bool {
 }
 
 // ── sync scoping ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod write_order_tests {
+    use super::*;
+    use core_engine::cmd::SetOptions;
+
+    fn set(key: &str) -> Command {
+        Command::Set(key.to_string(), b"value".to_vec(), SetOptions::default())
+    }
+
+    #[tokio::test]
+    async fn conflicting_writes_share_one_ordering_domain() {
+        let hub = ReplHub::new();
+        let first = hub.lock_commands(&[set("same-key")]).await;
+        let contender = Arc::clone(&hub);
+        let (entered_tx, mut entered_rx) = mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            let _second = contender.lock_commands(&[set("same-key")]).await;
+            entered_tx.send(()).await.expect("receiver alive");
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), entered_rx.recv())
+                .await
+                .is_err(),
+            "a conflicting write entered before the first propagated"
+        );
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(1), entered_rx.recv())
+            .await
+            .expect("contender should be released")
+            .expect("contender should signal");
+        task.await.expect("contender task panicked");
+    }
+
+    #[tokio::test]
+    async fn independent_keys_remain_concurrent() {
+        let hub = ReplHub::new();
+        let _first = hub.lock_commands(&[set("one")]).await;
+        let contender = Arc::clone(&hub);
+        tokio::time::timeout(Duration::from_secs(1), async move {
+            let _second = contender.lock_commands(&[set("two")]).await;
+        })
+        .await
+        .expect("independent keys should not block each other");
+    }
+
+    #[tokio::test]
+    async fn full_sync_barrier_conflicts_with_every_write() {
+        let hub = ReplHub::new();
+        let barrier = hub.lock_all_writes().await;
+        let contender = Arc::clone(&hub);
+        let task = tokio::spawn(async move {
+            let _write = contender.lock_commands(&[set("any-key")]).await;
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!task.is_finished(), "write crossed the full-sync barrier");
+        drop(barrier);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("write should resume after snapshot capture")
+            .expect("write task panicked");
+    }
+}

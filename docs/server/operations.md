@@ -41,8 +41,8 @@ Sampled every 5 seconds, because these are levels rather than events.
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `recached_memory_bytes` | gauge | Approximate heap used by stored data. Compare against `RECACHED_MAX_MEMORY`. |
-| `recached_keys` | gauge | Live keys, excluding expired entries awaiting sweep. Compare against `RECACHED_MAX_KEYS`. |
+| `recached_memory_bytes` | gauge | Incremental logical bytes for stored keys and values. This is not process RSS. Compare it with `RECACHED_MAX_MEMORY`. |
+| `recached_keys` | gauge | Maintained stored-key count. Expired entries remain until bounded active expiry removes them. Compare it with `RECACHED_MAX_KEYS`. |
 | `recached_evictions_total` | counter | Keys evicted since start. A rising rate means the cache is working at its cap. |
 | `recached_replicas_connected` | gauge | Replicas currently attached to this primary. |
 | `recached_live_queries` | gauge | Registered `QSUB` patterns across all connections. |
@@ -50,6 +50,8 @@ Sampled every 5 seconds, because these are levels rather than events.
 | `recached_dedup_clients_tracked` | gauge | Clients with exactly-once bookkeeping in memory. |
 | `recached_replication_queue_depth` | gauge | Deepest replica send queue, in frames — work the primary has not yet put on the wire. |
 | `recached_replication_lag_frames` | gauge | Frames the furthest-behind replica has been sent but has not acknowledged applying. Zero means every replica is caught up. |
+
+Recached does not export command latency histograms or a slow-command log. Use an external client-side latency histogram until those features exist. Process RSS remains the capacity metric for allocator overhead, network buffers, and fragmentation.
 
 ### Reading the two replication gauges
 
@@ -159,7 +161,7 @@ is worth knowing where the walls are:
 | Queued commands per `MULTI` | 10,000 | `RECACHED_MAX_MULTI_QUEUE` |
 | `WATCH`ed keys per connection | 1,024 | `RECACHED_MAX_WATCHES_PER_CONN` |
 | Live queries (`QSUB`) per connection | 64 | `RECACHED_MAX_LIVE_QUERIES` |
-| Keys returned in a live query's initial state | 10,000 | `RECACHED_MAX_QSUB_INITIAL_KEYS` |
+| Keys allowed in a complete live-query initial state | 10,000 | `RECACHED_MAX_QSUB_INITIAL_KEYS` |
 | Keys sampled per eviction pass | 10 | `RECACHED_EVICTION_SAMPLE` |
 | Replication frame | 512 MB | No |
 | Glob pattern length (`KEYS`, `SCAN MATCH`, `PSUBSCRIBE`, sync scopes) | 1,024 bytes | No |

@@ -322,13 +322,27 @@ pub(crate) static KEYSPACE_MISSES: std::sync::LazyLock<metrics::Counter> =
 /// by value — the hot path hands it straight to the store without a clone;
 /// callers that still need the command afterwards (write fan-out) clone first.
 pub(crate) fn execute_and_record(store: &KeyValueStore, cmd: Command) -> Value {
+    execute_and_record_with_evictions(store, cmd).0
+}
+
+/// Execute and retain implicit capacity evictions for the propagation layer.
+/// An error can still carry evictions when a multi-key insert exhausted the
+/// eligible victim set after removing some keys, so those removals mark the
+/// store dirty and must not be discarded with the failed command response.
+pub(crate) fn execute_and_record_with_evictions(
+    store: &KeyValueStore,
+    cmd: Command,
+) -> (Value, Vec<String>) {
     let name = command_name(&cmd);
     let is_write = is_write_command(&cmd);
     let is_get = matches!(cmd, Command::Get(_));
-    let response = store.execute(cmd);
+    let (response, evicted) = store.execute_reporting(cmd);
     record_command(name);
     if matches!(response, Value::Error(_)) {
         counter!("recached_command_errors_total", "command" => name).increment(1);
+        if !evicted.is_empty() {
+            store.mark_dirty();
+        }
     } else if is_write {
         store.mark_dirty();
     }
@@ -345,19 +359,7 @@ pub(crate) fn execute_and_record(store: &KeyValueStore, cmd: Command) -> Value {
             _ => {}
         }
     }
-    response
-}
-
-/// True when at least one consumer of write effects exists (WebSocket peers,
-/// AOF, replicas, or watched keys). When false — the common standalone case —
-/// the caller can move the command into `execute_and_record` without cloning
-/// and skip `apply_write_effects` entirely.
-pub(crate) fn write_effects_armed(
-    tx: &broadcast::Sender<SyncMsg>,
-    state: &ServerState,
-    watch_registry: &WatchRegistry,
-) -> bool {
-    tx.receiver_count() > 0 || state.needs_write_log() || !watch_registry.is_empty()
+    (response, evicted)
 }
 
 // ── TCP listeners ─────────────────────────────────────────────────────────────

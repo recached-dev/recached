@@ -90,19 +90,9 @@ while offline is not served afterwards.
 
 ## Known limitations
 
-These are upstream behaviours in the sync protocol, not choices this crate
-makes. They affect `recached-edge` in the browser identically. Each has a
-regression test in `tests/live.rs`, marked `#[ignore]` with the details.
+This upstream sync behavior affects `recached-edge` in the browser identically.
 
-- **TTLs converge within ~1s, not instantly.** A local copy does not expire on
-  its own clock; it learns of the expiry when the server's once-per-second
-  sweep removes the key and announces it as a delete. Fine for session caches;
-  compare a stored deadline yourself if you need an exact instant.
-- **Collections do not hydrate on connect.** `qstate` sends collections as bare
-  type-name markers rather than contents, and the client drops them. A hash,
-  list, set, zset or JSON key written *before* you connect stays invisible until
-  its next write. Live updates after that point are complete. String keys are
-  unaffected.
+- **TTL deletion is eventual, not instant.** A local copy does not expire on its own clock. It learns of expiry when the server's background sweep removes the key and announces a delete. The server checks at most 256 TTL-bearing keys per one-second tick, so convergence time grows with the volatile keyspace. Compare a stored deadline yourself when exact expiry matters.
 
 ## Testing
 

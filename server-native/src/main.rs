@@ -674,14 +674,13 @@ async fn run(
         tokio::spawn(async move {
             run_repl_client(primary_addr, store_r, state_r, pwd_r, fo_r, tx_r, tls_r).await;
         });
-        if let Some(t) = failover_timeout_secs {
+        if failover_timeout_secs.is_some() {
             info!(
-                "Running as replica — auto-failover enabled (promotes after {}s of primary being unreachable)",
-                t
+                "Running as replica — RECACHED_FAILOVER_TIMEOUT is deprecated and ignored; fence the old primary, then use REPLICAOF NO ONE"
             );
         } else {
             info!(
-                "Running as replica — write commands will be rejected (auto-failover disabled; set RECACHED_FAILOVER_TIMEOUT to enable)"
+                "Running as replica — writes are rejected until manually promoted with REPLICAOF NO ONE"
             );
         }
     }
@@ -700,22 +699,40 @@ async fn run(
     // forever.
     {
         let store_sweep = Arc::clone(&store);
+        let state_sweep = Arc::clone(&state);
         let registry_sweep = watch_registry.clone();
+        let tx_sweep = tx.clone();
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_secs(EVICTION_INTERVAL_SECS));
             loop {
                 interval.tick().await;
-                // Only pay to collect the key names when something is
-                // listening for them; on a node with no watchers and no
-                // replicas that clone is per-sweep work for nobody.
-                if registry_sweep.is_empty() {
-                    store_sweep.sweep_expired();
-                } else {
-                    let expired = store_sweep.sweep_expired_reporting();
+                // Active expiry and eviction can remove keys no client named.
+                // Share the all-write barrier with snapshots and QSUB initial
+                // state so removal plus notification is one observable step.
+                let _write_guards = state_sweep.replicas.lock_all_writes().await;
+                // Bound maintenance work per tick. The cursor advances through
+                // the TTL-only dense index, so large persistent keyspaces cost
+                // nothing here and large volatile keyspaces are amortized.
+                let expired = store_sweep.sweep_expired_reporting_budget(256);
+                if !registry_sweep.is_empty() {
                     notify_removed(&registry_sweep, &expired).await;
                 }
-                store_sweep.try_evict_for_memory();
+                if store_sweep.max_memory_bytes().is_some() {
+                    let (_, evicted) = store_sweep.try_evict_for_memory_reporting();
+                    if !evicted.is_empty() {
+                        store_sweep.mark_dirty();
+                        apply_eviction_effects(
+                            &evicted,
+                            &tx_sweep,
+                            0,
+                            &state_sweep,
+                            &registry_sweep,
+                            &store_sweep,
+                        )
+                        .await;
+                    }
+                }
             }
         });
     }
@@ -733,8 +750,8 @@ async fn run(
             let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(5));
             loop {
                 ticker.tick().await;
-                // One walk of the keyspace feeds both gauges and the cached
-                // sample INFO reads, instead of one walk per number.
+                // One read of the incrementally maintained counters feeds both
+                // gauges and the cached sample used by INFO.
                 let sample = store_m.keyspace_sample();
                 store_sampled_keyspace(sample);
                 gauge!("recached_memory_bytes").set(sample.memory_bytes as f64);

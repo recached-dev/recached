@@ -163,14 +163,6 @@ async fn a_counter_propagates_as_its_value() {
 }
 
 #[tokio::test]
-#[ignore = "upstream: qstate sends collections as bare type-name markers. \
-            `matching_key_values` (store.rs:1217) yields SimpleString(\"hash\"), \
-            but `apply_qstate` only handles BulkString and Array and silently \
-            drops anything else — so a client that connects AFTER a collection \
-            was written never sees it until the next write to that key. The \
-            comment in apply_qstate claiming 'collections arrive type-tagged, so \
-            the initial state of a live query is complete' is false; keychange \
-            uses get_current (full contents), qstate does not."]
 async fn a_hash_hydrates_with_its_fields() {
     let url = server_url!();
     let key = ns("hash");

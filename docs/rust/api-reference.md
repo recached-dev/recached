@@ -148,7 +148,7 @@ replayed pointlessly after a reconnect. Use `read_command` for those.
 
 ::: warning `set_ex` expires locally within about a second, not exactly
 The server enforces the TTL exactly; a local copy learns about it when the
-server's once-per-second sweep removes the key. See
+server's bounded background sweep removes the key. See
 [Known limitations](/rust/getting-started#known-limitations).
 :::
 
