@@ -336,7 +336,10 @@ pub(crate) fn execute_and_record_with_evictions(
     let name = command_name(&cmd);
     let is_write = is_write_command(&cmd);
     let is_get = matches!(cmd, Command::Get(_));
+    let started = std::time::Instant::now();
     let (response, evicted) = store.execute_reporting(cmd);
+    histogram!("recached_command_duration_seconds", "command" => name)
+        .record(started.elapsed().as_secs_f64());
     record_command(name);
     if matches!(response, Value::Error(_)) {
         counter!("recached_command_errors_total", "command" => name).increment(1);

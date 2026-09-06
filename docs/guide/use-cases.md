@@ -49,8 +49,8 @@ this is Redis plus a pub/sub channel plus a WebSocket server plus reconnection a
 several hundred lines that are easy to get subtly wrong under packet loss.
 
 Recached ships that path: writes replay from a durable outbox after reconnect, `incr`/`decr` merge
-additively rather than clobbering, `jmerge` deep-merges documents, and delivery is exactly-once via a
-`DEDUP` envelope. See [Offline & Reconnection](/browser/offline).
+additively rather than clobbering, `jmerge` deep-merges documents, and a `DEDUP` envelope suppresses
+ordinary reconnect replays. See [Offline & Reconnection](/browser/offline) for the server-crash boundary.
 
 ### Feature flags and config that must flip instantly
 

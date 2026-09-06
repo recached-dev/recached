@@ -15,7 +15,103 @@ pub(crate) enum PubSubMsg {
     },
 }
 
-pub(crate) type PubSubSender = mpsc::UnboundedSender<PubSubMsg>;
+const PUBSUB_QUEUE_ITEMS: usize = 256;
+const PUBSUB_QUEUE_BYTES: usize = 8 * 1024 * 1024;
+
+pub(crate) struct QueuedPubSubMsg {
+    pub(crate) message: PubSubMsg,
+    charged_bytes: usize,
+    budget: Arc<PubSubBudget>,
+}
+
+impl Drop for QueuedPubSubMsg {
+    fn drop(&mut self) {
+        self.budget
+            .pending_bytes
+            .fetch_sub(self.charged_bytes, Ordering::AcqRel);
+    }
+}
+
+struct PubSubBudget {
+    pending_bytes: AtomicUsize,
+}
+
+#[derive(Clone)]
+pub(crate) struct PubSubSender {
+    tx: mpsc::Sender<QueuedPubSubMsg>,
+    overflow: mpsc::Sender<()>,
+    budget: Arc<PubSubBudget>,
+}
+
+impl PubSubSender {
+    fn send(&self, message: PubSubMsg) -> bool {
+        let charged_bytes =
+            pubsub_message_bytes(&message).saturating_add(std::mem::size_of::<QueuedPubSubMsg>());
+        if self
+            .budget
+            .pending_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                pending
+                    .checked_add(charged_bytes)
+                    .filter(|next| *next <= PUBSUB_QUEUE_BYTES)
+            })
+            .is_err()
+        {
+            self.signal_overflow();
+            return false;
+        }
+
+        let queued = QueuedPubSubMsg {
+            message,
+            charged_bytes,
+            budget: Arc::clone(&self.budget),
+        };
+        if self.tx.try_send(queued).is_err() {
+            self.signal_overflow();
+            return false;
+        }
+        true
+    }
+
+    fn signal_overflow(&self) {
+        counter!("recached_pubsub_overflows_total").increment(1);
+        let _ = self.overflow.try_send(());
+    }
+
+    fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+}
+
+pub(crate) fn pubsub_channel(
+    overflow: mpsc::Sender<()>,
+) -> (PubSubSender, mpsc::Receiver<QueuedPubSubMsg>) {
+    let (tx, rx) = mpsc::channel(PUBSUB_QUEUE_ITEMS);
+    (
+        PubSubSender {
+            tx,
+            overflow,
+            budget: Arc::new(PubSubBudget {
+                pending_bytes: AtomicUsize::new(0),
+            }),
+        },
+        rx,
+    )
+}
+
+fn pubsub_message_bytes(message: &PubSubMsg) -> usize {
+    match message {
+        PubSubMsg::Message { channel, message } => channel.len().saturating_add(message.len()),
+        PubSubMsg::PMessage {
+            pattern,
+            channel,
+            message,
+        } => pattern
+            .len()
+            .saturating_add(channel.len())
+            .saturating_add(message.len()),
+    }
+}
 
 pub(crate) struct PubSubHub {
     pub(crate) channel_subs: HashMap<String, Vec<(u64, PubSubSender)>>,
@@ -110,12 +206,10 @@ impl PubSubHub {
         {
             let subs = e.get_mut();
             subs.retain(|(_, tx)| {
-                let ok = tx
-                    .send(PubSubMsg::Message {
-                        channel: channel.to_string(),
-                        message: message.to_vec(),
-                    })
-                    .is_ok();
+                let ok = tx.send(PubSubMsg::Message {
+                    channel: channel.to_string(),
+                    message: message.to_vec(),
+                });
                 if ok {
                     count += 1;
                 }
@@ -133,14 +227,11 @@ impl PubSubHub {
             .map(|(p, _, tx)| (p.clone(), tx.clone()))
             .collect();
         for (pattern, tx) in pattern_txs {
-            if tx
-                .send(PubSubMsg::PMessage {
-                    pattern,
-                    channel: channel.to_string(),
-                    message: message.to_vec(),
-                })
-                .is_ok()
-            {
+            if tx.send(PubSubMsg::PMessage {
+                pattern,
+                channel: channel.to_string(),
+                message: message.to_vec(),
+            }) {
                 count += 1;
             }
         }
@@ -153,7 +244,7 @@ pub(crate) type SharedPubSub = Arc<tokio::sync::Mutex<PubSubHub>>;
 
 // ── observable keys ───────────────────────────────────────────────────────────
 
-pub(crate) fn encode_pubsub_msg(msg: PubSubMsg, protover: u8) -> Vec<u8> {
+pub(crate) fn encode_pubsub_msg(msg: &PubSubMsg, protover: u8) -> Vec<u8> {
     let frame = |parts: Vec<Value>| {
         if protover >= 3 {
             Value::Push(parts)
@@ -164,8 +255,8 @@ pub(crate) fn encode_pubsub_msg(msg: PubSubMsg, protover: u8) -> Vec<u8> {
     match msg {
         PubSubMsg::Message { channel, message } => frame(vec![
             Value::BulkString(Some(b"message".to_vec())),
-            Value::BulkString(Some(channel.into_bytes())),
-            Value::BulkString(Some(message)),
+            Value::BulkString(Some(channel.as_bytes().to_vec())),
+            Value::BulkString(Some(message.clone())),
         ])
         .serialize(),
         PubSubMsg::PMessage {
@@ -174,9 +265,9 @@ pub(crate) fn encode_pubsub_msg(msg: PubSubMsg, protover: u8) -> Vec<u8> {
             message,
         } => frame(vec![
             Value::BulkString(Some(b"pmessage".to_vec())),
-            Value::BulkString(Some(pattern.into_bytes())),
-            Value::BulkString(Some(channel.into_bytes())),
-            Value::BulkString(Some(message)),
+            Value::BulkString(Some(pattern.as_bytes().to_vec())),
+            Value::BulkString(Some(channel.as_bytes().to_vec())),
+            Value::BulkString(Some(message.clone())),
         ])
         .serialize(),
     }

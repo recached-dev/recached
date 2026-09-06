@@ -4,12 +4,12 @@ All notable changes to Recached are documented here.
 
 ## [0.3.4] (Unreleased)
 
-- Improved concurrent write, transaction, `WATCH`, replication, and failover correctness
-- Bounded keyspace scanning, expiry, memory accounting, and eviction work
-- Propagated evictions and expirations across persistence, replicas, watchers, and sync clients
+- Fixed concurrent writes, transactions, `WATCH`, and expiry and eviction propagation
+- Made snapshots, AOF, and dedup persistence atomic, fail-closed, and observable
+- Bounded pub/sub, live-query, and replication queues and added partial replica resync
+- Bounded keyspace maintenance and reduced small-value and collection memory use
 - Improved live-query snapshots and collection hydration
-- Reduced memory use for small values and collections
-- Added reproducible memory benchmarks
+- Expanded metrics, fault coverage, benchmarks, and operational documentation
 
 ## [0.3.3] (2026-09-05)
 

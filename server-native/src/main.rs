@@ -71,14 +71,14 @@ use core_engine::store::{
     EvictionPolicy, KeyValueStore, KeyspaceSample, SnapshotEntry, glob_match,
 };
 use futures_util::{SinkExt, StreamExt};
-use metrics::{counter, gauge};
+use metrics::{counter, gauge, histogram};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::ErrorKind;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -389,11 +389,19 @@ async fn run(
         }
     };
 
-    load_snapshot(&store, &save_path).await;
+    let loaded_snapshot = load_snapshot_checkpoint(&store, &save_path)
+        .await
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("failed to load snapshot {}: {e}", save_path.display()),
+            )
+        })?;
 
     let snap_cfg = Arc::new(SnapshotConfig {
         path: save_path,
         last_save: AtomicI64::new(now_unix_secs()),
+        checkpoint_id: AtomicU64::new(loaded_snapshot.aof_checkpoint),
     });
 
     // ── AOF ───────────────────────────────────────────────────────────────
@@ -411,19 +419,15 @@ async fn run(
     let aof: Option<Arc<AofWriter>> = if let Some(path) = aof_path {
         match AofWriter::open(path.clone(), aof_sync).await {
             Ok(w) => {
-                replay_aof(&store, &path).await;
+                replay_aof_from_checkpoint(&store, &path, loaded_snapshot.aof_checkpoint)
+                    .await
+                    .map_err(|e| {
+                        std::io::Error::new(
+                            e.kind(),
+                            format!("failed to replay AOF {}: {e}", path.display()),
+                        )
+                    })?;
                 let writer = Arc::new(w);
-                if aof_sync == AofSync::EverySec {
-                    let w2 = Arc::clone(&writer);
-                    tokio::spawn(async move {
-                        let mut interval =
-                            tokio::time::interval(tokio::time::Duration::from_secs(1));
-                        loop {
-                            interval.tick().await;
-                            w2.flush().await;
-                        }
-                    });
-                }
                 info!(
                     "AOF enabled: {:?} (sync={})",
                     path,
@@ -449,8 +453,11 @@ async fn run(
                 Some(writer)
             }
             Err(e) => {
-                warn!("AOF open failed: {} — running without AOF", e);
-                None
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("failed to open configured AOF {}: {e}", path.display()),
+                )
+                .into());
             }
         }
     } else {
@@ -495,6 +502,16 @@ async fn run(
         .and_then(|v| v.parse().ok())
         .filter(|&n: &usize| n > 0)
         .unwrap_or(DEFAULT_REPL_CHANNEL_CAPACITY);
+    let repl_queue_bytes = std::env::var("RECACHED_REPL_BUFFER_BYTES")
+        .ok()
+        .and_then(|value| parse_memory_bytes(&value))
+        .filter(|&bytes| bytes > 0)
+        .unwrap_or(DEFAULT_REPL_QUEUE_BYTES);
+    let repl_backlog_bytes = std::env::var("RECACHED_REPL_BACKLOG_BYTES")
+        .ok()
+        .and_then(|value| parse_memory_bytes(&value))
+        .filter(|&bytes| bytes > 0)
+        .unwrap_or(DEFAULT_REPL_BACKLOG_BYTES);
     let failover_timeout_secs: Option<u64> = std::env::var("RECACHED_FAILOVER_TIMEOUT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -572,6 +589,14 @@ async fn run(
 
     let is_replica_start = replicaof.is_some();
     let replicas: ReplRegistry = ReplHub::new();
+    if repl_listen {
+        replicas.configure_backlog(repl_backlog_bytes);
+        replicas.configure_queue_bytes(repl_queue_bytes);
+        info!(
+            "Replication buffers: backlog={} bytes, per-replica queue={} bytes / {} frames",
+            repl_backlog_bytes, repl_queue_bytes, repl_channel_capacity
+        );
+    }
 
     // ── server state ──────────────────────────────────────────────────────
     let state = Arc::new(ServerState {
@@ -582,25 +607,38 @@ async fn run(
         dedup: std::sync::Mutex::new(HashMap::new()),
         ephemeral: std::sync::Mutex::new(HashMap::new()),
         dedup_dirty: std::sync::atomic::AtomicBool::new(false),
+        dedup_order: tokio::sync::Mutex::new(()),
+        save_lock: tokio::sync::Mutex::new(()),
+        persistence_healthy: AtomicBool::new(true),
+        persistence_failures: AtomicU64::new(0),
     });
+    gauge!("recached_persistence_healthy").set(1.0);
 
-    // Restore exactly-once bookkeeping before accepting connections, so a
+    // Restore duplicate-suppression bookkeeping before accepting connections, so a
     // client replaying an unacknowledged write after a restart is recognised
     // rather than applied twice.
-    state.load_dedup().await;
+    state.load_dedup().await.map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!(
+                "failed to load dedup sidecar {}: {e}",
+                state.dedup_path().display()
+            ),
+        )
+    })?;
 
-    // ── Dedup flush ───────────────────────────────────────────────────────
-    // The map is one u64 per client, so it can be persisted far more often than
-    // the snapshot. This bounds the duplicate window on an unclean shutdown to
-    // roughly this interval rather than to the snapshot cadence.
+    if let Some(aof) = &state.aof
+        && aof.sync == AofSync::EverySec
     {
-        let state_dedup = Arc::clone(&state);
+        let state_flush = Arc::clone(&state);
+        let aof_flush = Arc::clone(aof);
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(1));
-            ticker.tick().await;
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
             loop {
-                ticker.tick().await;
-                state_dedup.persist_dedup().await;
+                interval.tick().await;
+                if let Err(e) = aof_flush.flush().await {
+                    state_flush.record_persistence_failure("aof_fsync", &e);
+                }
             }
         });
     }
@@ -624,7 +662,7 @@ async fn run(
                         .iter()
                         .any(|c| elapsed >= c.secs && dirty >= c.changes)
                 {
-                    state_snap.save(&store_snap).await;
+                    let _ = state_snap.save(&store_snap).await;
                 }
             }
         });
@@ -707,6 +745,12 @@ async fn run(
                 tokio::time::interval(tokio::time::Duration::from_secs(EVICTION_INTERVAL_SECS));
             loop {
                 interval.tick().await;
+                let memory_over_limit = store_sweep
+                    .max_memory_bytes()
+                    .is_some_and(|limit| store_sweep.approximate_memory_bytes() > limit);
+                if store_sweep.volatile_key_count() == 0 && !memory_over_limit {
+                    continue;
+                }
                 // Active expiry and eviction can remove keys no client named.
                 // Share the all-write barrier with snapshots and QSUB initial
                 // state so removal plus notification is one observable step.
@@ -757,10 +801,22 @@ async fn run(
                 gauge!("recached_memory_bytes").set(sample.memory_bytes as f64);
                 gauge!("recached_keys").set(sample.keys as f64);
                 counter!("recached_evictions_total").absolute(store_m.evicted_count());
+                counter!("recached_persistence_errors_total", "operation" => "all")
+                    .absolute(state_m.persistence_failures.load(Ordering::Relaxed));
+                let last_save = state_m.snap.last_save.load(Ordering::Relaxed);
+                gauge!("recached_last_save_age_seconds")
+                    .set(now_unix_secs().saturating_sub(last_save).max(0) as f64);
+                if let Some(aof) = &state_m.aof
+                    && let Ok(metadata) = tokio::fs::metadata(&aof.path).await
+                {
+                    gauge!("recached_aof_bytes").set(metadata.len() as f64);
+                }
                 gauge!("recached_replicas_connected")
                     .set(state_m.replicas.count.load(Ordering::Relaxed) as f64);
                 gauge!("recached_replication_queue_depth")
                     .set(state_m.replicas.max_queue_depth().await as f64);
+                gauge!("recached_replication_queue_bytes")
+                    .set(state_m.replicas.max_queue_bytes().await as f64);
                 gauge!("recached_replication_lag_frames")
                     .set(state_m.replicas.max_lag_frames().await as f64);
                 gauge!("recached_live_queries")
@@ -948,8 +1004,10 @@ async fn run(
 
             _ = &mut shutdown_rx => {
                 info!("Shutdown signal received, saving final snapshot...");
-                state.save(&store).await;
-                info!("Done. Goodbye.");
+                match state.save(&store).await {
+                    Ok(()) => info!("Done. Goodbye."),
+                    Err(e) => error!(error = %e, "final snapshot failed; shutting down with the existing persistence files intact"),
+                }
                 break;
             }
         }

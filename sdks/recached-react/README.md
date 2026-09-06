@@ -1,10 +1,10 @@
 # @recached/react
 
-Official React hooks for [Recached](https://github.com/recached-dev/recached) — zero-latency reactive cache with automatic server sync and cross-tab sharing.
+Official React hooks for [Recached](https://github.com/recached-dev/recached) — a local reactive cache with automatic server sync and cross-tab sharing.
 
 ## Features
 
-- **Zero-latency reads** — all reads are served from local WASM memory, no network round-trip
+- **Local reads** — reads are served from local WASM memory without a network round trip
 - **Automatic re-renders** — components update when a key changes from any source: local writes, server WebSocket push, or BroadcastChannel cross-tab sync
 - **React 18 concurrent-safe** — built on `useSyncExternalStore`, no tearing
 - **TypeScript-first** — full type inference including `useKeyJSON<T>`

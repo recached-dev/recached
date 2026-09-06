@@ -1504,9 +1504,6 @@ impl KeyValueStore {
         }
     }
 
-    /// Current state of every live key matching the glob pattern, in
-    /// `get_current` form (strings in full; collections type-tagged with their
-    /// complete contents), capped at `limit` entries. Backs QSUB initial state.
     /// Every live key matching `pattern`, without materialising its value.
     ///
     /// `matching_key_values` clones each value, which is wasted work for a
@@ -1521,6 +1518,9 @@ impl KeyValueStore {
             .collect()
     }
 
+    /// Current state of every live key matching the glob pattern, in
+    /// `get_current` form (strings in full; collections type-tagged with their
+    /// complete contents), capped at `limit` entries. Backs QSUB initial state.
     pub fn matching_key_values(&self, pattern: &str, limit: usize) -> Vec<(String, Value)> {
         let now = now_ms();
         self.data
@@ -1529,6 +1529,19 @@ impl KeyValueStore {
             .take(limit)
             .map(|e| (e.key().clone(), Self::encode_current_value(&e.value)))
             .collect()
+    }
+
+    /// Number of physical keys carrying a TTL.
+    ///
+    /// The server uses this cheap index read to avoid taking its global write
+    /// barrier on maintenance ticks when active expiry has no possible work.
+    pub fn volatile_key_count(&self) -> usize {
+        self.index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .volatile
+            .keys
+            .len()
     }
 
     /// Drop every expired volatile entry. This full form is retained for

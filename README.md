@@ -15,7 +15,7 @@
 
 Every caching solution forces a choice: server-side caches like Redis mean every frontend read is a network round-trip; client-side state like Zustand or SWR means two caches — one on the server and one in every client, with manual staleness code gluing them together. **Recached removes the choice.**
 
-The same Rust cache engine runs natively on your server (RESP on port 6379 — any Redis client works today, zero code changes) and as WebAssembly inside the browser. Reads always come from local WASM memory. The WebSocket is only a sync path, not a read path.
+The same Rust cache engine runs natively on your server (RESP on port 6379) and as WebAssembly inside the browser. Common Redis clients work with Recached's documented command subset. Browser reads come from local WASM memory; the WebSocket is a sync path, not a read path.
 
 **Multi-threaded is the default, not a flag.** Recached executes commands on every core, over a sharded keyspace, with no configuration. Redis and Valkey keep the command path on a single thread and offer *I/O* threading as an opt-in (`io-threads`, off by default) — a reasonable choice in C, where sharing mutable state across threads is checked by review rather than by the compiler. Rust's ownership model makes that checkable at build time, so threading the command path is a design decision rather than a risk to be opted into. You can [verify the scaling directly](#benchmarks) by varying the worker count and nothing else.
 
@@ -79,7 +79,7 @@ A **Rust service** can be one of those connected clients too, via [`recached-emb
 
 ## Quick look
 
-**Backend** — any Redis client, port 6379:
+**Backend** — a RESP client using the supported command subset, port 6379:
 
 ```javascript
 import Redis from 'ioredis';

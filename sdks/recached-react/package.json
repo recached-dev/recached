@@ -1,7 +1,7 @@
 {
   "name": "@recached/react",
   "version": "0.3.4",
-  "description": "Official React hooks for Recached \u2014 zero-latency reactive cache",
+  "description": "Official React hooks for Recached \u2014 local reactive cache",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -35,7 +35,7 @@
     "@testing-library/dom": "^10.4.1",
     "@testing-library/react": "^16.3.2",
     "@types/node": "^26.1.2",
-    "@types/react": "^18",
+    "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
     "jsdom": "^30.0.1",
     "react": "^19.2.8",
@@ -50,7 +50,7 @@
     "cache",
     "wasm",
     "real-time",
-    "zero-latency"
+    "local-cache"
   ],
   "license": "Apache-2.0",
   "repository": {
