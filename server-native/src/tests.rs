@@ -1678,13 +1678,10 @@ async fn integration_kill_primary_mid_write() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
-async fn integration_failover_promotes() {
-    // Point replica at a port that refuses connections immediately so the
-    // unreachable timer starts on the first loop iteration without any
-    // real primary required.  Promotion happens after:
-    //   connect fail (fast) → backoff 2s → connect fail → elapsed ≥ 1s → promote
-    // so we wait 3s to be safe.
+async fn integration_failover_timeout_does_not_promote() {
+    // Point the replica at a port that refuses connections. The deprecated
+    // one-second timeout must not make an isolated replica writable: without
+    // quorum and fencing that would create split brain during a partition.
     let replica_state = Arc::new(ServerState {
         snap: Arc::new(SnapshotConfig {
             path: tmp_path("failover_snap.rdb"),
@@ -1709,12 +1706,11 @@ async fn integration_failover_promotes() {
         run_repl_client(dead_addr, rs, rst, None, Some(1), rtx, None).await;
     });
 
-    // Wait for 2 backoff cycles (initial fail + 2s sleep + retry fail → promote)
-    tokio::time::sleep(tokio::time::Duration::from_millis(3000)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(2300)).await;
 
     assert!(
-        !replica_state.is_replica(),
-        "replica should have promoted after primary was unreachable for >1s"
+        replica_state.is_replica(),
+        "an unreachable-primary timeout must never promote without fencing"
     );
 }
 
@@ -2068,6 +2064,58 @@ async fn integration_tcp_watch_exec_aborts_on_change() {
     assert_eq!(watcher.cmd(&["GET", "k"]).await, bulk("v1"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn integration_tcp_watch_exec_closes_the_check_to_lock_race() {
+    let srv = spawn_server().await;
+    let mut watcher = RespClient::connect(srv.tcp_addr).await;
+
+    assert_eq!(watcher.cmd(&["WATCH", "guarded"]).await, ok());
+    assert_eq!(watcher.cmd(&["MULTI"]).await, ok());
+    assert_eq!(
+        watcher.cmd(&["SET", "transaction-output", "written"]).await,
+        Value::SimpleString("QUEUED".into())
+    );
+
+    // Hold the watched key ordering domain, then queue a conflicting writer
+    // before EXEC. The writer must complete first after release. EXEC must wait
+    // for the same barrier, observe that invalidation, and abort. The old path
+    // checked WATCH first and did not lock watched-only keys, so it committed.
+    let barriers = srv
+        .state
+        .replicas
+        .lock_commands_and_keys(&[], ["guarded"])
+        .await;
+
+    let addr = srv.tcp_addr;
+    let mut writer_task = tokio::spawn(async move {
+        let mut writer = RespClient::connect(addr).await;
+        writer.cmd(&["SET", "guarded", "changed"]).await
+    });
+    assert!(
+        tokio::time::timeout(tokio::time::Duration::from_millis(50), &mut writer_task,)
+            .await
+            .is_err(),
+        "the competing writer should be waiting on the test barrier"
+    );
+
+    let mut exec_task = tokio::spawn(async move { watcher.cmd(&["EXEC"]).await });
+    assert!(
+        tokio::time::timeout(tokio::time::Duration::from_millis(50), &mut exec_task,)
+            .await
+            .is_err(),
+        "EXEC must reserve watched keys before checking invalidation"
+    );
+
+    drop(barriers);
+    assert_eq!(writer_task.await.unwrap(), ok());
+    assert_eq!(exec_task.await.unwrap(), Value::Array(None));
+    assert_eq!(
+        srv.store.execute(Command::Get("transaction-output".into())),
+        nil(),
+        "the invalidated transaction must not run"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn integration_tcp_watch_exec_runs_when_unchanged() {
     let srv = spawn_server().await;
@@ -2311,6 +2359,20 @@ fn administrative_commands_are_denied_not_merely_unscoped() {
             "{cmd:?} must be Admin-classified"
         );
     }
+}
+
+#[test]
+fn oversized_initial_qstate_is_refused_not_truncated() {
+    let store = KeyValueStore::new();
+    for i in 0..3 {
+        store.execute(Command::Set(
+            format!("q:{i}"),
+            "v".into(),
+            SetOptions::default(),
+        ));
+    }
+    assert_eq!(initial_qstate(&store, "q:*", 2), Err(2));
+    assert_eq!(initial_qstate(&store, "q:*", 3).unwrap().len(), 3);
 }
 
 #[test]

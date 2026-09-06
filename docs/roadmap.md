@@ -1,6 +1,6 @@
 # Roadmap
 
-Recached competes on **where the data can live** — the same engine on the server and in the browser, with sync in between. The [benchmarks](/guide/benchmarks) show this costs nothing in raw speed.
+Recached competes on **where the data can live** — the same engine on the server and in the browser, with sync in between. The [benchmark guide](/guide/benchmarks) explains how to measure its throughput and memory cost on the commit you deploy. The project does not publish a current cross-project performance claim.
 
 
 ---

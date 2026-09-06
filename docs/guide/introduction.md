@@ -17,10 +17,7 @@ threads execution itself over a sharded keyspace with no configuration. You can
 [verify the scaling directly](/guide/benchmarks#thread-scaling) by varying the worker count and
 nothing else.
 
-Two honest qualifications. This is an architectural difference, **not** a throughput claim: a
-[tuned Valkey](/guide/benchmarks#with-io-threads-enabled) still out-throughputs Recached on most
-commands. And it costs something real — cross-key atomicity, which single-threaded execution gives
-away for free. See [Concurrency model](/server/commands#concurrency-model).
+Two qualifications matter. This is an architectural difference, **not** a current throughput claim; compare the exact releases and configuration you plan to run using the [benchmark harness](/guide/benchmarks). It also does not provide fully isolated cross-key reads. See [Concurrency model](/server/commands#concurrency-model).
 
 **The distinguishing feature is elsewhere: the same engine runs where there is no server at all.**
 That is the `core-engine` crate: a pure Rust state machine with no network dependencies, no file I/O, and no OS-specific code. It compiles to native x86-64/ARM64 for the server **and** to `wasm32-unknown-unknown` for the browser. Both targets run the same cache logic from the same source. The WebSocket sync layer (port 6380) keeps the two sides consistent in real time.
@@ -64,8 +61,8 @@ Recached is a good fit when:
 ## When Recached is not the right fit
 
 - **You need very high-durability persistence.** Recached supports snapshots (RDB-style) and AOF, but it is still primarily an in-memory cache. If you cannot tolerate any data loss between fsync intervals, a purpose-built database is the right tool.
-- **You need multi-replica consensus failover.** Recached supports leader–follower replication with automatic single-replica failover (`RECACHED_FAILOVER_TIMEOUT`). If the primary is unreachable for the configured duration, the designated replica promotes itself. What it does not include is multi-replica quorum election: in a setup with several replicas, split-brain prevention requires you to designate one replica for auto-failover and keep the others as passive standbys.
-- **You depend on uncommon Redis commands.** Recached implements the commands most applications use, not all 250+. Server introspection (`INFO`, `SLOWLOG`, `COMMAND`), Lua scripting, and cluster mode are out of scope. RESP3 is supported for protocol negotiation and pub/sub delivery (`HELLO 3`), not for the full RESP3 type surface.
+- **You need unattended failover.** Recached supports primary/replica replication but has no quorum, leader election, or fencing service. Promotion requires an operator or orchestrator to fence the old primary and send `REPLICAOF NO ONE`. `RECACHED_FAILOVER_TIMEOUT` is deprecated and ignored.
+- **You depend on uncommon Redis commands.** Recached implements the commands most applications use, not all 250+. Latency introspection (`SLOWLOG`, `INFO latencystats`), Lua scripting, and cluster mode are out of scope. `INFO` and `COMMAND` expose the supported compatibility subset. RESP3 is supported for protocol negotiation and pub/sub delivery (`HELLO 3`), not for the full RESP3 type surface.
 - **You need very large datasets.** Recached is an in-memory cache — it is not a database. If your working set does not fit in RAM, Redis with RDB persistence or a proper database is the right tool.
 
 ## Binary values
@@ -107,7 +104,7 @@ were destroyed on the way in.
 
 Honest status, per layer:
 
-- **The cache server is production-ready for cache workloads.** Persistence (atomic snapshots + AOF), replication with auto-failover, TLS, constant-time auth, hardened parsers, Prometheus metrics, and a load/chaos suite in CI. Cache workloads also have a forgiving failure contract by nature — treat it as a cache, not a system of record.
+- **The cache server is a release candidate for cache workloads.** It includes atomic snapshots, an append-only file, ordered replication, TLS, constant-time authentication, hardened parsers, Prometheus metrics, and load/chaos tests. It still needs broad production validation and an independent security audit. Treat it as a cache, not a system of record.
 - **The sync layer (browser sync, live queries, offline outbox, scoped auth) is beta.** The invariants are [specified](/server/protocol), tested, and verified end-to-end — but the code is young and hasn't accumulated real-world miles or third-party security review yet. Concretely: don't expose the WebSocket port to the public internet for multi-tenant data until you've read [Sync Scopes](/server/sync-scopes) and understood the model, and expect occasional sharp edges.
 
 The road to 1.0 is hardening, not features: fuzzing the parser surfaces, automated browser testing, a security pass on the token path, and a protocol freeze once real-world usage has confirmed the design. Bug reports from production-like use are the most valuable contribution the project can receive right now.
@@ -120,10 +117,10 @@ The road to 1.0 is hardening, not features: fuzzing the parser surfaces, automat
 | Browser-side cache | Yes — WASM | No |
 | WebSocket sync | Built-in | Not built-in |
 | Persistence | Snapshot + AOF | RDB + AOF |
-| Replication | Primary/replica + auto-failover | Yes (+ Sentinel/Cluster) |
+| Replication | Primary/replica + manually fenced promotion | Yes (+ Sentinel/Cluster) |
 | Lua scripting | No (WASM scripting on roadmap) | Yes |
 | Cluster mode | No | Yes |
-| Command coverage | ~115 commands | 250+ |
+| Command coverage | 123 commands | 250+ |
 | License | Apache 2.0 | AGPLv3 / RSALv2 + SSPLv1 (BSD-3 up to 7.2; Valkey stayed BSD-3) |
 
 ## Recached vs SWR / React Query

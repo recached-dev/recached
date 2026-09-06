@@ -193,8 +193,7 @@ See [Offline & Reconnection](/browser/offline).
 
 ### Live query returned fewer keys than expected
 
-A live query's initial state is capped at **10,000 keys**. Beyond that the snapshot is truncated.
-Narrow the pattern.
+A live query's complete initial state is capped at **10,000 keys** by default. A broader query returns `ERR live query initial state exceeds 10000 keys` instead of a partial snapshot. Narrow the pattern or raise `RECACHED_MAX_QSUB_INITIAL_KEYS` deliberately.
 
 `FLUSHDB` arrives as one sentinel per subscribed pattern rather than one frame per key — if your
 client is hand-written, expand it locally.

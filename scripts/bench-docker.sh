@@ -33,7 +33,7 @@
 #   scripts/bench-docker.sh --quick         # 20k requests, for a smoke test
 #   SERVER_CPUS=0-5 BENCH_CPUS=6-7 scripts/bench-docker.sh
 #
-# Results land in $OUT (default bench-results/) as CSV plus a summary.md.
+# Results land in $OUT (default bench-results/) as CSV files plus conditions.txt.
 
 set -euo pipefail
 
@@ -53,6 +53,8 @@ CLIENTS=${CLIENTS:-50}    # parallel connections
 DATA=${DATA:-64}          # value size in bytes
 KEYSPACE=${KEYSPACE:-100000}
 PIPELINE=${PIPELINE:-16}
+MEMORY_KEYS=${MEMORY_KEYS:-100000}
+MEMORY_DATA=${MEMORY_DATA:-64}
 
 # Worker-thread counts for the scaling run. Keep the largest at or below the
 # number of cores in SERVER_CPUS: past that the curve measures oversubscription
@@ -276,6 +278,69 @@ else
   echo "# valkey image '$VALKEY_IMAGE' not present — skipping" >&2
 fi
 
+# ── run 3: memory per live key ───────────────────────────────────────────────
+#
+# Measure process RSS before and after loading each data shape. The delta is
+# divided by DBSIZE rather than the requested count because randomized keys can
+# collide. Linux /proc reports bytes without Docker's human-unit rounding.
+
+container_rss_kb() {
+  local name=$1 pid
+  pid=$(docker inspect -f '{{.State.Pid}}' "$name")
+  awk '/^VmRSS:/ { print $2 }' "/proc/$pid/status"
+}
+
+measure_memory() {
+  local label=$1 name=$2 test=$3 outfile=$4 baseline loaded keys delta bytes_per_key
+  wait_ready "$name"
+  in_bench_ns "$name" redis-cli -p 6379 flushdb >/dev/null
+  sleep 1
+  baseline=$(container_rss_kb "$name")
+  in_bench_ns "$name" redis-benchmark -p 6379 -t "$test" -n "$MEMORY_KEYS" \
+    -c "$CLIENTS" -d "$MEMORY_DATA" -r $((MEMORY_KEYS * 10)) -P "$PIPELINE" -q >/dev/null
+  sleep 1
+  keys=$(in_bench_ns "$name" redis-cli -p 6379 --raw dbsize)
+  loaded=$(container_rss_kb "$name")
+  delta=$(( (loaded - baseline) * 1024 ))
+  bytes_per_key=$(awk -v bytes="$delta" -v count="$keys" \
+    'BEGIN { if (count > 0) printf "%.2f", bytes / count; else print "n/a" }')
+  printf '%s,%s,%s,%s,%s,%s\n' "$label" "$test" "$keys" "$baseline" "$loaded" "$bytes_per_key" >>"$outfile"
+  in_bench_ns "$name" redis-cli -p 6379 flushdb >/dev/null
+}
+
+MEMORY_OUT="$OUT/memory-per-key.csv"
+echo 'server,dataset,live_keys,baseline_rss_kb,loaded_rss_kb,delta_bytes_per_key' >"$MEMORY_OUT"
+
+# Use a fresh process for every data shape. FLUSHDB removes keys but allocators
+# retain arenas, so reusing one process would contaminate later RSS baselines.
+for test in set hset sadd; do
+  name="bench-memory-recached-$test"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  start_recached "$name" ""
+  measure_memory recached "$name" "$test" "$MEMORY_OUT"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+done
+
+for test in set hset sadd; do
+  name="bench-memory-redis-$test"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  start_redis "$name"
+  measure_memory redis "$name" "$test" "$MEMORY_OUT"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+done
+
+if docker image inspect "$VALKEY_IMAGE" >/dev/null 2>&1; then
+  for test in set hset sadd; do
+    name="bench-memory-valkey-$test"
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    start_valkey "$name"
+    measure_memory valkey "$name" "$test" "$MEMORY_OUT"
+    docker rm -f "$name" >/dev/null 2>&1 || true
+  done
+fi
+
+cat "$MEMORY_OUT"
+
 # ── provenance ───────────────────────────────────────────────────────────────
 #
 # A benchmark without its conditions is an anecdote. Everything needed to
@@ -294,6 +359,7 @@ fi
   echo "workload:        -n $N -c $CLIENTS -d $DATA -r $KEYSPACE"
   echo "pipeline:        $PIPELINE"
   echo "scale threads:   $SCALE_THREADS"
+  echo "memory workload: $MEMORY_KEYS operations, $MEMORY_DATA-byte values, SET/HSET/SADD"
 } >"$OUT/conditions.txt"
 
 echo

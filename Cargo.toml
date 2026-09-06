@@ -11,7 +11,7 @@ resolver = "2"
 # ── Single source of truth for all crate versions ────────────────────────────
 # Members inherit with:  version.workspace = true  /  edition.workspace = true
 [workspace.package]
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["ThinkGrid Labs"]
@@ -26,6 +26,7 @@ sync-client = { path = "sync-client" }
 dashmap        = "6"
 indexmap       = "2"
 rand           = { version = "0.9", features = ["thread_rng"] }
+smallvec       = "1"
 
 # async runtime
 tokio          = { version = "1",     features = ["full"] }

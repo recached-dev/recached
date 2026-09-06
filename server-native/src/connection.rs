@@ -69,6 +69,22 @@ pub(crate) fn queue_time_rejection(cmd: &Command) -> Option<Vec<u8>> {
     }
 }
 
+/// Build a complete initial live-query snapshot or refuse it. Returning a
+/// partial snapshot is unsafe because reconnect reconciliation treats absence
+/// as deletion and would drop locally held keys that still exist upstream.
+pub(crate) fn initial_qstate(
+    store: &KeyValueStore,
+    pattern: &str,
+    limit: usize,
+) -> Result<Vec<(String, Value)>, usize> {
+    let values = store.matching_key_values(pattern, limit.saturating_add(1));
+    if values.len() > limit {
+        Err(limit)
+    } else {
+        Ok(values)
+    }
+}
+
 /// Encode a pub/sub delivery for a connection speaking protocol `protover`.
 ///
 /// RESP2 has no push type, so a subscribed RESP2 client expects a plain array
@@ -397,7 +413,22 @@ pub(crate) async fn handle_tcp<S>(
                                                     if writer.write_all(EXECABORT).await.is_err() { break 'outer; }
                                                 }
                                                 Some(queue) => {
-                                                    // Drain pending notifications so the CAS check isn't racy.
+                                                    // Reserve both the queued write keys and WATCH
+                                                    // keys before the CAS check. A conflicting write
+                                                    // that was already in flight completes first and
+                                                    // queues its notification; no new one can enter
+                                                    // between this check and transaction execution.
+                                                    let _write_guards = if store.has_capacity_limits() {
+                                                        state.replicas.lock_all_writes().await
+                                                    } else {
+                                                        state
+                                                            .replicas
+                                                            .lock_commands_and_keys(
+                                                                &queue,
+                                                                watched_keys.iter().map(String::as_str),
+                                                            )
+                                                            .await
+                                                    };
                                                     while watch_rx.try_recv().is_ok() {
                                                         watch_dirty = true;
                                                     }
@@ -409,7 +440,6 @@ pub(crate) async fn handle_tcp<S>(
                                                         if writer.write_all(&Value::Array(None).serialize()).await.is_err() { break 'outer; }
                                                     } else {
                                                         let mut results = Vec::with_capacity(queue.len());
-                                                        let armed = write_effects_armed(&tx, &state, &watch_registry);
                                                         for qcmd in queue {
                                                             let resp = match qcmd {
                                                                 // Delivery lives in the connection loop, not the
@@ -421,9 +451,10 @@ pub(crate) async fn handle_tcp<S>(
                                                                     let count = pubsub.lock().await.publish(channel, message);
                                                                     Value::Integer(count)
                                                                 }
-                                                                _ if armed && is_write_command(&qcmd) => {
-                                                                    let resp = execute_and_record(&store, qcmd.clone());
+                                                                _ if is_write_command(&qcmd) => {
+                                                                    let (resp, evicted) = execute_and_record_with_evictions(&store, qcmd.clone());
                                                                     apply_write_effects(&qcmd, &resp, &tx, 0, &state, &watch_registry, &store).await;
+                                                                    apply_eviction_effects(&evicted, &tx, 0, &state, &watch_registry, &store).await;
                                                                     resp
                                                                 }
                                                                 _ => execute_and_record(&store, qcmd),
@@ -673,12 +704,16 @@ pub(crate) async fn handle_tcp<S>(
                                                 }
                                                 _ => {}
                                             }
-                                            let response = if is_write_command(&cmd)
-                                                && write_effects_armed(&tx, &state, &watch_registry)
-                                            {
-                                                let response = execute_and_record(&store, cmd.clone());
-                                                apply_write_effects(&cmd, &response, &tx, 0, &state, &watch_registry, &store).await;
-                                                response
+                                            let response = if is_write_command(&cmd) {
+                                                execute_ordered_write(
+                                                    &cmd,
+                                                    &tx,
+                                                    0,
+                                                    &state,
+                                                    &watch_registry,
+                                                    &store,
+                                                )
+                                                .await
                                             } else {
                                                 execute_and_record(&store, cmd)
                                             };
@@ -1052,8 +1087,20 @@ pub(crate) async fn handle_ws<S>(
                                         ws_send!(EXECABORT);
                                     }
                                     Some(queue) => {
-                                        // Catch watched-key changes that arrived but the select
-                                        // loop hasn't drained yet, so the CAS check isn't racy.
+                                        // Match the TCP path: reserve queued write keys and
+                                        // WATCH keys before checking invalidation, so a write
+                                        // cannot land in the check-to-EXEC gap.
+                                        let _write_guards = if store.has_capacity_limits() {
+                                            state.replicas.lock_all_writes().await
+                                        } else {
+                                            state
+                                                .replicas
+                                                .lock_commands_and_keys(
+                                                    &queue,
+                                                    watched_keys.iter().map(String::as_str),
+                                                )
+                                                .await
+                                        };
                                         while watch_rx.try_recv().is_ok() {
                                             watch_dirty = true;
                                         }
@@ -1066,7 +1113,6 @@ pub(crate) async fn handle_ws<S>(
                                             ws_send!(&Value::Array(None).serialize());
                                         } else {
                                             let mut results = Vec::with_capacity(queue.len());
-                                            let armed = write_effects_armed(&tx, &state, &watch_registry);
                                             for qcmd in queue {
                                                 let resp = match qcmd {
                                                     // See the TCP path: delivery lives here,
@@ -1075,9 +1121,10 @@ pub(crate) async fn handle_ws<S>(
                                                         let count = pubsub.lock().await.publish(channel, message);
                                                         Value::Integer(count)
                                                     }
-                                                    _ if armed && is_write_command(&qcmd) => {
-                                                        let resp = execute_and_record(&store, qcmd.clone());
+                                                    _ if is_write_command(&qcmd) => {
+                                                        let (resp, evicted) = execute_and_record_with_evictions(&store, qcmd.clone());
                                                         apply_write_effects(&qcmd, &resp, &tx, conn_id, &state, &watch_registry, &store).await;
+                                                        apply_eviction_effects(&evicted, &tx, conn_id, &state, &watch_registry, &store).await;
                                                         resp
                                                     }
                                                     _ => execute_and_record(&store, qcmd),
@@ -1254,10 +1301,27 @@ pub(crate) async fn handle_ws<S>(
                                     ws_send!(b"-ERR live query limit per connection reached\r\n");
                                     continue 'outer;
                                 }
-                                // Register *before* snapshotting: a write landing in
-                                // between is delivered as a keychange after the initial
-                                // state, which is idempotent — the reverse order would
-                                // lose it.
+                                // Hold every write ordering domain while checking the
+                                // cap, registering the query, and taking its snapshot. A
+                                // successful qstate is therefore complete; an oversized
+                                // query is refused before it can receive a partial state.
+                                let _snapshot_guards = state.replicas.lock_all_writes().await;
+                                let kvs = match initial_qstate(
+                                    &store,
+                                    &pattern,
+                                    max_qsub_initial_keys(),
+                                ) {
+                                    Ok(values) => values,
+                                    Err(limit) => {
+                                        ws_send!(
+                                            &Value::Error(format!(
+                                                "ERR live query initial state exceeds {limit} keys; narrow the pattern"
+                                            ))
+                                            .serialize()
+                                        );
+                                        continue 'outer;
+                                    }
+                                };
                                 if qsub_patterns.insert(pattern.clone()) {
                                     let mut pats = watch_registry.patterns.lock().await;
                                     pats.entry(pattern.clone())
@@ -1265,7 +1329,6 @@ pub(crate) async fn handle_ws<S>(
                                         .push((conn_id, q_tx.clone()));
                                     watch_registry.sync_patterns_len(&pats);
                                 }
-                                let kvs = store.matching_key_values(&pattern, max_qsub_initial_keys());
                                 // Tagged reply so clients can recognise it among
                                 // interleaved frames: ["qstate", pattern, k, v, ...]
                                 let mut items = Vec::with_capacity(kvs.len() * 2 + 2);
@@ -1412,12 +1475,16 @@ pub(crate) async fn handle_ws<S>(
                                 if let Command::ESet(ref k, _) = cmd {
                                     state.claim_ephemeral(k, conn_id);
                                 }
-                                let response = if is_write_command(&cmd)
-                                    && write_effects_armed(&tx, &state, &watch_registry)
-                                {
-                                    let response = execute_and_record(&store, cmd.clone());
-                                    apply_write_effects(&cmd, &response, &tx, conn_id, &state, &watch_registry, &store).await;
-                                    response
+                                let response = if is_write_command(&cmd) {
+                                    execute_ordered_write(
+                                        &cmd,
+                                        &tx,
+                                        conn_id,
+                                        &state,
+                                        &watch_registry,
+                                        &store,
+                                    )
+                                    .await
                                 } else {
                                     execute_and_record(&store, cmd)
                                 };
@@ -1513,16 +1580,6 @@ pub(crate) async fn handle_ws<S>(
     let expired = state.take_ephemeral_for(conn_id);
     if !expired.is_empty() {
         let del = Command::Del(expired);
-        let response = store.execute(del.clone());
-        apply_write_effects(
-            &del,
-            &response,
-            &tx,
-            conn_id,
-            &state,
-            &watch_registry,
-            &store,
-        )
-        .await;
+        execute_ordered_write(&del, &tx, conn_id, &state, &watch_registry, &store).await;
     }
 }

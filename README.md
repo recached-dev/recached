@@ -56,7 +56,7 @@ cargo add --git https://github.com/recached-dev/recached recached-embed
 ```
 
 > [!IMPORTANT]
-> **Install `recached-edge@^0.3.1`.** Every published version from 0.1.3 to 0.3.0 shipped without
+> **Install `recached-edge@^0.3.4`.** Every published version from 0.1.3 to 0.3.0 shipped without
 > wasm-pack's `snippets/` directory and failed to import at all; 0.3.1 is the first release that
 > installs from npm. See the [changelog](CHANGELOG.md) for details.
 
@@ -125,47 +125,29 @@ What you give up is what needs a peer: pub/sub, live queries and cross-device sy
 
 ## Benchmarks
 
-Measured with `redis-benchmark` (100k requests, 50 connections, 64-byte values, randomized keys, persistence disabled on all servers) on a 4-core Intel i5-8259U laptop, July 2026 — Recached v0.1.8 vs Redis 7.2.5 vs Valkey 9.1.0, one server at a time. Current release is v0.3.1 (packaging only — no engine change since v0.3.0); these command paths were A/B tested across the v0.2.4 changes and spot-checked again on v0.3.0 (SET 455k, GET 518k, INCR 526k pipelined on the same laptop), moving within run-to-run noise each time — but the three-way suite has not been re-run since v0.1.8.
+Recached's measured performance claim is narrow: command execution scales across worker threads. The project does not publish a current Redis or Valkey comparison. The previous three-way table used Recached v0.1.8 and Redis 7.2.5, so it was removed instead of presenting stale results as current evidence.
 
-**Recached executes commands on every core**, not just one. Same machine, same binary, same workload — only the worker-thread count changes. Pipelined, on Linux, server pinned to 4 cores:
+The historical scaling run changed only `RECACHED_WORKER_THREADS`. It used one binary, one workload, and a fixed four-core Linux CPU set:
 
 | Worker threads | 1 | 2 | 4 |
 |---|---:|---:|---:|
-| Aggregate rps | 481,280 | 854,111 | **1,044,313** |
-| vs 1 thread | — | +77% | **+117%** |
+| Aggregate requests/s | 481,280 | 854,111 | 1,044,313 |
+| Change from one thread | baseline | +77% | +117% |
 
-Every command in the suite gains. Reproduce with [`scripts/bench-scaling.sh`](scripts/bench-scaling.sh), which aborts if the server reports a worker count other than the one requested.
+Treat this table as historical evidence for parallel command execution, not current release throughput. Run [`scripts/bench-scaling.sh`](scripts/bench-scaling.sh) against the commit you plan to deploy.
 
-Do not read that as a throughput claim over Redis or Valkey. Both ship I/O threading (`io-threads`, off by default), and with it enabled a tuned Valkey is comfortably ahead of Recached on most commands — see [the tuned comparison](https://recached.dev/guide/benchmarks#with-io-threads-enabled). Recached threads command *execution* rather than just I/O, which shows up on compute-heavy commands like `ZADD` and not much else. The reason to pick Recached is the browser, not the server benchmark.
+For a current cross-project run, use [`scripts/bench-docker.sh`](scripts/bench-docker.sh). It pins server and load-generator CPU sets, records image versions, measures pipelined and unpipelined workloads, and writes RSS delta per live key for strings, small hashes, and small sets. Publish the generated `conditions.txt` with any numbers.
 
-Pipelined (`-P 16`) — raw command throughput, requests/sec, **bold** = best per row:
-
-| Command | Recached | Redis 7.2.5 | Valkey 9.1.0 |
-|---|---:|---:|---:|
-| SET | **421,941** | 375,940 | 294,118 |
-| GET | **546,448** | 512,821 | 483,092 |
-| INCR | **448,430** | 421,941 | 413,223 |
-| LPUSH | **473,934** | 409,836 | 386,100 |
-| SADD | 421,941 | **462,963** | 378,788 |
-| HSET | **408,163** | 324,675 | 287,356 |
-| ZADD | **414,938** | 197,628 | 221,239 |
-
-Those figures are against **stock configurations**, where Redis and Valkey run single-threaded. That is how they ship, but it is not how you would tune them: with `io-threads` enabled both gain substantially and Valkey pulls ahead of Recached overall. The [benchmarks page](https://recached.dev/guide/benchmarks#with-io-threads-enabled) carries the tuned numbers rather than only the flattering ones. Unpipelined (one command per round-trip — the traffic shape of typical request-scoped cache calls), the localhost round-trip dominates and Recached runs at 46–96% of Redis with sub-millisecond p50 latency on every common command (GET 58.1k vs 61.6k rps; HSET is the weakest at 46%).
-
-**New in v0.2.4:** sorted sets gained a score-ordered index, so range reads no longer sort the whole set on every query. On a ~45k-member leaderboard, repeated `ZRANGE key 0 9` went from 244 to 133k rps (**546×**), and an alternating `ZADD` + `ZRANGE` loop from 65 s to 0.11 s (**597×**). `ZADD` gives up ~15% against a set that is actively being read; a write-only sorted set never builds the index and is unaffected. Measured as before/after ratios on a loaded machine — see the [benchmarks page](https://recached.dev/guide/benchmarks) for methodology.
-
-Full tables with latency percentiles, pipelined results, methodology, and known hotspots: **[recached.dev/guide/benchmarks](https://recached.dev/guide/benchmarks)**. Reproduce with [`scripts/benchmark.sh`](scripts/benchmark.sh) — results from server-grade hardware welcome.
-
----
+Recached's product distinction remains the browser engine: browser reads use local WebAssembly memory and avoid a server round trip.
 
 ## Maturity
 
 Being honest about where things stand:
 
-- **The cache server is production-ready for cache workloads** — persistence, replication with auto-failover, TLS, hardened parsers, metrics, and a load/chaos CI suite. Treat it as a cache, not a system of record.
+- **The cache server is a release candidate for cache workloads.** It includes persistence, ordered primary/replica replication, TLS, hardened parsers, metrics, and load/chaos tests. It has not completed broad production validation or an independent security audit. Treat it as a cache, not a system of record.
 - **The sync layer (browser sync, live queries, offline outbox, scoped auth) is beta** — the invariants are [specified](https://recached.dev/server/protocol) and tested end-to-end, but the code is young and hasn't had real-world miles or third-party security review yet. Don't put the WebSocket port on the public internet for multi-tenant data without reading [Sync Scopes](https://recached.dev/server/sync-scopes) first.
 
-- **The embedded Rust client (`recached-embed`) is brand new and unpublished** — it works end-to-end against a live server and is covered by a live test suite, but it has no production miles, is not on crates.io, and inherits one known sync-protocol gap: collections do not hydrate on connect. It is documented in [its docs](https://recached.dev/rust/getting-started#known-limitations) and affects the browser SDK identically.
+- **The embedded Rust client (`recached-embed`) is brand new and unpublished** — it works end-to-end against a live server and is covered by a live test suite, but it has no production miles and is not on crates.io.
 
 The road to 1.0 is hardening, not features. Bug reports from production-like use are the most valuable contribution right now.
 

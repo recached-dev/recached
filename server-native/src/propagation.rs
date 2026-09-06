@@ -67,6 +67,9 @@ pub(crate) fn is_write_command(cmd: &Command) -> bool {
 /// Used together with `broadcast_for()` — only call this when `broadcast_for`
 /// already confirmed a mutation occurred.
 pub(crate) fn primary_keys(cmd: &Command) -> Vec<String> {
+    if let Command::Dedup(_, _, inner) = cmd {
+        return primary_keys(inner);
+    }
     match cmd {
         Command::ESet(k, _)
         | Command::Set(k, _, _)
@@ -116,6 +119,142 @@ pub(crate) fn primary_keys(cmd: &Command) -> Vec<String> {
             vec![src.clone(), dst.clone()]
         }
         _ => vec![],
+    }
+}
+
+/// Keys whose state can affect a write's result.
+///
+/// This is deliberately broader than [`primary_keys`]: the source sets of a
+/// `*STORE` command are read while computing the destination, so they must be
+/// in the same ordering domain as that destination. `FLUSHDB` is represented
+/// by `None` because it conflicts with every key.
+pub(crate) fn ordering_keys(cmd: &Command) -> Option<Vec<String>> {
+    if let Command::Dedup(_, _, inner) = cmd {
+        return ordering_keys(inner);
+    }
+    match cmd {
+        Command::FlushDb => None,
+        Command::SInterStore(dst, sources)
+        | Command::SUnionStore(dst, sources)
+        | Command::SDiffStore(dst, sources) => {
+            let mut keys = Vec::with_capacity(sources.len() + 1);
+            keys.push(dst.clone());
+            keys.extend(sources.iter().cloned());
+            Some(keys)
+        }
+        _ => Some(primary_keys(cmd)),
+    }
+}
+
+/// Execute one write while its key-order guards remain held through durable
+/// logging and fan-out. This makes the store commit order the observable AOF,
+/// replica, watcher, and browser-sync order for every pair of conflicting
+/// writes.
+pub(crate) async fn execute_ordered_write(
+    cmd: &Command,
+    tx: &broadcast::Sender<SyncMsg>,
+    origin: u64,
+    state: &ServerState,
+    watch_registry: &WatchRegistry,
+    store: &KeyValueStore,
+) -> Value {
+    // Capacity eviction may choose any key, so capped stores already serialize
+    // their core writes and reserve every propagation ordering domain here.
+    // Uncapped stores retain per-key concurrency.
+    let _guards = if store.has_capacity_limits() {
+        state.replicas.lock_all_writes().await
+    } else {
+        state
+            .replicas
+            .lock_commands(std::slice::from_ref(cmd))
+            .await
+    };
+    let (response, evicted) = execute_and_record_with_evictions(store, cmd.clone());
+    apply_write_effects(cmd, &response, tx, origin, state, watch_registry, store).await;
+    apply_eviction_effects(&evicted, tx, origin, state, watch_registry, store).await;
+    response
+}
+
+/// Propagate implicit capacity victims as DEL operations. The caller holds the
+/// same ordering guards as the write that selected them, so local mutation,
+/// AOF, replication, browser sync, and watcher delivery agree on the order.
+pub(crate) async fn apply_eviction_effects(
+    evicted: &[String],
+    tx: &broadcast::Sender<SyncMsg>,
+    origin: u64,
+    state: &ServerState,
+    watch_registry: &WatchRegistry,
+    store: &KeyValueStore,
+) {
+    for key in evicted {
+        let deletion = Command::Del(vec![key.clone()]);
+        apply_write_effects(
+            &deletion,
+            &Value::Integer(1),
+            tx,
+            origin,
+            state,
+            watch_registry,
+            store,
+        )
+        .await;
+    }
+}
+
+#[cfg(test)]
+mod eviction_propagation_tests {
+    use super::*;
+    use core_engine::cmd::SetOptions;
+    use core_engine::store::{EvictionPolicy, KeyValueStore};
+    use std::sync::atomic::AtomicBool;
+
+    fn tmp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("recached_test_{name}_{}", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn implicit_capacity_eviction_is_replayed_as_a_delete() {
+        let path = tmp_path("capacity_eviction.aof");
+        let _ = tokio::fs::remove_file(&path).await;
+        let aof = AofWriter::open(path.clone(), AofSync::No).await.unwrap();
+        let state = ServerState {
+            snap: Arc::new(SnapshotConfig {
+                path: tmp_path("capacity_eviction.rdb"),
+                last_save: AtomicI64::new(0),
+            }),
+            aof: Some(Arc::new(aof)),
+            replicas: ReplHub::new(),
+            is_replica: AtomicBool::new(false),
+            dedup: std::sync::Mutex::new(HashMap::new()),
+            ephemeral: std::sync::Mutex::new(HashMap::new()),
+            dedup_dirty: AtomicBool::new(false),
+        };
+        let store = KeyValueStore::with_config(Some(1), None, EvictionPolicy::AllKeysRandom);
+        let tx = broadcast::channel::<SyncMsg>(8).0;
+        let watches = WatchHub::new();
+
+        for (key, value) in [("victim", "old"), ("replacement", "new")] {
+            let command = Command::Set(key.into(), value.into(), SetOptions::default());
+            assert_eq!(
+                execute_ordered_write(&command, &tx, 0, &state, &watches, &store).await,
+                Value::SimpleString("OK".into())
+            );
+        }
+        state.aof.as_ref().unwrap().flush().await;
+
+        let replayed = KeyValueStore::new();
+        assert_eq!(replay_aof(&replayed, &path).await, 3);
+        assert_eq!(
+            replayed.execute(Command::Get("victim".into())),
+            Value::BulkString(None),
+            "the implicit victim must not return after AOF replay"
+        );
+        assert_eq!(
+            replayed.execute(Command::Get("replacement".into())),
+            Value::BulkString(Some(b"new".to_vec()))
+        );
+
+        let _ = tokio::fs::remove_file(&path).await;
     }
 }
 

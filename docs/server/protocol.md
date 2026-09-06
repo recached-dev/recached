@@ -49,28 +49,18 @@ Every frame a client receives is exactly one of:
 | **Reply** | any RESP value not matching the rows below | Response to one command this connection sent |
 | **Mutation push** | RESP3 Push `>N` whose elements form a replayable command (`SET`, `HSET`, `JSET`, `JMERGE`, …) | Another client/backend mutated a key in scope — apply to the local store |
 | **Pub/sub push** | RESP3 Push `>3` = `["message", channel, payload]` | Pub/sub delivery. The WebSocket transport is always RESP3 — `HELLO 2` on it is refused, because the frame taxonomy below depends on the push type existing |
-| **Keychange push** | Array `["keychange", key, value]` | A watched / live-queried key changed, **or the server removed it on its own initiative** (see *Server-initiated removal*). `value`: full string, nil (deleted), or a type-name marker (`hash`, `list`, `set`, `zset`, `json`, `ratelimit`) whose content travels via mutation pushes instead |
+| **Keychange push** | Array `["keychange", key, value]` | A watched or live-queried key changed, or the server removed it on its own initiative. `value` is a full string, nil for deletion, or a type-tagged collection containing its complete current value. |
 | **Query state** | Array `["qstate", pattern, k1, v1, …]` | **Both** the reply to a `QSUB` **and** initial state to apply (same value encoding as keychange) |
 
 ### Server-initiated removal
 
-Not every removal follows a command. A key with a TTL is removed by the server's background
-sweep, which runs every second; reads only *mask* an expired entry, so the sweep is the sole
-remover. Such a removal is announced as an ordinary keychange with a nil value — the same
-shape a `DEL` produces — so no client needs to special-case it.
+Not every removal follows a client command. Reads mask an expired key immediately, while a background task checks at most 256 TTL-indexed keys per one-second tick and actively removes expired entries. The server announces each removal as a keychange with a nil value.
 
-Two consequences a client must account for:
+Capacity eviction is also propagated as an ordered `DEL`. AOF replay, replicas, browser peers, and key watchers therefore remove the same victim as the primary.
 
-- **Expiry is eventual, not exact.** A local copy does not expire on its own clock; it
-  converges within roughly one sweep interval of the server-side expiry. A client needing an
-  exact instant must compare a deadline itself.
-- **Removals during a disconnect are not reconciled.** `qstate` re-hydration adds keys but
-  does not remove local keys absent from the snapshot, so a key removed while a client was
-  disconnected survives its reconnect until something writes to it again. This is a known gap,
-  and it applies to `DEL` as much as to expiry.
+A successful `qstate` is complete for its pattern, so reconnect reconciliation can safely remove local keys absent from it. If the pattern matches more than `RECACHED_MAX_QSUB_INITIAL_KEYS`, the server returns an error instead of a truncated snapshot; narrow the pattern or raise the limit deliberately.
 
-Memory eviction does **not** currently emit a keychange; it runs inside the store, below the
-layer that owns the subscriber registry. Only deployments setting `maxmemory` are affected.
+Expiry deletion is eventual. A local copy does not expire on its own clock, and the bounded sweep may take multiple ticks to reach a key in a large volatile keyspace. Carry and compare a deadline in the value when exact expiry matters.
 
 ## The ordering invariant (acknowledgment correlation)
 

@@ -239,9 +239,7 @@ rogue replica rather than against an observer.
 The metrics port remains plaintext and unauthenticated regardless — firewall it.
 :::
 
-Note the failover model: single-replica automatic promotion only. In a multi-replica topology,
-designate one replica for auto-failover and keep the rest passive, or you risk split-brain — see
-[when Recached is not the right fit](/guide/introduction#when-recached-is-not-the-right-fit).
+Recached never promotes a replica from a timeout. Before sending `REPLICAOF NO ONE`, fence the old primary by stopping it or revoking client access. Without fencing, a network partition can leave two writable primaries. See [manual failover](/server/configuration#manual-failover).
 
 ## Resource limits
 

@@ -41,8 +41,8 @@ features:
     title: Cross-tab sync
     details: BroadcastChannel support means all tabs in the same browser share mutations automatically, with no server connection required.
   - icon: 🔒
-    title: Production-ready server
-    details: TLS, Prometheus metrics, password auth, IP allowlists, connection limits, eviction policies, and observable keys out of the box.
+    title: Hardened cache server
+    details: TLS, Prometheus metrics, password authentication, IP allowlists, connection limits, bounded eviction, and ordered replication. Release-candidate maturity.
 ---
 
 ## What is Recached?
