@@ -6,6 +6,7 @@ use dashmap::mapref::entry::Entry as DashEntry;
 use indexmap::IndexSet;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -349,7 +350,7 @@ fn in_score_range(score: f64, min: &ScoreBound, max: &ScoreBound) -> bool {
 /// *either* a string or bytes, so snapshots written by 0.2.1 and earlier — where
 /// values were `String` — still load.
 #[derive(Clone, PartialEq, Eq, Hash, Default)]
-pub struct Blob(pub Vec<u8>);
+pub struct Blob(pub SmallVec<[u8; 24]>);
 
 impl Blob {
     pub fn as_slice(&self) -> &[u8] {
@@ -362,12 +363,12 @@ impl Blob {
         self.0.is_empty()
     }
     pub fn into_vec(self) -> Vec<u8> {
-        self.0
+        self.0.into_vec()
     }
     /// Alias of `into_vec`, mirroring `String::into_bytes` at the many call
     /// sites that build a RESP `BulkString` straight from a stored value.
     pub fn into_bytes(self) -> Vec<u8> {
-        self.0
+        self.0.into_vec()
     }
     /// Append bytes, for `APPEND`.
     pub fn extend(&mut self, other: &[u8]) {
@@ -388,22 +389,22 @@ impl Blob {
 
 impl From<Vec<u8>> for Blob {
     fn from(v: Vec<u8>) -> Self {
-        Blob(v)
+        Blob(SmallVec::from_vec(v))
     }
 }
 impl From<&[u8]> for Blob {
     fn from(v: &[u8]) -> Self {
-        Blob(v.to_vec())
+        Blob(SmallVec::from_slice(v))
     }
 }
 impl From<String> for Blob {
     fn from(v: String) -> Self {
-        Blob(v.into_bytes())
+        Blob(SmallVec::from_vec(v.into_bytes()))
     }
 }
 impl From<&str> for Blob {
     fn from(v: &str) -> Self {
-        Blob(v.as_bytes().to_vec())
+        Blob(SmallVec::from_slice(v.as_bytes()))
     }
 }
 
@@ -433,26 +434,261 @@ impl<'de> Deserialize<'de> for Blob {
             }
             // Pre-0.2.2 snapshots stored values as msgpack strings.
             fn visit_str<E>(self, v: &str) -> Result<Blob, E> {
-                Ok(Blob(v.as_bytes().to_vec()))
+                Ok(Blob(SmallVec::from_slice(v.as_bytes())))
             }
             fn visit_string<E>(self, v: String) -> Result<Blob, E> {
-                Ok(Blob(v.into_bytes()))
+                Ok(Blob(SmallVec::from_vec(v.into_bytes())))
             }
             fn visit_bytes<E>(self, v: &[u8]) -> Result<Blob, E> {
-                Ok(Blob(v.to_vec()))
+                Ok(Blob(SmallVec::from_slice(v)))
             }
             fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Blob, E> {
-                Ok(Blob(v))
+                Ok(Blob(SmallVec::from_vec(v)))
             }
             fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Blob, A::Error> {
                 let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
                 while let Some(b) = seq.next_element::<u8>()? {
                     out.push(b);
                 }
-                Ok(Blob(out))
+                Ok(Blob(SmallVec::from_vec(out)))
             }
         }
         de.deserialize_any(V)
+    }
+}
+
+// ── Compact hash encoding ─────────────────────────────────────────────────────
+
+const INLINE_HASH_FIELDS: usize = 2;
+
+#[derive(Clone)]
+enum CompactHash {
+    Inline(SmallVec<[(String, Blob); INLINE_HASH_FIELDS]>),
+    Table(HashMap<String, Blob>),
+}
+
+impl CompactHash {
+    fn new() -> Self {
+        Self::Inline(SmallVec::new())
+    }
+
+    fn from_map(map: HashMap<String, Blob>) -> Self {
+        if map.len() <= INLINE_HASH_FIELDS {
+            Self::Inline(map.into_iter().collect())
+        } else {
+            Self::Table(map)
+        }
+    }
+
+    fn to_map(&self) -> HashMap<String, Blob> {
+        self.iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Inline(fields) => fields.len(),
+            Self::Table(fields) => fields.len(),
+        }
+    }
+
+    fn contains_key(&self, key: &str) -> bool {
+        self.get(key).is_some()
+    }
+
+    fn get(&self, key: &str) -> Option<&Blob> {
+        match self {
+            Self::Inline(fields) => fields
+                .iter()
+                .find_map(|(field, value)| (field == key).then_some(value)),
+            Self::Table(fields) => fields.get(key),
+        }
+    }
+
+    fn insert(&mut self, key: String, value: Blob) -> Option<Blob> {
+        match self {
+            Self::Inline(fields) => {
+                if let Some((_, old)) = fields.iter_mut().find(|(field, _)| field == &key) {
+                    return Some(std::mem::replace(old, value));
+                }
+                if fields.len() < INLINE_HASH_FIELDS {
+                    fields.push((key, value));
+                    return None;
+                }
+                let mut table = HashMap::with_capacity(fields.len() + 1);
+                table.extend(fields.drain(..));
+                let old = table.insert(key, value);
+                *self = Self::Table(table);
+                old
+            }
+            Self::Table(fields) => fields.insert(key, value),
+        }
+    }
+
+    fn insert_if_absent(&mut self, key: String, value: Blob) -> bool {
+        if self.contains_key(&key) {
+            false
+        } else {
+            self.insert(key, value);
+            true
+        }
+    }
+
+    fn remove(&mut self, key: &str) -> Option<Blob> {
+        match self {
+            Self::Inline(fields) => fields
+                .iter()
+                .position(|(field, _)| field == key)
+                .map(|position| fields.swap_remove(position).1),
+            Self::Table(fields) => fields.remove(key),
+        }
+    }
+
+    fn iter(&self) -> CompactHashIter<'_> {
+        match self {
+            Self::Inline(fields) => CompactHashIter::Inline(fields.iter()),
+            Self::Table(fields) => CompactHashIter::Table(fields.iter()),
+        }
+    }
+}
+
+enum CompactHashIter<'a> {
+    Inline(std::slice::Iter<'a, (String, Blob)>),
+    Table(std::collections::hash_map::Iter<'a, String, Blob>),
+}
+
+impl<'a> Iterator for CompactHashIter<'a> {
+    type Item = (&'a String, &'a Blob);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Inline(iter) => iter.next().map(|(key, value)| (key, value)),
+            Self::Table(iter) => iter.next(),
+        }
+    }
+}
+
+// ── Compact set encoding ──────────────────────────────────────────────────────
+
+const INLINE_SET_MEMBERS: usize = 4;
+
+#[derive(Clone)]
+enum CompactSet {
+    Inline(SmallVec<[String; INLINE_SET_MEMBERS]>),
+    Table(IndexSet<String>),
+}
+
+impl CompactSet {
+    fn new() -> Self {
+        Self::Inline(SmallVec::new())
+    }
+
+    fn from_index_set(set: IndexSet<String>) -> Self {
+        if set.len() <= INLINE_SET_MEMBERS {
+            Self::Inline(set.into_iter().collect())
+        } else {
+            Self::Table(set)
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Inline(members) => members.len(),
+            Self::Table(members) => members.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn contains(&self, member: &str) -> bool {
+        match self {
+            Self::Inline(members) => members.iter().any(|candidate| candidate == member),
+            Self::Table(members) => members.contains(member),
+        }
+    }
+
+    fn insert(&mut self, member: String) -> bool {
+        match self {
+            Self::Inline(members) => {
+                if members.iter().any(|candidate| candidate == &member) {
+                    return false;
+                }
+                if members.len() < INLINE_SET_MEMBERS {
+                    members.push(member);
+                    return true;
+                }
+                let mut table = IndexSet::with_capacity(members.len() + 1);
+                table.extend(members.drain(..));
+                let inserted = table.insert(member);
+                *self = Self::Table(table);
+                inserted
+            }
+            Self::Table(members) => members.insert(member),
+        }
+    }
+
+    fn swap_remove(&mut self, member: &str) -> bool {
+        match self {
+            Self::Inline(members) => members
+                .iter()
+                .position(|candidate| candidate == member)
+                .map(|position| members.swap_remove(position))
+                .is_some(),
+            Self::Table(members) => members.swap_remove(member),
+        }
+    }
+
+    fn swap_remove_index(&mut self, index: usize) -> Option<String> {
+        match self {
+            Self::Inline(members) => (index < members.len()).then(|| members.swap_remove(index)),
+            Self::Table(members) => members.swap_remove_index(index),
+        }
+    }
+
+    fn get_index(&self, index: usize) -> Option<&String> {
+        match self {
+            Self::Inline(members) => members.get(index),
+            Self::Table(members) => members.get_index(index),
+        }
+    }
+
+    fn drain_all(&mut self) -> Vec<String> {
+        match self {
+            Self::Inline(members) => members.drain(..).collect(),
+            Self::Table(members) => members.drain(..).collect(),
+        }
+    }
+
+    fn iter(&self) -> CompactSetIter<'_> {
+        match self {
+            Self::Inline(members) => CompactSetIter::Inline(members.iter()),
+            Self::Table(members) => CompactSetIter::Table(members.iter()),
+        }
+    }
+}
+
+impl FromIterator<String> for CompactSet {
+    fn from_iter<T: IntoIterator<Item = String>>(iter: T) -> Self {
+        Self::from_index_set(iter.into_iter().collect())
+    }
+}
+
+enum CompactSetIter<'a> {
+    Inline(std::slice::Iter<'a, String>),
+    Table(indexmap::set::Iter<'a, String>),
+}
+
+impl<'a> Iterator for CompactSetIter<'a> {
+    type Item = &'a String;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Inline(iter) => iter.next(),
+            Self::Table(iter) => iter.next(),
+        }
     }
 }
 
@@ -461,11 +697,11 @@ impl<'de> Deserialize<'de> for Blob {
 #[derive(Clone)]
 enum EntryValue {
     Str(Blob),
-    Hash(HashMap<String, Blob>),
+    Hash(Box<CompactHash>),
     List(VecDeque<Blob>),
     // IndexSet rather than HashSet: SPOP / SRANDMEMBER need O(1) access to a
     // random member by index, which a hash table cannot provide.
-    Set(IndexSet<String>),
+    Set(Box<CompactSet>),
     ZSet(ZSetInner),
     RateLimiter(RateLimiterInner),
     Json(serde_json::Value),
@@ -884,10 +1120,10 @@ macro_rules! typed_entry {
 
 // ── KeyspaceSample ────────────────────────────────────────────────────────────
 
-/// One pass over the keyspace, as reported to metrics and `INFO`.
+/// Incrementally maintained keyspace totals reported to metrics and `INFO`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct KeyspaceSample {
-    /// Live keys, excluding expired entries awaiting sweep.
+    /// Stored keys. Expired physical entries leave during active expiry.
     pub keys: usize,
     /// Of those, how many carry a TTL (`INFO keyspace` reports it as `expires`).
     pub volatile_keys: usize,
@@ -936,6 +1172,61 @@ pub struct SnapshotEntry {
     pub expires_at_ms: Option<u64>,
 }
 
+#[derive(Default)]
+struct DenseKeys {
+    keys: Vec<String>,
+    positions: HashMap<String, usize>,
+}
+
+impl DenseKeys {
+    fn insert(&mut self, key: &str) {
+        if self.positions.contains_key(key) {
+            return;
+        }
+        let pos = self.keys.len();
+        self.keys.push(key.to_string());
+        self.positions.insert(key.to_string(), pos);
+    }
+
+    fn remove(&mut self, key: &str) {
+        let Some(pos) = self.positions.remove(key) else {
+            return;
+        };
+        self.keys.swap_remove(pos);
+        if let Some(moved) = self.keys.get(pos) {
+            self.positions.insert(moved.clone(), pos);
+        }
+    }
+}
+
+#[derive(Default)]
+struct KeyIndex {
+    ordered: BTreeSet<String>,
+    all: DenseKeys,
+    volatile: DenseKeys,
+}
+
+impl KeyIndex {
+    fn sync(&mut self, key: &str, live_ttl: Option<bool>) {
+        match live_ttl {
+            None => {
+                self.ordered.remove(key);
+                self.all.remove(key);
+                self.volatile.remove(key);
+            }
+            Some(has_ttl) => {
+                self.ordered.insert(key.to_string());
+                self.all.insert(key);
+                if has_ttl {
+                    self.volatile.insert(key);
+                } else {
+                    self.volatile.remove(key);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct KeyValueStore {
     data: Arc<DashMap<String, Entry>>,
@@ -952,27 +1243,26 @@ pub struct KeyValueStore {
     /// Total keys evicted since start. Exported as a metric: without it an
     /// operator cannot tell a healthy cache from one thrashing at its cap.
     evicted: Arc<AtomicU64>,
-    /// Footprint as of the last exact measurement, and the bytes written since.
-    ///
-    /// `max_memory_bytes` used to be enforced only by the background sweep, so
-    /// between two ticks a client could write as much as it liked and the cap
-    /// simply did not apply — while `max_keys`, checked inline on every write,
-    /// did. Measuring exactly on the write path is not an option: it walks the
-    /// whole keyspace. So writes add a cheap upper bound to `untracked_bytes`
-    /// and pay for a real measurement only when the sum suggests the cap is
-    /// near. See `note_write`.
-    measured_memory: Arc<AtomicUsize>,
-    untracked_bytes: Arc<AtomicUsize>,
+    /// Incrementally maintained logical footprint. It is intentionally a
+    /// payload/accounting estimate, not process RSS; reads are O(1) and writes
+    /// update only the keys they touched.
+    memory_bytes: Arc<AtomicUsize>,
+    index: Arc<std::sync::Mutex<KeyIndex>>,
+    scan_cursors: Arc<std::sync::Mutex<HashMap<u64, String>>>,
+    next_scan_cursor: Arc<AtomicU64>,
+    expiry_cursor: Arc<AtomicUsize>,
+    /// Serializes capacity checks only when a key or memory cap is configured.
+    capacity_gate: Arc<std::sync::Mutex<()>>,
 }
 
 /// Fraction of `max_memory_bytes` eviction drops to once the cap is hit,
 /// expressed as the divisor of the overshoot to shed (`limit - limit/16` ≈ 94%).
 ///
 /// Without this headroom the store would sit exactly on the limit and the very
-/// next write would trip the gate again, so every write at the cap would pay
-/// for a full keyspace measurement. Evicting a little below it means the next
-/// measurement is only due after roughly `limit/16` more bytes are written,
-/// which amortises the scan against the writes that made it necessary.
+/// next write would trip the gate again. Evicting a little below it means the
+/// next capacity pass is only due after roughly `limit/16` more bytes are
+/// written, which amortises eviction work against the writes that made it
+/// necessary.
 const EVICTION_HEADROOM_DIVISOR: usize = 16;
 
 impl Default for KeyValueStore {
@@ -991,8 +1281,12 @@ impl KeyValueStore {
             dirty: Arc::new(AtomicU64::new(0)),
             eviction_sample: 10,
             evicted: Arc::new(AtomicU64::new(0)),
-            measured_memory: Arc::new(AtomicUsize::new(0)),
-            untracked_bytes: Arc::new(AtomicUsize::new(0)),
+            memory_bytes: Arc::new(AtomicUsize::new(0)),
+            index: Arc::new(std::sync::Mutex::new(KeyIndex::default())),
+            scan_cursors: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            next_scan_cursor: Arc::new(AtomicU64::new(1)),
+            expiry_cursor: Arc::new(AtomicUsize::new(0)),
+            capacity_gate: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -1005,8 +1299,12 @@ impl KeyValueStore {
             dirty: Arc::new(AtomicU64::new(0)),
             eviction_sample: 10,
             evicted: Arc::new(AtomicU64::new(0)),
-            measured_memory: Arc::new(AtomicUsize::new(0)),
-            untracked_bytes: Arc::new(AtomicUsize::new(0)),
+            memory_bytes: Arc::new(AtomicUsize::new(0)),
+            index: Arc::new(std::sync::Mutex::new(KeyIndex::default())),
+            scan_cursors: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            next_scan_cursor: Arc::new(AtomicU64::new(1)),
+            expiry_cursor: Arc::new(AtomicUsize::new(0)),
+            capacity_gate: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -1023,8 +1321,12 @@ impl KeyValueStore {
             dirty: Arc::new(AtomicU64::new(0)),
             eviction_sample: 10,
             evicted: Arc::new(AtomicU64::new(0)),
-            measured_memory: Arc::new(AtomicUsize::new(0)),
-            untracked_bytes: Arc::new(AtomicUsize::new(0)),
+            memory_bytes: Arc::new(AtomicUsize::new(0)),
+            index: Arc::new(std::sync::Mutex::new(KeyIndex::default())),
+            scan_cursors: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            next_scan_cursor: Arc::new(AtomicU64::new(1)),
+            expiry_cursor: Arc::new(AtomicUsize::new(0)),
+            capacity_gate: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -1045,125 +1347,101 @@ impl KeyValueStore {
         self.dirty.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Approximate heap usage in bytes — key+value sizes plus a fixed overhead per entry.
+    /// Incrementally maintained logical heap usage in bytes.
+    ///
+    /// This is key/value payload plus the fixed overhead used by
+    /// [`entry_size`]. It is O(1) to read and deliberately does not claim to be
+    /// allocator RSS.
     pub fn approximate_memory_bytes(&self) -> usize {
-        let total = self
-            .data
-            .iter()
-            .map(|r| entry_size(r.key(), r.value()))
-            .sum();
-        self.cache_measurement(total);
-        total
+        self.memory_bytes.load(Ordering::Relaxed)
     }
 
-    /// Records an exact measurement so the write-path gate in `note_write` can
-    /// compare against it without walking the keyspace itself.
-    ///
-    /// Writes landing between the walk and this call are dropped from
-    /// `untracked_bytes` and so go uncounted until the next measurement. That
-    /// undercount is bounded by what a few concurrent commands can write, and
-    /// self-corrects — the alternative, holding every shard for the duration of
-    /// the walk, would stall the whole store.
-    fn cache_measurement(&self, total: usize) {
-        self.measured_memory.store(total, Ordering::Relaxed);
-        self.untracked_bytes.store(0, Ordering::Relaxed);
+    fn entry_memory(&self, key: &str) -> usize {
+        self.data
+            .get(key)
+            .map_or(0, |entry| entry_size(key, entry.value()))
     }
 
-    /// Evict entries until memory usage is below `max_memory_bytes`, or the
-    /// eviction policy cannot free any more. Returns true if under limit.
-    ///
-    /// The total is scanned once up front, then maintained incrementally by
-    /// subtracting each evicted entry's measured size. The previous version
-    /// re-scanned the whole keyspace after every single eviction (O(N) per
-    /// eviction → O(N²) overall) — catastrophic under memory pressure. We
-    /// periodically re-scan to correct for drift from concurrent writes.
-    pub fn try_evict_for_memory(&self) -> bool {
-        let limit = match self.max_memory_bytes {
-            Some(l) => l,
-            None => return true,
-        };
-        let now = now_ms();
-        let mut current = self.approximate_memory_bytes();
-        if current <= limit {
-            return true;
+    fn adjust_memory(&self, before: usize, after: usize) {
+        if after >= before {
+            self.memory_bytes
+                .fetch_add(after.saturating_sub(before), Ordering::Relaxed);
+        } else {
+            let removed = before - after;
+            let _ =
+                self.memory_bytes
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                        Some(current.saturating_sub(removed))
+                    });
         }
-        // Shed a little past the cap, so the next write does not immediately
-        // demand another full measurement. See `EVICTION_HEADROOM_DIVISOR`.
+    }
+
+    fn sync_key_metadata(&self, key: &str) {
+        // Keep expired physical entries in the TTL index until the sweeper
+        // removes them. A very short TTL can elapse between mutation and this
+        // bookkeeping step; dropping it here would make it unreachable to the
+        // bounded sweeper and suppress the expiry notification.
+        let live_ttl = self
+            .data
+            .get(key)
+            .map(|entry| entry.expires_at_ms.is_some());
+        self.index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sync(key, live_ttl);
+    }
+
+    fn rebuild_metadata(&self) {
+        let now = now_ms();
+        let mut index = KeyIndex::default();
+        let mut memory = 0usize;
+        for entry in self.data.iter() {
+            if entry.value().is_expired(now) {
+                continue;
+            }
+            index.sync(entry.key(), Some(entry.value().expires_at_ms.is_some()));
+            memory = memory.saturating_add(entry_size(entry.key(), entry.value()));
+        }
+        *self
+            .index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = index;
+        self.memory_bytes.store(memory, Ordering::Relaxed);
+    }
+
+    /// Evict entries until the logical memory estimate is below the configured
+    /// cap, or the selected policy has no eligible victim.
+    pub fn try_evict_for_memory(&self) -> bool {
+        self.try_evict_for_memory_reporting().0
+    }
+
+    /// The maintenance form used by the server. It returns every implicit
+    /// deletion so replication, AOF, browser sync, and watchers can observe the
+    /// same keyspace transition as the local store.
+    pub fn try_evict_for_memory_reporting(&self) -> (bool, Vec<String>) {
+        let _capacity_guard = self
+            .capacity_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut evicted = Vec::new();
+        let within_limit = self.try_evict_for_memory_inner(&mut evicted);
+        (within_limit, evicted)
+    }
+
+    fn try_evict_for_memory_inner(&self, evicted: &mut Vec<String>) -> bool {
+        let Some(limit) = self.max_memory_bytes else {
+            return true;
+        };
         let target = limit - limit / EVICTION_HEADROOM_DIVISOR;
-        let mut since_resync = 0u32;
-        while current > target {
-            match self.evict_one(now) {
-                // Policy can't free anything more.
-                None => break,
-                Some(freed) => {
-                    current = current.saturating_sub(freed);
-                    since_resync += 1;
-                    if since_resync >= 64 {
-                        current = self.approximate_memory_bytes();
-                        since_resync = 0;
-                    }
-                }
+        while self.approximate_memory_bytes() > target {
+            if self.evict_one_reporting(now_ms(), evicted).is_none() {
+                break;
             }
         }
-        self.measured_memory.store(current, Ordering::Relaxed);
-        self.untracked_bytes.store(0, Ordering::Relaxed);
-        current <= limit
+        self.approximate_memory_bytes() <= limit
     }
 
-    /// Records that a write may have added `cost` bytes and evicts if that
-    /// pushes the estimate over `max_memory_bytes`.
-    ///
-    /// The comparison is two relaxed atomic loads and an add — cheap enough for
-    /// every write. Only when it trips is an exact measurement paid for, and
-    /// eviction then drops below the cap by enough that the next few thousand
-    /// writes stay on the cheap path.
-    ///
-    /// `cost` is an upper bound for the commands that carry their payload
-    /// inline. The `*STORE` set commands, whose result size is not knowable
-    /// without doing the work, contribute only their key: they are still caught
-    /// by the background sweep, exactly as everything was before.
-    fn note_write(&self, cost: usize) {
-        if cost == 0 {
-            return;
-        }
-        let Some(limit) = self.max_memory_bytes else {
-            return;
-        };
-        let pending = self.untracked_bytes.fetch_add(cost, Ordering::Relaxed) + cost;
-        if self
-            .measured_memory
-            .load(Ordering::Relaxed)
-            .saturating_add(pending)
-            > limit
-        {
-            self.try_evict_for_memory();
-        }
-    }
-
-    /// Returns the current value of a key for watch push notifications.
-    /// Strings are returned as bulk strings. Complex types return nil — the
-    /// watcher must use a type-specific command (HGETALL, LRANGE, etc.) to
-    /// fetch the full value. Deleted or expired keys also return nil.
-    /// The current value of `key`, as delivered to live-query subscribers.
-    ///
-    /// Strings come back as a bulk string and a missing or expired key as nil.
-    /// Collections come back **type-tagged**: an array whose first element names
-    /// the type, followed by its contents.
-    ///
-    /// ```text
-    /// hash  →  ["hash", field, value, ...]     (HGETALL order)
-    /// list  →  ["list", element, ...]          (head to tail)
-    /// set   →  ["set", member, ...]
-    /// zset  →  ["zset", member, score, ...]    (ascending score)
-    /// json  →  ["json", serialized-document]
-    /// ```
-    ///
-    /// The tag is what makes the payload unambiguous — a four-element array is
-    /// otherwise indistinguishable between a list of four items and a hash of
-    /// two pairs. Earlier versions sent only the type name, which forced every
-    /// subscriber into a follow-up `HGETALL`/`LRANGE` round-trip: exactly the
-    /// network hop local reads exist to avoid.
-    pub fn get_current(&self, key: &str) -> Value {
+    fn encode_current_value(value: &EntryValue) -> Value {
         fn tagged(tag: &str, mut items: Vec<Value>) -> Value {
             let mut out = Vec::with_capacity(items.len() + 1);
             out.push(Value::BulkString(Some(tag.as_bytes().to_vec())));
@@ -1177,43 +1455,55 @@ impl KeyValueStore {
             Value::BulkString(Some(b.as_slice().to_vec()))
         }
 
+        match value {
+            EntryValue::Str(s) => Value::BulkString(Some(s.clone().into_bytes())),
+            EntryValue::Hash(m) => {
+                let mut fields: Vec<(&String, &Blob)> = m.iter().collect();
+                fields.sort_by(|a, b| a.0.cmp(b.0));
+                let items = fields
+                    .into_iter()
+                    .flat_map(|(f, v)| [bulk(f), blob(v)])
+                    .collect();
+                tagged("hash", items)
+            }
+            EntryValue::List(l) => tagged("list", l.iter().map(blob).collect()),
+            EntryValue::Set(st) => tagged("set", st.iter().map(|m| bulk(m)).collect()),
+            EntryValue::ZSet(z) => {
+                let pairs: Vec<(&str, f64)> = z.iter_asc().collect();
+                let items = pairs
+                    .into_iter()
+                    .flat_map(|(m, sc)| [bulk(m), bulk(&format_score(sc))])
+                    .collect();
+                tagged("zset", items)
+            }
+            // Attempt state is transient and server-side; clients have no use
+            // for it and it must not leak into a browser replica.
+            EntryValue::RateLimiter(_) => Value::SimpleString("ratelimit".to_string()),
+            EntryValue::Json(doc) => tagged("json", vec![bulk(&doc.to_string())]),
+        }
+    }
+
+    /// The current value of `key`, as delivered to live-query subscribers.
+    ///
+    /// Strings come back as a bulk string and a missing or expired key as nil.
+    /// Collections come back type-tagged with their complete contents:
+    ///
+    /// ```text
+    /// hash  →  ["hash", field, value, ...]     (HGETALL order)
+    /// list  →  ["list", element, ...]          (head to tail)
+    /// set   →  ["set", member, ...]
+    /// zset  →  ["zset", member, score, ...]    (ascending score)
+    /// json  →  ["json", serialized-document]
+    /// ```
+    pub fn get_current(&self, key: &str) -> Value {
         let now = now_ms();
         match self.data.get(key) {
             None => Value::BulkString(None),
             Some(e) if e.is_expired(now) => Value::BulkString(None),
-            Some(e) => match &e.value {
-                EntryValue::Str(s) => Value::BulkString(Some(s.clone().into_bytes())),
-                EntryValue::Hash(m) => {
-                    let mut fields: Vec<(&String, &Blob)> = m.iter().collect();
-                    fields.sort_by(|a, b| a.0.cmp(b.0));
-                    let items = fields
-                        .into_iter()
-                        .flat_map(|(f, v)| [bulk(f), blob(v)])
-                        .collect();
-                    tagged("hash", items)
-                }
-                EntryValue::List(l) => tagged("list", l.iter().map(blob).collect()),
-                EntryValue::Set(st) => tagged("set", st.iter().map(|m| bulk(m)).collect()),
-                EntryValue::ZSet(z) => {
-                    let pairs: Vec<(&str, f64)> = z.iter_asc().collect();
-                    let items = pairs
-                        .into_iter()
-                        .flat_map(|(m, sc)| [bulk(m), bulk(&format_score(sc))])
-                        .collect();
-                    tagged("zset", items)
-                }
-                // Attempt state is transient and server-side; clients have no
-                // use for it and it must not leak into a browser replica.
-                EntryValue::RateLimiter(_) => Value::SimpleString("ratelimit".to_string()),
-                EntryValue::Json(doc) => tagged("json", vec![bulk(&doc.to_string())]),
-            },
+            Some(e) => Self::encode_current_value(&e.value),
         }
     }
 
-    /// Current state of every live key matching the glob pattern, in
-    /// `get_current` form (strings in full; collection types as type-name
-    /// markers), capped at `limit` entries. Backs live-query (QSUB) initial
-    /// state.
     /// Every live key matching `pattern`, without materialising its value.
     ///
     /// `matching_key_values` clones each value, which is wasted work for a
@@ -1228,72 +1518,94 @@ impl KeyValueStore {
             .collect()
     }
 
+    /// Current state of every live key matching the glob pattern, in
+    /// `get_current` form (strings in full; collections type-tagged with their
+    /// complete contents), capped at `limit` entries. Backs QSUB initial state.
     pub fn matching_key_values(&self, pattern: &str, limit: usize) -> Vec<(String, Value)> {
         let now = now_ms();
         self.data
             .iter()
             .filter(|e| !e.is_expired(now) && glob_match(pattern, e.key()))
             .take(limit)
-            .map(|e| {
-                let value = match &e.value {
-                    EntryValue::Str(s) => Value::BulkString(Some(s.clone().into_bytes())),
-                    EntryValue::Hash(_) => Value::SimpleString("hash".to_string()),
-                    EntryValue::List(_) => Value::SimpleString("list".to_string()),
-                    EntryValue::Set(_) => Value::SimpleString("set".to_string()),
-                    EntryValue::ZSet(_) => Value::SimpleString("zset".to_string()),
-                    EntryValue::RateLimiter(_) => Value::SimpleString("ratelimit".to_string()),
-                    EntryValue::Json(_) => Value::SimpleString("json".to_string()),
-                };
-                (e.key().clone(), value)
-            })
+            .map(|e| (e.key().clone(), Self::encode_current_value(&e.value)))
             .collect()
     }
 
-    /// Drop every expired entry.
+    /// Number of physical keys carrying a TTL.
     ///
-    /// Reads only *mask* an expired entry, so this sweep is the only thing
-    /// that ever removes one. Use [`sweep_expired_reporting`] when the caller
-    /// needs to know *which* keys went.
-    ///
-    /// [`sweep_expired_reporting`]: Self::sweep_expired_reporting
-    pub fn sweep_expired(&self) {
-        let now = now_ms();
-        self.data.retain(|_, e| !e.is_expired(now));
+    /// The server uses this cheap index read to avoid taking its global write
+    /// barrier on maintenance ticks when active expiry has no possible work.
+    pub fn volatile_key_count(&self) -> usize {
+        self.index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .volatile
+            .keys
+            .len()
     }
 
-    /// Drop every expired entry, naming the keys removed.
-    ///
-    /// Expiry is the one removal no client asked for, so it is also the one a
-    /// caller replicating the keyspace cannot learn about any other way: no
-    /// command ran, so no keychange was ever emitted, and the key would
-    /// survive in every replica with its last value forever.
-    ///
-    /// Separate from [`sweep_expired`] rather than a return value it can
-    /// ignore, because cloning every expired key name is real work on a
-    /// TTL-heavy cache and a node with nothing watching should not pay it.
-    /// Call this only when something is listening.
-    ///
-    /// [`sweep_expired`]: Self::sweep_expired
+    /// Drop every expired volatile entry. This full form is retained for
+    /// embedders and explicit maintenance; servers should use the bounded form.
+    pub fn sweep_expired(&self) {
+        self.sweep_expired_reporting();
+    }
+
+    /// Drop every currently expired volatile entry and return its key names.
     pub fn sweep_expired_reporting(&self) -> Vec<String> {
+        let keys = self
+            .index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .volatile
+            .keys
+            .clone();
+        self.remove_expired_candidates(keys)
+    }
+
+    /// Inspect at most `limit` volatile keys and remove the expired ones.
+    /// Cursoring through the dense TTL index bounds each server tick while
+    /// still eventually visiting the complete volatile keyspace.
+    pub fn sweep_expired_reporting_budget(&self, limit: usize) -> Vec<String> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let keys = {
+            let index = self
+                .index
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let len = index.volatile.keys.len();
+            if len == 0 {
+                return Vec::new();
+            }
+            let start = self.expiry_cursor.fetch_add(limit, Ordering::Relaxed) % len;
+            let take = limit.min(len);
+            (0..take)
+                .map(|offset| index.volatile.keys[(start + offset) % len].clone())
+                .collect()
+        };
+        self.remove_expired_candidates(keys)
+    }
+
+    fn remove_expired_candidates(&self, keys: Vec<String>) -> Vec<String> {
         let now = now_ms();
         let mut removed = Vec::new();
-        self.data.retain(|key, e| {
-            if e.is_expired(now) {
-                removed.push(key.clone());
-                false
-            } else {
-                true
+        for key in keys {
+            if let Some((removed_key, entry)) =
+                self.data.remove_if(&key, |_, entry| entry.is_expired(now))
+            {
+                let bytes = entry_size(&removed_key, &entry);
+                self.adjust_memory(bytes, 0);
+                removed.push(removed_key);
             }
-        });
+            // Re-read current state: a concurrent replacement may have landed
+            // between removal and bookkeeping.
+            self.sync_key_metadata(&key);
+        }
         removed
     }
 
-    /// Evict a single entry per the configured policy. Returns the number of
-    /// bytes freed (`Some`), or `None` if nothing could be evicted.
     /// Set how many keys each eviction pass samples (default 10, minimum 1).
-    ///
-    /// A larger sample approximates true LRU/TTL ordering more closely at the
-    /// cost of more work per eviction.
     pub fn set_eviction_sample(&mut self, sample: usize) {
         self.eviction_sample = sample.max(1);
     }
@@ -1318,119 +1630,109 @@ impl KeyValueStore {
         self.eviction_policy
     }
 
-    /// Live key count, excluding expired entries awaiting sweep.
+    /// Whether a write may choose and remove an unrelated capacity victim.
+    /// The server uses this to reserve every ordering stripe for capped stores.
+    pub fn has_capacity_limits(&self) -> bool {
+        self.max_keys.is_some() || self.max_memory_bytes.is_some()
+    }
+
+    /// O(1) stored-key count maintained with the key index. Expired physical
+    /// entries remain counted until the bounded active-expiry task removes them.
     pub fn key_count(&self) -> usize {
-        let now = now_ms();
-        self.data
-            .iter()
-            .filter(|r| !r.value().is_expired(now))
-            .count()
+        self.index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .all
+            .keys
+            .len()
     }
 
-    /// Live keys, keys carrying a TTL, and approximate bytes — in one pass.
-    ///
-    /// `key_count()` and `approximate_memory_bytes()` each walk the whole
-    /// keyspace. Callers that want more than one of these numbers (the metrics
-    /// sampler, `INFO`) would otherwise pay that walk two or three times over.
+    /// O(1) keyspace counters and logical-memory estimate for INFO/metrics.
+    /// Expired physical entries leave these counters during active expiry.
     pub fn keyspace_sample(&self) -> KeyspaceSample {
-        let now = now_ms();
-        let mut sample = KeyspaceSample::default();
-        for r in self.data.iter() {
-            if r.value().is_expired(now) {
-                continue;
-            }
-            sample.keys += 1;
-            if r.value().expires_at_ms.is_some() {
-                sample.volatile_keys += 1;
-            }
-            sample.memory_bytes += entry_size(r.key(), r.value());
+        let index = self
+            .index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        KeyspaceSample {
+            keys: index.all.keys.len(),
+            volatile_keys: index.volatile.keys.len(),
+            memory_bytes: self.approximate_memory_bytes(),
         }
-        // This walk is exact, so the write-path gate may as well benefit from
-        // it — the metrics sampler runs it every few seconds anyway.
-        self.cache_measurement(sample.memory_bytes);
-        sample
     }
 
-    /// Reservoir-samples up to `want` eligible keys and returns the one with the
-    /// lowest weight — the victim for one eviction.
-    ///
-    /// `weight` doubles as the eligibility test: `None` skips the entry.
-    ///
-    /// Only keys that actually land in the reservoir are cloned, so a pass costs
-    /// about `want + want·ln(n/want)` allocations. The previous version mapped
-    /// `key().clone()` across the whole iterator before handing it to
-    /// `choose_multiple`, and because `choose_multiple` is itself a reservoir
-    /// sampler it drains that iterator to the end: evicting one key from a
-    /// million-key store allocated and dropped a million `String`s, and
-    /// `try_evict_for_memory` calls this in a loop until it is under the limit.
-    ///
-    /// The walk over the keyspace is still O(n) — DashMap offers no random
-    /// access — but it is now a pointer walk rather than a million allocations.
-    fn sample_min_by_weight<F>(
-        &self,
-        rng: &mut impl Rng,
-        want: usize,
-        mut weight: F,
-    ) -> Option<String>
-    where
-        F: FnMut(&Entry) -> Option<u64>,
-    {
-        if want == 0 {
+    fn indexed_candidates(&self, volatile_only: bool, want: usize) -> Vec<String> {
+        let index = self
+            .index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source = if volatile_only {
+            &index.volatile.keys
+        } else {
+            &index.all.keys
+        };
+        if source.is_empty() || want == 0 {
+            return Vec::new();
+        }
+        let mut rng = rand::rng();
+        let take = want.min(source.len());
+        let mut positions = BTreeSet::new();
+        while positions.len() < take {
+            positions.insert(rng.random_range(0..source.len()));
+        }
+        positions
+            .into_iter()
+            .map(|position| source[position].clone())
+            .collect()
+    }
+
+    /// Choose one victim from a bounded random sample. Candidate acquisition
+    /// is O(sample), independent of total key count.
+    fn evict_one_reporting(&self, now: u64, evicted: &mut Vec<String>) -> Option<usize> {
+        let volatile = matches!(
+            self.eviction_policy,
+            EvictionPolicy::VolatileLru | EvictionPolicy::VolatileTtl
+        );
+        let want = if self.eviction_policy == EvictionPolicy::AllKeysRandom {
+            1
+        } else {
+            self.eviction_sample
+        };
+        if self.eviction_policy == EvictionPolicy::NoEviction {
             return None;
         }
-        let mut reservoir: Vec<(String, u64)> = Vec::with_capacity(want);
-        let mut seen = 0usize;
-        for r in self.data.iter() {
-            let Some(w) = weight(r.value()) else { continue };
-            if reservoir.len() < want {
-                reservoir.push((r.key().clone(), w));
-            } else {
-                // Algorithm R: the eligible entry at 0-based index `seen`
-                // displaces a uniformly chosen slot with probability
-                // `want / (seen + 1)`, which leaves every entry equally likely
-                // to be in the reservoir at the end of the walk.
-                let j = rng.random_range(0..=seen);
-                if j < want {
-                    reservoir[j] = (r.key().clone(), w);
-                }
-            }
-            seen += 1;
-        }
-        reservoir
+        let candidates = self.indexed_candidates(volatile, want);
+        let chosen = candidates
             .into_iter()
-            .min_by_key(|(_, w)| *w)
-            .map(|(k, _)| k)
+            .filter_map(|key| {
+                let entry = self.data.get(&key)?;
+                if entry.is_expired(now) {
+                    return Some((key, 0));
+                }
+                let weight = match self.eviction_policy {
+                    EvictionPolicy::AllKeysRandom => 0,
+                    EvictionPolicy::AllKeysLru | EvictionPolicy::VolatileLru => {
+                        entry.last_access_ms.load(Ordering::Relaxed)
+                    }
+                    EvictionPolicy::VolatileTtl => entry.expires_at_ms?,
+                    EvictionPolicy::NoEviction => return None,
+                };
+                Some((key, weight))
+            })
+            .min_by_key(|(_, weight)| *weight)
+            .map(|(key, _)| key)?;
+        let (removed_key, entry) = self.data.remove(&chosen)?;
+        let freed = entry_size(&removed_key, &entry);
+        self.adjust_memory(freed, 0);
+        self.sync_key_metadata(&removed_key);
+        self.evicted.fetch_add(1, Ordering::Relaxed);
+        evicted.push(removed_key);
+        Some(freed)
     }
 
+    #[cfg(test)]
     fn evict_one(&self, now: u64) -> Option<usize> {
-        let want = self.eviction_sample;
-        let mut rng = rand::rng();
-        let chosen: Option<String> = match self.eviction_policy {
-            EvictionPolicy::NoEviction => None,
-            EvictionPolicy::AllKeysLru => self.sample_min_by_weight(&mut rng, want, |e| {
-                Some(e.last_access_ms.load(Ordering::Relaxed))
-            }),
-            // Every key carries the same weight, so a reservoir of one already
-            // is the uniform pick — no need to sample more and then choose.
-            EvictionPolicy::AllKeysRandom => self.sample_min_by_weight(&mut rng, 1, |_| Some(0)),
-            EvictionPolicy::VolatileLru => self.sample_min_by_weight(&mut rng, want, |e| {
-                (e.expires_at_ms.is_some() && !e.is_expired(now))
-                    .then(|| e.last_access_ms.load(Ordering::Relaxed))
-            }),
-            EvictionPolicy::VolatileTtl => self.sample_min_by_weight(&mut rng, want, |e| {
-                let exp = e.expires_at_ms?;
-                (!e.is_expired(now)).then_some(exp)
-            }),
-        };
-        let key = chosen?;
-        // Treat a lost race (key already gone) as a successful eviction that
-        // freed nothing, so callers don't spin.
-        let freed = self
-            .data
-            .remove(&key)
-            .map_or(0, |(k, e)| entry_size(&k, &e));
-        self.evicted.fetch_add(1, Ordering::Relaxed);
-        Some(freed)
+        self.evict_one_reporting(now, &mut Vec::new())
     }
 
     pub fn snapshot(&self) -> Vec<SnapshotEntry> {
@@ -1441,7 +1743,7 @@ impl KeyValueStore {
             .map(|e| {
                 let value = match &e.value {
                     EntryValue::Str(s) => SnapshotValue::Str(s.clone()),
-                    EntryValue::Hash(m) => SnapshotValue::Hash(m.clone()),
+                    EntryValue::Hash(m) => SnapshotValue::Hash(m.to_map()),
                     EntryValue::List(l) => SnapshotValue::List(l.iter().cloned().collect()),
                     EntryValue::Set(s) => SnapshotValue::Set(s.iter().cloned().collect()),
                     EntryValue::ZSet(z) => {
@@ -1479,9 +1781,9 @@ impl KeyValueStore {
             }
             let value = match e.value {
                 SnapshotValue::Str(s) => EntryValue::Str(s),
-                SnapshotValue::Hash(m) => EntryValue::Hash(m),
+                SnapshotValue::Hash(m) => EntryValue::Hash(Box::new(CompactHash::from_map(m))),
                 SnapshotValue::List(l) => EntryValue::List(l.into_iter().collect()),
-                SnapshotValue::Set(s) => EntryValue::Set(s.into_iter().collect()),
+                SnapshotValue::Set(s) => EntryValue::Set(Box::new(s.into_iter().collect())),
                 SnapshotValue::ZSet(pairs) => EntryValue::ZSet(ZSetInner::from_pairs(pairs)),
                 SnapshotValue::RateLimiter {
                     limit,
@@ -1508,27 +1810,84 @@ impl KeyValueStore {
                 },
             );
         }
+        self.rebuild_metadata();
     }
 
-    /// Runs one command.
+    /// Replace the complete keyspace with a full-sync snapshot.
     ///
-    /// Wraps the private `execute_inner` so that `max_memory_bytes` is
-    /// enforced here, on the write path, and not only by the background sweep.
-    pub fn execute(&self, cmd: Command) -> Value {
-        let cost = write_cost(&cmd);
-        let out = self.execute_inner(cmd);
-        self.note_write(cost);
-        out
+    /// Replication reconnects must not overlay a primary snapshot onto stale
+    /// local keys: keys deleted while disconnected would otherwise survive.
+    pub fn replace(&self, entries: Vec<SnapshotEntry>) {
+        self.data.clear();
+        self.memory_bytes.store(0, Ordering::Relaxed);
+        *self
+            .index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = KeyIndex::default();
+        self.restore(entries);
     }
 
-    fn execute_inner(&self, cmd: Command) -> Value {
+    /// Runs one command and discards any implicit capacity-eviction details.
+    pub fn execute(&self, cmd: Command) -> Value {
+        self.execute_reporting(cmd).0
+    }
+
+    /// Runs one command and returns the keys removed implicitly by capacity
+    /// eviction. Server transports propagate these deletions as ordered DELs.
+    pub fn execute_reporting(&self, cmd: Command) -> (Value, Vec<String>) {
+        let scope = mutation_scope(&cmd);
+        let mut evicted = Vec::new();
+        if matches!(scope, MutationScope::ReadOnly) {
+            return (self.execute_inner(cmd, &mut evicted), evicted);
+        }
+
+        // Capacity checks and eviction choose across keys, so capped stores use
+        // one short synchronous gate. Uncapped stores retain DashMap's normal
+        // per-shard concurrency.
+        let _capacity_guard = self.has_capacity_limits().then(|| {
+            self.capacity_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
+
+        let out = match scope {
+            MutationScope::ReadOnly => unreachable!(),
+            MutationScope::All => {
+                let out = self.execute_inner(cmd, &mut evicted);
+                self.rebuild_metadata();
+                if self.max_memory_bytes.is_some() {
+                    self.try_evict_for_memory_inner(&mut evicted);
+                }
+                out
+            }
+            MutationScope::Keys(mut keys) => {
+                keys.sort_unstable();
+                keys.dedup();
+                let before = keys.iter().map(|key| self.entry_memory(key)).sum();
+                let out = self.execute_inner(cmd, &mut evicted);
+                let after = keys.iter().map(|key| self.entry_memory(key)).sum();
+                self.adjust_memory(before, after);
+                for key in &keys {
+                    self.sync_key_metadata(key);
+                }
+                if self.max_memory_bytes.is_some() {
+                    self.try_evict_for_memory_inner(&mut evicted);
+                }
+                out
+            }
+        };
+        (out, evicted)
+    }
+
+    fn execute_inner(&self, cmd: Command, evicted: &mut Vec<String>) -> Value {
         match cmd {
             // Ephemeral keys are ordinary strings to the engine — their lifetime
             // is enforced by the server, which is the layer that knows about
             // connections. Keeping the engine unaware keeps it I/O-free.
-            Command::ESet(key, value) => {
-                self.execute(Command::Set(key, value, crate::cmd::SetOptions::default()))
-            }
+            Command::ESet(key, value) => self.execute_inner(
+                Command::Set(key, value, crate::cmd::SetOptions::default()),
+                evicted,
+            ),
 
             // ── Core ─────────────────────────────────────────────────────────
             Command::Ping(msg) => match msg {
@@ -1572,75 +1931,96 @@ impl KeyValueStore {
             // ── Strings ───────────────────────────────────────────────────────
             Command::Set(key, val, opts) => {
                 let now = now_ms();
-
-                let (key_exists, existing_str, existing_ttl, wrongtype) = {
-                    match self.data.get(&key) {
-                        None => (false, None, None, false),
-                        Some(e) if e.is_expired(now) => (false, None, None, false),
-                        Some(e) => match &e.value {
-                            EntryValue::Str(s) => (true, Some(s.clone()), e.expires_at_ms, false),
-                            _ => (true, None, e.expires_at_ms, opts.get),
-                        },
-                    }
-                };
-
-                if wrongtype {
-                    return Value::Error(WRONGTYPE.to_string());
-                }
-
-                let condition_met = match &opts.condition {
-                    Some(SetCondition::Nx) => !key_exists,
-                    Some(SetCondition::Xx) => key_exists,
-                    None => true,
-                };
-
-                if !condition_met {
-                    return if opts.get {
-                        existing_str
-                            .map(|v| Value::BulkString(Some(v.into_bytes())))
-                            .unwrap_or(Value::BulkString(None))
-                    } else {
-                        Value::BulkString(None)
-                    };
-                }
-
                 if let Some(max) = self.max_keys
                     && self.data.len() >= max
                     && !self.data.contains_key(&key)
-                    && self.evict_one(now).is_none()
+                    && self.evict_one_reporting(now, evicted).is_none()
                 {
                     return Value::Error("ERR max keys limit reached".to_string());
                 }
 
-                let expires_at_ms = match &opts.expiry {
-                    None => None,
-                    Some(SetExpiry::Ex(s)) => {
-                        if *s > u64::MAX / 1000 {
-                            return Value::Error("ERR TTL overflow".to_string());
+                let expiry = |existing_ttl: Option<u64>| -> Result<Option<u64>, Value> {
+                    match &opts.expiry {
+                        None => Ok(None),
+                        Some(SetExpiry::Ex(seconds)) => {
+                            if *seconds > u64::MAX / 1000 {
+                                return Err(Value::Error("ERR TTL overflow".to_string()));
+                            }
+                            Ok(Some(now.saturating_add(seconds * 1000)))
                         }
-                        Some(now.saturating_add(s * 1000))
+                        Some(SetExpiry::Px(ms)) => Ok(Some(now.saturating_add(*ms))),
+                        Some(SetExpiry::Exat(seconds)) => Ok(Some(seconds.saturating_mul(1000))),
+                        Some(SetExpiry::Pxat(ms)) => Ok(Some(*ms)),
+                        Some(SetExpiry::KeepTtl) => Ok(existing_ttl),
                     }
-                    Some(SetExpiry::Px(ms)) => Some(now.saturating_add(*ms)),
-                    Some(SetExpiry::Exat(ts)) => Some(ts.saturating_mul(1000)),
-                    Some(SetExpiry::Pxat(ts_ms)) => Some(*ts_ms),
-                    Some(SetExpiry::KeepTtl) => existing_ttl,
                 };
 
-                self.data.insert(
-                    key,
-                    Entry {
-                        value: EntryValue::Str(val.into()),
-                        expires_at_ms,
-                        last_access_ms: AtomicU64::new(now),
-                    },
-                );
-
-                if opts.get {
-                    existing_str
-                        .map(|v| Value::BulkString(Some(v.into_bytes())))
-                        .unwrap_or(Value::BulkString(None))
-                } else {
-                    Value::SimpleString("OK".to_string())
+                // The condition check, optional old-value read, and replacement
+                // all happen under one DashMap entry guard. Two concurrent NX
+                // writers can therefore never both succeed.
+                match self.data.entry(key) {
+                    DashEntry::Occupied(mut occupied) => {
+                        let live = !occupied.get().is_expired(now);
+                        let existing_ttl = live.then_some(occupied.get().expires_at_ms).flatten();
+                        let existing_str = if live {
+                            match &occupied.get().value {
+                                EntryValue::Str(value) => Some(value.clone()),
+                                _ if opts.get => return Value::Error(WRONGTYPE.to_string()),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        let condition_met = match opts.condition {
+                            Some(SetCondition::Nx) => !live,
+                            Some(SetCondition::Xx) => live,
+                            None => true,
+                        };
+                        if !condition_met {
+                            return if opts.get {
+                                existing_str
+                                    .map(|value| Value::BulkString(Some(value.into_bytes())))
+                                    .unwrap_or(Value::BulkString(None))
+                            } else {
+                                Value::BulkString(None)
+                            };
+                        }
+                        let expires_at_ms = match expiry(existing_ttl) {
+                            Ok(expiry) => expiry,
+                            Err(error) => return error,
+                        };
+                        occupied.insert(Entry {
+                            value: EntryValue::Str(val.into()),
+                            expires_at_ms,
+                            last_access_ms: AtomicU64::new(now),
+                        });
+                        if opts.get {
+                            existing_str
+                                .map(|value| Value::BulkString(Some(value.into_bytes())))
+                                .unwrap_or(Value::BulkString(None))
+                        } else {
+                            Value::SimpleString("OK".to_string())
+                        }
+                    }
+                    DashEntry::Vacant(vacant) => {
+                        if matches!(opts.condition, Some(SetCondition::Xx)) {
+                            return Value::BulkString(None);
+                        }
+                        let expires_at_ms = match expiry(None) {
+                            Ok(expiry) => expiry,
+                            Err(error) => return error,
+                        };
+                        vacant.insert(Entry {
+                            value: EntryValue::Str(val.into()),
+                            expires_at_ms,
+                            last_access_ms: AtomicU64::new(now),
+                        });
+                        if opts.get {
+                            Value::BulkString(None)
+                        } else {
+                            Value::SimpleString("OK".to_string())
+                        }
+                    }
                 }
             }
 
@@ -1772,7 +2152,7 @@ impl KeyValueStore {
                     if new_count > available {
                         let needed = new_count - available;
                         for _ in 0..needed {
-                            if self.evict_one(now).is_none() {
+                            if self.evict_one_reporting(now, evicted).is_none() {
                                 return Value::Error("ERR max keys limit reached".to_string());
                             }
                         }
@@ -1786,19 +2166,24 @@ impl KeyValueStore {
 
             Command::SetNx(key, val) => {
                 let now = now_ms();
-                let exists = self.data.get(&key).is_some_and(|e| !e.is_expired(now));
-                if exists {
-                    return Value::Integer(0);
-                }
                 if let Some(max) = self.max_keys
                     && self.data.len() >= max
                     && !self.data.contains_key(&key)
-                    && self.evict_one(now).is_none()
+                    && self.evict_one_reporting(now, evicted).is_none()
                 {
                     return Value::Error("ERR max keys limit reached".to_string());
                 }
-                self.data.insert(key, Entry::new_str(val));
-                Value::Integer(1)
+                match self.data.entry(key) {
+                    DashEntry::Vacant(vacant) => {
+                        vacant.insert(Entry::new_str(val));
+                        Value::Integer(1)
+                    }
+                    DashEntry::Occupied(mut occupied) if occupied.get().is_expired(now) => {
+                        occupied.insert(Entry::new_str(val));
+                        Value::Integer(1)
+                    }
+                    DashEntry::Occupied(_) => Value::Integer(0),
+                }
             }
 
             Command::SetEx(key, secs, val) => {
@@ -1807,7 +2192,7 @@ impl KeyValueStore {
                 if let Some(max) = self.max_keys
                     && self.data.len() >= max
                     && !self.data.contains_key(&key)
-                    && self.evict_one(now).is_none()
+                    && self.evict_one_reporting(now, evicted).is_none()
                 {
                     return Value::Error("ERR max keys limit reached".to_string());
                 }
@@ -1821,7 +2206,7 @@ impl KeyValueStore {
                 if let Some(max) = self.max_keys
                     && self.data.len() >= max
                     && !self.data.contains_key(&key)
-                    && self.evict_one(now).is_none()
+                    && self.evict_one_reporting(now, evicted).is_none()
                 {
                     return Value::Error("ERR max keys limit reached".to_string());
                 }
@@ -1927,49 +2312,80 @@ impl KeyValueStore {
             }
 
             Command::Scan(cursor, pattern, count) => {
-                let now = now_ms();
-                let pat = pattern.as_deref().unwrap_or("*");
-                let batch = count.unwrap_or(10).max(1);
-                // Sort for a stable order so the numeric cursor is a meaningful
-                // offset across calls and COUNT actually paginates. This is
-                // O(N log N) per call (like KEYS), but each reply is bounded to
-                // `batch` keys instead of dumping the whole keyspace at once.
-                // As with Redis, concurrent inserts/deletes between calls may
-                // cause a key to be skipped or returned twice.
-                let mut all: Vec<String> = self
-                    .data
-                    .iter()
-                    .filter(|r| !r.value().is_expired(now) && glob_match(pat, r.key()))
-                    .map(|r| r.key().clone())
-                    .collect();
-                all.sort_unstable();
-                let start = cursor as usize;
-                let end = start.saturating_add(batch).min(all.len());
-                let page: &[String] = if start < all.len() {
-                    &all[start..end]
+                let last_key = if cursor == 0 {
+                    None
                 } else {
-                    &[]
+                    self.scan_cursors
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&cursor)
                 };
-                let next_cursor = if end >= all.len() { 0 } else { end as u64 };
-                let out: Vec<Value> = page
-                    .iter()
-                    .map(|k| Value::BulkString(Some(k.as_bytes().to_vec())))
+                if cursor != 0 && last_key.is_none() {
+                    return empty_scan();
+                }
+
+                let batch = count.unwrap_or(10).max(1);
+                let mut candidates: Vec<String> = {
+                    let index = self
+                        .index
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    match last_key {
+                        Some(ref key) => index
+                            .ordered
+                            .range::<String, _>((
+                                std::ops::Bound::Excluded(key),
+                                std::ops::Bound::Unbounded,
+                            ))
+                            .take(batch.saturating_add(1))
+                            .cloned()
+                            .collect(),
+                        None => index
+                            .ordered
+                            .iter()
+                            .take(batch.saturating_add(1))
+                            .cloned()
+                            .collect(),
+                    }
+                };
+                let has_more = candidates.len() > batch;
+                if has_more {
+                    candidates.truncate(batch);
+                }
+                let next_cursor = if has_more {
+                    let token = self.next_scan_cursor.fetch_add(1, Ordering::Relaxed).max(1);
+                    let last = candidates.last().cloned().unwrap_or_default();
+                    let mut cursors = self
+                        .scan_cursors
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if cursors.len() >= 4096
+                        && let Some(oldest) = cursors.keys().next().copied()
+                    {
+                        cursors.remove(&oldest);
+                    }
+                    cursors.insert(token, last);
+                    token
+                } else {
+                    0
+                };
+                let now = now_ms();
+                let pattern = pattern.as_deref().unwrap_or("*");
+                let values = candidates
+                    .into_iter()
+                    .filter(|key| {
+                        glob_match(pattern, key)
+                            && self
+                                .data
+                                .get(key)
+                                .is_some_and(|entry| !entry.is_expired(now))
+                    })
+                    .map(|key| Value::BulkString(Some(key.into_bytes())))
                     .collect();
-                Value::Array(Some(vec![
-                    Value::BulkString(Some(next_cursor.to_string().into_bytes())),
-                    Value::Array(Some(out)),
-                ]))
+                scan_reply(next_cursor, values)
             }
 
-            Command::DbSize => {
-                let now = now_ms();
-                Value::Integer(
-                    self.data
-                        .iter()
-                        .filter(|r| !r.value().is_expired(now))
-                        .count() as i64,
-                )
-            }
+            Command::DbSize => Value::Integer(self.key_count() as i64),
 
             Command::FlushDb => {
                 self.data.clear();
@@ -2021,7 +2437,7 @@ impl KeyValueStore {
                     key,
                     now,
                     EntryValue::Hash,
-                    HashMap::new()
+                    Box::new(CompactHash::new())
                 );
                 let new_count = pairs
                     .iter()
@@ -2100,7 +2516,8 @@ impl KeyValueStore {
                     Some(e) if e.is_expired(now) => Value::Array(Some(vec![])),
                     Some(e) => match &e.value {
                         EntryValue::Hash(h) => {
-                            let mut keys: Vec<&str> = h.keys().map(|s| s.as_str()).collect();
+                            let mut keys: Vec<&str> =
+                                h.iter().map(|(field, _)| field.as_str()).collect();
                             keys.sort_unstable();
                             Value::Array(Some(
                                 keys.into_iter()
@@ -2210,14 +2627,13 @@ impl KeyValueStore {
                     key,
                     now,
                     EntryValue::Hash,
-                    HashMap::new()
+                    Box::new(CompactHash::new())
                 );
-                if let std::collections::hash_map::Entry::Vacant(e) = h.entry(field) {
-                    e.insert(val.into());
-                    Value::Integer(1)
+                Value::Integer(if h.insert_if_absent(field, val.into()) {
+                    1
                 } else {
-                    Value::Integer(0)
-                }
+                    0
+                })
             }
 
             Command::HMGet(key, fields) => {
@@ -2518,7 +2934,7 @@ impl KeyValueStore {
                     key,
                     now,
                     EntryValue::Set,
-                    IndexSet::new()
+                    Box::new(CompactSet::new())
                 );
                 let added = members
                     .into_iter()
@@ -2657,7 +3073,7 @@ impl KeyValueStore {
                 self.data.insert(
                     dst,
                     Entry {
-                        value: EntryValue::Set(result),
+                        value: EntryValue::Set(Box::new(CompactSet::from_index_set(result))),
                         expires_at_ms: None,
                         last_access_ms: AtomicU64::new(now_ms()),
                     },
@@ -2685,7 +3101,7 @@ impl KeyValueStore {
                 self.data.insert(
                     dst,
                     Entry {
-                        value: EntryValue::Set(result),
+                        value: EntryValue::Set(Box::new(CompactSet::from_index_set(result))),
                         expires_at_ms: None,
                         last_access_ms: AtomicU64::new(now_ms()),
                     },
@@ -2713,7 +3129,7 @@ impl KeyValueStore {
                 self.data.insert(
                     dst,
                     Entry {
-                        value: EntryValue::Set(result),
+                        value: EntryValue::Set(Box::new(CompactSet::from_index_set(result))),
                         expires_at_ms: None,
                         last_access_ms: AtomicU64::new(now_ms()),
                     },
@@ -2738,7 +3154,7 @@ impl KeyValueStore {
                             // swap_remove_index is O(1), so popping k members costs
                             // O(k) regardless of set size.
                             let popped: Vec<String> = if n >= s.len() as u64 {
-                                s.drain(..).collect()
+                                s.drain_all()
                             } else {
                                 // `n < s.len()` here, so the narrowing is exact.
                                 (0..n as usize)
@@ -2787,7 +3203,12 @@ impl KeyValueStore {
                                 }
                                 let mut rng = rand::rng();
                                 let idx = rng.random_range(0..s.len());
-                                Value::BulkString(Some(s[idx].as_bytes().to_vec()))
+                                Value::BulkString(Some(
+                                    s.get_index(idx)
+                                        .expect("index in range")
+                                        .as_bytes()
+                                        .to_vec(),
+                                ))
                             }
                             Some(n) if n >= 0 => {
                                 // Positive count: up to n *distinct* random members.
@@ -2799,7 +3220,14 @@ impl KeyValueStore {
                                 let idxs = rand::seq::index::sample(&mut rng, s.len(), amount);
                                 Value::Array(Some(
                                     idxs.iter()
-                                        .map(|i| Value::BulkString(Some(s[i].as_bytes().to_vec())))
+                                        .map(|i| {
+                                            Value::BulkString(Some(
+                                                s.get_index(i)
+                                                    .expect("index in range")
+                                                    .as_bytes()
+                                                    .to_vec(),
+                                            ))
+                                        })
                                         .collect(),
                                 ))
                             }
@@ -2820,7 +3248,12 @@ impl KeyValueStore {
                                     (0..abs)
                                         .map(|_| {
                                             let idx = rng.random_range(0..s.len());
-                                            Value::BulkString(Some(s[idx].as_bytes().to_vec()))
+                                            Value::BulkString(Some(
+                                                s.get_index(idx)
+                                                    .expect("index in range")
+                                                    .as_bytes()
+                                                    .to_vec(),
+                                            ))
                                         })
                                         .collect(),
                                 ))
@@ -2867,12 +3300,12 @@ impl KeyValueStore {
                 // between, after which the member was silently dropped and the
                 // reply still claimed a successful move.
                 let mut dst_entry = self.data.entry(dst).or_insert_with(|| Entry {
-                    value: EntryValue::Set(IndexSet::new()),
+                    value: EntryValue::Set(Box::new(CompactSet::new())),
                     expires_at_ms: None,
                     last_access_ms: AtomicU64::new(now),
                 });
                 if dst_entry.is_expired(now) {
-                    dst_entry.value = EntryValue::Set(IndexSet::new());
+                    dst_entry.value = EntryValue::Set(Box::new(CompactSet::new()));
                     dst_entry.expires_at_ms = None;
                 }
                 if let EntryValue::Set(s) = &mut dst_entry.value {
@@ -3329,8 +3762,81 @@ impl KeyValueStore {
 
 // ── Free helpers ──────────────────────────────────────────────────────────────
 
+enum MutationScope {
+    ReadOnly,
+    Keys(Vec<String>),
+    All,
+}
+
+fn mutation_scope(cmd: &Command) -> MutationScope {
+    if let Command::Dedup(_, _, inner) = cmd {
+        return mutation_scope(inner);
+    }
+    let one = |key: &String| MutationScope::Keys(vec![key.clone()]);
+    match cmd {
+        Command::Set(key, _, _)
+        | Command::ESet(key, _)
+        | Command::Append(key, _)
+        | Command::GetSet(key, _)
+        | Command::SetNx(key, _)
+        | Command::SetEx(key, _, _)
+        | Command::PSetEx(key, _, _)
+        | Command::Incr(key)
+        | Command::Decr(key)
+        | Command::IncrBy(key, _)
+        | Command::DecrBy(key, _)
+        | Command::Expire(key, _)
+        | Command::PExpire(key, _)
+        | Command::ExpireAt(key, _)
+        | Command::PExpireAt(key, _)
+        | Command::Persist(key)
+        | Command::HSet(key, _)
+        | Command::HDel(key, _)
+        | Command::HIncrBy(key, _, _)
+        | Command::HIncrByFloat(key, _, _)
+        | Command::HSetNx(key, _, _)
+        | Command::LPush(key, _)
+        | Command::RPush(key, _)
+        | Command::LPushX(key, _)
+        | Command::RPushX(key, _)
+        | Command::LPop(key, _)
+        | Command::RPop(key, _)
+        | Command::LSet(key, _, _)
+        | Command::LRem(key, _, _)
+        | Command::LTrim(key, _, _)
+        | Command::SAdd(key, _)
+        | Command::SRem(key, _)
+        | Command::SPop(key, _)
+        | Command::ZAdd(key, _, _)
+        | Command::ZRem(key, _)
+        | Command::ZIncrBy(key, _, _)
+        | Command::RlSet(key, _, _)
+        | Command::RlCheck(key, _)
+        | Command::JSet(key, _, _)
+        | Command::JMerge(key, _) => one(key),
+        Command::Del(keys) | Command::Unlink(keys) => MutationScope::Keys(keys.clone()),
+        Command::MSet(pairs) => {
+            MutationScope::Keys(pairs.iter().map(|(key, _)| key.clone()).collect())
+        }
+        Command::Rename(source, destination) | Command::SMove(source, destination, _) => {
+            MutationScope::Keys(vec![source.clone(), destination.clone()])
+        }
+        Command::SInterStore(destination, sources)
+        | Command::SUnionStore(destination, sources)
+        | Command::SDiffStore(destination, sources) => {
+            let mut keys = Vec::with_capacity(sources.len() + 1);
+            keys.push(destination.clone());
+            keys.extend(sources.iter().cloned());
+            MutationScope::Keys(keys)
+        }
+        Command::FlushDb => MutationScope::All,
+        _ => MutationScope::ReadOnly,
+    }
+}
+
 /// Fixed byte charge for a command that grows a value without carrying the new
 /// bytes in its arguments — a counter bumped by `INCR`, a rate-limiter bucket.
+#[cfg(test)]
 const NOMINAL_WRITE_BYTES: usize = 24;
 
 /// Upper bound on the bytes `cmd` could add to the keyspace, used by
@@ -3343,6 +3849,7 @@ const NOMINAL_WRITE_BYTES: usize = 24;
 /// Reads are 0. Overestimating costs one extra keyspace walk; underestimating
 /// only delays enforcement to the next background sweep, which is where every
 /// command sat before.
+#[cfg(test)]
 fn write_cost(cmd: &Command) -> usize {
     // Per-entry overhead is charged so that many tiny keys still register.
     const OVERHEAD: usize = 64;
@@ -3652,7 +4159,7 @@ fn set_inter(
                 None => None,
                 Some(e) if e.is_expired(now) => None,
                 Some(e) => match &e.value {
-                    EntryValue::Set(s) => Some(s.clone()),
+                    EntryValue::Set(s) => Some(s.iter().cloned().collect::<IndexSet<String>>()),
                     _ => return Err(Value::Error(WRONGTYPE.to_string())),
                 },
             }
@@ -3683,7 +4190,7 @@ fn set_union(
                 None => None,
                 Some(e) if e.is_expired(now) => None,
                 Some(e) => match &e.value {
-                    EntryValue::Set(s) => Some(s.clone()),
+                    EntryValue::Set(s) => Some(s.iter().cloned().collect::<IndexSet<String>>()),
                     _ => return Err(Value::Error(WRONGTYPE.to_string())),
                 },
             }
@@ -3718,7 +4225,7 @@ fn set_diff(
                 None => None,
                 Some(e) if e.is_expired(now) => None,
                 Some(e) => match &e.value {
-                    EntryValue::Set(s) => Some(s.clone()),
+                    EntryValue::Set(s) => Some(s.iter().cloned().collect::<IndexSet<String>>()),
                     _ => return Err(Value::Error(WRONGTYPE.to_string())),
                 },
             }
@@ -3732,7 +4239,15 @@ fn set_diff(
 
 fn hash_incr_int(data: &DashMap<String, Entry>, key: String, field: String, delta: i64) -> Value {
     let now = now_ms();
-    typed_entry!(entry, h, data, key, now, EntryValue::Hash, HashMap::new());
+    typed_entry!(
+        entry,
+        h,
+        data,
+        key,
+        now,
+        EntryValue::Hash,
+        Box::new(CompactHash::new())
+    );
     let cur: i64 = h.get(&field).and_then(|s| s.parse_as()).unwrap_or(0);
     match cur.checked_add(delta) {
         None => Value::Error("ERR increment or decrement would overflow".to_string()),
@@ -3745,7 +4260,15 @@ fn hash_incr_int(data: &DashMap<String, Entry>, key: String, field: String, delt
 
 fn hash_incr_float(data: &DashMap<String, Entry>, key: String, field: String, delta: f64) -> Value {
     let now = now_ms();
-    typed_entry!(entry, h, data, key, now, EntryValue::Hash, HashMap::new());
+    typed_entry!(
+        entry,
+        h,
+        data,
+        key,
+        now,
+        EntryValue::Hash,
+        Box::new(CompactHash::new())
+    );
     let cur: f64 = h.get(&field).and_then(|s| s.parse_as()).unwrap_or(0.0);
     let new = cur + delta;
     if new.is_nan() || new.is_infinite() {
@@ -4611,6 +5134,69 @@ mod tests {
             total,
             "the same old value was handed to two callers: GETSET lost an update"
         );
+    }
+
+    #[test]
+    fn setnx_has_exactly_one_winner_under_concurrency() {
+        use std::sync::{Arc, Barrier};
+
+        const THREADS: usize = 16;
+        let store = Arc::new(KeyValueStore::new());
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let winners: usize = (0..THREADS)
+            .map(|worker| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    matches!(
+                        store.execute(Command::SetNx(
+                            "single-winner".into(),
+                            format!("worker-{worker}").into_bytes(),
+                        )),
+                        Value::Integer(1)
+                    ) as usize
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|worker| worker.join().expect("SETNX worker panicked"))
+            .sum();
+        assert_eq!(winners, 1);
+    }
+
+    #[test]
+    fn set_nx_get_has_exactly_one_missing_predecessor() {
+        use std::sync::{Arc, Barrier};
+
+        const THREADS: usize = 16;
+        let store = Arc::new(KeyValueStore::new());
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let missing: usize = (0..THREADS)
+            .map(|worker| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    matches!(
+                        store.execute(Command::Set(
+                            "single-winner".into(),
+                            format!("worker-{worker}").into_bytes(),
+                            SetOptions {
+                                condition: Some(crate::cmd::SetCondition::Nx),
+                                get: true,
+                                ..Default::default()
+                            },
+                        )),
+                        Value::BulkString(None)
+                    ) as usize
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|worker| worker.join().expect("SET NX GET worker panicked"))
+            .sum();
+        assert_eq!(missing, 1);
     }
 
     #[test]
@@ -5871,12 +6457,12 @@ mod tests {
         assert_eq!(kvs.len(), 3, "expired key must be skipped: {kvs:?}");
         assert_eq!(kvs[0], ("cart:1".to_string(), bulk("a")));
         assert_eq!(kvs[1], ("cart:2".to_string(), bulk("b")));
-        // Collection types come back as type-name markers, like get_current.
+        // Collections carry a tag plus their complete current contents.
         assert_eq!(
             kvs[2],
             (
                 "cart:list".to_string(),
-                Value::SimpleString("list".to_string())
+                Value::Array(Some(vec![bulk("list"), bulk("x")]))
             )
         );
         // Cap respected.
@@ -6526,7 +7112,7 @@ mod semantics_tests {
     }
 
     #[test]
-    fn keyspace_sample_excludes_expired_entries() {
+    fn keyspace_sample_changes_after_active_expiry_removes_entries() {
         let s = KeyValueStore::new();
         s.execute(Command::Set(
             "gone".into(),
@@ -6536,10 +7122,13 @@ mod semantics_tests {
         s.execute(Command::PExpire("gone".into(), 1));
         std::thread::sleep(std::time::Duration::from_millis(20));
 
-        let sample = s.keyspace_sample();
-        assert_eq!(sample.keys, 0);
-        assert_eq!(sample.volatile_keys, 0);
-        assert_eq!(sample.memory_bytes, 0);
+        let pending = s.keyspace_sample();
+        assert_eq!(pending.keys, 1);
+        assert_eq!(pending.volatile_keys, 1);
+        assert!(pending.memory_bytes > 0);
+
+        assert_eq!(s.sweep_expired_reporting_budget(1), vec!["gone"]);
+        assert_eq!(s.keyspace_sample(), KeyspaceSample::default());
     }
 
     #[test]
@@ -7086,10 +7675,9 @@ mod metrics_tests {
     use crate::cmd::{Command, SetOptions};
 
     #[test]
-    fn key_count_excludes_expired_entries() {
-        // The metric must report what a client can actually read, not what is
-        // still sitting in the map awaiting sweep — otherwise a dashboard shows
-        // a keyspace that is not there.
+    fn key_count_changes_only_when_active_expiry_removes_the_entry() {
+        // Reads and metrics must not silently consume an expiry event before
+        // the server's watcher-aware background task can announce it.
         let s = KeyValueStore::new();
         s.execute(Command::Set(
             "live".into(),
@@ -7105,6 +7693,12 @@ mod metrics_tests {
             },
         ));
         std::thread::sleep(std::time::Duration::from_millis(15));
+        assert_eq!(
+            s.key_count(),
+            2,
+            "counting must not remove the expired entry"
+        );
+        assert_eq!(s.sweep_expired_reporting_budget(1), vec!["dead"]);
         assert_eq!(s.key_count(), 1);
     }
 
@@ -7844,6 +8438,35 @@ mod eviction_sampling_tests {
         }
     }
 
+    #[test]
+    fn execute_reports_implicit_capacity_evictions() {
+        let store = KeyValueStore::with_config(Some(1), None, EvictionPolicy::AllKeysRandom);
+        assert_eq!(
+            store.execute(Command::Set(
+                "victim".into(),
+                "old".into(),
+                SetOptions::default(),
+            )),
+            Value::SimpleString("OK".into())
+        );
+
+        let (response, evicted) = store.execute_reporting(Command::Set(
+            "replacement".into(),
+            "new".into(),
+            SetOptions::default(),
+        ));
+        assert_eq!(response, Value::SimpleString("OK".into()));
+        assert_eq!(evicted, vec!["victim"]);
+        assert_eq!(
+            store.execute(Command::Get("victim".into())),
+            Value::BulkString(None)
+        );
+        assert_eq!(
+            store.execute(Command::Get("replacement".into())),
+            Value::BulkString(Some(b"new".to_vec()))
+        );
+    }
+
     /// The sampler must still pick a victim under every policy, and must pick
     /// the least-recently-used one when the whole keyspace fits in the sample.
     #[test]
@@ -8079,8 +8702,7 @@ mod write_path_memory_tests {
 
     /// An eviction pass sheds past the cap rather than stopping exactly on it.
     /// Without that headroom the store would sit on the limit and the very next
-    /// write would trip the gate again, so every write at the cap would pay for
-    /// a full keyspace measurement.
+    /// write would trip the gate again and require another eviction pass.
     ///
     /// Loaded through `restore`, which bypasses the write path, so the store is
     /// genuinely over the cap when the pass starts.
@@ -8685,5 +9307,79 @@ mod ttl_rounding_tests {
             ),
             other => panic!("expected an integer, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod storage_regression_tests {
+    use super::*;
+    use crate::cmd::SetOptions;
+
+    #[test]
+    fn replica_snapshot_replacement_drops_stale_keys() {
+        let replica = KeyValueStore::new();
+        replica.execute(Command::Set(
+            "stale".into(),
+            b"old".to_vec(),
+            SetOptions::default(),
+        ));
+        let primary = KeyValueStore::new();
+        primary.execute(Command::Set(
+            "current".into(),
+            b"new".to_vec(),
+            SetOptions::default(),
+        ));
+
+        replica.replace(primary.snapshot());
+
+        assert_eq!(
+            replica.execute(Command::Get("stale".into())),
+            Value::BulkString(None)
+        );
+        assert_eq!(
+            replica.execute(Command::Get("current".into())),
+            Value::BulkString(Some(b"new".to_vec()))
+        );
+    }
+
+    #[test]
+    fn collection_inline_storage_does_not_inflate_every_entry_value() {
+        assert!(
+            std::mem::size_of::<EntryValue>() <= 96,
+            "EntryValue is {} bytes",
+            std::mem::size_of::<EntryValue>()
+        );
+        assert!(
+            std::mem::size_of::<CompactHash>() <= 160,
+            "CompactHash is {} bytes",
+            std::mem::size_of::<CompactHash>()
+        );
+        assert!(
+            std::mem::size_of::<CompactSet>() <= 128,
+            "CompactSet is {} bytes",
+            std::mem::size_of::<CompactSet>()
+        );
+    }
+
+    #[test]
+    fn small_payloads_hashes_and_sets_stay_inline() {
+        let payload = Blob::from("small");
+        assert!(!payload.0.spilled());
+
+        let mut hash = CompactHash::new();
+        for i in 0..INLINE_HASH_FIELDS {
+            hash.insert(format!("f{i}"), Blob::from("v"));
+        }
+        assert!(matches!(hash, CompactHash::Inline(_)));
+        hash.insert("spill".into(), Blob::from("v"));
+        assert!(matches!(hash, CompactHash::Table(_)));
+
+        let mut set = CompactSet::new();
+        for i in 0..INLINE_SET_MEMBERS {
+            set.insert(format!("m{i}"));
+        }
+        assert!(matches!(set, CompactSet::Inline(_)));
+        set.insert("spill".into());
+        assert!(matches!(set, CompactSet::Table(_)));
     }
 }

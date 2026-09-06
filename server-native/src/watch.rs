@@ -3,9 +3,122 @@
 
 use crate::*;
 
-pub(crate) type WatchNotif = (String, Value);
+/// A single connection may buffer at most this many keychange notifications
+/// and this many payload bytes. Count and byte limits complement each other:
+/// many tiny updates cannot create an unbounded allocation, and a handful of
+/// maximum-size values cannot consume hundreds of megabytes.
+const NOTIFICATION_QUEUE_ITEMS: usize = 256;
+const NOTIFICATION_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 
-pub(crate) type WatchMap = HashMap<String, Vec<(u64, mpsc::UnboundedSender<WatchNotif>)>>;
+#[derive(Debug)]
+pub(crate) struct WatchNotif {
+    pub(crate) key: String,
+    pub(crate) value: Value,
+    charged_bytes: usize,
+    budget: Arc<NotificationBudget>,
+}
+
+impl Drop for WatchNotif {
+    fn drop(&mut self) {
+        self.budget
+            .pending_bytes
+            .fetch_sub(self.charged_bytes, Ordering::AcqRel);
+    }
+}
+
+#[derive(Debug)]
+struct NotificationBudget {
+    pending_bytes: AtomicUsize,
+}
+
+impl NotificationBudget {
+    fn reserve(&self, bytes: usize) -> bool {
+        self.pending_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                pending
+                    .checked_add(bytes)
+                    .filter(|next| *next <= NOTIFICATION_QUEUE_BYTES)
+            })
+            .is_ok()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct WatchSubscriber {
+    pub(crate) conn_id: u64,
+    tx: mpsc::Sender<WatchNotif>,
+    overflow: mpsc::Sender<()>,
+    budget: Arc<NotificationBudget>,
+}
+
+impl WatchSubscriber {
+    /// Queue a notification without ever waiting behind a slow socket. A full
+    /// queue signals the owning connection and removes this registration.
+    pub(crate) fn notify(&self, key: &str, value: &Value) -> bool {
+        let charged_bytes = key
+            .len()
+            .saturating_add(value_heap_bytes(value))
+            .saturating_add(std::mem::size_of::<WatchNotif>());
+        if !self.budget.reserve(charged_bytes) {
+            self.signal_overflow();
+            return false;
+        }
+
+        let notification = WatchNotif {
+            key: key.to_string(),
+            value: value.clone(),
+            charged_bytes,
+            budget: Arc::clone(&self.budget),
+        };
+        if self.tx.try_send(notification).is_err() {
+            // The failed item is dropped by TrySendError, releasing its charge.
+            self.signal_overflow();
+            return false;
+        }
+        true
+    }
+
+    fn signal_overflow(&self) {
+        counter!("recached_notification_overflows_total").increment(1);
+        let _ = self.overflow.try_send(());
+    }
+}
+
+pub(crate) fn notification_channel(
+    conn_id: u64,
+    overflow: mpsc::Sender<()>,
+) -> (WatchSubscriber, mpsc::Receiver<WatchNotif>) {
+    let (tx, rx) = mpsc::channel(NOTIFICATION_QUEUE_ITEMS);
+    (
+        WatchSubscriber {
+            conn_id,
+            tx,
+            overflow,
+            budget: Arc::new(NotificationBudget {
+                pending_bytes: AtomicUsize::new(0),
+            }),
+        },
+        rx,
+    )
+}
+
+fn value_heap_bytes(value: &Value) -> usize {
+    match value {
+        Value::SimpleString(value) | Value::Error(value) => value.len(),
+        Value::Integer(_) => std::mem::size_of::<i64>(),
+        Value::BulkString(value) => value.as_ref().map_or(0, Vec::len),
+        Value::Array(value) => value
+            .as_ref()
+            .map_or(0, |items| items.iter().map(value_heap_bytes).sum()),
+        Value::Push(items) => items.iter().map(value_heap_bytes).sum(),
+        Value::Map(entries) => entries
+            .iter()
+            .map(|(key, value)| value_heap_bytes(key).saturating_add(value_heap_bytes(value)))
+            .sum(),
+    }
+}
+
+pub(crate) type WatchMap = HashMap<String, Vec<WatchSubscriber>>;
 
 /// Watched-key and live-query registry. `watched_keys` / `watched_patterns`
 /// mirror the map lengths (updated by every writer while holding the lock) so
@@ -61,7 +174,7 @@ pub(crate) async fn unregister_all_qsubs(
     let mut pats = registry.patterns.lock().await;
     for p in qsub_patterns.drain() {
         if let Some(subs) = pats.get_mut(&p) {
-            subs.retain(|(id, _)| *id != conn_id);
+            subs.retain(|sub| sub.conn_id != conn_id);
             if subs.is_empty() {
                 pats.remove(&p);
             }
@@ -84,7 +197,7 @@ pub(crate) async fn unregister_all_watches(
     let mut reg = registry.map.lock().await;
     for key in watched_keys.drain() {
         if let Some(subs) = reg.get_mut(&key) {
-            subs.retain(|(id, _)| *id != conn_id);
+            subs.retain(|sub| sub.conn_id != conn_id);
             if subs.is_empty() {
                 reg.remove(&key);
             }

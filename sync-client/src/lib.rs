@@ -1,7 +1,7 @@
 //! Platform-neutral Recached sync client.
 //!
 //! This crate is the *brain* of every Recached client SDK: the durable
-//! outbox, exactly-once `DEDUP` envelopes, ordered-reply acknowledgment
+//! outbox, duplicate-suppression `DEDUP` envelopes, ordered-reply acknowledgment
 //! correlation, session re-establishment after reconnect, and backoff
 //! policy. It performs no I/O and knows nothing about WebSockets, IndexedDB,
 //! or timers — methods take the current connection state and return
@@ -328,7 +328,7 @@ impl SyncClient {
 
     // ── writes ────────────────────────────────────────────────────────────
 
-    /// Queue a write for the server. `dedup` wraps it in an exactly-once
+    /// Queue a write for the server. `dedup` wraps it in a duplicate-suppression
     /// envelope — store writes want this; connection-scoped commands
     /// (pub/sub) must not be wrapped, or a legitimately replayed SUBSCRIBE
     /// would be skipped as a duplicate.
@@ -619,12 +619,9 @@ impl SyncClient {
     /// starting empty on reload; a server process holding the same cache for
     /// months does not.
     ///
-    /// One caveat, unchanged by this: the server caps a snapshot at
-    /// `RECACHED_MAX_QSUB_INITIAL_KEYS` (10,000). If a pattern matches more
-    /// than that, the snapshot is truncated and reconciling against it drops
-    /// locally-held keys that do still exist. That is a pattern too broad to
-    /// embed, and the resulting local copy at least matches the snapshot it
-    /// was given rather than being an ever-growing superset of two.
+    /// The server refuses snapshots above `RECACHED_MAX_QSUB_INITIAL_KEYS`
+    /// rather than sending a partial one, so every qstate reaching this method
+    /// is complete and absence is safe to interpret as deletion.
     fn apply_qstate(&self, items: &[Value]) {
         let pattern = match items.get(1) {
             Some(Value::BulkString(Some(p))) => String::from_utf8_lossy(p).into_owned(),

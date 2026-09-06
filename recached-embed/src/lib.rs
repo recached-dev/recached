@@ -505,7 +505,7 @@ impl Cache {
     /// Send an arbitrary mutation, returning the server's reply.
     ///
     /// Goes through the outbox: it is replayed on reconnect and wrapped in an
-    /// exactly-once envelope, exactly like [`set`](Self::set). Use it for
+    /// duplicate-suppression envelope, like [`set`](Self::set). Use it for
     /// commands the typed helpers do not cover (`HSET`, `SADD`, `ZADD`, …).
     ///
     /// Only pass mutations. A read sent here would be replayed pointlessly

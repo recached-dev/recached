@@ -142,13 +142,13 @@ let hits = cache.incr_by("hits:today", 1).await?;
 cache.write_command(&["SADD", "tags", "rush"]).await?;
 ```
 
-`write_command` goes through the outbox and is wrapped in an exactly-once
-envelope, exactly like `set`. Pass mutations only — a read sent here would be
+`write_command` goes through the outbox and is wrapped in a duplicate-suppression
+envelope like `set`. Pass mutations only — a read sent here would be
 replayed pointlessly after a reconnect. Use `read_command` for those.
 
 ::: warning `set_ex` expires locally within about a second, not exactly
 The server enforces the TTL exactly; a local copy learns about it when the
-server's once-per-second sweep removes the key. See
+server's bounded background sweep removes the key. See
 [Known limitations](/rust/getting-started#known-limitations).
 :::
 

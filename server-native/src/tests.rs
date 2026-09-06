@@ -45,6 +45,7 @@ async fn spawn_server_cfg(
     let snap_cfg = Arc::new(SnapshotConfig {
         path: snap_path.unwrap_or_else(|| tmp_path("test.rdb")),
         last_save: AtomicI64::new(now_unix_secs()),
+        checkpoint_id: AtomicU64::new(0),
     });
     let state = Arc::new(ServerState {
         snap: snap_cfg,
@@ -54,6 +55,10 @@ async fn spawn_server_cfg(
         dedup: std::sync::Mutex::new(HashMap::new()),
         ephemeral: std::sync::Mutex::new(HashMap::new()),
         dedup_dirty: std::sync::atomic::AtomicBool::new(false),
+        dedup_order: tokio::sync::Mutex::new(()),
+        save_lock: tokio::sync::Mutex::new(()),
+        persistence_healthy: AtomicBool::new(true),
+        persistence_failures: AtomicU64::new(0),
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -221,7 +226,7 @@ fn is_write_command_classifies_correctly() {
 async fn replay_aof_missing_file() {
     let store = KeyValueStore::new();
     let path = tmp_path("aof_missing");
-    let count = replay_aof(&store, &path).await;
+    let count = replay_aof(&store, &path).await.unwrap();
     assert_eq!(count, 0);
 }
 
@@ -232,7 +237,7 @@ async fn replay_aof_basic() {
     let resp = "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n\
                 *3\r\n$3\r\nSET\r\n$3\r\nbaz\r\n$3\r\nqux\r\n";
     tokio::fs::write(&path, resp.as_bytes()).await.unwrap();
-    let count = replay_aof(&store, &path).await;
+    let count = replay_aof(&store, &path).await.unwrap();
     assert_eq!(count, 2);
     assert_eq!(store.execute(Command::DbSize), Value::Integer(2));
     let _ = tokio::fs::remove_file(&path).await;
@@ -246,7 +251,7 @@ async fn replay_aof_push_frames() {
     let path = tmp_path("aof_push.aof");
     let resp = ">3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
     tokio::fs::write(&path, resp.as_bytes()).await.unwrap();
-    let count = replay_aof(&store, &path).await;
+    let count = replay_aof(&store, &path).await.unwrap();
     assert_eq!(count, 1);
     assert_eq!(
         store.execute(Command::Get("foo".into())),
@@ -269,11 +274,12 @@ async fn snapshot_save_and_load() {
     let cfg = Arc::new(SnapshotConfig {
         path: path.clone(),
         last_save: AtomicI64::new(0),
+        checkpoint_id: AtomicU64::new(0),
     });
-    save_snapshot(&store, &cfg).await;
+    save_snapshot(&store, &cfg, 0).await.unwrap();
     assert!(path.exists());
     let store2 = KeyValueStore::new();
-    let loaded = load_snapshot(&store2, &path).await;
+    let loaded = load_snapshot(&store2, &path).await.unwrap();
     assert!(loaded);
     assert_eq!(
         store2.execute(Command::Get("hello".into())),
@@ -289,11 +295,12 @@ async fn aof_writer_append_and_truncate() {
     let path = tmp_path("aof_writer.aof");
     let aof = AofWriter::open(path.clone(), AofSync::No).await.unwrap();
     aof.append(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
-        .await;
-    aof.flush().await;
+        .await
+        .unwrap();
+    aof.flush().await.unwrap();
     let len_before = tokio::fs::metadata(&path).await.unwrap().len();
     assert!(len_before > 0);
-    aof.truncate().await;
+    aof.truncate().await.unwrap();
     let len_after = tokio::fs::metadata(&path).await.unwrap().len();
     assert_eq!(len_after, 0);
     let _ = tokio::fs::remove_file(&path).await;
@@ -817,7 +824,7 @@ async fn integration_save_and_reload() {
 
     // Load into a fresh store
     let store2 = KeyValueStore::new();
-    let loaded = load_snapshot(&store2, &snap).await;
+    let loaded = load_snapshot(&store2, &snap).await.unwrap();
     assert!(loaded);
     assert_eq!(
         store2.execute(Command::Get("hello".into())),
@@ -838,6 +845,7 @@ async fn integration_aof_replay() {
     let snap_cfg = Arc::new(SnapshotConfig {
         path: tmp_path("integ_aof.rdb"),
         last_save: AtomicI64::new(0),
+        checkpoint_id: AtomicU64::new(0),
     });
     let state = Arc::new(ServerState {
         snap: snap_cfg,
@@ -847,6 +855,10 @@ async fn integration_aof_replay() {
         dedup: std::sync::Mutex::new(HashMap::new()),
         ephemeral: std::sync::Mutex::new(HashMap::new()),
         dedup_dirty: std::sync::atomic::AtomicBool::new(false),
+        dedup_order: tokio::sync::Mutex::new(()),
+        save_lock: tokio::sync::Mutex::new(()),
+        persistence_healthy: AtomicBool::new(true),
+        persistence_failures: AtomicU64::new(0),
     });
 
     // Simulate writes captured by AOF
@@ -857,12 +869,12 @@ async fn integration_aof_replay() {
         .on_write(b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n")
         .await;
     if let Some(ref a) = state.aof {
-        a.flush().await;
+        a.flush().await.unwrap();
     }
 
     // Replay into fresh store
     let store2 = KeyValueStore::new();
-    let count = replay_aof(&store2, &path).await;
+    let count = replay_aof(&store2, &path).await.unwrap();
     assert_eq!(count, 2);
     assert_eq!(
         store2.execute(Command::Get("hello".into())),
@@ -993,7 +1005,7 @@ async fn flushdb_sends_one_sentinel_per_pattern_not_per_key() {
     assert!(keychanges[0].contains("bulk:*"));
 }
 
-// ── Exactly-once across a restart ─────────────────────────────────────────
+// ── Duplicate suppression across a checkpoint ─────────────────────────────
 
 /// Build a `ServerState` whose snapshot path (and therefore dedup sidecar)
 /// is `path` — the same file a restarted process would find.
@@ -1002,6 +1014,7 @@ fn state_with_snapshot_path(path: PathBuf) -> Arc<ServerState> {
         snap: Arc::new(SnapshotConfig {
             path,
             last_save: AtomicI64::new(now_unix_secs()),
+            checkpoint_id: AtomicU64::new(0),
         }),
         aof: None,
         replicas: ReplHub::new(),
@@ -1009,7 +1022,87 @@ fn state_with_snapshot_path(path: PathBuf) -> Arc<ServerState> {
         dedup: std::sync::Mutex::new(HashMap::new()),
         ephemeral: std::sync::Mutex::new(HashMap::new()),
         dedup_dirty: std::sync::atomic::AtomicBool::new(false),
+        dedup_order: tokio::sync::Mutex::new(()),
+        save_lock: tokio::sync::Mutex::new(()),
+        persistence_healthy: AtomicBool::new(true),
+        persistence_failures: AtomicU64::new(0),
     })
+}
+
+#[tokio::test]
+async fn a_failed_dedup_write_does_not_consume_its_id() {
+    let state = state_with_snapshot_path(tmp_path("dedup_failure.rdb"));
+    let store = KeyValueStore::new();
+    store.execute(Command::Set(
+        "typed".into(),
+        b"string".to_vec(),
+        SetOptions::default(),
+    ));
+    let wrapped = Command::Dedup(
+        "client-a".into(),
+        7,
+        Box::new(Command::HIncrBy("typed".into(), "field".into(), 1)),
+    );
+    let tx = broadcast::channel::<SyncMsg>(8).0;
+    let watches = WatchHub::new();
+
+    let response = execute_ordered_write(&wrapped, &tx, 1, &state, &watches, &store).await;
+    assert!(matches!(response, Value::Error(_)));
+    assert!(!state.dedup_is_duplicate("client-a", 7));
+
+    store.execute(Command::Del(vec!["typed".into()]));
+    assert_eq!(
+        execute_ordered_write(&wrapped, &tx, 1, &state, &watches, &store).await,
+        Value::Integer(1)
+    );
+    assert_eq!(
+        execute_ordered_write(&wrapped, &tx, 1, &state, &watches, &store).await,
+        Value::SimpleString("DUP".into())
+    );
+}
+
+#[tokio::test]
+async fn dedup_mark_is_checkpointed_with_the_successful_write() {
+    let snap = tmp_path("dedup_checkpoint.rdb");
+    let sidecar = snap.with_extension("dedup");
+    let _ = std::fs::remove_file(&snap);
+    let _ = std::fs::remove_file(&sidecar);
+    let state = state_with_snapshot_path(snap.clone());
+    let store = KeyValueStore::new();
+    let tx = broadcast::channel::<SyncMsg>(8).0;
+    let watches = WatchHub::new();
+    let wrapped = Command::Dedup(
+        "client-b".into(),
+        3,
+        Box::new(Command::Set(
+            "durable".into(),
+            b"value".to_vec(),
+            SetOptions::default(),
+        )),
+    );
+
+    assert_eq!(
+        execute_ordered_write(&wrapped, &tx, 1, &state, &watches, &store).await,
+        ok()
+    );
+    assert!(
+        !sidecar.exists(),
+        "dedup state must not outrun its data snapshot"
+    );
+    state.save(&store).await.unwrap();
+
+    let restored_store = KeyValueStore::new();
+    assert!(load_snapshot(&restored_store, &snap).await.unwrap());
+    let restored_state = state_with_snapshot_path(snap.clone());
+    restored_state.load_dedup().await.unwrap();
+    assert!(restored_state.dedup_is_duplicate("client-b", 3));
+    assert_eq!(
+        restored_store.execute(Command::Get("durable".into())),
+        Value::BulkString(Some(b"value".to_vec()))
+    );
+
+    let _ = std::fs::remove_file(snap);
+    let _ = std::fs::remove_file(sidecar);
 }
 
 #[tokio::test]
@@ -1025,7 +1118,7 @@ async fn dedup_marks_survive_a_restart() {
         first.dedup_seen("client-a", 2),
         "same id twice within a run"
     );
-    first.persist_dedup().await;
+    first.persist_dedup().await.unwrap();
 
     // Restart: fresh process, same snapshot path.
     let second = state_with_snapshot_path(snap.clone());
@@ -1035,7 +1128,7 @@ async fn dedup_marks_survive_a_restart() {
     );
 
     let third = state_with_snapshot_path(snap.clone());
-    third.load_dedup().await;
+    third.load_dedup().await.unwrap();
     assert!(
         third.dedup_seen("client-a", 2),
         "a replayed write must be recognised after a restart — this is the \
@@ -1056,11 +1149,11 @@ async fn persist_dedup_is_a_no_op_when_nothing_advanced() {
 
     let state = state_with_snapshot_path(snap.clone());
     state.dedup_seen("c", 1);
-    state.persist_dedup().await;
+    state.persist_dedup().await.unwrap();
     assert!(side.exists(), "first flush should write");
 
     let before = std::fs::metadata(&side).unwrap().modified().unwrap();
-    state.persist_dedup().await; // nothing changed since
+    state.persist_dedup().await.unwrap(); // nothing changed since
     let after = std::fs::metadata(&side).unwrap().modified().unwrap();
     assert_eq!(before, after, "unchanged marks must not rewrite the file");
 
@@ -1068,15 +1161,15 @@ async fn persist_dedup_is_a_no_op_when_nothing_advanced() {
 }
 
 #[tokio::test]
-async fn a_corrupt_dedup_sidecar_is_ignored_not_fatal() {
-    // Losing exactly-once bookkeeping is bad; refusing to boot is worse.
+async fn a_corrupt_dedup_sidecar_is_reported() {
+    // Silently losing duplicate-suppression bookkeeping would allow acknowledged
+    // writes to be applied twice after restart.
     let snap = tmp_path("dedup_corrupt.rdb");
     let side = snap.with_extension("dedup");
     std::fs::write(&side, b"not messagepack").unwrap();
 
     let state = state_with_snapshot_path(snap.clone());
-    state.load_dedup().await; // must not panic
-    assert!(!state.dedup_seen("client-a", 1), "server still functions");
+    assert!(state.load_dedup().await.is_err());
 
     let _ = std::fs::remove_file(&side);
 }
@@ -1086,7 +1179,7 @@ async fn a_missing_dedup_sidecar_is_a_clean_first_boot() {
     let snap = tmp_path("dedup_absent.rdb");
     let _ = std::fs::remove_file(snap.with_extension("dedup"));
     let state = state_with_snapshot_path(snap);
-    state.load_dedup().await;
+    state.load_dedup().await.unwrap();
     assert!(!state.dedup_seen("fresh", 1));
 }
 
@@ -1250,6 +1343,10 @@ async fn integration_replica_receives_write() {
             dedup: std::sync::Mutex::new(HashMap::new()),
             ephemeral: std::sync::Mutex::new(HashMap::new()),
             dedup_dirty: std::sync::atomic::AtomicBool::new(false),
+            dedup_order: tokio::sync::Mutex::new(()),
+            save_lock: tokio::sync::Mutex::new(()),
+            persistence_healthy: AtomicBool::new(true),
+            persistence_failures: AtomicU64::new(0),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1296,6 +1393,7 @@ async fn integration_replica_receives_write() {
         snap: Arc::new(SnapshotConfig {
             path: tmp_path("repl_snap.rdb"),
             last_save: AtomicI64::new(0),
+            checkpoint_id: AtomicU64::new(0),
         }),
         aof: None,
         replicas: ReplHub::new(),
@@ -1303,6 +1401,10 @@ async fn integration_replica_receives_write() {
         dedup: std::sync::Mutex::new(HashMap::new()),
         ephemeral: std::sync::Mutex::new(HashMap::new()),
         dedup_dirty: std::sync::atomic::AtomicBool::new(false),
+        dedup_order: tokio::sync::Mutex::new(()),
+        save_lock: tokio::sync::Mutex::new(()),
+        persistence_healthy: AtomicBool::new(true),
+        persistence_failures: AtomicU64::new(0),
     });
     let rs = Arc::clone(&replica_store);
     let rst = Arc::clone(&replica_state);
@@ -1446,6 +1548,7 @@ async fn replication_lag_counts_unacknowledged_frames() {
     let snap_cfg = Arc::new(SnapshotConfig {
         path: tmp_path("lag_snap.rdb"),
         last_save: AtomicI64::new(0),
+        checkpoint_id: AtomicU64::new(0),
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1473,8 +1576,23 @@ async fn replication_lag_counts_unacknowledged_frames() {
         });
     }
 
-    // A replica that reads the snapshot and then goes silent.
+    // A replica that negotiates a full snapshot and then goes silent.
     let mut sock = TcpStream::connect(addr).await.unwrap();
+    let mut magic = [0u8; 4];
+    sock.read_exact(&mut magic).await.unwrap();
+    assert_eq!(&magic, REPL_MAGIC);
+    let mut run_len = [0u8; 2];
+    sock.read_exact(&mut run_len).await.unwrap();
+    let mut run_id = vec![0u8; u16::from_le_bytes(run_len) as usize];
+    sock.read_exact(&mut run_id).await.unwrap();
+    sock.write_all(&0u16.to_le_bytes()).await.unwrap();
+    sock.write_all(&0u64.to_le_bytes()).await.unwrap();
+    let mut mode = [0u8; 1];
+    sock.read_exact(&mut mode).await.unwrap();
+    assert_eq!(mode[0], b'F');
+    let mut boundary = [0u8; 8];
+    sock.read_exact(&mut boundary).await.unwrap();
+    assert_eq!(u64::from_le_bytes(boundary), 0);
     let mut len_buf = [0u8; 4];
     sock.read_exact(&mut len_buf).await.unwrap();
     let mut snap = vec![0u8; u32::from_le_bytes(len_buf) as usize];
@@ -1566,6 +1684,7 @@ async fn integration_connection_limit() {
         snap: Arc::new(SnapshotConfig {
             path: tmp_path("conn_limit.rdb"),
             last_save: AtomicI64::new(0),
+            checkpoint_id: AtomicU64::new(0),
         }),
         aof: None,
         replicas: ReplHub::new(),
@@ -1573,6 +1692,10 @@ async fn integration_connection_limit() {
         dedup: std::sync::Mutex::new(HashMap::new()),
         ephemeral: std::sync::Mutex::new(HashMap::new()),
         dedup_dirty: std::sync::atomic::AtomicBool::new(false),
+        dedup_order: tokio::sync::Mutex::new(()),
+        save_lock: tokio::sync::Mutex::new(()),
+        persistence_healthy: AtomicBool::new(true),
+        persistence_failures: AtomicU64::new(0),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1678,17 +1801,15 @@ async fn integration_kill_primary_mid_write() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
-async fn integration_failover_promotes() {
-    // Point replica at a port that refuses connections immediately so the
-    // unreachable timer starts on the first loop iteration without any
-    // real primary required.  Promotion happens after:
-    //   connect fail (fast) → backoff 2s → connect fail → elapsed ≥ 1s → promote
-    // so we wait 3s to be safe.
+async fn integration_failover_timeout_does_not_promote() {
+    // Point the replica at a port that refuses connections. The deprecated
+    // one-second timeout must not make an isolated replica writable: without
+    // quorum and fencing that would create split brain during a partition.
     let replica_state = Arc::new(ServerState {
         snap: Arc::new(SnapshotConfig {
             path: tmp_path("failover_snap.rdb"),
             last_save: AtomicI64::new(0),
+            checkpoint_id: AtomicU64::new(0),
         }),
         aof: None,
         replicas: ReplHub::new(),
@@ -1696,6 +1817,10 @@ async fn integration_failover_promotes() {
         dedup: std::sync::Mutex::new(HashMap::new()),
         ephemeral: std::sync::Mutex::new(HashMap::new()),
         dedup_dirty: std::sync::atomic::AtomicBool::new(false),
+        dedup_order: tokio::sync::Mutex::new(()),
+        save_lock: tokio::sync::Mutex::new(()),
+        persistence_healthy: AtomicBool::new(true),
+        persistence_failures: AtomicU64::new(0),
     });
     let replica_store = Arc::new(KeyValueStore::new());
     let rs = Arc::clone(&replica_store);
@@ -1709,12 +1834,11 @@ async fn integration_failover_promotes() {
         run_repl_client(dead_addr, rs, rst, None, Some(1), rtx, None).await;
     });
 
-    // Wait for 2 backoff cycles (initial fail + 2s sleep + retry fail → promote)
-    tokio::time::sleep(tokio::time::Duration::from_millis(3000)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(2300)).await;
 
     assert!(
-        !replica_state.is_replica(),
-        "replica should have promoted after primary was unreachable for >1s"
+        replica_state.is_replica(),
+        "an unreachable-primary timeout must never promote without fencing"
     );
 }
 
@@ -1816,6 +1940,7 @@ async fn spawn_ws_server_full(
     let snap_cfg = Arc::new(SnapshotConfig {
         path: tmp_path("ws_test.rdb"),
         last_save: AtomicI64::new(now_unix_secs()),
+        checkpoint_id: AtomicU64::new(0),
     });
     let state = Arc::new(ServerState {
         snap: snap_cfg,
@@ -1825,6 +1950,10 @@ async fn spawn_ws_server_full(
         dedup: std::sync::Mutex::new(HashMap::new()),
         ephemeral: std::sync::Mutex::new(HashMap::new()),
         dedup_dirty: std::sync::atomic::AtomicBool::new(false),
+        dedup_order: tokio::sync::Mutex::new(()),
+        save_lock: tokio::sync::Mutex::new(()),
+        persistence_healthy: AtomicBool::new(true),
+        persistence_failures: AtomicU64::new(0),
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2066,6 +2195,58 @@ async fn integration_tcp_watch_exec_aborts_on_change() {
     // k changed since WATCH → EXEC aborts with a nil array.
     assert_eq!(watcher.cmd(&["EXEC"]).await, Value::Array(None));
     assert_eq!(watcher.cmd(&["GET", "k"]).await, bulk("v1"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn integration_tcp_watch_exec_closes_the_check_to_lock_race() {
+    let srv = spawn_server().await;
+    let mut watcher = RespClient::connect(srv.tcp_addr).await;
+
+    assert_eq!(watcher.cmd(&["WATCH", "guarded"]).await, ok());
+    assert_eq!(watcher.cmd(&["MULTI"]).await, ok());
+    assert_eq!(
+        watcher.cmd(&["SET", "transaction-output", "written"]).await,
+        Value::SimpleString("QUEUED".into())
+    );
+
+    // Hold the watched key ordering domain, then queue a conflicting writer
+    // before EXEC. The writer must complete first after release. EXEC must wait
+    // for the same barrier, observe that invalidation, and abort. The old path
+    // checked WATCH first and did not lock watched-only keys, so it committed.
+    let barriers = srv
+        .state
+        .replicas
+        .lock_commands_and_keys(&[], ["guarded"])
+        .await;
+
+    let addr = srv.tcp_addr;
+    let mut writer_task = tokio::spawn(async move {
+        let mut writer = RespClient::connect(addr).await;
+        writer.cmd(&["SET", "guarded", "changed"]).await
+    });
+    assert!(
+        tokio::time::timeout(tokio::time::Duration::from_millis(50), &mut writer_task,)
+            .await
+            .is_err(),
+        "the competing writer should be waiting on the test barrier"
+    );
+
+    let mut exec_task = tokio::spawn(async move { watcher.cmd(&["EXEC"]).await });
+    assert!(
+        tokio::time::timeout(tokio::time::Duration::from_millis(50), &mut exec_task,)
+            .await
+            .is_err(),
+        "EXEC must reserve watched keys before checking invalidation"
+    );
+
+    drop(barriers);
+    assert_eq!(writer_task.await.unwrap(), ok());
+    assert_eq!(exec_task.await.unwrap(), Value::Array(None));
+    assert_eq!(
+        srv.store.execute(Command::Get("transaction-output".into())),
+        nil(),
+        "the invalidated transaction must not run"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2311,6 +2492,20 @@ fn administrative_commands_are_denied_not_merely_unscoped() {
             "{cmd:?} must be Admin-classified"
         );
     }
+}
+
+#[test]
+fn oversized_initial_qstate_is_refused_not_truncated() {
+    let store = KeyValueStore::new();
+    for i in 0..3 {
+        store.execute(Command::Set(
+            format!("q:{i}"),
+            "v".into(),
+            SetOptions::default(),
+        ));
+    }
+    assert_eq!(initial_qstate(&store, "q:*", 2), Err(2));
+    assert_eq!(initial_qstate(&store, "q:*", 3).unwrap().len(), 3);
 }
 
 #[test]
@@ -3071,16 +3266,18 @@ fn pubsub_patterns_match_the_expected_channels() {
 fn hub_with(
     channels: &[(u64, &str)],
     patterns: &[(u64, &str)],
-) -> (PubSubHub, Vec<mpsc::UnboundedReceiver<PubSubMsg>>) {
+) -> (PubSubHub, Vec<mpsc::Receiver<QueuedPubSubMsg>>) {
     let mut hub = PubSubHub::new();
     let mut keepalive = Vec::new();
     for (id, ch) in channels {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (overflow, _overflow_rx) = mpsc::channel(1);
+        let (tx, rx) = pubsub_channel(overflow);
         hub.subscribe(*id, ch, tx);
         keepalive.push(rx);
     }
     for (id, pat) in patterns {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (overflow, _overflow_rx) = mpsc::channel(1);
+        let (tx, rx) = pubsub_channel(overflow);
         hub.psubscribe(*id, pat, tx);
         keepalive.push(rx);
     }
@@ -3179,6 +3376,21 @@ fn pubsub_channels_forgets_a_channel_once_its_last_subscriber_leaves() {
         bulk_strings(&handle_pubsub_command(&["CHANNELS".into()], &hub)).is_empty(),
         "an abandoned channel is not an active channel"
     );
+}
+
+#[tokio::test]
+async fn pubsub_disconnects_a_subscriber_whose_queue_is_full() {
+    let mut hub = PubSubHub::new();
+    let (overflow, mut overflow_rx) = mpsc::channel(1);
+    let (sender, _receiver) = pubsub_channel(overflow);
+    hub.subscribe(1, "hot", sender);
+
+    for _ in 0..256 {
+        assert_eq!(hub.publish("hot", b"x"), 1);
+    }
+    assert_eq!(hub.publish("hot", b"x"), 0);
+    assert!(overflow_rx.try_recv().is_ok());
+    assert_eq!(hub.subscriber_count("hot"), 0);
 }
 
 #[test]
@@ -3286,7 +3498,7 @@ fn memory_allocator_subcommands_are_refused_with_a_reason() {
 #[test]
 fn pubsub_message_encodes_as_a_resp3_push_frame() {
     let bytes = encode_pubsub_msg(
-        PubSubMsg::Message {
+        &PubSubMsg::Message {
             channel: "news".into(),
             message: "hello".into(),
         },
@@ -3308,7 +3520,7 @@ fn pubsub_message_encodes_as_an_array_for_resp2() {
     // every client that has not sent HELLO 3 — is unparseable, so a
     // subscribed connection would break outright.
     let bytes = encode_pubsub_msg(
-        PubSubMsg::Message {
+        &PubSubMsg::Message {
             channel: "news".into(),
             message: "hello".into(),
         },
@@ -3328,7 +3540,7 @@ fn pattern_message_carries_the_matching_pattern() {
     // subscribed to several patterns cannot tell them apart.
     for protover in [2u8, 3u8] {
         let bytes = encode_pubsub_msg(
-            PubSubMsg::PMessage {
+            &PubSubMsg::PMessage {
                 pattern: "news.*".into(),
                 channel: "news.tech".into(),
                 message: "hi".into(),
@@ -4170,7 +4382,7 @@ async fn integration_ws_sync_strict_mode_gates_and_filters() {
     );
 }
 
-// ── Exactly-once delivery (DEDUP) ─────────────────────────────────────────
+// ── Duplicate-suppressed delivery (DEDUP) ─────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn integration_dedup_skips_replayed_writes() {
@@ -4720,7 +4932,7 @@ mod hardening_tests {
             .unwrap();
 
         let writer = AofWriter::open(path.clone(), AofSync::No).await.unwrap();
-        writer.append(b"*1\r\n$4\r\nPING\r\n").await;
+        writer.append(b"*1\r\n$4\r\nPING\r\n").await.unwrap();
         let mode = tokio::fs::metadata(&path)
             .await
             .unwrap()
@@ -4732,7 +4944,7 @@ mod hardening_tests {
     }
 
     #[test]
-    fn temp_files_do_not_collide_between_processes() {
+    fn temp_files_do_not_collide_between_processes_or_operations() {
         // A fixed `.tmp` name meant two servers sharing a data directory would
         // clobber each other's half-written snapshot.
         let a = temp_sibling(std::path::Path::new("/data/recached.rdb"), "snap");
@@ -4744,9 +4956,69 @@ mod hardening_tests {
         assert!(a.to_string_lossy().ends_with(".tmp"), "{a:?}");
         assert_ne!(
             a,
+            temp_sibling(std::path::Path::new("/data/recached.rdb"), "snap")
+        );
+        assert_ne!(
+            a,
             temp_sibling(std::path::Path::new("/data/recached.rdb"), "dedup")
         );
     }
+}
+
+#[tokio::test]
+async fn failed_checkpoint_keeps_dirty_state_and_aof_until_recovery() {
+    let missing_dir = tmp_path("checkpoint_missing");
+    let _ = tokio::fs::remove_dir_all(&missing_dir).await;
+    let snapshot_path = missing_dir.join("dump.rdb");
+    let aof_path = tmp_path("checkpoint.aof");
+    let _ = tokio::fs::remove_file(&aof_path).await;
+    let aof = Arc::new(
+        AofWriter::open(aof_path.clone(), AofSync::No)
+            .await
+            .unwrap(),
+    );
+    aof.append(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
+        .await
+        .unwrap();
+
+    let store = KeyValueStore::new();
+    store.execute(Command::Set(
+        "k".into(),
+        b"v".to_vec(),
+        SetOptions::default(),
+    ));
+    store.mark_dirty();
+    let state = ServerState {
+        snap: Arc::new(SnapshotConfig {
+            path: snapshot_path,
+            last_save: AtomicI64::new(0),
+            checkpoint_id: AtomicU64::new(0),
+        }),
+        aof: Some(Arc::clone(&aof)),
+        replicas: ReplHub::new(),
+        is_replica: AtomicBool::new(false),
+        dedup: std::sync::Mutex::new(HashMap::new()),
+        ephemeral: std::sync::Mutex::new(HashMap::new()),
+        dedup_dirty: AtomicBool::new(false),
+        dedup_order: tokio::sync::Mutex::new(()),
+        save_lock: tokio::sync::Mutex::new(()),
+        persistence_healthy: AtomicBool::new(true),
+        persistence_failures: AtomicU64::new(0),
+    };
+
+    assert!(state.save(&store).await.is_err());
+    assert!(store.dirty_count() > 0);
+    assert!(!state.persistence_is_healthy());
+    assert!(tokio::fs::metadata(&aof_path).await.unwrap().len() > 0);
+
+    tokio::fs::create_dir_all(&missing_dir).await.unwrap();
+    state.save(&store).await.unwrap();
+    assert_eq!(store.dirty_count(), 0);
+    assert!(state.persistence_is_healthy());
+    assert_eq!(tokio::fs::metadata(&aof_path).await.unwrap().len(), 0);
+
+    let _ = tokio::fs::remove_dir_all(&missing_dir).await;
+    let _ = tokio::fs::remove_file(&aof_path).await;
 }
 
 /// A command that cannot be queued must poison the whole transaction.
@@ -5119,10 +5391,11 @@ mod sweep_notification {
     async fn subscribe_pattern(
         registry: &WatchRegistry,
         pattern: &str,
-    ) -> mpsc::UnboundedReceiver<WatchNotif> {
-        let (tx, rx) = mpsc::unbounded_channel::<WatchNotif>();
+    ) -> mpsc::Receiver<WatchNotif> {
+        let (overflow, _overflow_rx) = mpsc::channel(1);
+        let (subscriber, rx) = notification_channel(1, overflow);
         let mut pats = registry.patterns.lock().await;
-        pats.insert(pattern.to_string(), vec![(1, tx)]);
+        pats.insert(pattern.to_string(), vec![subscriber]);
         registry.sync_patterns_len(&pats);
         rx
     }
@@ -5156,10 +5429,10 @@ mod sweep_notification {
         assert_eq!(expired, vec!["fare:MNL-CEB".to_string()]);
         notify_removed(&registry, &expired).await;
 
-        let (key, value) = rx.try_recv().expect("live query was never told");
-        assert_eq!(key, "fare:MNL-CEB");
+        let notification = rx.try_recv().expect("live query was never told");
+        assert_eq!(notification.key, "fare:MNL-CEB");
         assert_eq!(
-            value,
+            notification.value,
             Value::BulkString(None),
             "nil is already the delete encoding, so existing clients apply it unchanged"
         );
@@ -5169,10 +5442,11 @@ mod sweep_notification {
     async fn an_expiry_sweep_notifies_exact_key_watchers_too() {
         let store = KeyValueStore::new();
         let registry: WatchRegistry = WatchHub::new();
-        let (tx, mut rx) = mpsc::unbounded_channel::<WatchNotif>();
+        let (overflow, _overflow_rx) = mpsc::channel(1);
+        let (subscriber, mut rx) = notification_channel(1, overflow);
         {
             let mut map = registry.map.lock().await;
-            map.insert("session:abc".to_string(), vec![(1, tx)]);
+            map.insert("session:abc".to_string(), vec![subscriber]);
             registry.sync_len(&map);
         }
 
@@ -5182,9 +5456,9 @@ mod sweep_notification {
         let expired = store.sweep_expired_reporting();
         notify_removed(&registry, &expired).await;
 
-        let (key, value) = rx.try_recv().expect("WATCH-er was never told");
-        assert_eq!(key, "session:abc");
-        assert_eq!(value, Value::BulkString(None));
+        let notification = rx.try_recv().expect("WATCH-er was never told");
+        assert_eq!(notification.key, "session:abc");
+        assert_eq!(notification.value, Value::BulkString(None));
     }
 
     #[tokio::test]
@@ -5223,5 +5497,24 @@ mod sweep_notification {
         notify_removed(&registry, &expired).await;
 
         assert!(rx.try_recv().is_err(), "nothing expired, nothing to say");
+    }
+
+    #[tokio::test]
+    async fn a_full_notification_queue_signals_and_drops_the_subscriber() {
+        let registry: WatchRegistry = WatchHub::new();
+        let (overflow, mut overflow_rx) = mpsc::channel(1);
+        let (subscriber, _rx) = notification_channel(7, overflow);
+        {
+            let mut map = registry.map.lock().await;
+            map.insert("hot".to_string(), vec![subscriber]);
+            registry.sync_len(&map);
+        }
+
+        for _ in 0..=256 {
+            notify_removed(&registry, &["hot".to_string()]).await;
+        }
+
+        assert!(overflow_rx.try_recv().is_ok());
+        assert_eq!(registry.watched_keys.load(Ordering::Relaxed), 0);
     }
 }

@@ -67,6 +67,9 @@ pub(crate) fn is_write_command(cmd: &Command) -> bool {
 /// Used together with `broadcast_for()` — only call this when `broadcast_for`
 /// already confirmed a mutation occurred.
 pub(crate) fn primary_keys(cmd: &Command) -> Vec<String> {
+    if let Command::Dedup(_, _, inner) = cmd {
+        return primary_keys(inner);
+    }
     match cmd {
         Command::ESet(k, _)
         | Command::Set(k, _, _)
@@ -116,6 +119,188 @@ pub(crate) fn primary_keys(cmd: &Command) -> Vec<String> {
             vec![src.clone(), dst.clone()]
         }
         _ => vec![],
+    }
+}
+
+/// Keys whose state can affect a write's result.
+///
+/// This is deliberately broader than [`primary_keys`]: the source sets of a
+/// `*STORE` command are read while computing the destination, so they must be
+/// in the same ordering domain as that destination. `FLUSHDB` is represented
+/// by `None` because it conflicts with every key.
+pub(crate) fn ordering_keys(cmd: &Command) -> Option<Vec<String>> {
+    if let Command::Dedup(_, _, inner) = cmd {
+        return ordering_keys(inner);
+    }
+    match cmd {
+        Command::FlushDb => None,
+        Command::SInterStore(dst, sources)
+        | Command::SUnionStore(dst, sources)
+        | Command::SDiffStore(dst, sources) => {
+            let mut keys = Vec::with_capacity(sources.len() + 1);
+            keys.push(dst.clone());
+            keys.extend(sources.iter().cloned());
+            Some(keys)
+        }
+        _ => Some(primary_keys(cmd)),
+    }
+}
+
+/// Execute one write while its key-order guards remain held through durable
+/// logging and fan-out. This makes the store commit order the observable AOF,
+/// replica, watcher, and browser-sync order for every pair of conflicting
+/// writes.
+pub(crate) async fn execute_ordered_write(
+    cmd: &Command,
+    tx: &broadcast::Sender<SyncMsg>,
+    origin: u64,
+    state: &ServerState,
+    watch_registry: &WatchRegistry,
+    store: &KeyValueStore,
+) -> Value {
+    if !state.persistence_is_healthy() {
+        let name = command_name(cmd);
+        record_command(name);
+        counter!("recached_command_errors_total", "command" => name).increment(1);
+        return Value::Error(
+            "MISCONF persistence is unhealthy; writes are disabled until SAVE succeeds".to_string(),
+        );
+    }
+    let (effective, dedup) = match cmd {
+        Command::Dedup(client, id, inner) => (inner.as_ref(), Some((client.as_str(), *id))),
+        other => (other, None),
+    };
+    let _dedup_order = if dedup.is_some() {
+        Some(state.dedup_order.lock().await)
+    } else {
+        None
+    };
+    if let Some((client, id)) = dedup
+        && state.dedup_is_duplicate(client, id)
+    {
+        record_command(command_name(effective));
+        return Value::SimpleString("DUP".to_string());
+    }
+
+    // Capacity eviction may choose any key, so capped stores already serialize
+    // their core writes and reserve every propagation ordering domain here.
+    // Uncapped stores retain per-key concurrency.
+    let _guards = if store.has_capacity_limits() {
+        state.replicas.lock_all_writes().await
+    } else {
+        state
+            .replicas
+            .lock_commands(std::slice::from_ref(effective))
+            .await
+    };
+    let (response, evicted) = execute_and_record_with_evictions(store, effective.clone());
+    apply_write_effects(
+        effective,
+        &response,
+        tx,
+        origin,
+        state,
+        watch_registry,
+        store,
+    )
+    .await;
+    apply_eviction_effects(&evicted, tx, origin, state, watch_registry, store).await;
+    if !matches!(response, Value::Error(_)) {
+        if let Command::ESet(key, _) = effective {
+            state.claim_ephemeral(key, origin);
+        }
+        if let Some((client, id)) = dedup {
+            state.commit_dedup(client, id);
+        }
+    }
+    response
+}
+
+/// Propagate implicit capacity victims as DEL operations. The caller holds the
+/// same ordering guards as the write that selected them, so local mutation,
+/// AOF, replication, browser sync, and watcher delivery agree on the order.
+pub(crate) async fn apply_eviction_effects(
+    evicted: &[String],
+    tx: &broadcast::Sender<SyncMsg>,
+    origin: u64,
+    state: &ServerState,
+    watch_registry: &WatchRegistry,
+    store: &KeyValueStore,
+) {
+    for key in evicted {
+        let deletion = Command::Del(vec![key.clone()]);
+        apply_write_effects(
+            &deletion,
+            &Value::Integer(1),
+            tx,
+            origin,
+            state,
+            watch_registry,
+            store,
+        )
+        .await;
+    }
+}
+
+#[cfg(test)]
+mod eviction_propagation_tests {
+    use super::*;
+    use core_engine::cmd::SetOptions;
+    use core_engine::store::{EvictionPolicy, KeyValueStore};
+    use std::sync::atomic::AtomicBool;
+
+    fn tmp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("recached_test_{name}_{}", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn implicit_capacity_eviction_is_replayed_as_a_delete() {
+        let path = tmp_path("capacity_eviction.aof");
+        let _ = tokio::fs::remove_file(&path).await;
+        let aof = AofWriter::open(path.clone(), AofSync::No).await.unwrap();
+        let state = ServerState {
+            snap: Arc::new(SnapshotConfig {
+                path: tmp_path("capacity_eviction.rdb"),
+                last_save: AtomicI64::new(0),
+                checkpoint_id: AtomicU64::new(0),
+            }),
+            aof: Some(Arc::new(aof)),
+            replicas: ReplHub::new(),
+            is_replica: AtomicBool::new(false),
+            dedup: std::sync::Mutex::new(HashMap::new()),
+            ephemeral: std::sync::Mutex::new(HashMap::new()),
+            dedup_dirty: AtomicBool::new(false),
+            dedup_order: tokio::sync::Mutex::new(()),
+            save_lock: tokio::sync::Mutex::new(()),
+            persistence_healthy: AtomicBool::new(true),
+            persistence_failures: AtomicU64::new(0),
+        };
+        let store = KeyValueStore::with_config(Some(1), None, EvictionPolicy::AllKeysRandom);
+        let tx = broadcast::channel::<SyncMsg>(8).0;
+        let watches = WatchHub::new();
+
+        for (key, value) in [("victim", "old"), ("replacement", "new")] {
+            let command = Command::Set(key.into(), value.into(), SetOptions::default());
+            assert_eq!(
+                execute_ordered_write(&command, &tx, 0, &state, &watches, &store).await,
+                Value::SimpleString("OK".into())
+            );
+        }
+        state.aof.as_ref().unwrap().flush().await.unwrap();
+
+        let replayed = KeyValueStore::new();
+        assert_eq!(replay_aof(&replayed, &path).await.unwrap(), 3);
+        assert_eq!(
+            replayed.execute(Command::Get("victim".into())),
+            Value::BulkString(None),
+            "the implicit victim must not return after AOF replay"
+        );
+        assert_eq!(
+            replayed.execute(Command::Get("replacement".into())),
+            Value::BulkString(Some(b"new".to_vec()))
+        );
+
+        let _ = tokio::fs::remove_file(&path).await;
     }
 }
 
@@ -177,7 +362,7 @@ async fn fan_out(registry: &WatchRegistry, key_values: &[(String, Value)]) {
         let mut reg = registry.map.lock().await;
         for (key, value) in key_values {
             if let Some(subs) = reg.get_mut(key) {
-                subs.retain(|(_, tx)| tx.send((key.clone(), value.clone())).is_ok());
+                subs.retain(|sub| sub.notify(key, value));
                 if subs.is_empty() {
                     reg.remove(key);
                 }
@@ -193,7 +378,7 @@ async fn fan_out(registry: &WatchRegistry, key_values: &[(String, Value)]) {
         for (pattern, subs) in pats.iter_mut() {
             for (key, value) in key_values {
                 if core_engine::store::glob_match(pattern, key) {
-                    subs.retain(|(_, tx)| tx.send((key.clone(), value.clone())).is_ok());
+                    subs.retain(|sub| sub.notify(key, value));
                 }
             }
             emptied |= subs.is_empty();
@@ -221,7 +406,7 @@ pub(crate) async fn notify_flushdb(registry: &WatchRegistry, watched_before: Vec
         let mut reg = registry.map.lock().await;
         for key in &watched_before {
             if let Some(subs) = reg.get_mut(key) {
-                subs.retain(|(_, tx)| tx.send((key.clone(), Value::BulkString(None))).is_ok());
+                subs.retain(|sub| sub.notify(key, &Value::BulkString(None)));
             }
         }
         registry.sync_len(&reg);
@@ -231,7 +416,7 @@ pub(crate) async fn notify_flushdb(registry: &WatchRegistry, watched_before: Vec
         let mut emptied = false;
         for (pattern, subs) in pats.iter_mut() {
             let sentinel = pattern.clone();
-            subs.retain(|(_, tx)| tx.send((sentinel.clone(), Value::BulkString(None))).is_ok());
+            subs.retain(|sub| sub.notify(&sentinel, &Value::BulkString(None)));
             emptied |= subs.is_empty();
         }
         if emptied {
@@ -1022,7 +1207,7 @@ mod expiry_propagation_tests {
             long_ago,
         )
         .unwrap();
-        aof.append(&frame).await;
+        aof.append(&frame).await.unwrap();
         // A live key, to prove replay still works at all.
         let live = broadcast_for(
             &Command::SetEx("session:live".into(), 600, "tok".into()),
@@ -1030,11 +1215,11 @@ mod expiry_propagation_tests {
             now_unix_ms(),
         )
         .unwrap();
-        aof.append(&live).await;
-        aof.flush().await;
+        aof.append(&live).await.unwrap();
+        aof.flush().await.unwrap();
 
         let store = KeyValueStore::new();
-        assert_eq!(replay_aof(&store, &path).await, 2);
+        assert_eq!(replay_aof(&store, &path).await.unwrap(), 2);
 
         assert_eq!(
             store.execute(Command::Get("session:revoked".into())),
@@ -1073,7 +1258,8 @@ mod expiry_propagation_tests {
         let aof = AofWriter::open(path.clone(), AofSync::No).await.unwrap();
 
         aof.append(b">3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
-            .await;
+            .await
+            .unwrap();
         let long_ago = now_unix_ms() - 3_600_000;
         let frame = broadcast_for(
             &Command::Expire("k".into(), 30),
@@ -1081,11 +1267,11 @@ mod expiry_propagation_tests {
             long_ago,
         )
         .unwrap();
-        aof.append(&frame).await;
-        aof.flush().await;
+        aof.append(&frame).await.unwrap();
+        aof.flush().await.unwrap();
 
         let store = KeyValueStore::new();
-        replay_aof(&store, &path).await;
+        replay_aof(&store, &path).await.unwrap();
         assert_eq!(
             store.execute(Command::Get("k".into())),
             Value::BulkString(None),
@@ -1211,12 +1397,12 @@ mod counter_ttl_propagation_tests {
                 now,
             ),
         ] {
-            aof.append(&frame.unwrap()).await;
+            aof.append(&frame.unwrap()).await.unwrap();
         }
-        aof.flush().await;
+        aof.flush().await.unwrap();
 
         let store = KeyValueStore::new();
-        replay_aof(&store, &path).await;
+        replay_aof(&store, &path).await.unwrap();
 
         assert_eq!(
             store.execute(Command::Get("rate:user:42".into())),

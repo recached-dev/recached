@@ -2,7 +2,7 @@
 
 ## What Recached is
 
-Recached is an in-memory cache server written in Rust. It speaks RESP (the Redis Serialization Protocol) on port 6379, so any Redis client — `ioredis`, `node-redis`, `redis-py`, `Jedis` — works against it today with no code changes.
+Recached is an in-memory cache server written in Rust. It speaks RESP (the Redis Serialization Protocol) on port 6379, so common clients such as `ioredis`, `node-redis`, `redis-py`, and `Jedis` can use its documented command subset.
 
 Values are binary-safe, as they are in Redis: a value is stored and returned as the exact bytes you
 sent. *Keys* and other identifiers must be text — see [Binary values](#binary-values).
@@ -17,10 +17,7 @@ threads execution itself over a sharded keyspace with no configuration. You can
 [verify the scaling directly](/guide/benchmarks#thread-scaling) by varying the worker count and
 nothing else.
 
-Two honest qualifications. This is an architectural difference, **not** a throughput claim: a
-[tuned Valkey](/guide/benchmarks#with-io-threads-enabled) still out-throughputs Recached on most
-commands. And it costs something real — cross-key atomicity, which single-threaded execution gives
-away for free. See [Concurrency model](/server/commands#concurrency-model).
+Two qualifications matter. This is an architectural difference, **not** a current throughput claim; compare the exact releases and configuration you plan to run using the [benchmark harness](/guide/benchmarks). It also does not provide fully isolated cross-key reads. See [Concurrency model](/server/commands#concurrency-model).
 
 **The distinguishing feature is elsewhere: the same engine runs where there is no server at all.**
 That is the `core-engine` crate: a pure Rust state machine with no network dependencies, no file I/O, and no OS-specific code. It compiles to native x86-64/ARM64 for the server **and** to `wasm32-unknown-unknown` for the browser. Both targets run the same cache logic from the same source. The WebSocket sync layer (port 6380) keeps the two sides consistent in real time.
@@ -49,7 +46,7 @@ Three crates with hard dependency boundaries:
 |---|---|
 | `core-engine` | Pure state machine — no networking, no I/O. RESP parser, typed command dispatch, sharded lock-free store (`DashMap`), TTL engine, optional key cap. Compiles to both native and `wasm32`. |
 | `server-native` | Tokio TCP server (port 6379) + WebSocket server (port 6380). Persistent read buffers handle fragmented RESP. Per-connection pub/sub via `mpsc` channels. Connection semaphore, auth rate-limiting, sender-ID broadcast filter. |
-| `wasm-edge` | `wasm-bindgen` JS bindings. Local zero-latency reads, RESP-over-WebSocket sync. Closure lifecycle managed to avoid memory leaks on reconnect. |
+| `wasm-edge` | `wasm-bindgen` JS bindings. Local reads without a network hop, RESP-over-WebSocket sync. Closure lifecycle managed to avoid memory leaks on reconnect. |
 
 ## When to use Recached
 
@@ -59,13 +56,13 @@ Recached is a good fit when:
 - **You want live UI without polling.** The WebSocket sync replaces a polling loop without requiring you to build a separate SSE or WebSocket server.
 - **You want a frontend-only cache with TTL.** The WASM module works entirely without a server. Call `createCache()` without `connect` and you get a local cache with TTLs, counters, JSON documents, glob queries, optional IndexedDB persistence and cross-tab sync — no Recached server, no Redis, no backend changes required. Pub/sub, live queries and cross-device sync are what you give up; see [no server at all](/guide/use-cases#no-server-at-all) for the full boundary.
 - **You need cross-tab sync.** BroadcastChannel support means all open tabs in the same browser share mutations automatically.
-- **You want a drop-in Redis replacement** for the subset of commands most applications actually use (strings, expiry, counters, collections, transactions, pub/sub).
+- **You want to reuse a Redis client** for Recached's documented command subset (strings, expiry, counters, collections, transactions, and pub/sub).
 
 ## When Recached is not the right fit
 
 - **You need very high-durability persistence.** Recached supports snapshots (RDB-style) and AOF, but it is still primarily an in-memory cache. If you cannot tolerate any data loss between fsync intervals, a purpose-built database is the right tool.
-- **You need multi-replica consensus failover.** Recached supports leader–follower replication with automatic single-replica failover (`RECACHED_FAILOVER_TIMEOUT`). If the primary is unreachable for the configured duration, the designated replica promotes itself. What it does not include is multi-replica quorum election: in a setup with several replicas, split-brain prevention requires you to designate one replica for auto-failover and keep the others as passive standbys.
-- **You depend on uncommon Redis commands.** Recached implements the commands most applications use, not all 250+. Server introspection (`INFO`, `SLOWLOG`, `COMMAND`), Lua scripting, and cluster mode are out of scope. RESP3 is supported for protocol negotiation and pub/sub delivery (`HELLO 3`), not for the full RESP3 type surface.
+- **You need unattended failover.** Recached supports primary/replica replication but has no quorum, leader election, or fencing service. Promotion requires an operator or orchestrator to fence the old primary and send `REPLICAOF NO ONE`. `RECACHED_FAILOVER_TIMEOUT` is deprecated and ignored.
+- **You depend on uncommon Redis commands.** Recached implements the commands most applications use, not all 250+. Latency introspection (`SLOWLOG`, `INFO latencystats`), Lua scripting, and cluster mode are out of scope. `INFO` and `COMMAND` expose the supported compatibility subset. RESP3 is supported for protocol negotiation and pub/sub delivery (`HELLO 3`), not for the full RESP3 type surface.
 - **You need very large datasets.** Recached is an in-memory cache — it is not a database. If your working set does not fit in RAM, Redis with RDB persistence or a proper database is the right tool.
 
 ## Binary values
@@ -107,7 +104,7 @@ were destroyed on the way in.
 
 Honest status, per layer:
 
-- **The cache server is production-ready for cache workloads.** Persistence (atomic snapshots + AOF), replication with auto-failover, TLS, constant-time auth, hardened parsers, Prometheus metrics, and a load/chaos suite in CI. Cache workloads also have a forgiving failure contract by nature — treat it as a cache, not a system of record.
+- **The cache server is a release candidate for cache workloads.** It includes atomic snapshots, an append-only file, ordered replication, TLS, constant-time authentication, hardened parsers, Prometheus metrics, and load/chaos tests. It still needs broad production validation and an independent security audit. Treat it as a cache, not a system of record.
 - **The sync layer (browser sync, live queries, offline outbox, scoped auth) is beta.** The invariants are [specified](/server/protocol), tested, and verified end-to-end — but the code is young and hasn't accumulated real-world miles or third-party security review yet. Concretely: don't expose the WebSocket port to the public internet for multi-tenant data until you've read [Sync Scopes](/server/sync-scopes) and understood the model, and expect occasional sharp edges.
 
 The road to 1.0 is hardening, not features: fuzzing the parser surfaces, automated browser testing, a security pass on the token path, and a protocol freeze once real-world usage has confirmed the design. Bug reports from production-like use are the most valuable contribution the project can receive right now.
@@ -120,10 +117,10 @@ The road to 1.0 is hardening, not features: fuzzing the parser surfaces, automat
 | Browser-side cache | Yes — WASM | No |
 | WebSocket sync | Built-in | Not built-in |
 | Persistence | Snapshot + AOF | RDB + AOF |
-| Replication | Primary/replica + auto-failover | Yes (+ Sentinel/Cluster) |
+| Replication | Primary/replica + manually fenced promotion | Yes (+ Sentinel/Cluster) |
 | Lua scripting | No (WASM scripting on roadmap) | Yes |
 | Cluster mode | No | Yes |
-| Command coverage | ~115 commands | 250+ |
+| Command coverage | 123 commands | 250+ |
 | License | Apache 2.0 | AGPLv3 / RSALv2 + SSPLv1 (BSD-3 up to 7.2; Valkey stayed BSD-3) |
 
 ## Recached vs SWR / React Query
@@ -149,7 +146,7 @@ Recached replaces the manual caching layer developers build on top of Zustand or
 | What it is | Cache + **sync fabric** between backend and clients | Embedded **database** inside the app |
 | Data model | Keys — strings, collections, JSON | Documents with MongoDB-like queries, indexes, ACID transactions |
 | Server | The server is the product (Redis-compatible) | None — runs entirely on-device |
-| Superpower | Multi-client sync: scoped auth, live fan-out, offline outbox, exactly-once delivery | On-device vector + hybrid search, rich queries |
+| Superpower | Multi-client sync: scoped auth, live fan-out, offline outbox, deduplicated replay | On-device vector + hybrid search, rich queries |
 | Truth model | **Shared truth** across users and devices | **Device-local truth** |
 
 The one-line rule: **TalaDB is where one device's data lives; Recached is how many devices agree.** A notes app with on-device semantic search wants TalaDB. A shared cart, live dashboard, presence, or agent-output streaming wants Recached. An app that needs both — locally queryable data that also syncs across users — is exactly where the two are designed to meet: TalaDB's planned `SyncAdapter` interface can use Recached as its sync backbone.

@@ -1,12 +1,12 @@
 ---
 layout: home
 title: "Recached — Rust Cache for Backend and Browser"
-description: "A Rust cache server that runs natively on your backend and as WebAssembly in the browser. Redis-compatible on the server, zero-latency local reads in the browser."
+description: "A Rust cache server that runs natively on your backend and as WebAssembly in the browser. A Redis-compatible command subset on the server and local reads in the browser."
 
 hero:
   name: "Recached ⚡"
   text: "Cache that runs everywhere."
-  tagline: "Redis-compatible on your server. WebAssembly in the browser. Zero-latency reads. Automatic sync."
+  tagline: "A Redis-compatible server. WebAssembly in the browser. Local reads without a network hop."
   image:
     src: /recached.jpg
     alt: Recached
@@ -26,14 +26,14 @@ hero:
 
 features:
   - icon: ⚡
-    title: Zero-latency local reads
+    title: Local reads without a network hop
     details: The browser WASM module holds a live copy of the cache in local memory. Reads never leave the browser — no network hop, no round-trip.
   - icon: 🔄
     title: Automatic WebSocket sync
     details: Any mutation on the server is pushed to all connected browser instances instantly. Any write from the browser is pushed to the server and fanned out to other tabs.
   - icon: 🦀
-    title: Redis-compatible server
-    details: Speaks RESP on port 6379. Drop it in front of any Redis client — ioredis, node-redis, redis-py — with no code changes.
+    title: Redis-compatible command subset
+    details: Speaks RESP on port 6379 and works with common clients such as ioredis, node-redis, and redis-py. Check COMMAND for the supported subset before migrating.
   - icon: 🌐
     title: Offline-first browser cache
     details: IndexedDB persistence means the cache survives page refreshes. Users see their data immediately, before any network request completes.
@@ -41,15 +41,15 @@ features:
     title: Cross-tab sync
     details: BroadcastChannel support means all tabs in the same browser share mutations automatically, with no server connection required.
   - icon: 🔒
-    title: Production-ready server
-    details: TLS, Prometheus metrics, password auth, IP allowlists, connection limits, eviction policies, and observable keys out of the box.
+    title: Hardened cache server
+    details: TLS, Prometheus metrics, password authentication, IP allowlists, connection limits, bounded eviction, and ordered replication. Release-candidate maturity.
 ---
 
 ## What is Recached?
 
 Every caching solution forces a choice: server-side caches like Redis mean every frontend read is a network round-trip; client-side state like Zustand or SWR means two caches — one on the server and one in every client, with manual staleness code gluing them together. **Recached removes the choice.**
 
-The same Rust cache engine runs natively on your server (RESP on port 6379 — any Redis client works today, zero code changes) and as WebAssembly inside the browser. Reads always come from local WASM memory. The WebSocket is only a sync path, not a read path.
+The same Rust cache engine runs natively on your server (RESP on port 6379) and as WebAssembly inside the browser. Common Redis clients work with the commands Recached implements. Browser reads come from local WASM memory; the WebSocket is a sync path, not a read path.
 
 ```typescript
 import { createCache } from 'recached-edge'
@@ -59,7 +59,7 @@ const cache = await createCache({
   connect: { url: 'ws://localhost:6380' },    // syncs with the server
 })
 
-cache.get('inventory:item:99') // "42" — from local WASM memory, 0 ms
+cache.get('inventory:item:99') // "42" — local WASM memory, no network request
 
 // React to any store mutation — local writes, server push, or cross-tab sync
 cache.onMutation(() => {

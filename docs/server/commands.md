@@ -4,24 +4,21 @@ Recached implements the subset of RESP commands that most applications use. Comm
 
 ## Concurrency model
 
-Recached executes commands on **every** CPU core. Redis and Valkey execute commands on one. That is the main structural difference between them, and it cuts both ways — it is where Recached's pipelined throughput advantage comes from, and it is the one place where Recached's semantics are genuinely weaker than Redis's.
-
-Concretely: the keyspace is a sharded map, and a command takes the lock for the shard its key lives in. Two commands on keys in different shards run at the same time on different threads.
+Recached schedules independent commands across worker threads over a sharded keyspace. Commands whose write sets overlap share ordering barriers; unrelated keys can progress concurrently.
 
 **What that guarantees**
 
-- **Every single-key command is atomic.** `INCR`, `APPEND`, `SETNX`, `GETSET`, `HINCRBY`, `LPUSH`, `ZADD` and the rest do their read-modify-write under one lock. Concurrent callers are serialised per key, exactly as on Redis.
-- **`WATCH` compare-and-swap is sound.** A watched key that changes before `EXEC` aborts the transaction, over both transports.
-- **No torn values.** A reader sees the value before a write or the value after it, never a mixture.
+- **Single-key commands are atomic.** Read-modify-write commands such as `INCR`, `SETNX`, `GETSET`, `HINCRBY`, `LPUSH`, and `ZADD` hold one entry guard for the decision and mutation.
+- **Conflicting writers are ordered.** A multi-key write or `MULTI`/`EXEC` reserves all of its write keys against other server writes until persistence, replication, and notifications have recorded the result.
+- **`WATCH` compare-and-swap is sound.** `EXEC` reserves both its write keys and watched keys before checking invalidation, so a writer cannot land between the check and execution.
+- **Values are not torn.** A reader sees a value before or after an individual mutation, never a partial value.
 
 **What it does not guarantee**
 
-- **Commands that span keys are not atomic across those keys.** `MSET` applies key by key; `SMOVE` removes from the source and then adds to the destination, so the member is briefly in neither set. A concurrent reader can catch either mid-flight. Redis, being single-threaded, cannot show you these states.
-- **`MULTI`/`EXEC` is not isolated.** The queued commands run as a batch, but another connection's write can interleave between two of them. See [Transactions](#transactions).
+- **Readers do not join the writer barriers.** Commands such as `MSET` and `SMOVE` update their keys one at a time. A concurrent reader can observe an intermediate cross-key state even though another writer cannot interleave on those keys.
+- **`MULTI`/`EXEC` is writer-isolated, not fully isolated.** Another connection cannot write a key reserved by the transaction, but reads may observe results between queued commands.
 
-**The rule of thumb:** if correctness depends on several keys changing together, `WATCH` the keys you read and retry on abort. Do not rely on `MULTI` alone for mutual exclusion. For a single key, nothing is required — it is already atomic.
-
-This is a deliberate trade, not an oversight. Restoring cross-key atomicity means a global lock, which is precisely the single-threaded design that costs Redis the throughput shown in the [benchmarks](/guide/benchmarks). Recached is a cache; the workloads it targets are overwhelmingly single-key.
+If correctness depends on values read before a transaction, `WATCH` those keys and retry when `EXEC` returns nil. Use a database or another system with fully isolated multi-key transactions when readers must observe several keys changing as one indivisible state transition.
 
 ---
 
@@ -146,14 +143,14 @@ redis-cli -p 6379 INFO server memory
 
 - **`role`** reports `master` or `slave`, matching Redis's wire spelling because tooling greps for exactly those strings. `connected_replicas` is emitted as an alias of `connected_slaves` for readability; both carry the same number.
 - **`loading`** is always `0`. Recached loads its snapshot before binding a listener, so a client that can reach the server is never looking at one still loading. Client ready-checks gate on this field.
-- **`used_memory`** and the `keyspace` counts come from a keyspace sample refreshed every 5 seconds, not a fresh walk per call — so polling `INFO` once a second costs the same as polling it once a minute. Both are approximations, as `used_memory` is in Redis.
+- **`used_memory`** and keyspace counts come from incrementally maintained counters sampled every 5 seconds. `INFO` does not walk the keyspace. `used_memory` measures logical key/value bytes, not allocator RSS. Expired physical entries leave these counters when the bounded active-expiry task removes them.
 - **`maxmemory`** and `recached_max_keys` report `0` when no limit is configured, matching Redis's convention for "unbounded".
 
 ### Not implemented
 
 `INFO` does not report the `cpu`, `commandstats`, `latencystats`, or `errorstats` sections. Per-command call counts and error counts are exported to [Prometheus](/server/operations#metrics-endpoint) on port 9091 instead, which is where they belong for dashboards and alerting. `INFO` is for the operator at a terminal and for client ready-checks.
 
-**Recached does not measure command latency anywhere** — not in `INFO`, and not on the metrics endpoint. `recached_commands_total` counts calls, `recached_command_errors_total` counts failures, and neither says how long anything took. So there is currently no way to see a slow command, which matters most for the commands that clone a whole collection under a shard guard: prefer the bounded reads (`HSCAN`, `SSCAN`, `ZSCAN`, `GETRANGE`) over `HGETALL` and `SMEMBERS` on large keys rather than expecting to catch the problem after the fact. Latency histograms and `SLOWLOG` are not implemented.
+`INFO` does not expose latency sections, but Prometheus exports `recached_command_duration_seconds{command=...}`. Recached does not implement `SLOWLOG`, so use client tracing for individual slow requests. Prefer bounded reads (`HSCAN`, `SSCAN`, `ZSCAN`, `GETRANGE`) over whole-collection replies on large keys.
 
 ### Access
 
@@ -210,14 +207,14 @@ The most common data type. Values are always stored as byte strings; numeric ope
 | `TYPE key` | Returns the type of the value stored at key: `string`, `hash`, `list`, `set`, `zset`, `ratelimit`, or `none` if the key does not exist. |
 | `RENAME key newkey` | Renames a key. Returns an error if the source key does not exist. Overwrites `newkey` if it already exists. |
 | `KEYS pattern` | Returns all keys matching the glob pattern. `*` matches any sequence of bytes, `?` matches exactly one byte. **Character classes (`[abc]`) are not supported** — brackets match literally. Patterns are capped at 1,024 bytes. Warning: `KEYS *` on a large store is slow — prefer `SCAN`. |
-| `SCAN cursor [MATCH pattern] [COUNT count]` | Iterates keys incrementally, returning at most `COUNT` keys per call (default 10) plus the next cursor. Start with cursor `0` and continue until the returned cursor is `0`. `MATCH` filters results by glob pattern. As in Redis, keys inserted or deleted mid-iteration may be missed or returned twice. |
-| `DBSIZE` | Returns the total number of keys in the store. |
+| `SCAN cursor [MATCH pattern] [COUNT count]` | Iterates a maintained ordered key index. Each call examines at most `COUNT` keys (default 10), so work and reply size are bounded independently of total key count. `MATCH` may make a page shorter than `COUNT`. Start with `0` and continue until the returned cursor is `0`. Abandoned cursors are capped at 4,096 sessions. Concurrent changes may be missed or returned twice. |
+| `DBSIZE` | Returns the maintained stored-key count in O(1) time. Reads still treat an expired key as missing immediately, but `DBSIZE` may include its physical entry until the bounded active-expiry task removes it. |
 | `FLUSHDB [ASYNC]` | Removes all keys from the store. `ASYNC` is accepted but does not change behavior (the flush is always synchronous). |
 | `MEMORY USAGE key [SAMPLES count]` | Approximate bytes held by one key — the key name, its value, and a fixed per-entry overhead. Returns nil when the key does not exist or has expired. `SAMPLES` is accepted and ignored. |
 
 ### MEMORY USAGE
 
-The figure is the same one the eviction loop bills the key for, not a second estimate written alongside it. That is the point: "which key is eating my `maxmemory`" and "which key gets evicted next" are answered from one measurement, so they cannot disagree.
+The figure uses the same logical key/value accounting as eviction. It excludes allocator metadata, fragmentation, connection buffers, replication queues, and other process memory. Use process RSS for host capacity planning.
 
 ```bash
 redis-cli -p 6379 MEMORY USAGE session:8f21
@@ -424,11 +421,11 @@ Controls which keys a WebSocket connection receives pushes for and may operate o
 
 On the TCP port, `SYNC` returns an error — backend connections are trusted and unscoped.
 
-### Exactly-once envelope
+### Deduplicated replay envelope
 
 | Command | Description |
 |---|---|
-| `DEDUP client-id id command args...` | Wraps a write with a per-client monotonic id. If `id` is at or below the highest id already applied for `client-id`, the write is skipped and the reply is `+DUP` — used by the browser SDK's offline-replay so a write whose acknowledgment was lost never applies twice. Client ids are 1–64 characters and should be unguessable (the SDK uses `crypto.randomUUID()`). Scope checks, replica rejection, and metrics all apply to the wrapped command. Dedup marks are in-memory, per server, swept after 24 h idle. |
+| `DEDUP client-id id command args...` | Wraps a write with a per-client monotonic id. If `id` is at or below the highest id already applied for `client-id`, the write is skipped and the reply is `+DUP`. Client ids are 1–64 characters and should be unguessable (the SDK uses `crypto.randomUUID()`). Scope checks, replica rejection, persistence health, and metrics apply to the wrapped command. High-water marks are persisted beside the snapshot and swept after 24 h idle. |
 
 ---
 
@@ -488,18 +485,16 @@ client ignores the new shape.
 
 ## Transactions
 
-Transactions queue commands and run them as one batch at `EXEC`, with optimistic locking through `WATCH`. After `EXEC`, the full result set is broadcast to WebSocket clients.
+Transactions queue commands and run them as one batch at `EXEC`, with optimistic locking through `WATCH`. The server reserves the union of queued write keys until every command and its persistence, replication, and notification effects finish. After `EXEC`, the full result set is broadcast to WebSocket clients.
 
-::: warning `EXEC` is a batch, not an isolated one
-Recached executes commands on every worker thread. Nothing holds a global lock across the `EXEC` loop, so a write from another connection **can** land between two queued commands. Redis gets that isolation for free by executing everything on one thread; Recached trades it for parallelism.
+::: warning Writer isolation is not reader isolation
+A conflicting server write cannot interleave between queued commands. Reads do not acquire these ordering barriers, so another connection may observe intermediate results between two commands in the transaction.
 
-What you still get is what most transaction code actually depends on:
-
-- **Nothing runs before `EXEC`.** Queued commands are held, not executed, so a partially-typed transaction never touches the keyspace.
+- **Nothing runs before `EXEC`.** Queued commands are held until execution.
 - **All or nothing on a queue error.** If any command fails to queue, `EXEC` runs none of them and returns `EXECABORT`.
-- **Full `WATCH` CAS.** If a watched key changed after `WATCH`, `EXEC` runs nothing and returns a nil array.
+- **`WATCH` closes the check-to-write race.** `EXEC` reserves watched keys before checking invalidation. If one changed after `WATCH`, it runs nothing and returns a nil array.
 
-So `WATCH`-based compare-and-swap is sound, and that is the right tool here. What is *not* sound is treating `MULTI`/`EXEC` alone as a critical section — for example queuing `GET k` then `SET k <derived>` and assuming no one else wrote `k` in between. Put the key under `WATCH` and the pattern is correct again.
+Use `WATCH` for compare-and-swap. Do not use `MULTI`/`EXEC` when concurrent readers must observe several keys changing atomically.
 :::
 
 | Command | Description |
@@ -574,7 +569,9 @@ Replication topology is set at startup with [`RECACHED_REPLICAOF`](/server/confi
 |---|---|
 | `REPLICAOF NO ONE` | Promotes this replica to a primary: it stops following its upstream and begins accepting writes. This is the **only** accepted form — pointing a running server at a new primary (`REPLICAOF host port`) is rejected with an error. To re-point a server, restart it with a different `RECACHED_REPLICAOF`. |
 
-Automatic promotion on primary failure is configured with `RECACHED_FAILOVER_TIMEOUT`; `REPLICAOF NO ONE` is the manual equivalent. Note that promotion is not coordinated between replicas — see [when Recached is not the right fit](/guide/introduction#when-recached-is-not-the-right-fit) for the split-brain caveat.
+Promotion is always manual. Fence the old primary before sending `REPLICAOF NO ONE`; otherwise both nodes can accept writes after a partition. `RECACHED_FAILOVER_TIMEOUT` is deprecated and ignored. See [manual failover](/server/configuration#manual-failover).
+
+Replication uses the versioned `RCP1` stream. A replica reconnects with its primary run id and last applied offset. The primary sends missing frames from its bounded backlog when available and falls back to a full snapshot otherwise.
 
 ---
 
@@ -584,8 +581,8 @@ Snapshot commands write the in-memory store to disk in MessagePack format. The s
 
 | Command | Description |
 |---|---|
-| `SAVE` | Synchronously writes a snapshot to disk. Blocks until the file is written. Returns `OK` on success. |
-| `BGSAVE` | Triggers a background snapshot. Returns immediately; the save runs in a background task while the server continues accepting connections. |
+| `SAVE` | Synchronously creates a snapshot/AOF checkpoint. Returns `OK` only after the snapshot is durable and the covered AOF is truncated; returns `MISCONF` on failure. |
+| `BGSAVE` | Starts the same checkpoint in a background task and returns immediately. Reads continue, but writes pause while the checkpoint holds its all-write barrier. |
 | `LASTSAVE` | Returns the Unix timestamp (seconds) of the most recent successful snapshot. Returns the server start time if no save has completed yet. |
 
 ### Example
@@ -598,7 +595,7 @@ LASTSAVE        # (integer) 1746794400
 ```
 
 ```bash
-# Force a synchronous save (blocks until done — use BGSAVE in production)
+# Force a synchronous save
 SAVE            # +OK
 ```
 

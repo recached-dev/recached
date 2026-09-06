@@ -42,28 +42,23 @@ pub(crate) async fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::
 /// safely on disk. Only meaningful on unix — Windows has no directory handle to
 /// sync — so the call is compiled out elsewhere.
 #[cfg(unix)]
-pub(crate) async fn sync_parent_dir(path: &std::path::Path) {
+pub(crate) async fn sync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
     let Some(dir) = path.parent() else {
-        return;
+        return Ok(());
     };
-    // An empty parent means the path was relative with no directory component.
     let dir = if dir.as_os_str().is_empty() {
         std::path::Path::new(".")
     } else {
         dir
     };
-    match tokio::fs::File::open(dir).await {
-        Ok(f) => {
-            if let Err(e) = f.sync_all().await {
-                warn!("Directory fsync failed for {:?}: {}", dir, e);
-            }
-        }
-        Err(e) => warn!("Could not open {:?} to fsync: {}", dir, e),
-    }
+    let file = tokio::fs::File::open(dir).await?;
+    file.sync_all().await
 }
 
 #[cfg(not(unix))]
-pub(crate) async fn sync_parent_dir(_path: &std::path::Path) {}
+pub(crate) async fn sync_parent_dir(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
 
 /// Tighten an already-open file to `0600`, ignoring failure.
 ///
@@ -78,7 +73,7 @@ pub(crate) async fn restrict_permissions(f: &tokio::fs::File) {
         .await;
 }
 
-/// Path for a temp file alongside `path`, distinct per process.
+/// Path for a temp file alongside `path`, distinct per operation.
 ///
 /// The previous fixed `.tmp` name meant two servers sharing a directory would
 /// clobber each other's half-written snapshot, and made the target predictable
@@ -86,7 +81,9 @@ pub(crate) async fn restrict_permissions(f: &tokio::fs::File) {
 /// unguessable, so it is a defence against collision rather than against an
 /// attacker who already controls the data directory.
 pub(crate) fn temp_sibling(path: &std::path::Path, tag: &str) -> PathBuf {
-    path.with_extension(format!("{tag}.{}.tmp", std::process::id()))
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
+    let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    path.with_extension(format!("{tag}.{}.{id}.tmp", std::process::id()))
 }
 
 // ── snapshot persistence ──────────────────────────────────────────────────────
@@ -94,51 +91,95 @@ pub(crate) fn temp_sibling(path: &std::path::Path, tag: &str) -> PathBuf {
 pub(crate) struct SnapshotConfig {
     pub(crate) path: PathBuf,
     pub(crate) last_save: AtomicI64,
+    pub(crate) checkpoint_id: AtomicU64,
 }
 
-pub(crate) async fn save_snapshot(store: &KeyValueStore, cfg: &SnapshotConfig) {
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SnapshotFile {
+    version: u8,
+    aof_checkpoint: u64,
+    entries: Vec<SnapshotEntry>,
+}
+
+pub(crate) struct LoadedSnapshot {
+    #[allow(dead_code)]
+    pub(crate) found: bool,
+    pub(crate) aof_checkpoint: u64,
+}
+
+pub(crate) async fn save_snapshot(
+    store: &KeyValueStore,
+    cfg: &SnapshotConfig,
+    aof_checkpoint: u64,
+) -> std::io::Result<()> {
     let entries = store.snapshot();
     let count = entries.len();
     let tmp = temp_sibling(&cfg.path, "snap");
-    match rmp_serde::to_vec(&entries) {
-        Err(e) => warn!("Snapshot serialize failed: {}", e),
-        Ok(bytes) => match write_private(&tmp, &bytes).await {
-            Err(e) => warn!("Snapshot write failed: {}", e),
-            Ok(()) => match tokio::fs::rename(&tmp, &cfg.path).await {
-                Err(e) => warn!("Snapshot rename failed: {}", e),
-                Ok(()) => {
-                    sync_parent_dir(&cfg.path).await;
-                    cfg.last_save.store(now_unix_secs(), Ordering::Relaxed);
-                    info!("Snapshot saved: {} entries → {:?}", count, cfg.path);
-                }
-            },
-        },
+    let bytes = rmp_serde::to_vec(&SnapshotFile {
+        version: 1,
+        aof_checkpoint,
+        entries,
+    })
+    .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e.to_string()))?;
+    if let Err(error) = write_private(&tmp, &bytes).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(error);
     }
+    if let Err(error) = tokio::fs::rename(&tmp, &cfg.path).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(error);
+    }
+    sync_parent_dir(&cfg.path).await?;
+    info!("Snapshot saved: {} entries → {:?}", count, cfg.path);
+    Ok(())
 }
 
-pub(crate) async fn load_snapshot(store: &KeyValueStore, path: &std::path::Path) -> bool {
-    match tokio::fs::read(path).await {
+pub(crate) async fn load_snapshot_checkpoint(
+    store: &KeyValueStore,
+    path: &std::path::Path,
+) -> std::io::Result<LoadedSnapshot> {
+    let bytes = match tokio::fs::read(path).await {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             info!("No snapshot at {:?}, starting fresh", path);
-            false
+            return Ok(LoadedSnapshot {
+                found: false,
+                aof_checkpoint: 0,
+            });
         }
-        Err(e) => {
-            warn!("Snapshot read failed: {}", e);
-            false
-        }
-        Ok(bytes) => match rmp_serde::from_slice::<Vec<SnapshotEntry>>(&bytes) {
-            Err(e) => {
-                warn!("Snapshot deserialize failed: {}", e);
-                false
+        Err(e) => return Err(e),
+        Ok(bytes) => bytes,
+    };
+    let (entries, aof_checkpoint) =
+        if let Ok(snapshot) = rmp_serde::from_slice::<SnapshotFile>(&bytes) {
+            if snapshot.version != 1 {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("unsupported snapshot format version {}", snapshot.version),
+                ));
             }
-            Ok(entries) => {
-                let count = entries.len();
-                store.restore(entries);
-                info!("Snapshot loaded: {} entries ← {:?}", count, path);
-                true
-            }
-        },
-    }
+            (snapshot.entries, snapshot.aof_checkpoint)
+        } else {
+            (
+                rmp_serde::from_slice::<Vec<SnapshotEntry>>(&bytes)
+                    .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e.to_string()))?,
+                0,
+            )
+        };
+    let count = entries.len();
+    store.restore(entries);
+    info!("Snapshot loaded: {} entries ← {:?}", count, path);
+    Ok(LoadedSnapshot {
+        found: true,
+        aof_checkpoint,
+    })
+}
+
+#[cfg(test)]
+pub(crate) async fn load_snapshot(
+    store: &KeyValueStore,
+    path: &std::path::Path,
+) -> std::io::Result<bool> {
+    Ok(load_snapshot_checkpoint(store, path).await?.found)
 }
 
 // ── AOF ───────────────────────────────────────────────────────────────────────
@@ -175,93 +216,142 @@ impl AofWriter {
         })
     }
 
-    pub(crate) async fn append(&self, resp: &[u8]) {
+    pub(crate) async fn append(&self, resp: &[u8]) -> std::io::Result<()> {
         let mut f = self.file.lock().await;
-        if f.write_all(resp).await.is_err() {
-            warn!("AOF write failed");
-            return;
-        }
+        f.write_all(resp).await?;
         if self.sync == AofSync::Always {
-            // `flush()` alone only pushes tokio's buffer into a `write` syscall,
-            // which leaves the bytes in the page cache — surviving a process
-            // crash but not a power loss or kernel panic. `always` exists
-            // precisely to survive the latter, so it has to reach the device.
-            if let Err(e) = f.flush().await {
-                warn!("AOF flush failed: {}", e);
-                return;
-            }
-            if let Err(e) = f.sync_data().await {
-                warn!("AOF fsync failed: {}", e);
-            }
+            f.flush().await?;
+            f.sync_data().await?;
         }
+        Ok(())
     }
 
     /// Flush and fsync. Called on the `everysec` ticker and before shutdown.
     ///
     /// `sync_data` rather than `sync_all`: the AOF is append-only, so its
     /// metadata beyond the length carries nothing worth an extra barrier.
-    pub(crate) async fn flush(&self) {
+    pub(crate) async fn flush(&self) -> std::io::Result<()> {
         let mut f = self.file.lock().await;
-        if let Err(e) = f.flush().await {
-            warn!("AOF flush failed: {}", e);
-            return;
-        }
-        if let Err(e) = f.sync_data().await {
-            warn!("AOF fsync failed: {}", e);
-        }
+        f.flush().await?;
+        f.sync_data().await
     }
 
-    pub(crate) async fn truncate(&self) {
+    pub(crate) async fn truncate(&self) -> std::io::Result<()> {
         let f = self.file.lock().await;
-        match f.set_len(0).await {
-            // The truncation itself must be durable, or a crash can resurrect a
-            // log the snapshot has already subsumed and replay it on top.
-            Ok(()) => match f.sync_all().await {
-                Ok(()) => info!("AOF truncated after snapshot save"),
-                Err(e) => warn!("AOF truncate fsync failed: {}", e),
-            },
-            Err(e) => warn!("AOF truncate failed: {}", e),
-        }
+        f.set_len(0).await?;
+        f.sync_all().await?;
+        info!("AOF truncated after snapshot save");
+        Ok(())
     }
 }
 
-pub(crate) async fn replay_aof(store: &KeyValueStore, path: &std::path::Path) -> usize {
+#[cfg(test)]
+pub(crate) async fn replay_aof(
+    store: &KeyValueStore,
+    path: &std::path::Path,
+) -> std::io::Result<usize> {
+    replay_aof_from_checkpoint(store, path, 0).await
+}
+
+pub(crate) async fn replay_aof_from_checkpoint(
+    store: &KeyValueStore,
+    path: &std::path::Path,
+    snapshot_checkpoint: u64,
+) -> std::io::Result<usize> {
     let bytes = match tokio::fs::read(path).await {
-        Err(e) if e.kind() == ErrorKind::NotFound => return 0,
-        Err(e) => {
-            warn!("AOF read failed: {}", e);
-            return 0;
-        }
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
         Ok(b) => b,
     };
-    let mut replayed = 0usize;
+
+    let mut replay_start = 0usize;
     let mut offset = 0;
     while offset < bytes.len() {
         match Value::parse(&bytes[offset..]) {
             Ok((value, consumed)) => {
                 offset += consumed;
+                if checkpoint_marker(&value) == Some(snapshot_checkpoint) {
+                    replay_start = offset;
+                }
+            }
+            Err(e) if e.is_incomplete() => break,
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("AOF corrupted at offset {offset}: {e}"),
+                ));
+            }
+        }
+    }
+
+    let mut replayed = 0usize;
+    let mut offset = replay_start;
+    while offset < bytes.len() {
+        match Value::parse(&bytes[offset..]) {
+            Ok((value, consumed)) => {
+                offset += consumed;
+                if checkpoint_marker(&value).is_some() {
+                    continue;
+                }
                 // Writes are recorded via `on_write` in RESP3 Push form (`>N`);
                 // normalise to Array so Command::from_value can parse them.
                 let normalised = match value {
                     Value::Push(inner) => Value::Array(Some(inner)),
                     other => other,
                 };
-                if let Ok(cmd) = Command::from_value(normalised) {
-                    store.execute(cmd);
-                    replayed += 1;
+                let cmd = Command::from_value(normalised).map_err(|e| {
+                    std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!("invalid AOF command at offset {}: {e}", offset - consumed),
+                    )
+                })?;
+                if let Value::Error(message) = store.execute(cmd) {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "AOF command failed at offset {}: {message}",
+                            offset - consumed
+                        ),
+                    ));
                 }
+                replayed += 1;
             }
-            Err(e) if e.is_incomplete() => break,
-            Err(_) => {
-                warn!("AOF corrupted at offset {}, stopping replay", offset);
+            Err(e) if e.is_incomplete() => {
+                warn!("Ignoring incomplete AOF tail at offset {}", offset);
                 break;
+            }
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("AOF corrupted at offset {offset}: {e}"),
+                ));
             }
         }
     }
     if replayed > 0 {
         info!("AOF replayed: {} commands ← {:?}", replayed, path);
     }
-    replayed
+    Ok(replayed)
+}
+
+fn checkpoint_marker(value: &Value) -> Option<u64> {
+    let items = match value {
+        Value::Push(items) | Value::Array(Some(items)) => items,
+        _ => return None,
+    };
+    match items.as_slice() {
+        [Value::BulkString(Some(name)), Value::BulkString(Some(id))]
+            if name == b"RECACHED-CHECKPOINT" =>
+        {
+            std::str::from_utf8(id).ok()?.parse().ok()
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn checkpoint_frame(id: u64) -> Vec<u8> {
+    let id = id.to_string();
+    resp_push(&[b"RECACHED-CHECKPOINT", id.as_bytes()])
 }
 
 // ── Replication ───────────────────────────────────────────────────────────────
@@ -302,7 +392,8 @@ mod durability_tests {
             .unwrap();
         for i in 0..64 {
             w.append(format!("*1\r\n${}\r\n{}\r\n", i.to_string().len(), i).as_bytes())
-                .await;
+                .await
+                .unwrap();
         }
         drop(w);
 
@@ -324,9 +415,9 @@ mod durability_tests {
         let w = AofWriter::open(path.clone(), AofSync::EverySec)
             .await
             .unwrap();
-        w.append(b"*1\r\n$4\r\nPING\r\n").await;
-        w.flush().await;
-        w.flush().await; // nothing new to sync
+        w.append(b"*1\r\n$4\r\nPING\r\n").await.unwrap();
+        w.flush().await.unwrap();
+        w.flush().await.unwrap(); // nothing new to sync
         assert_eq!(
             tokio::fs::read(&path).await.unwrap(),
             b"*1\r\n$4\r\nPING\r\n"
@@ -342,12 +433,12 @@ mod durability_tests {
         let dir = scratch("aof_trunc");
         let path = dir.join("c.aof");
         let w = AofWriter::open(path.clone(), AofSync::No).await.unwrap();
-        w.append(b"*1\r\n$4\r\nPING\r\n").await;
-        w.truncate().await;
+        w.append(b"*1\r\n$4\r\nPING\r\n").await.unwrap();
+        w.truncate().await.unwrap();
         assert_eq!(tokio::fs::metadata(&path).await.unwrap().len(), 0);
 
-        w.append(b"*1\r\n$4\r\nECHO\r\n").await;
-        w.flush().await;
+        w.append(b"*1\r\n$4\r\nECHO\r\n").await.unwrap();
+        w.flush().await.unwrap();
         assert_eq!(
             tokio::fs::read(&path).await.unwrap(),
             b"*1\r\n$4\r\nECHO\r\n",
@@ -374,14 +465,15 @@ mod durability_tests {
         let cfg = SnapshotConfig {
             path: path.clone(),
             last_save: AtomicI64::new(0),
+            checkpoint_id: AtomicU64::new(0),
         };
-        save_snapshot(&store, &cfg).await;
+        save_snapshot(&store, &cfg, 7).await.unwrap();
 
         assert!(path.exists(), "snapshot must exist after save");
-        assert!(
-            cfg.last_save.load(Ordering::Relaxed) > 0,
-            "a completed save must advance LASTSAVE"
-        );
+        let loaded = load_snapshot_checkpoint(&KeyValueStore::new(), &path)
+            .await
+            .unwrap();
+        assert_eq!(loaded.aof_checkpoint, 7);
 
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
@@ -396,7 +488,7 @@ mod durability_tests {
 
         // And the bytes are a snapshot we can actually read back.
         let restored = KeyValueStore::new();
-        assert!(load_snapshot(&restored, &path).await);
+        assert!(load_snapshot(&restored, &path).await.unwrap());
         assert_eq!(
             restored.execute(Command::Get("k7".into())),
             Value::BulkString(Some(b"v7".to_vec()))
@@ -406,13 +498,124 @@ mod durability_tests {
     }
 
     #[tokio::test]
-    async fn syncing_a_parent_directory_tolerates_odd_paths() {
-        // Best-effort by contract: a path with no parent, or one that does not
-        // exist, must warn rather than panic or hang. The snapshot path is
-        // frequently relative ("recached.rdb"), which has an empty parent.
-        sync_parent_dir(std::path::Path::new("recached.rdb")).await;
-        sync_parent_dir(std::path::Path::new("/")).await;
-        sync_parent_dir(std::path::Path::new("/nonexistent-recached-dir/x.rdb")).await;
+    async fn matching_checkpoint_marker_skips_the_aof_prefix_in_the_snapshot() {
+        let dir = scratch("checkpoint_replay");
+        let snapshot_path = dir.join("dump.rdb");
+        let aof_path = dir.join("append.aof");
+        let snapshot_store = KeyValueStore::new();
+        snapshot_store.execute(Command::RPush("items".into(), vec![b"a".to_vec()]));
+        let cfg = SnapshotConfig {
+            path: snapshot_path.clone(),
+            last_save: AtomicI64::new(0),
+            checkpoint_id: AtomicU64::new(0),
+        };
+        save_snapshot(&snapshot_store, &cfg, 42).await.unwrap();
+
+        let aof = AofWriter::open(aof_path.clone(), AofSync::No)
+            .await
+            .unwrap();
+        aof.append(&resp_push(&[b"RPUSH", b"items", b"a"]))
+            .await
+            .unwrap();
+        aof.append(&checkpoint_frame(42)).await.unwrap();
+        aof.append(&resp_push(&[b"RPUSH", b"items", b"b"]))
+            .await
+            .unwrap();
+        aof.flush().await.unwrap();
+
+        let restored = KeyValueStore::new();
+        let loaded = load_snapshot_checkpoint(&restored, &snapshot_path)
+            .await
+            .unwrap();
+        assert_eq!(loaded.aof_checkpoint, 42);
+        assert_eq!(
+            replay_aof_from_checkpoint(&restored, &aof_path, loaded.aof_checkpoint)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            restored.execute(Command::LRange("items".into(), 0, -1)),
+            Value::Array(Some(vec![
+                Value::BulkString(Some(b"a".to_vec())),
+                Value::BulkString(Some(b"b".to_vec())),
+            ]))
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn unmatched_checkpoint_marker_replays_the_whole_aof() {
+        let dir = scratch("unmatched_checkpoint");
+        let aof_path = dir.join("append.aof");
+        let aof = AofWriter::open(aof_path.clone(), AofSync::No)
+            .await
+            .unwrap();
+        aof.append(&resp_push(&[b"RPUSH", b"items", b"a"]))
+            .await
+            .unwrap();
+        aof.append(&checkpoint_frame(9)).await.unwrap();
+        aof.append(&resp_push(&[b"RPUSH", b"items", b"b"]))
+            .await
+            .unwrap();
+        aof.flush().await.unwrap();
+
+        let restored = KeyValueStore::new();
+        assert_eq!(
+            replay_aof_from_checkpoint(&restored, &aof_path, 8)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            restored.execute(Command::LRange("items".into(), 0, -1)),
+            Value::Array(Some(vec![
+                Value::BulkString(Some(b"a".to_vec())),
+                Value::BulkString(Some(b"b".to_vec())),
+            ]))
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_bare_entry_snapshot_still_loads() {
+        let dir = scratch("legacy_snapshot");
+        let path = dir.join("dump.rdb");
+        let source = KeyValueStore::new();
+        source.execute(Command::Set(
+            "legacy".into(),
+            b"value".to_vec(),
+            Default::default(),
+        ));
+        write_private(&path, &rmp_serde::to_vec(&source.snapshot()).unwrap())
+            .await
+            .unwrap();
+
+        let restored = KeyValueStore::new();
+        let loaded = load_snapshot_checkpoint(&restored, &path).await.unwrap();
+        assert!(loaded.found);
+        assert_eq!(loaded.aof_checkpoint, 0);
+        assert_eq!(
+            restored.execute(Command::Get("legacy".into())),
+            Value::BulkString(Some(b"value".to_vec()))
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn syncing_a_parent_directory_reports_invalid_paths() {
+        // Relative snapshot paths are supported, while an invalid parent must
+        // be surfaced so a successful save is never reported prematurely.
+        sync_parent_dir(std::path::Path::new("recached.rdb"))
+            .await
+            .unwrap();
+        sync_parent_dir(std::path::Path::new("/")).await.unwrap();
+        assert!(
+            sync_parent_dir(std::path::Path::new("/nonexistent-recached-dir/x.rdb"))
+                .await
+                .is_err()
+        );
     }
 
     #[test]

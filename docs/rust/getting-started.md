@@ -104,8 +104,7 @@ cache.watch("fare:*").await?;
 doubles as a start-up barrier — the first request never races hydration.
 Re-subscription after a reconnect is automatic.
 
-The server caps initial state at **10,000 keys per pattern**. A pattern
-matching more than that is a sign the working set is too large to embed.
+The server caps a complete initial state at **10,000 keys per pattern**. `watch()` returns an error for a broader pattern instead of applying a partial snapshot. Narrow the pattern or raise `RECACHED_MAX_QSUB_INITIAL_KEYS` deliberately.
 
 ---
 
@@ -195,29 +194,11 @@ not carry has been deleted or has expired — and nothing else would ever say so
 because `keychange` only reports what happened while the socket was up. The
 client now drops those keys when it re-hydrates.
 
-The one edge: the server caps a snapshot at `RECACHED_MAX_QSUB_INITIAL_KEYS`
-(10,000). A pattern matching more than that is truncated, and reconciling
-against a truncated snapshot drops locally-held keys that do still exist — a
-sign the pattern is too broad to embed in the first place.
+The server refuses a pattern whose complete snapshot exceeds `RECACHED_MAX_QSUB_INITIAL_KEYS` (10,000 by default), so reconciliation never runs against a partial snapshot.
 :::
 
-::: tip TTLs converge within about a second, not instantly
-A local copy does not expire on its own clock. The server masks an expired key
-on read but only *removes* it in a background sweep, and that removal is what
-reaches you — as an ordinary delete. The sweep runs every second, so a watched
-volatile key disappears locally within roughly a second of expiring, not at the
-instant it expires.
-
-Fine for session caches and rate-limit tiers. If you need an exact expiry
-instant, compare a stored deadline yourself rather than relying on the key
-vanishing.
-:::
-
-::: danger Collections do not hydrate on connect
-`qstate` sends collections as bare type-name markers rather than contents, and
-the client drops them. A hash, list, set, sorted set or JSON key written
-*before* you connect stays invisible until its next write. Live updates after
-that point are complete, and string keys are unaffected.
+::: tip TTL deletion is eventual, not instant
+A local copy does not expire on its own clock. The server masks an expired key on read, then a background sweep announces its removal as an ordinary delete. The sweep checks at most 256 TTL-bearing keys per one-second tick, so convergence time grows with the volatile keyspace. Compare a stored deadline yourself when exact expiry matters.
 :::
 
 ---

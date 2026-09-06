@@ -1,6 +1,6 @@
 # Operations
 
-Running Recached in production: what it exports, what to alert on, and what it does **not** tell you yet.
+Running Recached in production: what it exports, what to alert on, and which limits fail closed.
 
 ## Metrics endpoint
 
@@ -23,8 +23,7 @@ or firewall it.
 
 ## What is exported
 
-Six series. That is the complete list — the exporter is deliberately small, and the gaps below are
-real.
+Traffic metrics are event-driven:
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
@@ -34,6 +33,21 @@ real.
 | `recached_connections_active` | gauge | — | Connections currently open (TCP and WebSocket combined). |
 | `recached_keyspace_hits_total` | counter | — | Reads that found a live key. |
 | `recached_keyspace_misses_total` | counter | — | Reads that found nothing or an expired key. |
+| `recached_command_duration_seconds` | histogram | `command` | End-to-end store execution time by command. |
+
+### Persistence and queue health
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `recached_persistence_healthy` | gauge | — | `1` while persistence is healthy; `0` after an AOF or checkpoint failure. Writes then return `MISCONF` until `SAVE` succeeds. |
+| `recached_persistence_errors_total` | counter | `operation` | Persistence failures by operation; `operation="all"` is the aggregate. |
+| `recached_snapshot_saves_total` | counter | `status` | Completed and failed checkpoints. |
+| `recached_snapshot_duration_seconds` | histogram | — | Time a checkpoint holds the save and all-write barriers. |
+| `recached_last_successful_save_timestamp_seconds` | gauge | — | Unix timestamp of the last successful checkpoint. |
+| `recached_last_save_age_seconds` | gauge | — | Seconds since the last successful checkpoint. |
+| `recached_aof_bytes` | gauge | — | Current AOF file size when AOF is enabled. |
+| `recached_notification_overflows_total` | counter | — | WATCH/QSUB clients disconnected because their bounded notification queue filled. |
+| `recached_pubsub_overflows_total` | counter | — | Pub/sub clients disconnected because their bounded delivery queue filled. |
 
 ### Capacity and sync
 
@@ -41,15 +55,22 @@ Sampled every 5 seconds, because these are levels rather than events.
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `recached_memory_bytes` | gauge | Approximate heap used by stored data. Compare against `RECACHED_MAX_MEMORY`. |
-| `recached_keys` | gauge | Live keys, excluding expired entries awaiting sweep. Compare against `RECACHED_MAX_KEYS`. |
+| `recached_memory_bytes` | gauge | Incremental logical bytes for stored keys and values. This is not process RSS. Compare it with `RECACHED_MAX_MEMORY`. |
+| `recached_keys` | gauge | Maintained stored-key count. Expired entries remain until bounded active expiry removes them. Compare it with `RECACHED_MAX_KEYS`. |
 | `recached_evictions_total` | counter | Keys evicted since start. A rising rate means the cache is working at its cap. |
 | `recached_replicas_connected` | gauge | Replicas currently attached to this primary. |
 | `recached_live_queries` | gauge | Registered `QSUB` patterns across all connections. |
 | `recached_watched_keys` | gauge | Keys under `WATCH`. |
-| `recached_dedup_clients_tracked` | gauge | Clients with exactly-once bookkeeping in memory. |
+| `recached_dedup_clients_tracked` | gauge | Clients with duplicate-suppression high-water marks in memory. |
 | `recached_replication_queue_depth` | gauge | Deepest replica send queue, in frames — work the primary has not yet put on the wire. |
+| `recached_replication_queue_bytes` | gauge | Encoded bytes in the deepest replica send queue. |
 | `recached_replication_lag_frames` | gauge | Frames the furthest-behind replica has been sent but has not acknowledged applying. Zero means every replica is caught up. |
+| `recached_replication_backlog_bytes` | gauge | Bytes retained for partial replica resynchronization. |
+| `recached_replication_syncs_total` | counter | Full and partial synchronizations, labeled by `type`. |
+| `recached_replication_sync_duration_seconds` | histogram | Initial full or partial synchronization time, labeled by `type`. |
+| `recached_replication_disconnects_total` | counter | Replica disconnects caused by the frame or byte queue limit, labeled by `reason`. |
+
+Recached does not implement `SLOWLOG`. The command histogram identifies which command class is slow; use client-side tracing when you need individual request attribution. Process RSS remains the capacity metric for allocator overhead, network buffers, and fragmentation.
 
 ### Reading the two replication gauges
 
@@ -57,15 +78,13 @@ They fail differently, which is why both exist:
 
 - **Queue depth high, lag high** — the primary cannot hand frames off fast enough. The replica's
   channel is backing up, usually a slow or saturated network link. A replica whose queue fills is
-  disconnected outright so it resyncs from a snapshot rather than falling further behind.
+  disconnected outright. It resumes from the retained backlog when possible and otherwise receives a fresh snapshot.
 - **Queue depth zero, lag high** — everything was written to the socket and the replica is not
   acknowledging it. The frames are in flight, or the replica is applying them slowly, or it is
   wedged. This is the case queue depth alone cannot see, and it is the one worth alerting on.
 
-Lag is measured in frames, not bytes or seconds: one frame is one replicated write command.
-
-A replica running a build older than 0.2.2 never acknowledges, so its lag climbs without bound while
-replication works normally. Upgrade both ends together.
+Lag is measured in frames, not bytes or seconds: one frame is one replicated write command. The
+`RCP1` replication handshake rejects incompatible peers; upgrade primary and replicas together.
 
 ### What is still not exported
 
@@ -107,6 +126,9 @@ Thresholds are starting points — tune to your traffic.
 | Eviction churn | `rate(recached_evictions_total[5m])` climbing | The working set no longer fits; results will start missing. |
 | Replica lost | `recached_replicas_connected` drops | Failover risk — the standby is no longer following. |
 | Replica falling behind | `recached_replication_lag_frames` > 1000 for 5m | The standby is not keeping up; a failover now would lose those writes. |
+| Persistence unhealthy | `recached_persistence_healthy == 0` | Writes are being refused after an AOF or checkpoint failure. Fix storage, then run `SAVE`. |
+| Save stalled | high `recached_snapshot_duration_seconds` or rising `recached_last_save_age_seconds` | Checkpoints pause writers and may be blocked on storage. |
+| Slow consumers | increase in either overflow counter | A pub/sub, WATCH, or QSUB client cannot drain its bounded queue. |
 
 ## Health checking
 
@@ -131,7 +153,8 @@ livenessProbe:
 ```
 
 The `/metrics` endpoint returning 200 proves the metrics listener is up, **not** that the cache is
-healthy — they are separate listeners. Probe the cache port.
+healthy — they are separate listeners. Probe the cache port for liveness and require
+`recached_persistence_healthy == 1` for write readiness when persistence is enabled.
 
 For a human-readable snapshot at a terminal — uptime, connected clients, keyspace size, replication
 role — use [`INFO`](/server/commands#info):
@@ -159,9 +182,13 @@ is worth knowing where the walls are:
 | Queued commands per `MULTI` | 10,000 | `RECACHED_MAX_MULTI_QUEUE` |
 | `WATCH`ed keys per connection | 1,024 | `RECACHED_MAX_WATCHES_PER_CONN` |
 | Live queries (`QSUB`) per connection | 64 | `RECACHED_MAX_LIVE_QUERIES` |
-| Keys returned in a live query's initial state | 10,000 | `RECACHED_MAX_QSUB_INITIAL_KEYS` |
+| Keys allowed in a complete live-query initial state | 10,000 | `RECACHED_MAX_QSUB_INITIAL_KEYS` |
 | Keys sampled per eviction pass | 10 | `RECACHED_EVICTION_SAMPLE` |
 | Replication frame | 512 MB | No |
+| WATCH/QSUB delivery queue | 256 messages and 8 MiB per connection | No |
+| Pub/sub delivery queue | 256 messages and 8 MiB per connection | No |
+| Replica delivery queue | 4,096 frames and 8 MiB per replica | `RECACHED_REPL_BUFFER` / `RECACHED_REPL_BUFFER_BYTES` |
+| Partial-resync backlog | 16 MiB per primary | `RECACHED_REPL_BACKLOG_BYTES` |
 | Glob pattern length (`KEYS`, `SCAN MATCH`, `PSUBSCRIBE`, sync scopes) | 1,024 bytes | No |
 | Elements reserved up front for an aggregate | 1,024 | No |
 | Client outbox (browser, offline writes) | 10,000 writes | via `sync-client` |
@@ -171,21 +198,26 @@ than compiled — see [Configuration](/server/configuration#environment-variable
 
 ## Backup and restore
 
-Snapshots are MessagePack files at `RECACHED_SAVE_PATH`, written atomically (temp file plus rename),
-so copying the file while the server runs is safe.
+Snapshots are MessagePack files at `RECACHED_SAVE_PATH`, written atomically (temp file, fsync,
+rename, and directory fsync). A single snapshot read therefore sees a complete old or new file, but
+a durable deployment is a checkpoint set: snapshot, `.dedup` sidecar, and—when enabled—AOF. Do not
+copy those files one by one while writes or another save can run; that can combine files from
+different checkpoints.
 
 ```bash
 # Take a snapshot on demand, then confirm it completed
 redis-cli -p 6379 BGSAVE
 redis-cli -p 6379 LASTSAVE     # timestamp advances when the save lands
 
-# Back up
-cp /var/lib/recached/dump.msgpack /backups/dump-$(date +%F).msgpack
+# Stop the server after SAVE, then copy the snapshot, its .dedup sidecar,
+# and the AOF (when configured), or capture them with one atomic filesystem
+# snapshot while the server is paused.
 ```
 
-A sidecar file sits next to the snapshot with a `.dedup` extension, holding exactly-once high-water
-marks. Back it up with the snapshot: without it a restarted server can re-apply a write a client
-replays. Losing it is not fatal — the server starts normally and rebuilds the marks.
+A sidecar file sits next to the snapshot with a `.dedup` extension, holding duplicate-suppression
+high-water marks. Back it up as part of the same checkpoint set: without it a restarted server can
+re-apply a write a client replays. A missing sidecar is a clean first boot; a present but corrupt
+sidecar is a startup error.
 
 To restore, stop the server, put the snapshot (and its `.dedup` sidecar) at `RECACHED_SAVE_PATH`, and
 start it — both load at boot. There is **no import path from a Redis RDB file**; the formats are unrelated.
@@ -197,8 +229,9 @@ costs you every write since the last save.
 
 Recached is pre-1.0 and the wire protocol is not frozen — see the
 [protocol spec](/server/protocol). Read the [changelog](https://github.com/recached-dev/recached/blob/main/CHANGELOG.md)
-before upgrading a minor version, and upgrade server and browser SDK together: the sync protocol is
-versioned between them, and mixed versions are not a supported configuration.
+before upgrading a minor version, and upgrade server and browser SDK together. The replication
+protocol identifies itself as `RCP1`; mixed replication protocol versions fail explicitly and are
+not supported.
 
-Snapshot format is backward compatible — a newer server reads an older snapshot. The reverse is not
-guaranteed, so keep a copy of the pre-upgrade snapshot if you may need to roll back.
+The current versioned snapshot envelope accepts legacy bare-entry snapshots. The reverse is not
+guaranteed, so keep a complete copy of the pre-upgrade checkpoint set if you may need to roll back.

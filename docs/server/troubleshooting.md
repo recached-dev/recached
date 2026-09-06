@@ -85,8 +85,8 @@ replica. Unlike `recached_replication_queue_depth`, it stays high when the prima
 everything to the socket and the replica is not keeping up — see
 [Operations → Reading the two replication gauges](/server/operations#reading-the-two-replication-gauges).
 
-Lag that climbs without bound while replication otherwise works usually means the replica predates
-0.2.2 and never acknowledges. Upgrade both ends together.
+The `RCP1` handshake rejects incompatible replication peers instead of silently using different
+framing. Upgrade primary and replicas together.
 
 ### Memory keeps growing
 
@@ -176,9 +176,10 @@ reconnect.
 It should not — every store write carries a `DEDUP` envelope and the server skips ids at or below the
 client's high-water mark, replying `+DUP`.
 
-The documented residual: dedup marks live in **server memory** and are swept after 24 h idle. A
-server restart inside the acknowledgment window can admit one duplicate. If your workload cannot
-tolerate that, make the operation idempotent at the application level.
+Dedup marks live in memory and are checkpointed beside the data snapshot; idle entries are swept
+after 24 hours. An AOF can replay a newer mutation than the snapshot without its dedup identity, so a
+retry after a server crash can apply a non-idempotent command twice. If your workload cannot tolerate
+that, enforce idempotency at the application level.
 
 ### Concurrent writes clobber each other
 
@@ -193,8 +194,7 @@ See [Offline & Reconnection](/browser/offline).
 
 ### Live query returned fewer keys than expected
 
-A live query's initial state is capped at **10,000 keys**. Beyond that the snapshot is truncated.
-Narrow the pattern.
+A live query's complete initial state is capped at **10,000 keys** by default. A broader query returns `ERR live query initial state exceeds 10000 keys` instead of a partial snapshot. Narrow the pattern or raise `RECACHED_MAX_QSUB_INITIAL_KEYS` deliberately.
 
 `FLUSHDB` arrives as one sentinel per subscribed pattern rather than one frame per key — if your
 client is hand-written, expand it locally.

@@ -28,17 +28,19 @@ Recached is configured entirely through environment variables. There is no confi
 | `RECACHED_MAX_MULTI_QUEUE` | `10000` | Commands that may be queued inside one `MULTI`. |
 | `RECACHED_MAX_WATCHES_PER_CONN` | `1024` | Keys a single connection may `WATCH`. |
 | `RECACHED_MAX_LIVE_QUERIES` | `64` | Live queries (`QSUB`) a single connection may hold. |
-| `RECACHED_MAX_QSUB_INITIAL_KEYS` | `10000` | Keys returned in a live query's initial `qstate` reply. Beyond this the snapshot is truncated — narrow the pattern instead of raising it. |
+| `RECACHED_MAX_QSUB_INITIAL_KEYS` | `10000` | Maximum keys in a live query's complete initial `qstate` reply. A pattern matching more keys is refused instead of returning an unsafe partial snapshot. Narrow the pattern or raise this limit deliberately. |
 | `RECACHED_REPL_ENABLE` | _(disabled)_ | Set to `1`/`true`/`yes`/`on` to bind the replication listener. **Required on every node that serves replicas**, including a replica serving sub-replicas. Without it the port is not bound at all. Enabling it on any interface other than loopback without `RECACHED_REPL_PASSWORD` makes the server **refuse to start**. An unrecognised value is also a startup error. |
 | `RECACHED_REPL_PORT` | `6381` | TCP port the replication listener binds, when `RECACHED_REPL_ENABLE` is set. Honours `RECACHED_ALLOW_IPS` and counts against `RECACHED_MAX_CONNECTIONS`. |
-| `RECACHED_REPLICAOF` | _(none)_ | Set to `host:port` to run this server as a read-only replica. On startup it connects to the primary, receives a full snapshot, and then streams all subsequent writes. Reconnects automatically with exponential backoff on disconnect. Independent of `RECACHED_REPL_ENABLE`, which governs only whether *this* node accepts replicas of its own. |
+| `RECACHED_REPLICAOF` | _(none)_ | Set to `host:port` to run this server as a read-only replica. The first connection receives a full snapshot and then streams writes. A reconnect resumes from its last applied offset when the primary still has that offset in its backlog; otherwise it receives a fresh snapshot. Independent of `RECACHED_REPL_ENABLE`, which governs only whether *this* node accepts replicas. |
 | `RECACHED_REPL_PASSWORD` | _(none)_ | Shared secret for the replication channel. When set, replicas must send this password during the handshake before receiving any data. Must match on both primary and replica. **Mandatory** when the replication listener is enabled on a non-loopback interface. Failed attempts are throttled per source address. |
 | `RECACHED_REPL_TLS_CA` | _(none)_ | Path to a PEM file holding the **CA certificate** that issued the primary's certificate. Setting it enables **TLS on the outbound replication connection** and makes the primary's identity verified rather than assumed. Note this needs a real two-certificate chain — a single self-signed certificate is rejected as `CaUsedAsEndEntity`; see [Security → Encrypting replication](/server/security#encrypting-replication) for the `openssl` recipe. A public bundle such as `/etc/ssl/certs/ca-certificates.crt` works if the primary's certificate is publicly issued. Set on **replicas**. |
 | `RECACHED_REPL_TLS_SERVERNAME` | _(host of `RECACHED_REPLICAOF`)_ | Name to verify the primary's certificate against. Override when `RECACHED_REPLICAOF` points at an IP but the certificate names a host — a cert for `primary.internal` does not validate against `10.0.1.5` unless it carries that IP as a SAN. |
-| `RECACHED_FAILOVER_TIMEOUT` | _(disabled)_ | Seconds a replica waits with the primary unreachable before automatically promoting itself to primary. Set on replicas only. `0` or unset disables auto-failover — the replica reconnects indefinitely. See [auto-failover](#auto-failover) below. |
-| `RECACHED_REPL_BUFFER` | `4096` | Per-replica channel capacity (number of pending write frames buffered on the primary before a lagging replica is disconnected). A replica that falls this many writes behind is dropped and must reconnect from a fresh snapshot. Increase if replicas are on a consistently slow or high-latency link; decrease to reduce memory use per replica. |
-| `RECACHED_MAX_MEMORY` | _(unlimited)_ | Maximum approximate heap usage for the key-value store. Accepts a byte count or a human-readable suffix: `512mb`, `2gb`, `1073741824`. When the limit is exceeded, the background eviction loop runs the configured eviction policy. Has no effect when `RECACHED_EVICTION` is `noeviction`. |
-| `RECACHED_TLS_CERT` | _(none)_ | Path to a PEM-encoded TLS certificate file. TLS is enabled on both client ports (RESP and WebSocket) when this and `RECACHED_TLS_KEY` are set. It does not cover the replication or metrics ports. |
+| `RECACHED_FAILOVER_TIMEOUT` | _(deprecated; ignored)_ | Retained for configuration compatibility. Recached logs a warning and never promotes automatically because timeout-only promotion has no quorum or fencing. Fence the old primary, then send `REPLICAOF NO ONE` to the chosen replica. |
+| `RECACHED_REPL_BUFFER` | `4096` | Maximum pending frames per replica. Reaching either this limit or `RECACHED_REPL_BUFFER_BYTES` disconnects the replica. It then attempts a partial resync and falls back to a snapshot when its offset is no longer retained. |
+| `RECACHED_REPL_BUFFER_BYTES` | `8mb` | Maximum encoded bytes queued for one replica. This is the primary memory bound; the frame count separately protects workloads made of many tiny writes. |
+| `RECACHED_REPL_BACKLOG_BYTES` | `16mb` | Primary-wide backlog retained for partial replica resynchronization, including while no replica is connected. Once an offset falls out of this byte window, reconnecting from it requires a full snapshot. |
+| `RECACHED_MAX_MEMORY` | _(unlimited)_ | Maximum logical bytes for stored keys and values. Accepts a byte count or suffix such as `512mb`, `2gb`, or `1073741824`. This counter is maintained incrementally and is not process RSS. Writes enforce the limit immediately with the selected eviction policy; the background loop also checks it. |
+| `RECACHED_TLS_CERT` | _(none)_ | Path to a PEM-encoded TLS certificate file. TLS is enabled on RESP, WebSocket, and the replication listener when this and `RECACHED_TLS_KEY` are set. It does not cover the metrics port. |
 | `RECACHED_TLS_KEY` | _(none)_ | Path to a PEM-encoded TLS private key file. Set both this and `RECACHED_TLS_CERT` or neither — if exactly one is present the server **refuses to start** rather than silently serving plaintext. |
 | `RUST_LOG` | `info` | Log level. Accepts `error`, `warn`, `info`, `debug`, `trace`. Module-specific: `RUST_LOG=recached=debug,tokio=warn`. |
 
@@ -46,7 +48,7 @@ Recached is configured entirely through environment variables. There is no confi
 
 ## Eviction policies
 
-Eviction runs when `RECACHED_MAX_KEYS` is reached and a write command would add a new key.
+Eviction runs inline when a write would exceed `RECACHED_MAX_KEYS` or the logical `RECACHED_MAX_MEMORY` counter. Victim selection examines at most `RECACHED_EVICTION_SAMPLE` indexed candidates per eviction, independent of total key count. An implicit eviction is propagated as an ordered `DEL` to AOF, replicas, browser peers, and key watchers.
 
 | Policy | Behavior |
 |---|---|
@@ -69,11 +71,12 @@ Recached persists data on the server with the same two mechanisms Redis uses —
 | Defaults (snapshot every 15 min) | Everything since the last snapshot — up to 15 minutes |
 | `RECACHED_SAVE="900:1,300:10,60:10000"` | Bounded by the tightest matching condition — busy servers snapshot every minute |
 | Snapshot + AOF `everysec` | At most ~1 second |
-| Snapshot + AOF `always` | Essentially nothing — fsync on every write |
-| Replica configured (`RECACHED_REPLICAOF`) | Nothing that reached the replica — promote it with `REPLICAOF NO ONE` |
+| Snapshot + AOF `always` | Writes completed by the configured fsync boundary |
 | `RECACHED_SAVE_INTERVAL=0`, no AOF | Everything — pure in-memory cache |
 
-**Recovery order on restart:** the snapshot is loaded first, then AOF commands written after that snapshot are replayed on top — same order as Redis. Snapshot writes are atomic (write to `.tmp`, rename into place), so a crash mid-save can never corrupt the previous snapshot, and a clean shutdown (SIGTERM / Ctrl-C) always saves a final snapshot.
+**Recovery order on restart:** the snapshot is loaded first, then AOF commands not covered by that snapshot are replayed on top. Each checkpoint records an AOF marker in the snapshot, so a crash after installing the snapshot but before truncating the AOF does not apply covered non-idempotent writes twice. Snapshot writes are atomic (write, fsync, rename, and directory fsync). Snapshot, AOF, or dedup corruption is a startup error rather than an empty-cache fallback. A clean shutdown attempts a final checkpoint and reports any failure.
+
+A checkpoint serializes all save triggers and pauses writes while it installs the durable snapshot and truncates the covered AOF. Reads continue. If a snapshot, AOF append, or fsync fails at runtime, Recached reports `MISCONF` for later writes until a `SAVE` succeeds; the failed checkpoint does not clear dirty state or truncate the AOF.
 
 Two recached-specific durability properties worth knowing:
 
@@ -163,7 +166,7 @@ scrape_configs:
     scrape_interval: 15s
 ```
 
-Available metrics include key count, command latency histograms, active connections, and WebSocket client count.
+Available metrics include key count, command counts and latency, active connections, persistence health and save latency, replication lag and sync latency, memory estimates, evictions, and WebSocket client count.
 
 ### With AOF + snapshot (strong durability)
 
@@ -208,7 +211,7 @@ development platform for this setting.
 
 ### With leader-follower replication
 
-Run a primary and one or more read-only replicas. Replicas receive a full snapshot on connect, then stream every subsequent write in real time.
+Run a primary and one or more read-only replicas. Replicas receive a full snapshot on first connect, then stream every subsequent write. Reconnects use the `RCP1` run id and applied offset to request only missing backlog frames when possible.
 
 ::: warning The replication listener is opt-in
 `RECACHED_REPL_ENABLE=1` is required on any node that accepts replicas. Without it port 6381 is
@@ -237,36 +240,27 @@ replication).
 
 Replicas reconnect automatically with exponential backoff (2s → 4s → … → 30s cap) if the primary is temporarily unavailable. Write commands sent to a replica return `-READONLY`.
 
-Each replica has an internal write buffer (default 4096 frames, set by `RECACHED_REPL_BUFFER`). If a replica falls that many writes behind — due to a slow network or an overloaded replica host — it is disconnected and must reconnect from a fresh snapshot. This prevents a lagging replica from consuming unbounded memory on the primary or blocking the primary's write path.
+Each replica queue is bounded by both frames (`RECACHED_REPL_BUFFER`, default 4096) and encoded bytes (`RECACHED_REPL_BUFFER_BYTES`, default 8 MiB). A full queue disconnects that replica without blocking primary writes. The primary retains `RECACHED_REPL_BACKLOG_BYTES` (default 16 MiB) for partial resync; a reconnect falls back to a full snapshot only after its offset leaves that window or the primary restarts.
 
 To promote a replica to primary at runtime (manual failover), send `REPLICAOF NO ONE` over any RESP connection to the replica. It immediately starts accepting writes.
 
-### With auto-failover {#auto-failover}
+### With manually fenced failover {#manual-failover}
 
-Set `RECACHED_FAILOVER_TIMEOUT` on the replica. If the primary is unreachable for that many seconds, the replica promotes itself automatically without any manual intervention.
+Recached does not promote a replica from an unreachable-primary timeout. A timeout cannot distinguish a failed primary from a network partition, so automatic promotion could create two writable primaries.
+
+Promote a replica only after an external system or operator has fenced the old primary:
+
+1. Stop the old primary or revoke its client network access.
+2. Check `recached_replication_lag_frames` on the chosen replica's upstream before the failure, if that metric is available.
+3. Send `REPLICAOF NO ONE` to the chosen replica.
+4. Point clients and remaining replicas at the new primary.
+5. Rebuild the old primary as a replica before restoring its client access.
 
 ```bash
-# Primary
-RECACHED_SAVE_PATH="/data/recached.rdb" \
-RECACHED_REPL_ENABLE=1 \
-RECACHED_REPL_PORT="6381" \
-RECACHED_REPL_PASSWORD="repl-secret" \
-recached-server
-
-# Replica — promotes itself after 30s of primary being unreachable
-RECACHED_REPLICAOF="primary-host:6381" \
-RECACHED_REPL_PASSWORD="repl-secret" \
-RECACHED_FAILOVER_TIMEOUT="30" \
-recached-server
+redis-cli -h replica-host -p 6379 REPLICAOF NO ONE
 ```
 
-**How the timer works.** The `RECACHED_FAILOVER_TIMEOUT` clock starts the first time a connect attempt fails or the live sync stream drops. It resets to zero as soon as the replica successfully reconnects to the primary. This means a brief primary restart (e.g. a rolling deploy) that completes before the timeout elapses does not trigger promotion.
-
-**Split-brain risk.** Auto-failover is safe in a single-replica setup. With multiple replicas, two replicas could both time out simultaneously and both promote — creating two independent primaries accepting diverging writes. To avoid this:
-
-- Use `RECACHED_FAILOVER_TIMEOUT` only on a designated standby replica, not all replicas.
-- Keep the timeout long enough (≥ 2× your typical primary restart time) to avoid spurious promotion on routine restarts.
-- After a failover event, update clients and other replicas to point at the new primary before bringing the old primary back online.
+`RECACHED_FAILOVER_TIMEOUT` is deprecated and ignored. Use an orchestrator that supplies leader election and fencing if you need unattended failover.
 
 ### With multi-condition autosave (RECACHED_SAVE)
 
@@ -298,7 +292,7 @@ RECACHED_SAVE_INTERVAL="0" \
 recached-server
 ```
 
-The snapshot file is written atomically: the server writes to a `.tmp` file and renames it into place, so a crash mid-save cannot corrupt the previous snapshot. Expired keys are silently skipped on restore. On a clean shutdown (SIGTERM or Ctrl-C), a final snapshot is saved before the process exits.
+The snapshot file is written atomically and durably through a unique temporary file, fsync, rename, and parent-directory fsync. Expired keys are skipped on restore. Saves are serialized and pause writes until the snapshot/AOF checkpoint is complete. On SIGTERM or Ctrl-C, the server attempts a final snapshot before exiting and logs a failure if it cannot complete.
 
 ### High-connection workloads
 

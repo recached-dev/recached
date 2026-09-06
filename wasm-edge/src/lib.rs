@@ -20,7 +20,7 @@ use web_sys::{BroadcastChannel, Event, MessageEvent, WebSocket};
 export function openRecachedDb() {
     return new Promise((resolve, reject) => {
         // v2 added 'outbox' (writes awaiting server acknowledgment);
-        // v3 adds 'meta' (client identity + session epoch for exactly-once).
+        // v3 adds 'meta' (client identity + session epoch for replay deduplication).
         const req = indexedDB.open('recached', 3);
         req.onupgradeneeded = (e) => {
             const db = e.target.result;
@@ -654,7 +654,7 @@ impl RecachedCache {
         }
     }
 
-    /// Queue a store write (dedup-wrapped for exactly-once delivery).
+    /// Queue a store write (DEDUP-wrapped to suppress reconnect replays).
     fn ws_enqueue(&self, encoded: &[u8]) {
         queue_write(&self.shared, encoded, true);
     }
@@ -715,7 +715,7 @@ impl RecachedCache {
         wasm_bindgen_futures::future_to_promise(async move {
             let db = JsFuture::from(open_recached_db()).await?;
 
-            // ── exactly-once identity ─────────────────────────────────────
+            // ── duplicate-suppression identity ───────────────────────────
             // Adopt the stored client id (so dedup high-water marks span
             // sessions) unless this session already sent writes under the
             // random one — switching ids mid-stream would fragment the mark.
@@ -1189,7 +1189,7 @@ impl RecachedCache {
         }
     }
 
-    /// Get a value from the local store (zero latency).
+    /// Get a value from the local store without a network round trip.
     pub fn get(&self, key: &str) -> Result<Option<String>, JsValue> {
         match self.store.execute(Command::Get(key.to_string())) {
             Value::BulkString(Some(data)) => match String::from_utf8(data) {
@@ -1982,7 +1982,7 @@ mod browser_tests {
 
     #[wasm_bindgen_test]
     async fn meta_round_trips_the_client_identity() {
-        // The client id and epoch are what make delivery exactly-once across
+        // The client id and epoch suppress duplicate delivery across
         // reloads; losing them re-issues ids the server has already seen.
         let db = fresh_db().await;
         JsFuture::from(idb_meta_put(

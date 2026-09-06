@@ -2,7 +2,7 @@
 
 The browser and edge runtime client for [Recached](https://github.com/recached-dev/recached) — a Rust-powered in-memory cache that runs natively on the server and inside the browser via WebAssembly.
 
-Zero-latency local reads. Automatic background sync to the Recached server over WebSockets.
+Local reads without a network round trip. Automatic background sync to the Recached server over WebSockets.
 
 ## Install
 

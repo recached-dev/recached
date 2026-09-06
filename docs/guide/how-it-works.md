@@ -21,7 +21,7 @@ The state machine. No networking, no file I/O, no OS-specific code.
 - **RESP parser:** Recursive descent, depth-limited to 128 levels to prevent stack-overflow DoS. Handles partial reads — the server buffers bytes until a complete command arrives.
 - **Command dispatch:** Typed enum over the full command set. Each variant carries its parsed arguments. Dispatch is a match on the enum — no string parsing at execution time.
 - **Store:** `Arc<DashMap<String, Entry>>` where each `Entry` holds an `EntryValue` enum (`Str`, `Hash`, `List`, `Set`, `ZSet`) plus `expires_at_ms: Option<u64>` and `written_at_ms: u64` for eviction bookkeeping.
-- **TTL engine:** Expiry is stored inline on each entry as an absolute millisecond timestamp. Expiry is checked lazily on every read (expired entries return nil). A background task sweeps the map every second and removes expired entries actively.
+- **TTL engine:** Expiry is stored inline on each entry as an absolute millisecond timestamp. Reads mask expired entries immediately. A background task checks at most 256 TTL-indexed keys per one-second tick and removes expired entries actively.
 - **Key cap:** If `RECACHED_MAX_KEYS` is set, every write command checks the store length before inserting. When the cap is reached, the configured eviction policy runs or the command errors.
 
 Because `core-engine` has no network code, it can be embedded anywhere: the Tokio server, a unit test, or a WASM binary.

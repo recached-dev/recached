@@ -270,7 +270,7 @@ pub enum Command {
     /// Interpretation of the arguments (token verification, pattern grants)
     /// happens in the server layer; the store never sees this command.
     Sync(Vec<String>),
-    // ── Exactly-once delivery (WebSocket only) ─────────────────────────────────
+    // ── Duplicate-suppressed replay (WebSocket only) ───────────────────────────
     /// DEDUP client_id id command args... — wraps a write with a per-client
     /// monotonic id so an offline-replayed duplicate is skipped. Unwrapped in
     /// the server layer; the store never sees this command.
@@ -724,7 +724,7 @@ impl Command {
                         Ok(Command::Sync(patterns))
                     }
 
-                    // ── Exactly-once delivery ──────────────────────────────────
+                    // ── Duplicate-suppressed replay ────────────────────────────
                     "DEDUP" => {
                         need!(4);
                         let client_id = extract_string(&arr[1]).unwrap_or_default();
@@ -2534,7 +2534,7 @@ mod tests {
         );
     }
 
-    // ── Exactly-once delivery ─────────────────────────────────────────────────
+    // ── Duplicate-suppressed replay ───────────────────────────────────────────
 
     #[test]
     fn dedup_parse_wraps_inner_command() {
@@ -3176,7 +3176,7 @@ mod arity_and_error_tests {
     }
 
     // ── DEDUP ─────────────────────────────────────────────────────────────────
-    // The exactly-once envelope. A malformed client id or id must be refused
+    // The duplicate-suppression envelope. A malformed client id or id must be refused
     // rather than silently treated as a fresh write.
 
     #[test]

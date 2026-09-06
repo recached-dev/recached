@@ -49,8 +49,8 @@ this is Redis plus a pub/sub channel plus a WebSocket server plus reconnection a
 several hundred lines that are easy to get subtly wrong under packet loss.
 
 Recached ships that path: writes replay from a durable outbox after reconnect, `incr`/`decr` merge
-additively rather than clobbering, `jmerge` deep-merges documents, and delivery is exactly-once via a
-`DEDUP` envelope. See [Offline & Reconnection](/browser/offline).
+additively rather than clobbering, `jmerge` deep-merges documents, and a `DEDUP` envelope suppresses
+ordinary reconnect replays. See [Offline & Reconnection](/browser/offline) for the server-crash boundary.
 
 ### Feature flags and config that must flip instantly
 
@@ -129,12 +129,7 @@ Being specific here is more useful than a feature grid.
 rate-limit counters read only by your API. Recached will do this correctly, but you would be adopting
 a young project to solve a problem two extremely mature ones already solve.
 
-**Raw single-node throughput above all → Valkey, or Redis.** Unpipelined, Recached runs at 46–96% of
-Redis depending on the command. Pipelined, it leads both — but only against their stock
-single-threaded defaults; with `io-threads` enabled a tuned Valkey is comfortably ahead of Recached
-overall ([benchmarks](/guide/benchmarks#with-io-threads-enabled)). Recached threads command execution
-rather than only I/O, which wins on compute-heavy commands like `ZADD`. If server-side throughput is
-the thing you are optimising, that is not a reason to switch.
+**Raw single-node throughput above all → benchmark Valkey, Redis, and Recached on your target host.** Recached does not publish a current cross-project winner. Its worker threads provide parallel command execution, but that architectural property does not predict the fastest server for your command mix, pipeline depth, persistence settings, or hardware. Use the [reproducible benchmark harness](/guide/benchmarks) before switching.
 
 **Pure memory-efficient blob caching at scale → Memcached.** Memcached's slab allocator and
 multi-threaded simplicity are excellent for large, uniform, ephemeral values. Recached is not
@@ -151,11 +146,7 @@ tier.
 explicitly out of scope; see [Commands](/server/commands). RESP3 exists only for protocol
 negotiation and pub/sub framing (`HELLO 3`), not the full type surface.
 
-**You need several keys to change together, atomically → Redis.** Because Recached executes on every
-core, a command that spans keys (`MSET`, `SMOVE`) is not atomic across them, and `MULTI`/`EXEC` is a
-batch rather than an isolated section — another connection's write can interleave. Single-key
-commands *are* atomic, and `WATCH`-based compare-and-swap works, which covers most cache code. But if
-you want a true multi-key critical section for free, that is what single-threaded execution buys you.
+**You need several keys to change together, atomically → Redis.** Because Recached executes on every core, a command that spans keys (`MSET`, `SMOVE`) is not isolated from concurrent readers. `MULTI`/`EXEC` reserves its write keys against other writers, but a reader can still observe intermediate command results. Single-key commands are atomic, and `WATCH`-based compare-and-swap works. Use Redis when readers must observe a multi-key transaction as one indivisible state change.
 See [Concurrency model](/server/commands#concurrency-model).
 
 ## Compared directly
@@ -169,13 +160,13 @@ See [Concurrency model](/server/commands#concurrency-model).
 | Cross-tab sync | **Built in** | No | No |
 | Data structures | Strings, hashes, lists, sets, sorted sets, JSON | All of those + streams, bitmaps, HLL, geo | Strings only |
 | Persistence | Snapshot + AOF | RDB + AOF | None |
-| Replication | Primary/replica + single-replica auto-failover | Primary/replica + Sentinel + Cluster | None |
+| Replication | Primary/replica + manually fenced promotion | Primary/replica + Sentinel + Cluster | None |
 | Scripting | No (WASM scripting on roadmap) | Lua | No |
 | Cluster / sharding | No | Yes | Client-side sharding |
 | Threading | Multi-threaded — commands execute on every core | Threaded I/O (`io-threads`, off by default); command execution on one thread | Multi-threaded |
 | Cross-key atomicity | Single-key only ([why](/server/commands#concurrency-model)) | Everything, including `MULTI`/`EXEC` | Single-key only |
-| Command coverage | ~106 | 250+ | ~15 |
-| Maturity | Young — server production-ready for cache workloads, sync layer beta | 15+ years | 20+ years |
+| Command coverage | 123 | 250+ | ~15 |
+| Maturity | Server release candidate; sync layer beta | 15+ years | 20+ years |
 | License | Apache 2.0 | AGPLv3 / RSALv2 + SSPLv1 (BSD-3 up to 7.2) | BSD-3 |
 
 Read the [maturity statement](/guide/introduction#maturity) before putting the sync layer in front of
@@ -211,7 +202,7 @@ Before switching a workload over, check:
    must be valid UTF-8 — Redis allows binary there. Applications that use binary keys are rare; if
    yours does, that is a blocker. See [Binary values](/guide/introduction#binary-values).
 3. **Persistence expectations.** Confirm snapshot + AOF semantics match what you assume today.
-4. **Replication topology.** Single-replica auto-failover only; no Sentinel or quorum election.
+4. **Replication topology.** Promotion requires external fencing and `REPLICAOF NO ONE`; there is no Sentinel or quorum election.
 5. **Eviction.** Review the key cap and TTL behaviour in
    [Configuration](/server/configuration) against your memory budget.
 
