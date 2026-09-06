@@ -85,8 +85,8 @@ replica. Unlike `recached_replication_queue_depth`, it stays high when the prima
 everything to the socket and the replica is not keeping up — see
 [Operations → Reading the two replication gauges](/server/operations#reading-the-two-replication-gauges).
 
-Lag that climbs without bound while replication otherwise works usually means the replica predates
-0.2.2 and never acknowledges. Upgrade both ends together.
+The `RCP1` handshake rejects incompatible replication peers instead of silently using different
+framing. Upgrade primary and replicas together.
 
 ### Memory keeps growing
 
@@ -176,9 +176,10 @@ reconnect.
 It should not — every store write carries a `DEDUP` envelope and the server skips ids at or below the
 client's high-water mark, replying `+DUP`.
 
-The documented residual: dedup marks live in **server memory** and are swept after 24 h idle. A
-server restart inside the acknowledgment window can admit one duplicate. If your workload cannot
-tolerate that, make the operation idempotent at the application level.
+Dedup marks live in memory and are checkpointed beside the data snapshot; idle entries are swept
+after 24 hours. An AOF can replay a newer mutation than the snapshot without its dedup identity, so a
+retry after a server crash can apply a non-idempotent command twice. If your workload cannot tolerate
+that, enforce idempotency at the application level.
 
 ### Concurrent writes clobber each other
 

@@ -1,7 +1,7 @@
 {
   "name": "@recached/vue",
   "version": "0.3.4",
-  "description": "Official Vue 3 composables for Recached \u2014 zero-latency reactive cache",
+  "description": "Official Vue 3 composables for Recached \u2014 local reactive cache",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -48,7 +48,7 @@
     "cache",
     "wasm",
     "real-time",
-    "zero-latency"
+    "local-cache"
   ],
   "license": "Apache-2.0",
   "repository": {

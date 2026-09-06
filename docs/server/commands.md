@@ -150,7 +150,7 @@ redis-cli -p 6379 INFO server memory
 
 `INFO` does not report the `cpu`, `commandstats`, `latencystats`, or `errorstats` sections. Per-command call counts and error counts are exported to [Prometheus](/server/operations#metrics-endpoint) on port 9091 instead, which is where they belong for dashboards and alerting. `INFO` is for the operator at a terminal and for client ready-checks.
 
-**Recached does not measure command latency anywhere** — not in `INFO`, and not on the metrics endpoint. `recached_commands_total` counts calls, `recached_command_errors_total` counts failures, and neither says how long anything took. So there is currently no way to see a slow command, which matters most for the commands that clone a whole collection under a shard guard: prefer the bounded reads (`HSCAN`, `SSCAN`, `ZSCAN`, `GETRANGE`) over `HGETALL` and `SMEMBERS` on large keys rather than expecting to catch the problem after the fact. Latency histograms and `SLOWLOG` are not implemented.
+`INFO` does not expose latency sections, but Prometheus exports `recached_command_duration_seconds{command=...}`. Recached does not implement `SLOWLOG`, so use client tracing for individual slow requests. Prefer bounded reads (`HSCAN`, `SSCAN`, `ZSCAN`, `GETRANGE`) over whole-collection replies on large keys.
 
 ### Access
 
@@ -421,11 +421,11 @@ Controls which keys a WebSocket connection receives pushes for and may operate o
 
 On the TCP port, `SYNC` returns an error — backend connections are trusted and unscoped.
 
-### Exactly-once envelope
+### Deduplicated replay envelope
 
 | Command | Description |
 |---|---|
-| `DEDUP client-id id command args...` | Wraps a write with a per-client monotonic id. If `id` is at or below the highest id already applied for `client-id`, the write is skipped and the reply is `+DUP` — used by the browser SDK's offline-replay so a write whose acknowledgment was lost never applies twice. Client ids are 1–64 characters and should be unguessable (the SDK uses `crypto.randomUUID()`). Scope checks, replica rejection, and metrics all apply to the wrapped command. Dedup marks are in-memory, per server, swept after 24 h idle. |
+| `DEDUP client-id id command args...` | Wraps a write with a per-client monotonic id. If `id` is at or below the highest id already applied for `client-id`, the write is skipped and the reply is `+DUP`. Client ids are 1–64 characters and should be unguessable (the SDK uses `crypto.randomUUID()`). Scope checks, replica rejection, persistence health, and metrics apply to the wrapped command. High-water marks are persisted beside the snapshot and swept after 24 h idle. |
 
 ---
 
@@ -571,6 +571,8 @@ Replication topology is set at startup with [`RECACHED_REPLICAOF`](/server/confi
 
 Promotion is always manual. Fence the old primary before sending `REPLICAOF NO ONE`; otherwise both nodes can accept writes after a partition. `RECACHED_FAILOVER_TIMEOUT` is deprecated and ignored. See [manual failover](/server/configuration#manual-failover).
 
+Replication uses the versioned `RCP1` stream. A replica reconnects with its primary run id and last applied offset. The primary sends missing frames from its bounded backlog when available and falls back to a full snapshot otherwise.
+
 ---
 
 ## Persistence
@@ -579,8 +581,8 @@ Snapshot commands write the in-memory store to disk in MessagePack format. The s
 
 | Command | Description |
 |---|---|
-| `SAVE` | Synchronously writes a snapshot to disk. Blocks until the file is written. Returns `OK` on success. |
-| `BGSAVE` | Triggers a background snapshot. Returns immediately; the save runs in a background task while the server continues accepting connections. |
+| `SAVE` | Synchronously creates a snapshot/AOF checkpoint. Returns `OK` only after the snapshot is durable and the covered AOF is truncated; returns `MISCONF` on failure. |
+| `BGSAVE` | Starts the same checkpoint in a background task and returns immediately. Reads continue, but writes pause while the checkpoint holds its all-write barrier. |
 | `LASTSAVE` | Returns the Unix timestamp (seconds) of the most recent successful snapshot. Returns the server start time if no save has completed yet. |
 
 ### Example
@@ -593,7 +595,7 @@ LASTSAVE        # (integer) 1746794400
 ```
 
 ```bash
-# Force a synchronous save (blocks until done — use BGSAVE in production)
+# Force a synchronous save
 SAVE            # +OK
 ```
 

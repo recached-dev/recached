@@ -1,7 +1,7 @@
 //! Platform-neutral Recached sync client.
 //!
 //! This crate is the *brain* of every Recached client SDK: the durable
-//! outbox, exactly-once `DEDUP` envelopes, ordered-reply acknowledgment
+//! outbox, duplicate-suppression `DEDUP` envelopes, ordered-reply acknowledgment
 //! correlation, session re-establishment after reconnect, and backoff
 //! policy. It performs no I/O and knows nothing about WebSockets, IndexedDB,
 //! or timers — methods take the current connection state and return
@@ -328,7 +328,7 @@ impl SyncClient {
 
     // ── writes ────────────────────────────────────────────────────────────
 
-    /// Queue a write for the server. `dedup` wraps it in an exactly-once
+    /// Queue a write for the server. `dedup` wraps it in a duplicate-suppression
     /// envelope — store writes want this; connection-scoped commands
     /// (pub/sub) must not be wrapped, or a legitimately replayed SUBSCRIBE
     /// would be skipped as a duplicate.

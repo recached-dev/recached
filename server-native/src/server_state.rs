@@ -9,11 +9,11 @@ pub(crate) struct ServerState {
     pub(crate) replicas: ReplRegistry,
     /// true = currently acting as a read-only replica
     pub(crate) is_replica: std::sync::atomic::AtomicBool,
-    /// Exactly-once bookkeeping for DEDUP-wrapped writes: client id →
+    /// Duplicate-suppression bookkeeping for DEDUP-wrapped writes: client id →
     /// (highest id applied, last-seen ms). Clients send monotonically
     /// increasing ids and replay in order, so a single high-water mark per
-    /// client suffices — no seen-set. In-memory only: a server restart
-    /// reopens the (already narrow) duplicate window, which is documented.
+    /// client suffices — no seen-set. Marks are committed only after the
+    /// wrapped write succeeds and are persisted with snapshot checkpoints.
     pub(crate) dedup: std::sync::Mutex<HashMap<String, (u64, u64)>>,
     /// Ephemeral (`ESET`) keys → the connection that currently owns them.
     ///
@@ -24,6 +24,14 @@ pub(crate) struct ServerState {
     pub(crate) ephemeral: std::sync::Mutex<HashMap<String, u64>>,
     /// Set when a dedup high-water mark advances; cleared once persisted.
     pub(crate) dedup_dirty: std::sync::atomic::AtomicBool,
+    /// Serializes DEDUP checks through successful execution and mark commit.
+    pub(crate) dedup_order: tokio::sync::Mutex<()>,
+    /// Serializes SAVE, BGSAVE, autosave, and shutdown checkpoints.
+    pub(crate) save_lock: tokio::sync::Mutex<()>,
+    /// False after a persistence failure. Client writes remain disabled until
+    /// an operator completes a successful SAVE or restarts with healthy files.
+    pub(crate) persistence_healthy: AtomicBool,
+    pub(crate) persistence_failures: AtomicU64,
 }
 
 impl ServerState {
@@ -71,50 +79,87 @@ impl ServerState {
     /// True when a write must be RESP-encoded for the durability/replication
     /// path even if no other consumer needs it.
     pub(crate) fn needs_write_log(&self) -> bool {
-        self.aof.is_some() || !self.replicas.is_empty()
+        self.aof.is_some() || self.replicas.is_enabled()
     }
 
-    /// Record a DEDUP-wrapped write. Returns `true` when `id` was already
-    /// applied for this client (the write must be skipped). Marks the id
-    /// *before* execution so a crash between check and execute can never
-    /// double-apply.
-    pub(crate) fn dedup_seen(&self, client: &str, id: u64) -> bool {
+    pub(crate) fn dedup_is_duplicate(&self, client: &str, id: u64) -> bool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
         let mut map = self.dedup.lock().expect("dedup mutex poisoned");
         if map.len() > DEDUP_SWEEP_THRESHOLD {
+            let before = map.len();
             map.retain(|_, (_, seen)| now.saturating_sub(*seen) < DEDUP_IDLE_MS);
+            if map.len() != before {
+                self.dedup_dirty.store(true, Ordering::Release);
+            }
         }
         match map.get_mut(client) {
             Some((hwm, seen)) => {
                 *seen = now;
-                if id <= *hwm {
-                    true
-                } else {
-                    *hwm = id;
-                    self.dedup_dirty.store(true, Ordering::Relaxed);
-                    false
-                }
+                id <= *hwm
             }
-            None => {
-                map.insert(client.to_string(), (id, now));
-                self.dedup_dirty.store(true, Ordering::Relaxed);
-                false
-            }
+            None => false,
         }
     }
 
-    /// Called after every successful write: appends to AOF and fans out to replicas.
+    pub(crate) fn commit_dedup(&self, client: &str, id: u64) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mut map = self.dedup.lock().expect("dedup mutex poisoned");
+        match map.get_mut(client) {
+            Some((hwm, seen)) => {
+                *hwm = (*hwm).max(id);
+                *seen = now;
+            }
+            None => {
+                map.insert(client.to_string(), (id, now));
+            }
+        }
+        self.dedup_dirty.store(true, Ordering::Release);
+    }
+
+    /// Test/support convenience for the check-then-commit operation.
+    #[cfg(test)]
+    pub(crate) fn dedup_seen(&self, client: &str, id: u64) -> bool {
+        if self.dedup_is_duplicate(client, id) {
+            true
+        } else {
+            self.commit_dedup(client, id);
+            false
+        }
+    }
+
+    pub(crate) fn persistence_is_healthy(&self) -> bool {
+        self.persistence_healthy.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn record_persistence_failure(
+        &self,
+        operation: &'static str,
+        error: &std::io::Error,
+    ) {
+        self.persistence_healthy.store(false, Ordering::Release);
+        self.persistence_failures.fetch_add(1, Ordering::Relaxed);
+        gauge!("recached_persistence_healthy").set(0.0);
+        counter!("recached_persistence_errors_total", "operation" => operation).increment(1);
+        error!(operation, error = %error, "persistence failure; client writes are disabled");
+    }
+
+    /// Called after every successful in-memory write. A runtime AOF error
+    /// latches the server unhealthy so later client writes fail closed.
     pub(crate) async fn on_write(&self, resp: &[u8]) {
-        if let Some(aof) = &self.aof {
-            aof.append(resp).await;
+        if let Some(aof) = &self.aof
+            && let Err(e) = aof.append(resp).await
+        {
+            self.record_persistence_failure("aof_append", &e);
         }
-        if self.replicas.is_empty() {
-            return;
+        if self.replicas.is_enabled() {
+            self.replicas.fan_out(resp.to_vec()).await;
         }
-        self.replicas.fan_out(resp.to_vec()).await;
     }
 
     /// Path of the dedup sidecar, alongside the snapshot.
@@ -122,64 +167,119 @@ impl ServerState {
         self.snap.path.with_extension("dedup")
     }
 
-    /// Persist dedup high-water marks so exactly-once delivery survives a
-    /// restart. Written atomically (temp + rename) and only when a mark has
-    /// advanced. The map is one `u64` per client, so this stays small enough to
-    /// flush far more often than the snapshot.
-    pub(crate) async fn persist_dedup(&self) {
+    /// Persist dedup high-water marks in the same checkpoint as store data.
+    /// Written atomically (temp + rename) and only when a mark has advanced.
+    /// The map stores one `u64` per client.
+    pub(crate) async fn persist_dedup(&self) -> std::io::Result<()> {
         if !self.dedup_dirty.swap(false, Ordering::Relaxed) {
-            return;
+            return Ok(());
         }
-        let marks: Vec<(String, u64)> = match self.dedup.lock() {
-            Ok(map) => map.iter().map(|(c, (hwm, _))| (c.clone(), *hwm)).collect(),
-            Err(_) => return,
-        };
-        let path = self.dedup_path();
-        let tmp = temp_sibling(&path, "dedup");
-        match rmp_serde::to_vec(&marks) {
-            Err(e) => warn!("Dedup serialize failed: {}", e),
-            Ok(bytes) => match write_private(&tmp, &bytes).await {
-                Err(e) => warn!("Dedup write failed: {}", e),
-                Ok(()) => match tokio::fs::rename(&tmp, &path).await {
-                    Err(e) => warn!("Dedup rename failed: {}", e),
-                    Ok(()) => sync_parent_dir(&path).await,
-                },
-            },
+        let result = async {
+            let marks: Vec<(String, u64)> = self
+                .dedup
+                .lock()
+                .map_err(|_| std::io::Error::other("dedup mutex poisoned"))?
+                .iter()
+                .map(|(client, (hwm, _))| (client.clone(), *hwm))
+                .collect();
+            let path = self.dedup_path();
+            let tmp = temp_sibling(&path, "dedup");
+            let bytes = rmp_serde::to_vec(&marks)
+                .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e.to_string()))?;
+            if let Err(error) = write_private(&tmp, &bytes).await {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err(error);
+            }
+            if let Err(error) = tokio::fs::rename(&tmp, &path).await {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err(error);
+            }
+            sync_parent_dir(&path).await
         }
+        .await;
+        if result.is_err() {
+            self.dedup_dirty.store(true, Ordering::Release);
+        }
+        result
     }
 
     /// Restore dedup marks at boot. `seen` timestamps are not persisted — they
     /// only drive idle sweeping, so restored entries start their idle clock now.
-    pub(crate) async fn load_dedup(&self) {
+    pub(crate) async fn load_dedup(&self) -> std::io::Result<()> {
         let path = self.dedup_path();
-        let Ok(bytes) = tokio::fs::read(&path).await else {
-            return;
+        let bytes = match tokio::fs::read(&path).await {
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+            Ok(bytes) => bytes,
         };
-        match rmp_serde::from_slice::<Vec<(String, u64)>>(&bytes) {
-            Err(e) => warn!("Dedup sidecar unreadable ({}), ignoring: {:?}", e, path),
-            Ok(marks) => {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
-                if let Ok(mut map) = self.dedup.lock() {
-                    let count = marks.len();
-                    for (client, hwm) in marks {
-                        map.insert(client, (hwm, now));
-                    }
-                    info!("Restored {} dedup high-water mark(s)", count);
-                }
-            }
+        let marks = rmp_serde::from_slice::<Vec<(String, u64)>>(&bytes)
+            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e.to_string()))?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mut map = self
+            .dedup
+            .lock()
+            .map_err(|_| std::io::Error::other("dedup mutex poisoned"))?;
+        let count = marks.len();
+        for (client, hwm) in marks {
+            map.insert(client, (hwm, now));
         }
+        info!("Restored {} dedup high-water mark(s)", count);
+        Ok(())
     }
 
-    /// Save snapshot, reset the dirty counter, then truncate AOF (snapshot subsumes the log).
-    pub(crate) async fn save(&self, store: &KeyValueStore) {
-        self.persist_dedup().await;
-        save_snapshot(store, &self.snap).await;
-        store.reset_dirty();
-        if let Some(aof) = &self.aof {
-            aof.truncate().await;
+    /// Establish one exact snapshot/AOF checkpoint. Client writes remain
+    /// blocked until the durable snapshot is installed and the old AOF is
+    /// truncated, so no post-snapshot write can be discarded.
+    pub(crate) async fn save(&self, store: &KeyValueStore) -> std::io::Result<()> {
+        let _save = self.save_lock.lock().await;
+        let started = std::time::Instant::now();
+        let _writes = self.replicas.lock_all_writes().await;
+        let checkpoint_id = self
+            .snap
+            .checkpoint_id
+            .load(Ordering::Acquire)
+            .saturating_add(1);
+        let result = async {
+            if let Some(aof) = &self.aof {
+                // The marker must be durable before the snapshot that names it.
+                // Startup can then distinguish every crash point around the
+                // later AOF truncation.
+                aof.append(&checkpoint_frame(checkpoint_id)).await?;
+                aof.flush().await?;
+            }
+            save_snapshot(store, &self.snap, checkpoint_id).await?;
+            self.persist_dedup().await?;
+            if let Some(aof) = &self.aof {
+                aof.truncate().await?;
+            }
+            Ok(())
+        }
+        .await;
+        histogram!("recached_snapshot_duration_seconds").record(started.elapsed().as_secs_f64());
+        match result {
+            Ok(()) => {
+                store.reset_dirty();
+                self.snap
+                    .checkpoint_id
+                    .store(checkpoint_id, Ordering::Release);
+                self.snap
+                    .last_save
+                    .store(now_unix_secs(), Ordering::Release);
+                self.persistence_healthy.store(true, Ordering::Release);
+                gauge!("recached_persistence_healthy").set(1.0);
+                gauge!("recached_last_successful_save_timestamp_seconds")
+                    .set(now_unix_secs() as f64);
+                counter!("recached_snapshot_saves_total", "status" => "success").increment(1);
+                Ok(())
+            }
+            Err(e) => {
+                counter!("recached_snapshot_saves_total", "status" => "error").increment(1);
+                self.record_persistence_failure("snapshot", &e);
+                Err(e)
+            }
         }
     }
 }

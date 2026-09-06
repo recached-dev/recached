@@ -2,7 +2,7 @@
 
 ## What Recached is
 
-Recached is an in-memory cache server written in Rust. It speaks RESP (the Redis Serialization Protocol) on port 6379, so any Redis client — `ioredis`, `node-redis`, `redis-py`, `Jedis` — works against it today with no code changes.
+Recached is an in-memory cache server written in Rust. It speaks RESP (the Redis Serialization Protocol) on port 6379, so common clients such as `ioredis`, `node-redis`, `redis-py`, and `Jedis` can use its documented command subset.
 
 Values are binary-safe, as they are in Redis: a value is stored and returned as the exact bytes you
 sent. *Keys* and other identifiers must be text — see [Binary values](#binary-values).
@@ -46,7 +46,7 @@ Three crates with hard dependency boundaries:
 |---|---|
 | `core-engine` | Pure state machine — no networking, no I/O. RESP parser, typed command dispatch, sharded lock-free store (`DashMap`), TTL engine, optional key cap. Compiles to both native and `wasm32`. |
 | `server-native` | Tokio TCP server (port 6379) + WebSocket server (port 6380). Persistent read buffers handle fragmented RESP. Per-connection pub/sub via `mpsc` channels. Connection semaphore, auth rate-limiting, sender-ID broadcast filter. |
-| `wasm-edge` | `wasm-bindgen` JS bindings. Local zero-latency reads, RESP-over-WebSocket sync. Closure lifecycle managed to avoid memory leaks on reconnect. |
+| `wasm-edge` | `wasm-bindgen` JS bindings. Local reads without a network hop, RESP-over-WebSocket sync. Closure lifecycle managed to avoid memory leaks on reconnect. |
 
 ## When to use Recached
 
@@ -56,7 +56,7 @@ Recached is a good fit when:
 - **You want live UI without polling.** The WebSocket sync replaces a polling loop without requiring you to build a separate SSE or WebSocket server.
 - **You want a frontend-only cache with TTL.** The WASM module works entirely without a server. Call `createCache()` without `connect` and you get a local cache with TTLs, counters, JSON documents, glob queries, optional IndexedDB persistence and cross-tab sync — no Recached server, no Redis, no backend changes required. Pub/sub, live queries and cross-device sync are what you give up; see [no server at all](/guide/use-cases#no-server-at-all) for the full boundary.
 - **You need cross-tab sync.** BroadcastChannel support means all open tabs in the same browser share mutations automatically.
-- **You want a drop-in Redis replacement** for the subset of commands most applications actually use (strings, expiry, counters, collections, transactions, pub/sub).
+- **You want to reuse a Redis client** for Recached's documented command subset (strings, expiry, counters, collections, transactions, and pub/sub).
 
 ## When Recached is not the right fit
 
@@ -146,7 +146,7 @@ Recached replaces the manual caching layer developers build on top of Zustand or
 | What it is | Cache + **sync fabric** between backend and clients | Embedded **database** inside the app |
 | Data model | Keys — strings, collections, JSON | Documents with MongoDB-like queries, indexes, ACID transactions |
 | Server | The server is the product (Redis-compatible) | None — runs entirely on-device |
-| Superpower | Multi-client sync: scoped auth, live fan-out, offline outbox, exactly-once delivery | On-device vector + hybrid search, rich queries |
+| Superpower | Multi-client sync: scoped auth, live fan-out, offline outbox, deduplicated replay | On-device vector + hybrid search, rich queries |
 | Truth model | **Shared truth** across users and devices | **Device-local truth** |
 
 The one-line rule: **TalaDB is where one device's data lives; Recached is how many devices agree.** A notes app with on-device semantic search wants TalaDB. A shared cart, live dashboard, presence, or agent-output streaming wants Recached. An app that needs both — locally queryable data that also syncs across users — is exactly where the two are designed to meet: TalaDB's planned `SyncAdapter` interface can use Recached as its sync backbone.

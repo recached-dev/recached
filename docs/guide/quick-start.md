@@ -49,7 +49,7 @@ Any Redis CLI tool works. The server speaks RESP.
 
 ## 2. Connect from your backend
 
-Use any Redis client. No special driver needed — Recached speaks RESP on port 6379.
+Use a standard Redis client with Recached's supported command subset; no Recached-specific backend driver is required.
 
 ### Node.js (ioredis)
 

@@ -237,12 +237,13 @@ pub(crate) async fn handle_tcp<S>(
     let mut multi_dirty = false;
     let mut subscribed_channels: HashSet<String> = HashSet::new();
     let mut subscribed_patterns: HashSet<String> = HashSet::new();
-    let (ps_tx, mut ps_rx) = mpsc::unbounded_channel::<PubSubMsg>();
+    let (overflow_tx, mut overflow_rx) = mpsc::channel(1);
+    let (ps_tx, mut ps_rx) = pubsub_channel(overflow_tx.clone());
     // WATCH state for optimistic-lock transactions over TCP. Unlike the WS
     // handler, TCP clients are not sent keychange pushes — WATCH is pure CAS.
     let mut watched_keys: HashSet<String> = HashSet::new();
     let mut watch_dirty = false;
-    let (watch_tx, mut watch_rx) = mpsc::unbounded_channel::<WatchNotif>();
+    let (watch_subscriber, mut watch_rx) = notification_channel(conn_id, overflow_tx.clone());
 
     'outer: loop {
         let is_subscribed = !subscribed_channels.is_empty() || !subscribed_patterns.is_empty();
@@ -413,6 +414,27 @@ pub(crate) async fn handle_tcp<S>(
                                                     if writer.write_all(EXECABORT).await.is_err() { break 'outer; }
                                                 }
                                                 Some(queue) => {
+                                                    if queue.iter().any(is_write_command)
+                                                        && !state.persistence_is_healthy()
+                                                    {
+                                                        unregister_all_watches(
+                                                            &watch_registry,
+                                                            conn_id,
+                                                            &mut watched_keys,
+                                                        )
+                                                        .await;
+                                                        while watch_rx.try_recv().is_ok() {}
+                                                        watch_dirty = false;
+                                                        let error = Value::Error(
+                                                            "MISCONF persistence is unhealthy; writes are disabled until SAVE succeeds"
+                                                                .to_string(),
+                                                        )
+                                                        .serialize();
+                                                        if writer.write_all(&error).await.is_err() {
+                                                            break 'outer;
+                                                        }
+                                                        continue 'parse;
+                                                    }
                                                     // Reserve both the queued write keys and WATCH
                                                     // keys before the CAS check. A conflicting write
                                                     // that was already in flight completes first and
@@ -578,7 +600,7 @@ pub(crate) async fn handle_tcp<S>(
                                                     let mut reg = watch_registry.map.lock().await;
                                                     for key in &keys {
                                                         if watched_keys.insert(key.clone()) {
-                                                            reg.entry(key.clone()).or_default().push((conn_id, watch_tx.clone()));
+                                                            reg.entry(key.clone()).or_default().push(watch_subscriber.clone());
                                                         }
                                                     }
                                                     watch_registry.sync_len(&reg);
@@ -596,7 +618,7 @@ pub(crate) async fn handle_tcp<S>(
                                                 let mut reg = watch_registry.map.lock().await;
                                                 for key in &targets {
                                                     if let Some(subs) = reg.get_mut(key) {
-                                                        subs.retain(|(id, _)| *id != conn_id);
+                                                        subs.retain(|sub| sub.conn_id != conn_id);
                                                         if subs.is_empty() { reg.remove(key); }
                                                     }
                                                 }
@@ -625,14 +647,22 @@ pub(crate) async fn handle_tcp<S>(
                                             // Snapshot commands — handled here (async I/O, not in execute())
                                             match &cmd {
                                                 Command::Save => {
-                                                    state.save(&store).await;
-                                                    if writer.write_all(b"+OK\r\n").await.is_err() { break 'outer; }
+                                                    let response = match state.save(&store).await {
+                                                        Ok(()) => b"+OK\r\n".to_vec(),
+                                                        Err(e) => Value::Error(format!(
+                                                            "MISCONF snapshot failed: {e}"
+                                                        ))
+                                                        .serialize(),
+                                                    };
+                                                    if writer.write_all(&response).await.is_err() { break 'outer; }
                                                     continue 'parse;
                                                 }
                                                 Command::BgSave => {
                                                     let s = Arc::clone(&store);
                                                     let st = Arc::clone(&state);
-                                                    tokio::spawn(async move { st.save(&s).await; });
+                                                    tokio::spawn(async move {
+                                                        let _ = st.save(&s).await;
+                                                    });
                                                     if writer.write_all(b"+Background saving started\r\n").await.is_err() { break 'outer; }
                                                     continue 'parse;
                                                 }
@@ -759,7 +789,11 @@ pub(crate) async fn handle_tcp<S>(
             msg = ps_rx.recv(), if is_subscribed => {
                 match msg {
                     Some(m) => {
-                        if writer.write_all(&encode_pubsub_msg(m, protover)).await.is_err() {
+                        if writer
+                            .write_all(&encode_pubsub_msg(&m.message, protover))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                         // `writer` is a BufWriter, and a delivery is not a
@@ -781,6 +815,13 @@ pub(crate) async fn handle_tcp<S>(
                 if notif.is_some() {
                     watch_dirty = true;
                 }
+            }
+
+            overflow = overflow_rx.recv() => {
+                if overflow.is_some() {
+                    warn!("TCP conn {} notification queue overflowed; disconnecting", conn_id);
+                }
+                break;
             }
         }
     }
@@ -894,11 +935,12 @@ pub(crate) async fn handle_ws<S>(
     let mut multi_dirty = false;
     let mut subscribed_channels: HashSet<String> = HashSet::new();
     let mut subscribed_patterns: HashSet<String> = HashSet::new();
-    let (ps_tx, mut ps_rx) = mpsc::unbounded_channel::<PubSubMsg>();
+    let (overflow_tx, mut overflow_rx) = mpsc::channel(1);
+    let (ps_tx, mut ps_rx) = pubsub_channel(overflow_tx.clone());
     let mut watched_keys: HashSet<String> = HashSet::new();
     // Set when any watched key changes; EXEC aborts (returns nil) if true.
     let mut watch_dirty = false;
-    let (watch_tx, mut watch_rx) = mpsc::unbounded_channel::<WatchNotif>();
+    let (watch_subscriber, mut watch_rx) = notification_channel(conn_id, overflow_tx.clone());
     // Sync scopes for this connection. `strict` (RECACHED_SYNC_SECRET set)
     // means: no pushes and no key commands until a signed token is presented.
     // Without a secret, scopes are an opt-in bandwidth filter (legacy fan-out
@@ -908,7 +950,7 @@ pub(crate) async fn handle_ws<S>(
     // Live-query subscriptions (QSUB). Keychange notifications for matching
     // keys arrive on their own channel so they never dirty WATCH transactions.
     let mut qsub_patterns: HashSet<String> = HashSet::new();
-    let (q_tx, mut q_rx) = mpsc::unbounded_channel::<WatchNotif>();
+    let (qsub_subscriber, mut q_rx) = notification_channel(conn_id, overflow_tx);
 
     // Replies go out as *text* frames whenever the RESP bytes are valid UTF-8,
     // which is the overwhelming majority and is what every existing client
@@ -1087,6 +1129,26 @@ pub(crate) async fn handle_ws<S>(
                                         ws_send!(EXECABORT);
                                     }
                                     Some(queue) => {
+                                        if queue.iter().any(is_write_command)
+                                            && !state.persistence_is_healthy()
+                                        {
+                                            unregister_all_watches(
+                                                &watch_registry,
+                                                conn_id,
+                                                &mut watched_keys,
+                                            )
+                                            .await;
+                                            while watch_rx.try_recv().is_ok() {}
+                                            watch_dirty = false;
+                                            ws_send!(
+                                                &Value::Error(
+                                                    "MISCONF persistence is unhealthy; writes are disabled until SAVE succeeds"
+                                                        .to_string(),
+                                                )
+                                                .serialize()
+                                            );
+                                            continue;
+                                        }
                                         // Match the TCP path: reserve queued write keys and
                                         // WATCH keys before checking invalidation, so a write
                                         // cannot land in the check-to-EXEC gap.
@@ -1243,7 +1305,7 @@ pub(crate) async fn handle_ws<S>(
                                             if watched_keys.insert(key.clone()) {
                                                 reg.entry(key.clone())
                                                     .or_default()
-                                                    .push((conn_id, watch_tx.clone()));
+                                                    .push(watch_subscriber.clone());
                                             }
                                         }
                                         watch_registry.sync_len(&reg);
@@ -1261,7 +1323,7 @@ pub(crate) async fn handle_ws<S>(
                                     let mut reg = watch_registry.map.lock().await;
                                     for key in &targets {
                                         if let Some(subs) = reg.get_mut(key) {
-                                            subs.retain(|(id, _)| *id != conn_id);
+                                            subs.retain(|sub| sub.conn_id != conn_id);
                                             if subs.is_empty() {
                                                 reg.remove(key);
                                             }
@@ -1301,16 +1363,33 @@ pub(crate) async fn handle_ws<S>(
                                     ws_send!(b"-ERR live query limit per connection reached\r\n");
                                     continue 'outer;
                                 }
-                                // Hold every write ordering domain while checking the
-                                // cap, registering the query, and taking its snapshot. A
-                                // successful qstate is therefore complete; an oversized
-                                // query is refused before it can receive a partial state.
-                                let _snapshot_guards = state.replicas.lock_all_writes().await;
-                                let kvs = match initial_qstate(
-                                    &store,
-                                    &pattern,
-                                    max_qsub_initial_keys(),
-                                ) {
+                                // Snapshot and registration are one ordered step, but
+                                // serialization and socket I/O happen after releasing all
+                                // write barriers. A slow client therefore cannot pause
+                                // unrelated writers.
+                                let qstate = {
+                                    let _snapshot_guards =
+                                        state.replicas.lock_all_writes().await;
+                                    match initial_qstate(
+                                        &store,
+                                        &pattern,
+                                        max_qsub_initial_keys(),
+                                    ) {
+                                        Ok(values) => {
+                                            if qsub_patterns.insert(pattern.clone()) {
+                                                let mut pats =
+                                                    watch_registry.patterns.lock().await;
+                                                pats.entry(pattern.clone())
+                                                    .or_default()
+                                                    .push(qsub_subscriber.clone());
+                                                watch_registry.sync_patterns_len(&pats);
+                                            }
+                                            Ok(values)
+                                        }
+                                        Err(limit) => Err(limit),
+                                    }
+                                };
+                                let kvs = match qstate {
                                     Ok(values) => values,
                                     Err(limit) => {
                                         ws_send!(
@@ -1322,13 +1401,6 @@ pub(crate) async fn handle_ws<S>(
                                         continue 'outer;
                                     }
                                 };
-                                if qsub_patterns.insert(pattern.clone()) {
-                                    let mut pats = watch_registry.patterns.lock().await;
-                                    pats.entry(pattern.clone())
-                                        .or_default()
-                                        .push((conn_id, q_tx.clone()));
-                                    watch_registry.sync_patterns_len(&pats);
-                                }
                                 // Tagged reply so clients can recognise it among
                                 // interleaved frames: ["qstate", pattern, k, v, ...]
                                 let mut items = Vec::with_capacity(kvs.len() * 2 + 2);
@@ -1355,7 +1427,7 @@ pub(crate) async fn handle_ws<S>(
                                     let mut pats = watch_registry.patterns.lock().await;
                                     for p in &targets {
                                         if let Some(subs) = pats.get_mut(p) {
-                                            subs.retain(|(id, _)| *id != conn_id);
+                                            subs.retain(|sub| sub.conn_id != conn_id);
                                             if subs.is_empty() {
                                                 pats.remove(p);
                                             }
@@ -1367,20 +1439,6 @@ pub(crate) async fn handle_ws<S>(
                             }
 
                             cmd => {
-                                // Exactly-once: unwrap the DEDUP envelope. An id at or
-                                // below this client's high-water mark was already applied
-                                // (its acknowledgment was lost) — skip it. +DUP still
-                                // acknowledges the write so the client retires it.
-                                let cmd = match cmd {
-                                    Command::Dedup(client, id, inner) => {
-                                        if state.dedup_seen(&client, id) {
-                                            ws_send!(b"+DUP\r\n");
-                                            continue 'outer;
-                                        }
-                                        *inner
-                                    }
-                                    other => other,
-                                };
                                 if is_subscribed && !matches!(cmd, Command::Ping(_)) {
                                     ws_send!(b"-ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in subscribe mode\r\n");
                                     continue 'outer;
@@ -1393,14 +1451,22 @@ pub(crate) async fn handle_ws<S>(
                                 // Snapshot commands
                                 match &cmd {
                                     Command::Save => {
-                                        state.save(&store).await;
-                                        ws_send!(b"+OK\r\n");
+                                        let response = match state.save(&store).await {
+                                            Ok(()) => b"+OK\r\n".to_vec(),
+                                            Err(e) => Value::Error(format!(
+                                                "MISCONF snapshot failed: {e}"
+                                            ))
+                                            .serialize(),
+                                        };
+                                        ws_send!(&response);
                                         continue 'outer;
                                     }
                                     Command::BgSave => {
                                         let s = Arc::clone(&store);
                                         let st = Arc::clone(&state);
-                                        tokio::spawn(async move { st.save(&s).await; });
+                                        tokio::spawn(async move {
+                                            let _ = st.save(&s).await;
+                                        });
                                         ws_send!(b"+Background saving started\r\n");
                                         continue 'outer;
                                     }
@@ -1472,9 +1538,6 @@ pub(crate) async fn handle_ws<S>(
                                 // branch below, which only runs when a peer, replica, AOF or
                                 // watcher is present — ownership must be recorded even on a
                                 // standalone server with no listeners.
-                                if let Command::ESet(ref k, _) = cmd {
-                                    state.claim_ephemeral(k, conn_id);
-                                }
                                 let response = if is_write_command(&cmd) {
                                     execute_ordered_write(
                                         &cmd,
@@ -1528,7 +1591,7 @@ pub(crate) async fn handle_ws<S>(
             msg = ps_rx.recv(), if is_subscribed => {
                 match msg {
                     Some(m) => {
-                        let bytes = encode_pubsub_msg(m, 3);
+                        let bytes = encode_pubsub_msg(&m.message, 3);
                         ws_send!(&bytes);
                     }
                     None => break,
@@ -1536,12 +1599,12 @@ pub(crate) async fn handle_ws<S>(
             }
 
             notif = watch_rx.recv(), if !watched_keys.is_empty() => {
-                if let Some((key, value)) = notif {
+                if let Some(notif) = notif {
                     // A watched key changed: mark the transaction dirty (so a
                     // following EXEC aborts) and still push the keychange to the
                     // client for the observable-keys feature.
                     watch_dirty = true;
-                    let bytes = encode_keychange(&key, &value);
+                    let bytes = encode_keychange(&notif.key, &notif.value);
                     ws_send!(&bytes);
                 }
             }
@@ -1549,10 +1612,17 @@ pub(crate) async fn handle_ws<S>(
             // Live-query keychange: same frame as WATCH pushes, but never
             // dirties transactions.
             notif = q_rx.recv(), if !qsub_patterns.is_empty() => {
-                if let Some((key, value)) = notif {
-                    let bytes = encode_keychange(&key, &value);
+                if let Some(notif) = notif {
+                    let bytes = encode_keychange(&notif.key, &notif.value);
                     ws_send!(&bytes);
                 }
+            }
+
+            overflow = overflow_rx.recv() => {
+                if overflow.is_some() {
+                    warn!("WS conn {} notification queue overflowed; disconnecting", conn_id);
+                }
+                break;
             }
         }
     }
@@ -1564,7 +1634,7 @@ pub(crate) async fn handle_ws<S>(
         let mut reg = watch_registry.map.lock().await;
         for key in &watched_keys {
             if let Some(subs) = reg.get_mut(key) {
-                subs.retain(|(id, _)| *id != conn_id);
+                subs.retain(|sub| sub.conn_id != conn_id);
                 if subs.is_empty() {
                     reg.remove(key);
                 }
