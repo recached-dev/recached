@@ -1,6 +1,6 @@
 # recached-edge
 
-The browser and edge runtime client for [Recached](https://github.com/recached-dev/recached) — a Rust-powered in-memory cache that runs natively on the server and inside the browser via WebAssembly.
+The browser and edge runtime client for [Recached](https://github.com/recached-sh/recached) — a Rust-powered in-memory cache that runs natively on the server and inside the browser via WebAssembly.
 
 Local reads without a network round trip. Automatic background sync to the Recached server over WebSockets.
 
@@ -324,13 +324,13 @@ await cache.clear_persistence();
 
 ```bash
 # Docker
-docker run -p 6380:6380 ghcr.io/recached-dev/recached:latest
+docker run -p 6380:6380 ghcr.io/recached-sh/recached:latest
 
 # With authentication
-docker run -p 6380:6380 -e RECACHED_PASSWORD=secret ghcr.io/recached-dev/recached:latest
+docker run -p 6380:6380 -e RECACHED_PASSWORD=secret ghcr.io/recached-sh/recached:latest
 ```
 
-See the [Recached README](https://github.com/recached-dev/recached) for full server configuration.
+See the [Recached README](https://github.com/recached-sh/recached) for full server configuration.
 
 ## Browser compatibility
 

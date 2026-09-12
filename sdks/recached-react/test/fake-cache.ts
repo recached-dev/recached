@@ -62,6 +62,7 @@ export function makeFakeCache() {
     liveQuery: vi.fn(() => vi.fn()),
     subscribe: vi.fn(),
     unsubscribe: vi.fn(),
+    disconnect: vi.fn(),
 
     /** Number of mutation listeners still registered — leak detection. */
     get listenerCount() {

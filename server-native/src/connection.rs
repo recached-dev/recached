@@ -414,6 +414,26 @@ pub(crate) async fn handle_tcp<S>(
                                                     if writer.write_all(EXECABORT).await.is_err() { break 'outer; }
                                                 }
                                                 Some(queue) => {
+                                                    if state.is_replica()
+                                                        && queue.iter().any(is_write_command)
+                                                    {
+                                                        unregister_all_watches(
+                                                            &watch_registry,
+                                                            conn_id,
+                                                            &mut watched_keys,
+                                                        )
+                                                        .await;
+                                                        while watch_rx.try_recv().is_ok() {}
+                                                        watch_dirty = false;
+                                                        if writer
+                                                            .write_all(b"-READONLY You can't write against a read only replica.\r\n")
+                                                            .await
+                                                            .is_err()
+                                                        {
+                                                            break 'outer;
+                                                        }
+                                                        continue 'parse;
+                                                    }
                                                     if queue.iter().any(is_write_command)
                                                         && !state.persistence_is_healthy()
                                                     {
@@ -535,8 +555,18 @@ pub(crate) async fn handle_tcp<S>(
                                     match cmd {
                                         Command::Subscribe(channels) => {
                                             for ch in channels {
-                                                subscribed_channels.insert(ch.clone());
-                                                pubsub.lock().await.subscribe(conn_id, &ch, ps_tx.clone());
+                                                let is_new = !subscribed_channels.contains(&ch);
+                                                if is_new
+                                                    && subscribed_channels.len()
+                                                        + subscribed_patterns.len()
+                                                        >= max_pubsub_subscriptions_per_conn()
+                                                {
+                                                    if writer.write_all(b"-ERR pubsub subscription limit per connection reached\r\n").await.is_err() { break 'outer; }
+                                                    continue;
+                                                }
+                                                if subscribed_channels.insert(ch.clone()) {
+                                                    pubsub.lock().await.subscribe(conn_id, &ch, ps_tx.clone());
+                                                }
                                                 let count = subscribed_channels.len() + subscribed_patterns.len();
                                                 let ack = resp_subscribe_ack("subscribe", &ch, count);
                                                 if writer.write_all(&ack).await.is_err() { break 'outer; }
@@ -561,8 +591,18 @@ pub(crate) async fn handle_tcp<S>(
                                         }
                                         Command::PSubscribe(patterns) => {
                                             for pat in patterns {
-                                                subscribed_patterns.insert(pat.clone());
-                                                pubsub.lock().await.psubscribe(conn_id, &pat, ps_tx.clone());
+                                                let is_new = !subscribed_patterns.contains(&pat);
+                                                if is_new
+                                                    && subscribed_channels.len()
+                                                        + subscribed_patterns.len()
+                                                        >= max_pubsub_subscriptions_per_conn()
+                                                {
+                                                    if writer.write_all(b"-ERR pubsub subscription limit per connection reached\r\n").await.is_err() { break 'outer; }
+                                                    continue;
+                                                }
+                                                if subscribed_patterns.insert(pat.clone()) {
+                                                    pubsub.lock().await.psubscribe(conn_id, &pat, ps_tx.clone());
+                                                }
                                                 let count = subscribed_channels.len() + subscribed_patterns.len();
                                                 let ack = resp_subscribe_ack("psubscribe", &pat, count);
                                                 if writer.write_all(&ack).await.is_err() { break 'outer; }
@@ -1129,6 +1169,20 @@ pub(crate) async fn handle_ws<S>(
                                         ws_send!(EXECABORT);
                                     }
                                     Some(queue) => {
+                                        if state.is_replica()
+                                            && queue.iter().any(is_write_command)
+                                        {
+                                            unregister_all_watches(
+                                                &watch_registry,
+                                                conn_id,
+                                                &mut watched_keys,
+                                            )
+                                            .await;
+                                            while watch_rx.try_recv().is_ok() {}
+                                            watch_dirty = false;
+                                            ws_send!(b"-READONLY You can't write against a read only replica.\r\n");
+                                            continue;
+                                        }
                                         if queue.iter().any(is_write_command)
                                             && !state.persistence_is_healthy()
                                         {
@@ -1242,8 +1296,17 @@ pub(crate) async fn handle_ws<S>(
                         match cmd {
                             Command::Subscribe(channels) => {
                                 for ch in channels {
-                                    subscribed_channels.insert(ch.clone());
-                                    pubsub.lock().await.subscribe(conn_id, &ch, ps_tx.clone());
+                                    let is_new = !subscribed_channels.contains(&ch);
+                                    if is_new
+                                        && subscribed_channels.len() + subscribed_patterns.len()
+                                            >= max_pubsub_subscriptions_per_conn()
+                                    {
+                                        ws_send!(b"-ERR pubsub subscription limit per connection reached\r\n");
+                                        continue;
+                                    }
+                                    if subscribed_channels.insert(ch.clone()) {
+                                        pubsub.lock().await.subscribe(conn_id, &ch, ps_tx.clone());
+                                    }
                                     let count = subscribed_channels.len() + subscribed_patterns.len();
                                     ws_send!(&resp_subscribe_ack("subscribe", &ch, count));
                                 }
@@ -1265,8 +1328,17 @@ pub(crate) async fn handle_ws<S>(
                             }
                             Command::PSubscribe(patterns) => {
                                 for pat in patterns {
-                                    subscribed_patterns.insert(pat.clone());
-                                    pubsub.lock().await.psubscribe(conn_id, &pat, ps_tx.clone());
+                                    let is_new = !subscribed_patterns.contains(&pat);
+                                    if is_new
+                                        && subscribed_channels.len() + subscribed_patterns.len()
+                                            >= max_pubsub_subscriptions_per_conn()
+                                    {
+                                        ws_send!(b"-ERR pubsub subscription limit per connection reached\r\n");
+                                        continue;
+                                    }
+                                    if subscribed_patterns.insert(pat.clone()) {
+                                        pubsub.lock().await.psubscribe(conn_id, &pat, ps_tx.clone());
+                                    }
                                     let count = subscribed_channels.len() + subscribed_patterns.len();
                                     ws_send!(&resp_subscribe_ack("psubscribe", &pat, count));
                                 }
@@ -1342,15 +1414,14 @@ pub(crate) async fn handle_ws<S>(
 
                             Command::QSub(pattern) => {
                                 // Strict mode: the requested pattern must sit inside a
-                                // granted scope. A grant covers the request when it is
-                                // identical or glob-matches the request as literal text
-                                // (prefix-style grants: `cart:*` covers `cart:42:*`).
+                                // granted scope. Matching the pattern text itself does not
+                                // prove containment, so ambiguous wildcard grants are only
+                                // accepted on exact equality.
                                 if strict {
                                     let allowed = sync_scopes.as_ref().is_some_and(|scopes| {
-                                        scopes.iter().any(|s| {
-                                            s == &pattern
-                                                || core_engine::store::glob_match(s, &pattern)
-                                        })
+                                        scopes
+                                            .iter()
+                                            .any(|scope| scope_covers_pattern(scope, &pattern))
                                     });
                                     if !allowed {
                                         ws_send!(b"-NOSCOPE pattern is outside this connection's sync scopes\r\n");

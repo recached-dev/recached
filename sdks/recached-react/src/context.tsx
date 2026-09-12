@@ -36,16 +36,26 @@ export function RecachedProvider({ options, cache: prebuilt, children }: Provide
   const [cache, setCache] = useState<Cache | null>(prebuilt ?? null);
 
   useEffect(() => {
-    if (prebuilt) return;
+    if (prebuilt) {
+      setCache(prebuilt);
+      return;
+    }
     let cancelled = false;
+    let owned: Cache | null = null;
+    setCache(null);
     createCache(options).then((c) => {
-      if (!cancelled) setCache(c);
+      if (cancelled) {
+        c.disconnect();
+      } else {
+        owned = c;
+        setCache(c);
+      }
     });
     return () => {
       cancelled = true;
+      owned?.disconnect();
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [options, prebuilt]);
 
   if (!cache) return null;
   return <RecachedCtx.Provider value={cache}>{children}</RecachedCtx.Provider>;

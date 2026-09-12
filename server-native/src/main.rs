@@ -332,24 +332,42 @@ async fn run(
     }
 
     // ── store ─────────────────────────────────────────────────────────────
-    let max_keys = std::env::var("RECACHED_MAX_KEYS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok());
+    let max_keys = match std::env::var("RECACHED_MAX_KEYS") {
+        Ok(value) => Some(value.trim().parse::<usize>().map_err(|_| {
+            std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "RECACHED_MAX_KEYS must be a non-negative integer",
+            )
+        })?),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(error.into()),
+    };
 
-    let max_memory_bytes = std::env::var("RECACHED_MAX_MEMORY")
-        .ok()
-        .and_then(|v| parse_memory_bytes(&v));
+    let max_memory_bytes = match std::env::var("RECACHED_MAX_MEMORY") {
+        Ok(value) => Some(parse_memory_bytes(&value).ok_or_else(|| {
+            std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "RECACHED_MAX_MEMORY must be a non-overflowing byte count or KB/MB/GB value",
+            )
+        })?),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(error.into()),
+    };
 
-    let eviction_policy = match std::env::var("RECACHED_EVICTION")
-        .unwrap_or_default()
-        .to_lowercase()
-        .as_str()
-    {
+    let eviction_raw = std::env::var("RECACHED_EVICTION").unwrap_or_default();
+    let eviction_policy = match eviction_raw.to_lowercase().as_str() {
+        "" | "noeviction" => EvictionPolicy::NoEviction,
         "allkeys-lru" | "lru" => EvictionPolicy::AllKeysLru,
         "allkeys-random" | "random" => EvictionPolicy::AllKeysRandom,
         "volatile-lru" => EvictionPolicy::VolatileLru,
         "volatile-ttl" | "ttl" => EvictionPolicy::VolatileTtl,
-        _ => EvictionPolicy::NoEviction,
+        _ => {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("RECACHED_EVICTION has unknown policy '{eviction_raw}'"),
+            )
+            .into());
+        }
     };
 
     if max_keys.is_some() || max_memory_bytes.is_some() {
@@ -374,10 +392,19 @@ async fn run(
     // Falls back to RECACHED_SAVE_INTERVAL (single-condition, 1 change required).
     let save_conditions: Vec<SaveCondition> = if let Ok(s) = std::env::var("RECACHED_SAVE") {
         parse_save_conditions(&s)
+            .map_err(|error| std::io::Error::new(ErrorKind::InvalidInput, error))?
     } else {
         let interval: u64 = std::env::var("RECACHED_SAVE_INTERVAL")
             .ok()
-            .and_then(|v| v.parse().ok())
+            .map(|value| {
+                value.trim().parse().map_err(|_| {
+                    std::io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "RECACHED_SAVE_INTERVAL must be a non-negative integer",
+                    )
+                })
+            })
+            .transpose()?
             .unwrap_or(900);
         if interval > 0 {
             vec![SaveCondition {
@@ -406,14 +433,18 @@ async fn run(
 
     // ── AOF ───────────────────────────────────────────────────────────────
     let aof_path = std::env::var("RECACHED_AOF_PATH").ok().map(PathBuf::from);
-    let aof_sync = match std::env::var("RECACHED_AOF_SYNC")
-        .unwrap_or_default()
-        .to_lowercase()
-        .as_str()
-    {
+    let aof_sync_raw = std::env::var("RECACHED_AOF_SYNC").unwrap_or_default();
+    let aof_sync = match aof_sync_raw.to_lowercase().as_str() {
         "always" => AofSync::Always,
         "no" => AofSync::No,
-        _ => AofSync::EverySec,
+        "" | "everysec" => AofSync::EverySec,
+        _ => {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("RECACHED_AOF_SYNC has unknown mode '{aof_sync_raw}'"),
+            )
+            .into());
+        }
     };
 
     let aof: Option<Arc<AofWriter>> = if let Some(path) = aof_path {

@@ -7,7 +7,7 @@ cannot be published before they are. Depend on it by git in the meantime:
 
 ```toml
 [dependencies]
-recached-embed = { git = "https://github.com/recached-dev/recached", branch = "dev" }
+recached-embed = { git = "https://github.com/recached-sh/recached.git", branch = "dev" }
 ```
 
 Publishing `core-engine` would make its `KeyValueStore` / `Command` / `Value`

@@ -14,7 +14,7 @@ Recached is pre-1.0. Only the latest released version receives security fixes.
 **Do not open a public issue.**
 
 Report privately through GitHub's [private vulnerability
-reporting](https://github.com/recached-dev/recached/security/advisories/new) on
+reporting](https://github.com/recached-sh/recached/security/advisories/new) on
 this repository. If that is unavailable to you, email the maintainers via the
 address on the organisation profile.
 

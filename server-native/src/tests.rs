@@ -437,6 +437,26 @@ async fn integration_pubsub_frame_type_follows_the_negotiated_protocol() {
 }
 
 #[tokio::test]
+async fn integration_repeated_subscribe_does_not_duplicate_registration() {
+    let srv = spawn_server().await;
+    let mut subscriber = RespClient::connect(srv.tcp_addr).await;
+    assert!(matches!(
+        subscriber.cmd(&["SUBSCRIBE", "news"]).await,
+        Value::Array(_)
+    ));
+    assert!(matches!(
+        subscriber.cmd(&["SUBSCRIBE", "news"]).await,
+        Value::Array(_)
+    ));
+
+    let mut inspector = RespClient::connect(srv.tcp_addr).await;
+    assert_eq!(
+        inspector.cmd(&["PUBSUB", "NUMSUB", "news"]).await,
+        Value::Array(Some(vec![bulk("news"), int(1)]))
+    );
+}
+
+#[tokio::test]
 async fn integration_incr_and_expiry() {
     let srv = spawn_server().await;
     let mut c = RespClient::connect(srv.tcp_addr).await;
@@ -925,6 +945,21 @@ async fn integration_replica_rejects_writes() {
     let r = c.cmd(&["SET", "k", "v"]).await;
     assert!(matches!(&r, Value::Error(e) if e.contains("READONLY")));
     // Reads still work
+    assert_eq!(c.cmd(&["GET", "k"]).await, nil());
+}
+
+#[tokio::test]
+async fn integration_replica_rejects_writes_queued_in_multi() {
+    let srv = spawn_server_cfg(None, None, true).await;
+    let mut c = RespClient::connect(srv.tcp_addr).await;
+
+    assert_eq!(c.cmd(&["MULTI"]).await, ok());
+    assert_eq!(
+        c.cmd(&["SET", "k", "v"]).await,
+        Value::SimpleString("QUEUED".into())
+    );
+    let response = c.cmd(&["EXEC"]).await;
+    assert!(matches!(&response, Value::Error(message) if message.contains("READONLY")));
     assert_eq!(c.cmd(&["GET", "k"]).await, nil());
 }
 
@@ -2127,6 +2162,22 @@ impl WsClient {
             return v;
         }
     }
+}
+
+#[tokio::test]
+async fn integration_ws_replica_rejects_writes_queued_in_multi() {
+    let srv = spawn_ws_server().await;
+    srv.state.is_replica.store(true, Ordering::Release);
+    let mut c = WsClient::connect(srv.tcp_addr).await;
+
+    assert_eq!(c.cmd(&["MULTI"]).await, ok());
+    assert_eq!(
+        c.cmd(&["SET", "k", "v"]).await,
+        Value::SimpleString("QUEUED".into())
+    );
+    let response = c.cmd(&["EXEC"]).await;
+    assert!(matches!(&response, Value::Error(message) if message.contains("READONLY")));
+    assert_eq!(srv.store.execute(Command::Get("k".into())), nil());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4063,7 +4114,7 @@ fn very_large_scores_do_not_lose_their_exponent() {
 
 #[test]
 fn save_conditions_parse_as_seconds_colon_changes() {
-    let c = parse_save_conditions("900:1,300:10,60:10000");
+    let c = parse_save_conditions("900:1,300:10,60:10000").unwrap();
     assert_eq!(c.len(), 3);
     assert_eq!(c[0].secs, 900);
     assert_eq!(c[0].changes, 1);
@@ -4073,25 +4124,21 @@ fn save_conditions_parse_as_seconds_colon_changes() {
 
 #[test]
 fn save_conditions_tolerate_whitespace() {
-    let c = parse_save_conditions(" 900 : 1 , 300 : 10 ");
+    let c = parse_save_conditions(" 900 : 1 , 300 : 10 ").unwrap();
     assert_eq!(c.len(), 2);
     assert_eq!(c[0].secs, 900);
     assert_eq!(c[1].changes, 10);
 }
 
 #[test]
-fn malformed_save_conditions_are_skipped_not_fatal() {
-    // A bad pair is dropped so one typo cannot disable autosave entirely —
-    // but a wholly invalid string yields no conditions, which the caller
-    // treats as "autosave off".
-    let c = parse_save_conditions("900:1,garbage,300:10");
-    assert_eq!(c.len(), 2, "valid pairs survive a bad one");
-    assert!(parse_save_conditions("").is_empty());
-    assert!(parse_save_conditions("nonsense").is_empty());
-    assert!(
-        parse_save_conditions("900").is_empty(),
-        "missing ':changes'"
-    );
+fn malformed_save_conditions_are_rejected() {
+    assert!(parse_save_conditions("900:1,garbage,300:10").is_err());
+    assert!(parse_save_conditions("").unwrap().is_empty());
+    assert!(parse_save_conditions("0").unwrap().is_empty());
+    assert!(parse_save_conditions("nonsense").is_err());
+    assert!(parse_save_conditions("900").is_err());
+    assert!(parse_save_conditions("0:1").is_err());
+    assert!(parse_save_conditions("1:0").is_err());
 }
 
 // ── TLS configuration ─────────────────────────────────────────────────────
@@ -4304,6 +4351,13 @@ fn parse_memory_bytes_rejects_nonsense_rather_than_defaulting() {
     for bad in ["", "abc", "10 bananas", "-5", "1.5mb", "mb"] {
         assert_eq!(parse_memory_bytes(bad), None, "{bad:?} should not parse");
     }
+}
+
+#[test]
+fn parse_memory_bytes_rejects_overflow() {
+    assert_eq!(parse_memory_bytes(&format!("{}gb", usize::MAX)), None);
+    assert_eq!(parse_memory_bytes(&format!("{}mb", usize::MAX)), None);
+    assert_eq!(parse_memory_bytes(&format!("{}kb", usize::MAX)), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

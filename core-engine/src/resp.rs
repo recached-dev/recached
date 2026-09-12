@@ -372,6 +372,12 @@ impl Value {
                     return Err(ParseError::Incomplete { needed: end });
                 }
 
+                if &buffer[head_len + length..end] != b"\r\n" {
+                    return Err(ParseError::InvalidHeader(
+                        "bulk string payload is not terminated by CRLF",
+                    ));
+                }
+
                 // The payload is copied only when a value is being built;
                 // measuring steps over it.
                 let payload = build.then(|| buffer[head_len..head_len + length].to_vec());
@@ -774,6 +780,12 @@ mod parser_edge_tests {
     fn rejects_malformed_integer() {
         let err = Value::parse(b":notanumber\r\n").unwrap_err().to_string();
         assert!(err.contains("Invalid integer"), "got {err}");
+    }
+
+    #[test]
+    fn rejects_bulk_payload_without_trailing_crlf() {
+        let err = Value::parse(b"$3\r\nabcXX").unwrap_err().to_string();
+        assert!(err.contains("terminated by CRLF"), "got {err}");
     }
 
     #[test]

@@ -10,6 +10,10 @@ All notable changes to Recached are documented here.
 - Bounded keyspace maintenance and reduced small-value and collection memory use
 - Improved live-query snapshots and collection hydration
 - Expanded metrics, fault coverage, benchmarks, and operational documentation
+- Closed replica transaction and strict live-query scope authorization bypasses
+- Enforced `noeviction` memory caps and rejected ambiguous persistence and capacity configuration
+- Fixed RESP framing, integer overflow, duplicate pub/sub registration, and crash-safe browser outbox restoration
+- Fixed React cache ownership and subscription lifecycle handling
 
 ## [0.3.3] (2026-09-05)
 

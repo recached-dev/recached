@@ -24,6 +24,26 @@ pub(crate) fn scopes_match(scopes: &[String], keys: &[String]) -> bool {
             .any(|k| scopes.iter().any(|p| core_engine::store::glob_match(p, k)))
 }
 
+/// Conservatively prove that every key matched by `requested` is also covered
+/// by `grant`. General glob containment is easy to get subtly wrong. Recached's
+/// documented scope form is a literal namespace prefix followed by `*`, so we
+/// accept that form (and exact equality) and reject ambiguous wildcard grants.
+pub(crate) fn scope_covers_pattern(grant: &str, requested: &str) -> bool {
+    if grant == requested || grant == "*" {
+        return true;
+    }
+    let Some(prefix) = grant.strip_suffix('*') else {
+        return false;
+    };
+    if prefix.contains(['*', '?']) {
+        return false;
+    }
+    let requested_prefix = requested
+        .find(['*', '?'])
+        .map_or(requested, |index| &requested[..index]);
+    requested_prefix.starts_with(prefix)
+}
+
 /// Verify a signed sync-scope token and return the granted patterns.
 ///
 /// Token format: `base64url(payload) "." base64url(hmac_sha256(secret, base64url(payload)))`
@@ -312,6 +332,27 @@ pub(crate) fn handle_sync_command(
             *scopes = Some(pats);
             reply
         }
+    }
+}
+
+#[cfg(test)]
+mod scope_containment_tests {
+    use super::scope_covers_pattern;
+
+    #[test]
+    fn prefix_grants_cover_only_narrower_patterns() {
+        assert!(scope_covers_pattern("cart:*", "cart:42:*"));
+        assert!(scope_covers_pattern("cart:*", "cart:42:item:?"));
+        assert!(scope_covers_pattern("*", "anything:*"));
+        assert!(!scope_covers_pattern("cart:42:*", "cart:*"));
+        assert!(!scope_covers_pattern("cart:*", "user:*"));
+    }
+
+    #[test]
+    fn ambiguous_glob_grants_require_exact_equality() {
+        assert!(scope_covers_pattern("tenant:?", "tenant:?"));
+        assert!(!scope_covers_pattern("tenant:?", "tenant:*"));
+        assert!(!scope_covers_pattern("tenant:*:item:*", "tenant:1:item:*"));
     }
 }
 

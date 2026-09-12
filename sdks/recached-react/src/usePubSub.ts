@@ -37,5 +37,5 @@ export function usePubSub(
       unsub();
       cache.unsubscribe(channel);
     };
-  }, [channel]);
+  }, [cache, channel]);
 }

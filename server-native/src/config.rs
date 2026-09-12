@@ -36,6 +36,13 @@ pub(crate) fn max_qsubs_per_conn() -> usize {
     *V.get_or_init(|| env_limit("RECACHED_MAX_LIVE_QUERIES", 64))
 }
 
+/// Exact channels plus glob patterns one connection may subscribe to.
+/// Override: `RECACHED_MAX_PUBSUB_SUBSCRIPTIONS`.
+pub(crate) fn max_pubsub_subscriptions_per_conn() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_limit("RECACHED_MAX_PUBSUB_SUBSCRIPTIONS", 1_024))
+}
+
 /// Cap on the number of key/value pairs returned as QSUB initial state, so a
 /// pattern matching a huge keyspace cannot produce an unbounded reply frame.
 /// Keys returned in a live query's initial state.
@@ -360,11 +367,17 @@ pub(crate) fn parse_memory_bytes(s: &str) -> Option<usize> {
         n.trim()
             .parse::<usize>()
             .ok()
-            .map(|n| n * 1024 * 1024 * 1024)
+            .and_then(|n| n.checked_mul(1024 * 1024 * 1024))
     } else if let Some(n) = s.strip_suffix("mb") {
-        n.trim().parse::<usize>().ok().map(|n| n * 1024 * 1024)
+        n.trim()
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_mul(1024 * 1024))
     } else if let Some(n) = s.strip_suffix("kb") {
-        n.trim().parse::<usize>().ok().map(|n| n * 1024)
+        n.trim()
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_mul(1024))
     } else {
         s.parse().ok()
     }
@@ -380,13 +393,30 @@ pub(crate) struct SaveCondition {
 /// Parse `RECACHED_SAVE` value: comma-separated `seconds:changes` pairs.
 /// Example: `"900:1,300:10,60:10000"` → save after 1 change in 15 min,
 /// 10 changes in 5 min, or 10 000 changes in 1 min — whichever comes first.
-pub(crate) fn parse_save_conditions(s: &str) -> Vec<SaveCondition> {
+pub(crate) fn parse_save_conditions(s: &str) -> Result<Vec<SaveCondition>, String> {
+    if s.trim().is_empty() || s.trim() == "0" {
+        return Ok(Vec::new());
+    }
     s.split(',')
-        .filter_map(|pair| {
-            let mut parts = pair.trim().splitn(2, ':');
-            let secs: u64 = parts.next()?.trim().parse().ok()?;
-            let changes: u64 = parts.next()?.trim().parse().ok()?;
-            Some(SaveCondition { secs, changes })
+        .map(|pair| {
+            let pair = pair.trim();
+            let (secs, changes) = pair
+                .split_once(':')
+                .ok_or_else(|| format!("RECACHED_SAVE: invalid condition '{pair}'"))?;
+            let secs = secs
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| format!("RECACHED_SAVE: invalid seconds in '{pair}'"))?;
+            let changes = changes
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| format!("RECACHED_SAVE: invalid change count in '{pair}'"))?;
+            if secs == 0 || changes == 0 {
+                return Err(format!(
+                    "RECACHED_SAVE: seconds and changes must be positive in '{pair}'"
+                ));
+            }
+            Ok(SaveCondition { secs, changes })
         })
         .collect()
 }
@@ -499,6 +529,7 @@ mod limit_config_tests {
             ("RECACHED_MAX_MULTI_QUEUE", 10_000usize),
             ("RECACHED_MAX_WATCHES_PER_CONN", 1_024),
             ("RECACHED_MAX_LIVE_QUERIES", 64),
+            ("RECACHED_MAX_PUBSUB_SUBSCRIPTIONS", 1_024),
             ("RECACHED_MAX_QSUB_INITIAL_KEYS", 10_000),
             ("RECACHED_EVICTION_SAMPLE", 10),
         ] {
@@ -521,6 +552,7 @@ mod limit_config_tests {
         assert_eq!(max_multi_queue_len(), 10_000);
         assert_eq!(max_watches_per_conn(), 1_024);
         assert_eq!(max_qsubs_per_conn(), 64);
+        assert_eq!(max_pubsub_subscriptions_per_conn(), 1_024);
         assert_eq!(max_qsub_initial_keys(), 10_000);
     }
 }

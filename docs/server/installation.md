@@ -5,7 +5,7 @@
 The fastest way to run Recached in any environment.
 
 ```bash
-docker run -p 6379:6379 -p 6380:6380 ghcr.io/recached-dev/recached:latest
+docker run -p 6379:6379 -p 6380:6380 ghcr.io/recached-sh/recached:latest
 ```
 
 With environment variables for a production-like setup:
@@ -19,7 +19,7 @@ docker run \
   -e RECACHED_EVICTION="lru" \
   -e RECACHED_METRICS_PORT="9091" \
   -p 9091:9091 \
-  ghcr.io/recached-dev/recached:latest
+  ghcr.io/recached-sh/recached:latest
 ```
 
 ### Docker Compose
@@ -27,7 +27,7 @@ docker run \
 ```yaml
 services:
   recached:
-    image: ghcr.io/recached-dev/recached:latest
+    image: ghcr.io/recached-sh/recached:latest
     ports:
       - "6379:6379"
       - "6380:6380"
@@ -48,11 +48,11 @@ services:
 ```bash
 # The tap is the main repo rather than a separate homebrew-recached
 # repository, so the URL has to be given explicitly.
-brew tap recached-dev/recached https://github.com/recached-dev/recached
+brew tap recached-sh/recached https://github.com/recached-sh/recached.git
 
 # Homebrew 6.0 refuses to load formulae from an untrusted third-party tap.
 # Skip this on older Homebrew, which has no `trust` subcommand.
-brew trust recached-dev/recached
+brew trust recached-sh/recached
 
 brew install recached
 recached-server
@@ -96,7 +96,7 @@ RECACHED_PASSWORD="secret" RECACHED_MAX_KEYS="100000" recached-server
 Requirements: Rust 1.78+ with the `wasm32-unknown-unknown` target.
 
 ```bash
-git clone https://github.com/recached-dev/recached
+git clone https://github.com/recached-sh/recached.git
 cd recached
 
 # Build just the server binary

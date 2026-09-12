@@ -19,7 +19,7 @@ fi
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FORMULA="$ROOT/Formula/recached.rb"
-BASE="https://github.com/recached-dev/recached/releases/download/$TAG"
+BASE="https://github.com/recached-sh/recached/releases/download/$TAG"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 

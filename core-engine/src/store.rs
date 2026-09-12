@@ -1863,6 +1863,23 @@ impl KeyValueStore {
             MutationScope::Keys(mut keys) => {
                 keys.sort_unstable();
                 keys.dedup();
+                let memory_before = self.approximate_memory_bytes();
+                // `NoEviction` is a refusal policy, not permission to exceed
+                // the configured cap. Keep only the touched entries so an
+                // oversized write can be rolled back without cloning the
+                // entire keyspace on every command.
+                let rollback = (self.max_memory_bytes.is_some()
+                    && self.eviction_policy == EvictionPolicy::NoEviction)
+                    .then(|| {
+                        keys.iter()
+                            .map(|key| {
+                                (
+                                    key.clone(),
+                                    self.data.get(key).map(|entry| entry.value().clone()),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    });
                 let before = keys.iter().map(|key| self.entry_memory(key)).sum();
                 let out = self.execute_inner(cmd, &mut evicted);
                 let after = keys.iter().map(|key| self.entry_memory(key)).sum();
@@ -1871,7 +1888,31 @@ impl KeyValueStore {
                     self.sync_key_metadata(key);
                 }
                 if self.max_memory_bytes.is_some() {
-                    self.try_evict_for_memory_inner(&mut evicted);
+                    let within_limit = self.try_evict_for_memory_inner(&mut evicted);
+                    if !within_limit
+                        && self.approximate_memory_bytes() > memory_before
+                        && let Some(rollback) = rollback
+                    {
+                        for (key, previous) in rollback {
+                            match previous {
+                                Some(entry) => {
+                                    self.data.insert(key, entry);
+                                }
+                                None => {
+                                    self.data.remove(&key);
+                                }
+                            }
+                        }
+                        self.rebuild_metadata();
+                        evicted.clear();
+                        return (
+                            Value::Error(
+                                "OOM command not allowed when used memory > 'maxmemory'."
+                                    .to_string(),
+                            ),
+                            evicted,
+                        );
+                    }
                 }
                 out
             }
@@ -2217,7 +2258,10 @@ impl KeyValueStore {
             Command::Incr(key) => incr_by(&self.data, key, 1),
             Command::Decr(key) => incr_by(&self.data, key, -1),
             Command::IncrBy(key, delta) => incr_by(&self.data, key, delta),
-            Command::DecrBy(key, delta) => incr_by(&self.data, key, -delta),
+            Command::DecrBy(key, delta) => match delta.checked_neg() {
+                Some(delta) => incr_by(&self.data, key, delta),
+                None => Value::Error("ERR increment or decrement would overflow".to_string()),
+            },
 
             // ── Expiry ────────────────────────────────────────────────────────
             Command::Expire(key, secs) => set_expiry(
@@ -5359,6 +5403,10 @@ mod tests {
         assert_eq!(s.execute(Command::IncrBy("n".into(), 5)), int(15));
         assert_eq!(s.execute(Command::DecrBy("n".into(), 3)), int(12));
         assert_eq!(s.execute(Command::DecrBy("n".into(), 20)), int(-8));
+        assert!(matches!(
+            s.execute(Command::DecrBy("n".into(), i64::MIN)),
+            Value::Error(message) if message.contains("overflow")
+        ));
     }
 
     #[test]
@@ -6800,9 +6848,15 @@ mod capacity_tests {
     #[test]
     fn try_evict_reports_failure_when_policy_cannot_free_memory() {
         // A tiny limit with NoEviction: nothing can be freed, so the call must
-        // report failure rather than silently exceeding the cap.
+        // report failure for an already-oversized restored snapshot. Ordinary
+        // writes cannot create this state because the write path rejects them.
         let s = KeyValueStore::with_config(None, Some(64), EvictionPolicy::NoEviction);
-        fill(&s, 20);
+        s.restore(vec![SnapshotEntry {
+            key: "oversized".into(),
+            value: SnapshotValue::Str(vec![b'x'; 1_024].into()),
+            expires_at_ms: None,
+        }]);
+        assert!(s.approximate_memory_bytes() > 64);
         assert!(!s.try_evict_for_memory());
     }
 
@@ -8685,19 +8739,34 @@ mod write_path_memory_tests {
         assert_eq!(store.evicted_count(), 0);
     }
 
-    /// A store whose policy cannot free anything must still refuse to grow
-    /// without bound *and* must not spin: `NoEviction` means the write path
-    /// tries, fails, and moves on.
+    /// A store whose policy cannot free anything refuses the write and restores
+    /// the previous value rather than silently growing beyond the cap.
     #[test]
-    fn no_eviction_policy_does_not_spin_on_the_write_path() {
+    fn no_eviction_policy_refuses_growth_past_the_memory_cap() {
         let store = KeyValueStore::with_config(None, Some(LIMIT), EvictionPolicy::NoEviction);
         let value = vec![b'x'; 1024];
+        let mut rejected = 0;
         for i in 0..300 {
-            set(&store, &format!("k{i}"), &value);
+            if matches!(set(&store, &format!("k{i}"), &value), Value::Error(_)) {
+                rejected += 1;
+            }
         }
-        // Nothing was evicted — the policy forbids it — but the calls returned.
+        assert!(rejected > 0, "writes past the cap must be rejected");
         assert_eq!(store.evicted_count(), 0);
-        assert!(store.approximate_memory_bytes() > LIMIT);
+        assert!(store.approximate_memory_bytes() <= LIMIT);
+    }
+
+    #[test]
+    fn no_eviction_rollback_restores_an_existing_value() {
+        let store = KeyValueStore::with_config(None, Some(512), EvictionPolicy::NoEviction);
+        assert_eq!(set(&store, "k", b"small"), Value::SimpleString("OK".into()));
+        let response = set(&store, "k", &vec![b'x'; 2_048]);
+        assert!(matches!(response, Value::Error(message) if message.starts_with("OOM")));
+        assert_eq!(
+            store.get_current("k"),
+            Value::BulkString(Some(b"small".to_vec()))
+        );
+        assert!(store.approximate_memory_bytes() <= 512);
     }
 
     /// An eviction pass sheds past the cap rather than stopping exactly on it.

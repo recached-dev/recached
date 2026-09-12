@@ -110,7 +110,7 @@ export default defineConfig({
     },
 
     socialLinks: [
-      { icon: 'github', link: 'https://github.com/recached-dev/recached' },
+      { icon: 'github', link: 'https://github.com/recached-sh/recached' },
     ],
 
     footer: {
@@ -119,7 +119,7 @@ export default defineConfig({
     },
 
     editLink: {
-      pattern: 'https://github.com/recached-dev/recached/edit/main/docs/:path',
+      pattern: 'https://github.com/recached-sh/recached/edit/main/docs/:path',
       text: 'Edit this page on GitHub',
     },
 

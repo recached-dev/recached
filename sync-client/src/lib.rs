@@ -390,20 +390,21 @@ impl SyncClient {
         out
     }
 
-    /// Restore outbox rows persisted by a previous session (ordered by their
-    /// stored key). Rows are renumbered with fresh ids so they can never
-    /// collide with ids handed out this session; the wire frames are stored
-    /// verbatim, so their embedded dedup ids still match what the server may
-    /// have already applied. Returns `(old_id, new_id, frame)` for the
-    /// adapter to rewrite durable storage.
+    /// Restore outbox rows persisted by a previous session. Rows receive fresh
+    /// ids after any writes already queued this session, while preserving their
+    /// original order. Adapters must replace durable storage atomically with
+    /// the returned rows: an in-place delete/put loop can overwrite a row that
+    /// has not been visited yet.
     pub fn restore_outbox(&mut self, mut rows: Vec<(u64, Vec<u8>)>) -> Vec<(u64, u64, Vec<u8>)> {
         rows.sort_by_key(|(id, _)| *id);
         let mut rewrites = Vec::with_capacity(rows.len());
-        for (old_id, frame) in rows.into_iter().rev() {
+        for (old_id, frame) in rows {
             let new_id = self.outbox_seq;
-            self.outbox_seq += 1;
-            self.outbox.push_front((new_id, frame.clone()));
+            self.outbox_seq = self.outbox_seq.saturating_add(1);
             rewrites.push((old_id, new_id, frame));
+        }
+        for (_, new_id, frame) in rewrites.iter().rev() {
+            self.outbox.push_front((*new_id, frame.clone()));
         }
         rewrites
     }

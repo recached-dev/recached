@@ -69,6 +69,20 @@ export function idbOutboxDelete(db, id) {
         req.onerror   = (e) => reject(e.target.error);
     });
 }
+export function idbOutboxReplace(db, ids, cmds) {
+    return new Promise((resolve, reject) => {
+        // Renumbering must be one transaction. Deleting and inserting rows one
+        // at a time can overwrite an old id that has not been visited yet,
+        // losing a pending write if the tab closes during hydration.
+        const tx    = db.transaction('outbox', 'readwrite');
+        const store = tx.objectStore('outbox');
+        store.clear();
+        for (let i = 0; i < ids.length; i++) store.put(cmds[i], ids[i]);
+        tx.oncomplete = () => resolve(undefined);
+        tx.onerror    = (e) => reject(e.target.error);
+        tx.onabort    = (e) => reject(e.target.error);
+    });
+}
 export function idbWalReplace(db, cmds) {
     return new Promise((resolve, reject) => {
         // One transaction: the clear and the rewrite commit together or not at
@@ -131,6 +145,8 @@ extern "C" {
     fn idb_outbox_put_js(db: &JsValue, id: f64, cmd: &[u8]) -> Promise;
     #[wasm_bindgen(js_name = "idbOutboxDelete")]
     fn idb_outbox_delete_js(db: &JsValue, id: f64) -> Promise;
+    #[wasm_bindgen(js_name = "idbOutboxReplace")]
+    fn idb_outbox_replace_js(db: &JsValue, ids: &JsValue, cmds: &JsValue) -> Promise;
     #[wasm_bindgen(js_name = "idbWalClear")]
     fn idb_wal_clear_js(db: &JsValue) -> Promise;
     #[wasm_bindgen(js_name = "idbWalReplace")]
@@ -749,9 +765,9 @@ impl RecachedCache {
             // Restore the durable outbox: writes from a previous session that
             // never got a server acknowledgment. They re-send on the next
             // (re)connect, *before* writes queued in this session. Restored
-            // entries are renumbered with fresh ids so they can never collide
-            // with ids handed out in this session (replay order comes from
-            // deque position, not from the id).
+            // entries receive fresh ids after anything queued this session.
+            // Their durable rows are swapped atomically below, so renumbering
+            // cannot overwrite an old row that has not been visited yet.
             {
                 let result = JsFuture::from(idb_outbox_read_all(&db)).await?;
                 let pair = js_sys::Array::from(&result);
@@ -775,12 +791,13 @@ impl RecachedCache {
                 // await lets an incoming WebSocket frame re-enter and panic on a
                 // double borrow, killing the client mid-hydration.
                 let renumbered = core.borrow_mut().restore_outbox(restored);
-                for (old_id, new_id, frame) in renumbered {
-                    if new_id != old_id {
-                        let _ = JsFuture::from(idb_outbox_delete_js(&db, old_id as f64)).await;
-                        let _ = JsFuture::from(idb_outbox_put_js(&db, new_id as f64, &frame)).await;
-                    }
+                let ids = js_sys::Array::new();
+                let frames = js_sys::Array::new();
+                for (_, new_id, frame) in renumbered {
+                    ids.push(&JsValue::from_f64(new_id as f64));
+                    frames.push(&js_sys::Uint8Array::from(frame.as_slice()));
                 }
+                JsFuture::from(idb_outbox_replace_js(&db, &ids, &frames)).await?;
             }
 
             let result = JsFuture::from(idb_read_all(&db)).await?;
@@ -1774,8 +1791,8 @@ mod browser_tests {
 
     #[wasm_bindgen_test]
     async fn putting_the_same_id_replaces_rather_than_duplicates() {
-        // Renumbering on restore re-puts rows; duplicates would replay a write
-        // twice.
+        // IndexedDB outbox keys are unique; putting the same id must replace
+        // rather than leave two copies that would replay twice.
         let db = fresh_db().await;
         JsFuture::from(idb_outbox_put_js(&db, 5.0, b"FIRST"))
             .await
@@ -1787,6 +1804,30 @@ mod browser_tests {
         let (ids, vals) = outbox_rows(&db).await;
         assert_eq!(ids.len(), 1, "same key must overwrite");
         assert_eq!(vals[0], "SECOND");
+    }
+
+    #[wasm_bindgen_test]
+    async fn outbox_replace_atomically_installs_renumbered_rows() {
+        let db = fresh_db().await;
+        for (id, cmd) in [(7.0, b"OLD A".as_slice()), (8.0, b"OLD B".as_slice())] {
+            JsFuture::from(idb_outbox_put_js(&db, id, cmd))
+                .await
+                .unwrap();
+        }
+
+        let ids = js_sys::Array::new();
+        ids.push(&JsValue::from_f64(1.0));
+        ids.push(&JsValue::from_f64(2.0));
+        let frames = js_sys::Array::new();
+        frames.push(&js_sys::Uint8Array::from(b"NEW A".as_slice()));
+        frames.push(&js_sys::Uint8Array::from(b"NEW B".as_slice()));
+        JsFuture::from(idb_outbox_replace_js(&db, &ids, &frames))
+            .await
+            .expect("atomic outbox replacement");
+
+        let (stored_ids, values) = outbox_rows(&db).await;
+        assert_eq!(stored_ids, vec![1.0, 2.0]);
+        assert_eq!(values, vec!["NEW A".to_string(), "NEW B".to_string()]);
     }
 
     #[wasm_bindgen_test]

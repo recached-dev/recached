@@ -182,6 +182,7 @@ is worth knowing where the walls are:
 | Queued commands per `MULTI` | 10,000 | `RECACHED_MAX_MULTI_QUEUE` |
 | `WATCH`ed keys per connection | 1,024 | `RECACHED_MAX_WATCHES_PER_CONN` |
 | Live queries (`QSUB`) per connection | 64 | `RECACHED_MAX_LIVE_QUERIES` |
+| Pub/sub channel and pattern subscriptions per connection | 1,024 | `RECACHED_MAX_PUBSUB_SUBSCRIPTIONS` |
 | Keys allowed in a complete live-query initial state | 10,000 | `RECACHED_MAX_QSUB_INITIAL_KEYS` |
 | Keys sampled per eviction pass | 10 | `RECACHED_EVICTION_SAMPLE` |
 | Replication frame | 512 MB | No |
@@ -228,7 +229,7 @@ costs you every write since the last save.
 ## Upgrades
 
 Recached is pre-1.0 and the wire protocol is not frozen — see the
-[protocol spec](/server/protocol). Read the [changelog](https://github.com/recached-dev/recached/blob/main/CHANGELOG.md)
+[protocol spec](/server/protocol). Read the [changelog](https://github.com/recached-sh/recached/blob/main/CHANGELOG.md)
 before upgrading a minor version, and upgrade server and browser SDK together. The replication
 protocol identifies itself as `RCP1`; mixed replication protocol versions fail explicitly and are
 not supported.

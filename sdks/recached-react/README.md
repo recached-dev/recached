@@ -1,6 +1,6 @@
 # @recached/react
 
-Official React hooks for [Recached](https://github.com/recached-dev/recached) — a local reactive cache with automatic server sync and cross-tab sharing.
+Official React hooks for [Recached](https://github.com/recached-sh/recached) — a local reactive cache with automatic server sync and cross-tab sharing.
 
 ## Features
 

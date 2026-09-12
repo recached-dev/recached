@@ -74,6 +74,33 @@ describe('RecachedProvider', () => {
     expect(createCache).toHaveBeenCalledWith(options);
   });
 
+  it('disconnects a cache it created when the provider unmounts', async () => {
+    setCreateCache(async () => cache);
+    let view!: ReturnType<typeof render>;
+    await act(async () => {
+      view = render(
+        <RecachedProvider>
+          <span>ready</span>
+        </RecachedProvider>,
+      );
+    });
+    view.unmount();
+    expect(cache.disconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it('disconnects a late cache result after the provider unmounts', async () => {
+    let resolve!: (c: unknown) => void;
+    setCreateCache(() => new Promise((r) => (resolve = r)));
+    const view = render(
+      <RecachedProvider>
+        <span>ready</span>
+      </RecachedProvider>,
+    );
+    view.unmount();
+    await act(async () => resolve(cache));
+    expect(cache.disconnect).toHaveBeenCalledTimes(1);
+  });
+
   it('throws a nameable error when a hook is used outside the provider', () => {
     // React logs the thrown error; silence it so the run stays readable.
     const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -250,5 +277,26 @@ describe('usePubSub', () => {
     expect(first).not.toHaveBeenCalled();
     expect(second).toHaveBeenCalledWith('ping');
     expect(cache.subscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it('moves the subscription when the provider cache changes', () => {
+    const first = cache;
+    const second = makeFakeCache();
+    function Consumer() {
+      usePubSub('alerts', vi.fn());
+      return null;
+    }
+    const view = render(
+      <RecachedProvider cache={first as never}>
+        <Consumer />
+      </RecachedProvider>,
+    );
+    view.rerender(
+      <RecachedProvider cache={second as never}>
+        <Consumer />
+      </RecachedProvider>,
+    );
+    expect(first.unsubscribe).toHaveBeenCalledWith('alerts');
+    expect(second.subscribe).toHaveBeenCalledWith('alerts');
   });
 });

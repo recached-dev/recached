@@ -1,6 +1,6 @@
 class Recached < Formula
   desc "Blazing fast, multi-core drop-in replacement for Redis"
-  homepage "https://github.com/recached-dev/recached"
+  homepage "https://github.com/recached-sh/recached"
   version "0.3.4"
   license "Apache-2.0"
 
@@ -17,11 +17,11 @@ class Recached < Formula
   # placeholder makes brew fail loudly, which is the far better failure.
   on_macos do
     on_intel do
-      url "https://github.com/recached-dev/recached/releases/download/v0.3.4/recached-macos-amd64"
+      url "https://github.com/recached-sh/recached/releases/download/v0.3.4/recached-macos-amd64"
       sha256 "REPLACE_WITH_AMD64_SHA256"
     end
     on_arm do
-      url "https://github.com/recached-dev/recached/releases/download/v0.3.4/recached-macos-arm64"
+      url "https://github.com/recached-sh/recached/releases/download/v0.3.4/recached-macos-arm64"
       sha256 "REPLACE_WITH_ARM64_SHA256"
     end
   end

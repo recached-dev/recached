@@ -411,7 +411,7 @@ fn client_id_adoption_only_before_writes() {
 }
 
 #[test]
-fn restore_renumbers_but_preserves_frames_and_order() {
+fn restore_renumbers_without_collisions_and_preserves_order() {
     let mut c = client();
     // This session already queued one write before restore (connect-first flow).
     let session_write = c.enqueue_write(&to_resp(&["SET", "new", "1"]), true, false);
@@ -420,16 +420,35 @@ fn restore_renumbers_but_preserves_frames_and_order() {
     let old_frame_b = "*5\r\n$5\r\nDEDUP\r\n$8\r\nclient-a\r\n$1\r\n8\r\n$3\r\nDEL\r\n$1\r\nb\r\n";
     let rewrites = c.restore_outbox(vec![(8, old_frame_b.into()), (7, old_frame_a.into())]);
 
-    // New ids never collide with the session write's id.
-    for (_, new_id, _) in &rewrites {
-        assert_ne!(*new_id, session_write.id);
-    }
+    assert_eq!(
+        rewrites
+            .iter()
+            .map(|(old, new, _)| (*old, *new))
+            .collect::<Vec<_>>(),
+        vec![(7, 1), (8, 2)]
+    );
     // Replay order: restored rows first (oldest first), then this session's.
     let frames = c.on_open();
     assert_eq!(frames.len(), 3);
     assert_eq!(t(&frames[0]), old_frame_a);
     assert_eq!(t(&frames[1]), old_frame_b);
     assert_eq!(frames[2], session_write.frame);
+
+    let next = c.enqueue_write(&to_resp(&["SET", "later", "1"]), true, false);
+    assert_eq!(next.id, 3);
+}
+
+#[test]
+fn restore_cannot_collide_with_a_same_numbered_session_write() {
+    let mut c = client();
+    let session = c.enqueue_write(&to_resp(&["SET", "new", "1"]), true, false);
+    assert_eq!(session.id, 0);
+    let old = to_resp(&["SET", "old", "1"]);
+
+    let rewrites = c.restore_outbox(vec![(0, old.clone())]);
+    assert_eq!(rewrites[0].1, 1);
+    let frames = c.on_open();
+    assert_eq!(frames, vec![old, session.frame]);
 }
 
 // ── Sync scopes ───────────────────────────────────────────────────────────────
