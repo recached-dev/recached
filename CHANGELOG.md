@@ -2,7 +2,7 @@
 
 All notable changes to Recached are documented here.
 
-## [0.3.4] (Unreleased)
+## [0.3.4] (2026-09-013)
 
 - Fixed concurrent writes, transactions, `WATCH`, and expiry and eviction propagation
 - Made snapshots, AOF, and dedup persistence atomic, fail-closed, and observable
